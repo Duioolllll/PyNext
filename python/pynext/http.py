@@ -4,6 +4,14 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qs
 
 
+class BadRequest(Exception):
+    """A request could not be parsed or failed application validation."""
+
+
+def _reject_json_constant(_value):
+    raise ValueError("Non-finite numbers are not valid JSON")
+
+
 @dataclass(frozen=True)
 class Request:
     method: str
@@ -15,10 +23,17 @@ class Request:
 
     @property
     def query(self):
-        return parse_qs(self.query_string.decode("utf-8", errors="strict"), keep_blank_values=True)
+        try:
+            value = self.query_string.decode("utf-8", errors="strict")
+            return parse_qs(value, keep_blank_values=True, encoding="utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise BadRequest("Invalid UTF-8 query string") from exc
 
     async def json(self):
-        return json.loads(self.body)
+        try:
+            return json.loads(self.body, parse_constant=_reject_json_constant)
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+            raise BadRequest("Invalid JSON body") from exc
 
 
 class Response:

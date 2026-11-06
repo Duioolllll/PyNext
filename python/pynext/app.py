@@ -15,7 +15,7 @@ from .cache import CacheBusy, ISRCache
 from .client import compile_client, read_client_artifacts
 from .components import bind_islands
 from .build import discover, load_manifest
-from .http import Request, Response
+from .http import BadRequest, Request, Response
 
 log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
@@ -298,6 +298,8 @@ class App:
                                           tuple(scope.get("headers", [])), b"".join(chunks))
                         response = await self.dispatch(request)
                         break
+            except BadRequest:
+                response = Response("Bad Request", status=400)
             except Exception:
                 log.exception("Request failed")
                 response = Response("Internal Server Error", status=500)
