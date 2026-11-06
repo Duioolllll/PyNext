@@ -25,14 +25,22 @@ def test_slow_request_bodies_do_not_hold_execution_or_static_capacity(tmp_path):
         host, port = server.address.rsplit(":", 1)
         connections = []
         try:
-            for _ in range(64):
+            async def open_partial():
                 reader, writer = await asyncio.open_connection(host, int(port))
+                connections.append((reader, writer))
                 writer.write(b"POST /api/input HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\nx")
                 await writer.drain()
-                connections.append((reader, writer))
-            await asyncio.sleep(0.5)
+
+            await asyncio.gather(*(open_partial() for _ in range(64)))
             async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=5) as client:
-                assert (await client.post("/api/input", content=b"x")).status_code == 503
+                # Connections may be accepted before the server schedules each body read.
+                deadline = asyncio.get_running_loop().time() + 5
+                while True:
+                    response = await client.post("/api/input", content=b"x")
+                    if response.status_code == 503:
+                        break
+                    assert response.status_code == 200 and asyncio.get_running_loop().time() < deadline
+                    await asyncio.sleep(0.05)
                 assert (await client.get("/health.txt")).text == "healthy"
                 response = await client.get("/api/input")
                 assert response.status_code == 200 and response.json() == {"ok": True}
