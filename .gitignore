@@ -1,0 +1,10 @@
+.venv/
+target/
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.pytest_cache/
+.pynext/
+dist/
+node_modules/
