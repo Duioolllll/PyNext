@@ -8,6 +8,7 @@ from .app import _decode_path
 from .http import BadRequest, Request, Response
 
 log = logging.getLogger("pynext")
+REQUEST_TIMEOUT = 30
 
 
 def start_native(app, loop, host="127.0.0.1", port=3000):
@@ -21,8 +22,12 @@ def start_native(app, loop, host="127.0.0.1", port=3000):
                 request = Request(method.upper(), path, bytes(query),
                                   tuple((bytes(k), bytes(v)) for k, v in headers), bytes(body))
                 response = await app.dispatch(request)
+<<<<<<< HEAD
             except BadRequest as exc:
                 log.info("Bad request: %s", exc)
+=======
+            except BadRequest:
+>>>>>>> origin/main
                 response = Response("Bad Request", status=400)
             except Exception:
                 log.exception("Request failed")
@@ -34,7 +39,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000):
     def bridge(method, raw_path, query, headers, body):
         future = asyncio.run_coroutine_threadsafe(call(method, raw_path, query, headers, body), loop)
         try:
-            response = future.result(timeout=30)
+            response = future.result(timeout=REQUEST_TIMEOUT)
         except concurrent.futures.TimeoutError:
             future.cancel()
             response = Response("Gateway Timeout", status=504)

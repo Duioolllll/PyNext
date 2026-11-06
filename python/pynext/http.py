@@ -8,6 +8,14 @@ class BadRequest(ValueError):
     """Raised when a request's user-controlled representation is invalid."""
 
 
+class BadRequest(Exception):
+    """A request could not be parsed or failed application validation."""
+
+
+def _reject_json_constant(_value):
+    raise ValueError("Non-finite numbers are not valid JSON")
+
+
 @dataclass(frozen=True)
 class Request:
     method: str
@@ -20,6 +28,7 @@ class Request:
     @property
     def query(self):
         try:
+<<<<<<< HEAD
             query = self.query_string.decode("utf-8", errors="strict")
             unquote_to_bytes(query).decode("utf-8", errors="strict")
             return parse_qs(query, keep_blank_values=True, max_num_fields=1000)
@@ -30,6 +39,17 @@ class Request:
         try:
             return json.loads(self.body)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+=======
+            value = self.query_string.decode("utf-8", errors="strict")
+            return parse_qs(value, keep_blank_values=True, encoding="utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise BadRequest("Invalid UTF-8 query string") from exc
+
+    async def json(self):
+        try:
+            return json.loads(self.body, parse_constant=_reject_json_constant)
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+>>>>>>> origin/main
             raise BadRequest("Invalid JSON body") from exc
 
 
