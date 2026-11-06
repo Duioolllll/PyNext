@@ -309,12 +309,8 @@ class App:
                                           tuple(scope.get("headers", [])), b"".join(chunks))
                         response = await self.dispatch(request)
                         break
-<<<<<<< HEAD
             except BadRequest as exc:
                 log.info("Bad request: %s", exc)
-=======
-            except BadRequest:
->>>>>>> origin/main
                 response = Response("Bad Request", status=400)
             except Exception:
                 log.exception("Request failed")
