@@ -1,7 +1,7 @@
 use axum::{
-    body::{to_bytes, Body, Bytes},
+    body::{to_bytes, Body, Bytes, HttpBody},
     extract::{Request, State},
-    http::{HeaderName, HeaderValue, StatusCode},
+    http::{header, HeaderName, HeaderValue, StatusCode, Version},
     response::Response as AxumResponse,
     routing::any,
     Router as AxumRouter,
@@ -13,6 +13,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::error::Error as _;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -336,11 +337,15 @@ fn render(py: Python<'_>, tree_json: &str) -> PyResult<String> {
 struct ServerState {
     callback: Py<PyAny>,
     capacity: Arc<Semaphore>,
+    body_capacity: Arc<Semaphore>,
     static_pages: HashMap<String, Bytes>,
     public_assets: HashMap<String, PublicAsset>,
     client_assets: HashMap<String, Bytes>,
     isr_cache: Arc<PageCache>,
 }
+
+const MAX_REQUEST_BODY: usize = 1_048_576;
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct PublicAsset {
     body: Bytes,
@@ -392,15 +397,59 @@ fn plain_response(status: StatusCode, body: &'static str) -> AxumResponse<Body> 
         .expect("static response is valid")
 }
 
+// HTTP/1 connections with an unread body must not be reused for another request.
+fn close_with_unread_body(
+    mut response: AxumResponse<Body>,
+    version: Version,
+) -> AxumResponse<Body> {
+    if matches!(version, Version::HTTP_10 | Version::HTTP_11) {
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    response
+}
+
 async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> AxumResponse<Body> {
-    let permit = match state.capacity.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Server Busy"),
-    };
     let (parts, body) = request.into_parts();
-    let body = match to_bytes(body, 1_048_576).await {
-        Ok(bytes) => bytes,
-        Err(_) => return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
+    // Empty requests do not compete with clients currently uploading bodies.
+    let body = if body.is_end_stream() {
+        Bytes::new()
+    } else {
+        let _body_permit = match state.body_capacity.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return close_with_unread_body(
+                    plain_response(StatusCode::SERVICE_UNAVAILABLE, "Server Busy"),
+                    parts.version,
+                );
+            }
+        };
+        match tokio::time::timeout(BODY_READ_TIMEOUT, to_bytes(body, MAX_REQUEST_BODY)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                let status = if error
+                    .source()
+                    .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+                {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    "Payload Too Large"
+                } else {
+                    "Bad Request"
+                };
+                return close_with_unread_body(plain_response(status, message), parts.version);
+            }
+            Err(_) => {
+                return close_with_unread_body(
+                    plain_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout"),
+                    parts.version,
+                );
+            }
+        }
     };
     if parts.method == axum::http::Method::GET || parts.method == axum::http::Method::HEAD {
         if let Some(path) = static_path(parts.uri.path()) {
@@ -486,6 +535,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             }
         }
     }
+    // Static/cache hits never compete with Python handler execution.
+    let permit = match state.capacity.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Server Busy"),
+    };
     let method = parts.method.to_string();
     let path = parts.uri.path().to_string();
     let query = parts.uri.query().unwrap_or("").as_bytes().to_vec();
@@ -590,6 +644,7 @@ impl NativeServer {
                 let state = Arc::new(ServerState {
                     callback,
                     capacity: Arc::new(Semaphore::new(64)),
+                    body_capacity: Arc::new(Semaphore::new(64)),
                     static_pages: static_pages
                         .into_iter()
                         .map(|(path, body)| (path, Bytes::from(body)))

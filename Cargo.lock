@@ -300,6 +300,7 @@ name = "pynext-native"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "http-body-util",
  "pynext-cache",
  "pynext-router",
  "pyo3",
