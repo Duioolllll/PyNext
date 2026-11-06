@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/pynext-router", "crates/pynext-cache", "crates/pynext-native"]
+resolver = "2"
