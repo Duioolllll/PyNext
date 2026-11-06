@@ -1,3 +1,4 @@
+![Uploading Gemini_Generated_Image_n18z7gn18z7gn18z.png…]()
 # PyNext — 초기 프로토타입
 
 PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust로 구현하는 실험적 풀스택 프레임워크입니다. 이 저장소는 구현의 출발점이며, Next.js나 React의 호환 구현은 아닙니다.
