@@ -460,7 +460,10 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     .status(StatusCode::OK)
                     .header("content-type", "text/html; charset=utf-8")
                     .header("content-length", length.to_string())
-                    .header("content-security-policy", "script-src 'self'; object-src 'none'")
+                    .header(
+                        "content-security-policy",
+                        "script-src 'self'; object-src 'none'",
+                    )
                     .header("vary", "Cookie, Authorization")
                     .body(body)
                     .expect("static response is valid");
@@ -479,7 +482,10 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         .header("content-type", "text/html; charset=utf-8")
                         .header("content-length", length.to_string())
                         .header("cache-control", "public, max-age=0, must-revalidate")
-                        .header("content-security-policy", "script-src 'self'; object-src 'none'")
+                        .header(
+                            "content-security-policy",
+                            "script-src 'self'; object-src 'none'",
+                        )
                         .header("vary", "Cookie, Authorization")
                         .body(body)
                         .expect("cached response is valid");
