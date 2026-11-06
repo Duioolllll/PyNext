@@ -9,9 +9,10 @@ from pathlib import Path
 
 from . import _native
 from .assets import discover_public
+from .client import discover_client
 
 MANIFEST = ".pynext/manifest.json"
-VERSION = 4
+VERSION = 5
 MAX_STATIC_PAGES = 10_000
 
 
@@ -59,12 +60,15 @@ def discover(root):
         raise ValueError("No page.py or route.py files found")
     router = _native.Router(list(routes))
     public_sources = discover_public(root)
+    for path in list(routes) + list(public_sources):
+        if path == "/_pynext" or path.startswith("/_pynext/"):
+            raise ValueError(f"Reserved PyNext path: {path}")
     conflicts = set(public_sources).intersection(routes)
     if conflicts:
         raise ValueError(f"Public file conflicts with a page or API route: {sorted(conflicts)[0]}")
     return {"schema_version": VERSION, "routes": {p: routes[p] for p in router.ordered_routes()},
             "sources": {str(p.relative_to(root)): _hash(p) for p in files},
-            "public_sources": public_sources}
+            "public_sources": public_sources, "client_sources": discover_client(root)}
 
 
 def write_manifest(root):
@@ -79,6 +83,7 @@ def write_manifest(root):
         raise ValueError("Application sources changed during build; retry the build")
     manifest["render_modes"] = app.render_modes
     manifest["isr_policies"] = app.isr_policies
+    manifest["client"] = app.client_manifest
     manifest["static_pages"] = {}
     for path, (pattern, body) in rendered.items():
         digest = hashlib.sha256(body).hexdigest()
@@ -90,6 +95,9 @@ def write_manifest(root):
         digest = hashlib.sha256(body).hexdigest()
         _atomic_write(root / ".pynext" / "static" / f"{digest}.asset", body)
         manifest["assets"][path] = {"sha256": digest, "content_type": media_type}
+    for path, body in app.client_assets.items():
+        digest = path.rsplit("/", 1)[1].removesuffix(".js")
+        _atomic_write(root / ".pynext" / "static" / f"{digest}.js", body)
     target = root / MANIFEST
     _atomic_write(target, (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
     return manifest

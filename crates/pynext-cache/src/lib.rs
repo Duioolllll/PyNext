@@ -173,4 +173,39 @@ mod tests {
             CacheResult::Fresh(Bytes::from_static(b"one"))
         );
     }
+
+    #[test]
+    fn concurrent_reads_and_writes_preserve_limits() {
+        let cache = std::sync::Arc::new(PageCache::new(32, 256, 16));
+        let mut workers = Vec::new();
+        for worker in 0..8 {
+            let cache = cache.clone();
+            workers.push(std::thread::spawn(move || {
+                for iteration in 0..1000 {
+                    let key = format!("{worker}-{}", iteration % 20);
+                    cache.insert(
+                        key.clone(),
+                        Bytes::from_static(b"12345678"),
+                        Duration::from_secs(10),
+                        Duration::from_secs(10),
+                    );
+                    let _ = cache.lookup(&key);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let state = cache.state.lock().unwrap();
+        assert!(state.entries.len() <= 32);
+        assert!(state.total_bytes <= 256);
+        assert_eq!(
+            state.total_bytes,
+            state
+                .entries
+                .values()
+                .map(|entry| entry.body.len())
+                .sum::<usize>()
+        );
+    }
 }

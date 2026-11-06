@@ -40,7 +40,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000):
             response = Response("Gateway Timeout", status=504)
         return response.status, response.headers, response.body
 
-    return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.isr.store)
+    return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store)
 
 
 async def serve(app, host="127.0.0.1", port=3000):

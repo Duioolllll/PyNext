@@ -12,6 +12,8 @@ from urllib.parse import quote, unquote_to_bytes
 from . import _native
 from .assets import read_public_artifacts, read_public_sources
 from .cache import CacheBusy, ISRCache
+from .client import compile_client, read_client_artifacts
+from .components import bind_islands
 from .build import discover, load_manifest
 from .http import BadRequest, Request, Response
 
@@ -79,6 +81,8 @@ class App:
         self.static_generators = {}
         self.static_pages = {}
         self.public_assets = {}
+        self.client_assets = {}
+        self.client_manifest = {}
         # Application imports are resolved from the project's root.
         if str(self.root) not in sys.path:
             sys.path.insert(0, str(self.root))
@@ -139,12 +143,14 @@ class App:
                 raise ValueError("Render modes changed since build; run `pynext build` again")
             if manifest.get("isr_policies") != self.isr_policies:
                 raise ValueError("ISR policies changed since build; run `pynext build` again")
+            self.client_manifest, self.client_assets = read_client_artifacts(self.root, manifest)
             self.static_pages = read_static_pages(self.root, manifest, self.router)
             self.public_assets = read_public_artifacts(self.root, manifest)
             if set(self.static_pages).intersection(self.public_assets):
                 raise ValueError("A public file conflicts with a generated page; rebuild the application")
         else:
             self.public_assets = read_public_sources(self.root, manifest["public_sources"])
+            self.client_manifest, self.client_assets = compile_client(self.root, manifest["client_sources"])
 
     def _module(self, path):
         if path not in self.modules:
@@ -156,6 +162,7 @@ class App:
         tree = await _invoke(fn, request=request, params=params)
         for layout_fn in reversed(layouts):
             tree = await _invoke(layout_fn, children=tree)
+        tree = bind_islands(tree, self.client_manifest)
         payload = json.dumps(tree, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         html = await asyncio.to_thread(_native.render, payload)
         if isinstance(tree, dict) and tree.get("tag", "").lower() == "html":
@@ -172,6 +179,21 @@ class App:
                     return Response("Bad Request", status=400)
                 location += b"?" + request.query_string
             return Response("", status=308, headers=[(b"location", location)])
+        if path == "/_pynext" or path.startswith("/_pynext/"):
+            if path not in self.client_assets:
+                return Response("Not Found", status=404)
+            allow = b"GET, HEAD, OPTIONS"
+            if request.method == "OPTIONS":
+                return Response(b"", status=204, headers=[(b"allow", allow)], media_type=None)
+            if request.method not in {"GET", "HEAD"}:
+                return Response("Method Not Allowed", status=405, headers=[(b"allow", allow)])
+            response = Response(self.client_assets[path], media_type="text/javascript; charset=utf-8", headers=[
+                (b"cache-control", b"public, max-age=31536000, immutable"),
+                (b"x-content-type-options", b"nosniff"),
+            ])
+            if request.method == "HEAD":
+                response.body = b""
+            return response
         if path in self.public_assets:
             allow = b"GET, HEAD, OPTIONS"
             if request.method == "OPTIONS":

@@ -45,9 +45,9 @@ def _validate_component(name):
         raise ValueError(f"Invalid Unicode public filename: {name!r}") from exc
 
 
-def _read_public(root, parts):
+def _read_public(root, parts, source_dir="public"):
     """Open each component without following symlinks when the OS supports it."""
-    public = root / "public"
+    public = root / source_dir
     opened = []
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
@@ -76,7 +76,7 @@ def _read_public(root, parts):
                 raise ValueError(f"Public file exceeds {MAX_PUBLIC_FILE_BYTES} bytes")
             return data
     except OSError as exc:
-        raise ValueError(f"Cannot read public file safely: {'/'.join(parts)}") from exc
+        raise ValueError(f"Cannot read {source_dir} file safely: {'/'.join(parts)}") from exc
     finally:
         for fd in reversed(opened):
             os.close(fd)

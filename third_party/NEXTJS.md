@@ -24,6 +24,13 @@ ISR freshness, stale serving, and single-flight regeneration were informed by:
 - https://github.com/vercel/next.js/blob/6100e81e314f7aad0c94e189bbae87820d7efb37/packages/next/src/server/response-cache/index.ts
 - https://github.com/vercel/next.js/blob/6100e81e314f7aad0c94e189bbae87820d7efb37/packages/next/src/server/lib/incremental-cache/index.ts
 
+The explicit separation of server code and a client module manifest was
+informed by Next.js client-boundary handling. PyNext's island mount protocol is
+independent and does not implement React Server Components or React hydration:
+
+- https://github.com/vercel/next.js/blob/6100e81e314f7aad0c94e189bbae87820d7efb37/packages/next/src/build/webpack/loaders/next-flight-loader/index.ts
+- https://github.com/vercel/next.js/blob/6100e81e314f7aad0c94e189bbae87820d7efb37/packages/next/src/build/webpack/plugins/flight-manifest-plugin.ts
+
 PyNext supports a deliberately smaller route grammar; see the README. It does
 not include or implement Next.js, React, or the React Server Components protocol.
 

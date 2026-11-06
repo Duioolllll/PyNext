@@ -114,6 +114,18 @@ fn html_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
 }
 
+fn client_asset_url(value: &str) -> bool {
+    value
+        .strip_prefix("/_pynext/static/")
+        .and_then(|s| s.strip_suffix(".js"))
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
 fn render_node(node: &Value, output: &mut String, depth: usize) -> Result<(), String> {
     if depth > 256 {
         return Err("Render tree exceeds maximum depth".into());
@@ -138,6 +150,62 @@ fn render_node(node: &Value, output: &mut String, depth: usize) -> Result<(), St
             {
                 render_node(child, output, depth + 1)?;
             }
+        }
+        "island" => {
+            let name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("Island has no name")?;
+            if name.len() > 64
+                || !name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            {
+                return Err("Invalid island name".into());
+            }
+            let module = obj
+                .get("module")
+                .and_then(Value::as_str)
+                .ok_or("Island has no module")?;
+            if !client_asset_url(module) {
+                return Err("Invalid island module URL".into());
+            }
+            let props = obj
+                .get("props")
+                .filter(|v| v.is_object())
+                .ok_or("Island props must be an object")?;
+            let props = serde_json::to_string(props).map_err(|e| e.to_string())?;
+            if props.len() > 16_384 {
+                return Err("Island props exceed maximum size".into());
+            }
+            output.push_str("<div data-pynext-island=\"");
+            escape(name, output);
+            output.push_str("\" data-pynext-module=\"");
+            escape(module, output);
+            output.push_str("\" data-pynext-props=\"");
+            escape(&props, output);
+            output.push_str("\">");
+            for child in obj
+                .get("children")
+                .and_then(Value::as_array)
+                .ok_or("Island children must be an array")?
+            {
+                render_node(child, output, depth + 1)?;
+            }
+            output.push_str("</div>");
+        }
+        "client_runtime" => {
+            let src = obj
+                .get("src")
+                .and_then(Value::as_str)
+                .ok_or("Client runtime has no source")?;
+            if !client_asset_url(src) {
+                return Err("Invalid client runtime URL".into());
+            }
+            output.push_str("<script type=\"module\" src=\"");
+            escape(src, output);
+            output.push_str("\"></script>");
         }
         "element" => {
             let tag = obj
@@ -255,6 +323,7 @@ struct ServerState {
     capacity: Arc<Semaphore>,
     static_pages: HashMap<String, Bytes>,
     public_assets: HashMap<String, PublicAsset>,
+    client_assets: HashMap<String, Bytes>,
     isr_cache: Arc<PageCache>,
 }
 
@@ -316,6 +385,21 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     };
     if parts.method == axum::http::Method::GET || parts.method == axum::http::Method::HEAD {
         if let Some(path) = static_path(parts.uri.path()) {
+            if let Some(content) = state.client_assets.get(&path) {
+                let body = if parts.method == axum::http::Method::HEAD {
+                    Body::empty()
+                } else {
+                    Body::from(content.clone())
+                };
+                return AxumResponse::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/javascript; charset=utf-8")
+                    .header("content-length", content.len().to_string())
+                    .header("cache-control", "public, max-age=31536000, immutable")
+                    .header("x-content-type-options", "nosniff")
+                    .body(body)
+                    .expect("client asset response is valid");
+            }
             if let Some(asset) = state.public_assets.get(&path) {
                 let body = if parts.method == axum::http::Method::HEAD {
                     Body::empty()
@@ -430,6 +514,7 @@ impl NativeServer {
         port: u16,
         static_pages: HashMap<String, Vec<u8>>,
         public_assets: HashMap<String, (Vec<u8>, String)>,
+        client_assets: HashMap<String, Vec<u8>>,
         isr_cache: PyRef<'_, PyPageCache>,
     ) -> PyResult<Self> {
         let isr_cache = isr_cache.inner.clone();
@@ -473,6 +558,10 @@ impl NativeServer {
                         .map(|(path, body)| (path, Bytes::from(body)))
                         .collect(),
                     public_assets,
+                    client_assets: client_assets
+                        .into_iter()
+                        .map(|(path, body)| (path, Bytes::from(body)))
+                        .collect(),
                     isr_cache,
                 });
                 let app = AxumRouter::new().fallback(any(dispatch)).with_state(state);
