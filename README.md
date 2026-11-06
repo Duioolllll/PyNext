@@ -1,5 +1,9 @@
 # PyNext — 초기 프로토타입
 
+**Manual:** [English](docs/en/manual.md) · [한국어](docs/ko/manual.md) · [日本語](docs/ja/manual.md) · [简体中文](docs/zh-CN/manual.md)
+
+**Version:** v0.4.0 · [변경 이력](CHANGELOG.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
+
 PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust로 구현하는 실험적 풀스택 프레임워크입니다. 이 저장소는 구현의 출발점이며, Next.js나 React의 호환 구현은 아닙니다.
 
 현재는 Next.js 원본의 경로 정렬·충돌 검사를 참고해 Rust 라우터를 구현하고, Python 페이지·API 및 Rust HTML 렌더러와 연결했습니다. 참고한 원본의 고정 커밋과 MIT 라이선스는 [third_party/NEXTJS.md](third_party/NEXTJS.md)에 있습니다.
@@ -199,4 +203,3 @@ uv run --extra dev pytest
 빌드 후 `--production --path /about`을 추가하면 SSG 경로를 측정합니다.
 
 개발 단계와 Next.js 원본을 참조하는 범위는 [구현 로드맵](docs/ROADMAP.md)을 참고하세요.
-# PyNext
