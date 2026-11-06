@@ -201,3 +201,8 @@ uv run --extra dev pytest
 
 개발 단계와 Next.js 원본을 참조하는 범위는 [구현 로드맵](docs/ROADMAP.md)을 참고하세요.
 # PyNext
+
+## 라이선스
+
+PyNext 자체 코드는 [MIT License](LICENSE)로 배포됩니다. `third_party/` 아래의
+참고 자료는 각 파일에 표시된 별도 라이선스를 따릅니다.
