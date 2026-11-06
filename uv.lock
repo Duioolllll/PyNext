@@ -126,7 +126,7 @@ wheels = [
 
 [[package]]
 name = "pynext-framework"
-version = "0.1.0a0"
+version = "0.6.0a1"
 source = { editable = "." }
 
 [package.optional-dependencies]

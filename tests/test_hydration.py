@@ -1,7 +1,6 @@
 import asyncio
 import json
 from html.parser import HTMLParser
-from pathlib import Path
 
 import httpx
 import pytest
@@ -9,17 +8,6 @@ import pytest
 from pynext import create_app, h, island
 from pynext.build import write_manifest
 from pynext.server import start_native
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-@pytest.fixture
-def esbuild(monkeypatch):
-    executable = ROOT / "node_modules" / ".bin" / "esbuild"
-    if not executable.is_file():
-        pytest.fail("Run npm ci to install the islands build dependency")
-    monkeypatch.setenv("PYNEXT_ESBUILD", str(executable))
-
 
 def make_project(root, mode, strategy="load"):
     (root / "app").mkdir()

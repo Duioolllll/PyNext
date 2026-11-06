@@ -1,4 +1,5 @@
 import asyncio
+import os
 from pathlib import Path
 
 import httpx
@@ -22,7 +23,9 @@ def make_project(root):
     (public / "styles" / "site.css").write_bytes(b"body { color: navy; }")
     (public / "logo.txt").write_bytes(b"public asset")
     (public / "한 글.txt").write_text("hello", encoding="utf-8")
-    (public / "what?.bin").write_bytes(b"\x00\xff")
+    (public / "what#.bin").write_bytes(b"\x00\xff")
+    if os.name != "nt":
+        (public / "what?.bin").write_bytes(b"\x00\xff")
     return public
 
 
@@ -36,8 +39,10 @@ async def check_responses(client):
     assert head.status_code == 200 and head.content == b""
     assert int(head.headers["content-length"]) == len(response.content)
     assert (await client.get("/%ED%95%9C%20%EA%B8%80.txt")).text == "hello"
-    binary = await client.get("/what%3F.bin")
+    binary = await client.get("/what%23.bin")
     assert binary.content == b"\x00\xff" and binary.headers["content-type"] == "application/octet-stream"
+    if os.name != "nt":
+        assert (await client.get("/what%3F.bin")).content == b"\x00\xff"
     assert (await client.get("/logo.txt")).content == b"public asset"
     assert (await client.get("/something-else")).text == "<p>something-else</p>"
     assert (await client.get("/styles%2Fsite.css")).status_code == 400
@@ -65,7 +70,7 @@ def test_public_assets_in_asgi_and_axum_with_native_bypass(tmp_path, production)
                     raise AssertionError("native public file crossed the Python boundary")
                 app.dispatch = fail_dispatch
                 assert (await client.get("/styles/site.css")).content == b"body { color: navy; }"
-                head = await client.head("/what%3F.bin")
+                head = await client.head("/what%23.bin")
                 assert head.status_code == 200 and head.content == b""
                 assert int(head.headers["content-length"]) == 2
                 assert (await client.get("/something-else")).status_code == 500

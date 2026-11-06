@@ -1,5 +1,8 @@
-
 # PyNext — 초기 프로토타입
+
+**Manual:** [English](docs/en/manual.md) · [한국어](docs/ko/manual.md) · [日本語](docs/ja/manual.md) · [简体中文](docs/zh-CN/manual.md)
+
+**Version:** v0.6.0a1 · [변경 이력](CHANGELOG.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
 
 PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust로 구현하는 실험적 풀스택 프레임워크입니다. 이 저장소는 구현의 출발점이며, Next.js나 React의 호환 구현은 아닙니다.
 
@@ -61,7 +64,7 @@ async def users():
     return JSONResponse({"users": ["Alice", "Bob"]})
 ```
 
-`request.query`를 읽을 때 잘못된 UTF-8 쿼리 문자열과 `await request.json()`을 읽을 때 잘못된 JSON 본문은 `BadRequest` 예외가 발생하며 HTTP 400으로 응답합니다. 쿼리의 퍼센트 인코딩을 푼 결과도 UTF-8로 검사합니다. JSON의 `NaN`과 `Infinity`도 허용하지 않습니다. 파싱은 해당 속성이나 메서드를 읽을 때 이루어지므로, 읽지 않는 요청에는 적용되지 않습니다. 앱에서 직접 `from pynext import BadRequest`로 불러와 입력 검증 오류에 사용할 수도 있습니다. 클라이언트에는 예외의 상세 내용 대신 `Bad Request`만 전송합니다.
+`request.query`를 읽을 때 잘못된 UTF-8 쿼리 문자열과 `await request.json()`을 읽을 때 잘못된 JSON 본문은 `BadRequest` 예외가 발생하며 HTTP 400으로 응답합니다. 쿼리의 퍼센트 인코딩을 푼 결과도 UTF-8로 검사합니다. JSON의 `NaN`과 `Infinity`도 허용하지 않습니다. 파싱은 해당 속성이나 메서드를 읽을 때 이루어지므로, 읽지 않는 요청에는 적용되지 않습니다. 앱에서 직접 `from pynext import BadRequest`로 불러와 입력 검증 오류에 사용할 수도 있습니다. 클라이언트에는 예외의 상세 내용 대신 `Bad Request`만 전송합니다. 요청 본문은 최대 1 MiB이며 초과하면 413입니다.
 
 경로는 정적 경로, `[slug]`, 마지막 위치의 `[...path]`를 지원합니다. 우선순위는 정적 > 단일 동적 > catch-all입니다. catch-all 파라미터는 문자열 리스트이고 단일 동적 파라미터는 문자열입니다. 선택적 catch-all, 라우트 그룹, 병렬·인터셉트 라우트는 아직 지원하지 않습니다. 빌드 시 경로 충돌과 잘못된 핸들러를 검사하고 `.pynext/manifest.json`에 소스 해시를 기록합니다. `start`는 빌드 후 소스가 바뀌면 재빌드를 요구합니다.
 
@@ -146,6 +149,7 @@ island("chart", props={"value": 42}, strategy="visible",
 - island 진입점은 최대 256개, 소스 파일은 10,000개·총 10 MiB 이하이며 파일 하나는 1 MiB 이하입니다.
 - `props`는 공개되는 JSON 객체입니다. 비밀 값을 넣지 마세요. 크기는 16 KiB 이하이고 숫자는 JavaScript에서 안전하게 표현할 수 있어야 합니다.
 - islands가 있는 앱을 빌드하거나 개발 서버로 시작할 때 esbuild가 필요합니다. 프로젝트의 `node_modules/.bin/esbuild`, PATH 또는 `PYNEXT_ESBUILD` 환경 변수에서 찾습니다. 빌드가 끝난 운영 서버에는 esbuild가 필요하지 않습니다.
+- Windows에서는 npm의 esbuild를 Node로 실행합니다. `PYNEXT_ESBUILD`를 직접 설정할 때는 `.cmd`나 `.bat` 대신 네이티브 `esbuild.exe`를 지정해야 합니다.
 - 별도의 앱 프로젝트에서는 `npm install --save-dev --save-exact esbuild@0.28.1`로 예제와 같은 버전을 설치할 수 있습니다.
 - `/_pynext`는 프레임워크 내부 경로로 예약되어 있습니다. 앱과 공개 파일에는 사용할 수 없습니다.
 
@@ -178,12 +182,12 @@ ISR은 **공개 콘텐츠 전용**입니다. 페이지 함수는 `request`를 �
 ## 현재 상태와 제한
 
 - SSR은 Python에서 UI 트리를 만들고 Rust가 이스케이프해 직렬화하는 buffered 렌더링입니다. 문자열을 raw HTML로 삽입하는 API는 없습니다.
-- Axum 서버는 Python asyncio 루프에 요청을 전달하며 동시에 최대 64개 요청을 처리합니다. 슬롯이 모두 차면 새 요청은 최대 1초까지 슬롯을 기다린 뒤 503(`Retry-After: 1`)을 받습니다. 두 값은 `--max-concurrent`와 `--acquire-timeout-ms`로 바꿀 수 있습니다. Python 응답을 30초 동안 기다린 뒤에는 504를 반환하고 해당 코루틴의 취소를 요청합니다. 이미 스레드에서 실행 중인 동기 핸들러나 렌더링 함수는 강제로 중단되지 않아 504 이후에도 쓰기 등의 부작용을 일으키거나 자원을 점유할 수 있습니다. ISR 생성의 시간 초과나 취소에도 같은 제한이 있습니다. 쓰기 작업은 멱등성을 보장하고 DB·외부 서비스에 별도의 시간 제한을 설정해야 합니다. 강제 종료가 필요하면 별도의 프로세스 격리가 필요하며 현재 구현되어 있지 않습니다. 외부 ASGI 서버의 요청 시간 제한은 해당 서버가 관리합니다.
-- 모든 HTML 응답에는 `content-security-policy: script-src 'self'; object-src 'none'`이 붙습니다. ISR·SSG 응답에는 `vary: Cookie, Authorization`도 붙어 공유 캐시가 인증 요청에 공개 본문을 내놓지 않습니다.
+- Axum 서버는 본문 수신과 Python 실행에 각각 최대 64개 슬롯을 사용합니다. 본문 수신은 전체 10초를 넘으면 408이며, 해당 풀이 가득 차면 503입니다. 본문 없는 정적 파일과 신선한 ISR 캐시는 Python 실행 슬롯이 가득 차도 제공됩니다. 이 제한은 HTTP 헤더를 받는 시간이나 총 연결 수를 제한하지 않습니다. Python 응답을 30초 동안 기다린 뒤에는 504를 반환하고 해당 코루틴의 취소를 요청합니다. 이미 스레드에서 실행 중인 동기 핸들러나 렌더링 함수는 강제로 중단되지 않아 504 이후에도 쓰기 등의 부작용을 일으키거나 자원을 점유할 수 있습니다. ISR 생성의 시간 초과나 취소에도 같은 제한이 있습니다. 쓰기 작업은 멱등성을 보장하고 DB·외부 서비스에 별도의 시간 제한을 설정해야 합니다. 강제 종료가 필요하면 별도의 프로세스 격리가 필요하며 현재 구현되어 있지 않습니다. 외부 ASGI 서버의 요청 시간 제한은 해당 서버가 관리합니다.
+- Python 실행 슬롯의 기본값은 64개이며 `--max-concurrent`로 조정합니다. 최대 64개 요청이 기본 1초 동안 슬롯을 기다리고, 대기열이 가득 차거나 시간이 지나면 `Retry-After: 1`과 함께 503을 반환합니다. 대기 시간은 `--acquire-timeout-ms`로 조정합니다.
 - ASGI HTTP와 기본 lifespan을 지원합니다. WebSocket, 스트리밍, 요청 처리 중 연결 해제 감지와 완전한 ASGI 적합성 검증은 아직 구현되지 않았습니다.
 - ISR은 단일 프로세스 메모리 구현입니다. 워커 간 공유 캐시·무효화, 상호작용 시 island 로딩과 hydration 전 이벤트 재생, 자동 리로드, 프로덕션 보안·관측성 기능은 **미구현**입니다. PyNext의 hydration은 React나 React Server Components와 호환되지 않습니다. 현재 버전을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하는 데 사용하지 마세요.
 - 빌드할 때 앱 모듈을 import하므로 개발자가 작성한 Python 코드가 실행됩니다. 프로젝트를 신뢰할 수 있는 환경에서 빌드해야 합니다.
-- Python 파일의 앱 루트 기준 절대 import를 지원합니다. 파일 시스템 기반 로더의 상대 import는 아직 지원하지 않습니다.
+- 페이지·레이아웃·API 파일에서 `from .helpers import name` 같은 상대 import를 사용할 수 있습니다. **0.6 변경:** 프로젝트 루트를 전역 `sys.path`에 자동 추가하지 않습니다. 기존 루트 기준 절대 import가 실패하면 상대 import로 바꾸거나 프로젝트를 Python 패키지로 설치하세요.
 - `start`의 manifest는 앱 디렉터리의 Python 파일과 `public`·`islands` 파일 변화를 검사하지만 앱 밖 의존성, 외부 데이터나 환경 변수 변화까지 추적하지 않습니다. 현재 운영 시작에도 원본 `public`과 `islands` 디렉터리가 필요합니다. 정적 산출물은 프로세스마다 메모리에 적재하며, 이전 빌드의 사용하지 않는 파일을 자동 정리하지 않습니다.
 
 ## 테스트
@@ -193,16 +197,36 @@ cargo test -p pynext-router -p pynext-cache
 uv run --extra dev pytest
 ```
 
-실제 Chromium에서의 mount·클릭·CSP·정리 동작 검사는 Playwright와 브라우저가 설치된 환경에서 `tests/browser/islands_smoke.py`를 예제 서버와 함께 실행할 수 있습니다.
+예제를 빌드한 뒤 다음 명령으로 실제 Chromium에서 mount·hydration·CSP·정리 동작을 검사할 수 있습니다.
+
+```bash
+uv run --with playwright==1.62.0 python -m playwright install chromium
+uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
+```
 
 기초 부하 측정은 `uv run --extra dev python benchmarks/bench.py --mode axum` 또는
 `--mode asgi`로 실행합니다. 이 스크립트는 같은 프로세스에서 클라이언트도
 실행하는 간단한 회귀 측정 도구이며, 프레임워크 간 성능 비교 결과가 아닙니다.
 빌드 후 `--production --path /about`을 추가하면 SSG 경로를 측정합니다.
 
-개발 단계와 Next.js 원본을 참조하는 범위는 [구현 로드맵](docs/ROADMAP.md)을 참고하세요.
-# PyNext
+결과에는 전체 시도와 성공한 2xx 요청의 초당 처리량, 오류 비율, 상태 코드별 건수,
+전체·성공 요청의 p50/p95/p99, 응답 크기가 별도로 표시됩니다. `--warmup`으로
+준비 요청 수를 바꿀 수 있으며 준비 요청 오류도 따로 집계합니다. 기본 모드의
+프로세스 CPU 시간과 최대 RSS에는 부하 생성기와 서버가 함께 포함됩니다. RSS는
+측정 구간만이 아닌 프로세스 생애 동안의 최대값입니다.
 
+별도로 실행한 로컬 서버를 측정할 때는 `--base-url http://127.0.0.1:3000`을
+지정합니다. Linux에서는 `--server-pid <PID>`를 더해 해당 서버 프로세스의 CPU
+시간과 단일 코어 기준 사용률을 따로 확인할 수 있습니다. 이는 지정한 한 프로세스와
+그 스레드만 포함하며 자식 워커는 포함하지 않습니다. CI는 작은 동시 요청 실험의
+측정값을 저장하지만, 환경에 민감한 성능·메모리 회귀의 자동 임계값은 아직 없습니다.
+
+벤치마크 수치는 최소 비교 앱과 부분적으로 이식된 경로를 기준으로 하며,
+데이터베이스·실제 사용자 트래픽·완성된 클라이언트 기능을 포함한 운영 서비스의
+성능을 의미하지 않습니다. 처리량과 함께 offered load 대비 성공률, 4xx/5xx 및
+503 비율, 응답 크기와 p50/p95/p99를 함께 기록하세요.
+
+개발 단계와 Next.js 원본을 참조하는 범위는 [구현 로드맵](docs/ROADMAP.md)을 참고하세요.
 ## 라이선스
 
 PyNext 자체 코드는 [MIT License](LICENSE)로 배포됩니다. `third_party/` 아래의

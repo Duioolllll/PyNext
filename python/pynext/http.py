@@ -1,7 +1,7 @@
 import json
 import re
 from dataclasses import dataclass, field
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote_to_bytes
 
 
 class BadRequest(Exception):
@@ -24,11 +24,10 @@ class Request:
     @property
     def query(self):
         try:
-            value = self.query_string.decode("utf-8", errors="strict")
-            return parse_qs(value, keep_blank_values=True, encoding="utf-8", errors="strict")
+            query = self.query_string.decode("utf-8", errors="strict")
+            unquote_to_bytes(query).decode("utf-8", errors="strict")
+            return parse_qs(query, keep_blank_values=True, max_num_fields=1000)
         except (UnicodeDecodeError, ValueError) as exc:
-            # ValueError covers parse_qs refusing more than 1,000 fields;
-            # UnicodeDecodeError is a ValueError subclass, listed for clarity.
             raise BadRequest("Invalid query string") from exc
 
     async def json(self):
@@ -46,10 +45,20 @@ class Response:
         self.status = status
         self.headers = [(bytes(k).lower(), bytes(v)) for k, v in headers]
         for key, value in self.headers:
-            if not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9a-z-]+", key) or any(c < 32 or c == 127 for c in value):
+            if (not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9a-z-]+", key) or
+                    any(c < 32 or c == 127 for c in value)):
                 raise ValueError("Invalid response header")
+        if media_type:
+            try:
+                media_type_bytes = media_type.encode("ascii")
+            except UnicodeEncodeError as exc:
+                raise ValueError("Invalid media type") from exc
+            if any(c < 32 or c == 127 for c in media_type_bytes):
+                raise ValueError("Invalid media type")
         if media_type and not any(k == b"content-type" for k, _ in self.headers):
-            self.headers.append((b"content-type", media_type.encode("ascii")))
+            self.headers.append((b"content-type", media_type_bytes))
+        if not any(k == b"content-security-policy" for k, _ in self.headers):
+            self.headers.append((b"content-security-policy", b"script-src 'self'; object-src 'none'"))
         if status not in (204, 304) and not any(k == b"content-length" for k, _ in self.headers):
             self.headers.append((b"content-length", str(len(self.body)).encode("ascii")))
 

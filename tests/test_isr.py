@@ -243,6 +243,27 @@ def test_invalid_isr_policy_is_rejected(kwargs):
         page(**kwargs)
 
 
+@pytest.mark.parametrize("policy", [
+    '{"revalidate": 0, "stale": 1}',
+    '{"revalidate": -1, "stale": 1}',
+    '{"revalidate": True, "stale": 1}',
+    '{"revalidate": float("nan"), "stale": 1}',
+    '{"revalidate": 1, "stale": -1}',
+])
+def test_isr_policy_is_revalidated_when_loading_page(tmp_path, policy):
+    source = make_project(tmp_path)
+    source.write_text(source.read_text(encoding="utf-8") + f"\nPage.__pynext_cache_policy__ = {policy}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid ISR policy"):
+        create_app(tmp_path)
+
+
+def test_loaded_isr_policy_does_not_alias_page_metadata(tmp_path):
+    make_project(tmp_path)
+    app = create_app(tmp_path)
+    app._module("app/blog/[slug]/page.py").Page.__pynext_cache_policy__["revalidate"] = 0
+    assert app.isr_policies["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0}
+
+
 def test_isr_rejects_request_access_and_static_generator(tmp_path):
     source = make_project(tmp_path)
     original = source.read_text()

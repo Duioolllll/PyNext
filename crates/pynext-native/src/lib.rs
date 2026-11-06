@@ -1,7 +1,7 @@
 use axum::{
-    body::{to_bytes, Body, Bytes},
+    body::{to_bytes, Body, Bytes, HttpBody},
     extract::{Request, State},
-    http::{HeaderName, HeaderValue, StatusCode},
+    http::{header, HeaderName, HeaderValue, StatusCode, Version},
     response::Response as AxumResponse,
     routing::any,
     Router as AxumRouter,
@@ -13,6 +13,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::error::Error as _;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -336,12 +337,17 @@ fn render(py: Python<'_>, tree_json: &str) -> PyResult<String> {
 struct ServerState {
     callback: Py<PyAny>,
     capacity: Arc<Semaphore>,
+    body_capacity: Arc<Semaphore>,
+    waiting_capacity: Arc<Semaphore>,
     acquire_timeout: Duration,
     static_pages: HashMap<String, Bytes>,
     public_assets: HashMap<String, PublicAsset>,
     client_assets: HashMap<String, Bytes>,
     isr_cache: Arc<PageCache>,
 }
+
+const MAX_REQUEST_BODY: usize = 1_048_576;
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct PublicAsset {
     body: Bytes,
@@ -385,37 +391,72 @@ fn plain_response(status: StatusCode, body: &'static str) -> AxumResponse<Body> 
     AxumResponse::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
+        .header(
+            "content-security-policy",
+            "script-src 'self'; object-src 'none'",
+        )
         .body(Body::from(body))
         .expect("static response is valid")
 }
 
 fn busy_response() -> AxumResponse<Body> {
-    AxumResponse::builder()
-        .status(StatusCode::SERVICE_UNAVAILABLE)
-        .header("content-type", "text/plain; charset=utf-8")
-        .header("retry-after", "1")
-        .body(Body::from("Server Busy"))
-        .expect("busy response is valid")
+    let mut response = plain_response(StatusCode::SERVICE_UNAVAILABLE, "Server Busy");
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+// HTTP/1 connections with an unread body must not be reused for another request.
+fn close_with_unread_body(
+    mut response: AxumResponse<Body>,
+    version: Version,
+) -> AxumResponse<Body> {
+    if matches!(version, Version::HTTP_10 | Version::HTTP_11) {
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    response
 }
 
 async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> AxumResponse<Body> {
-    // Wait briefly for a slot instead of rejecting the moment the server is
-    // busy: a burst that clears within the timeout degrades gracefully, and
-    // only sustained overload gets a 503 with Retry-After. Waiting requests
-    // hold a Tokio task, not a Python worker thread.
-    let permit = match tokio::time::timeout(
-        state.acquire_timeout,
-        state.capacity.clone().acquire_owned(),
-    )
-    .await
-    {
-        Ok(Ok(permit)) => permit,
-        _ => return busy_response(),
-    };
     let (parts, body) = request.into_parts();
-    let body = match to_bytes(body, 1_048_576).await {
-        Ok(bytes) => bytes,
-        Err(_) => return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
+    // Empty requests do not compete with clients currently uploading bodies.
+    let body = if body.is_end_stream() {
+        Bytes::new()
+    } else {
+        let _body_permit = match state.body_capacity.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return close_with_unread_body(busy_response(), parts.version);
+            }
+        };
+        match tokio::time::timeout(BODY_READ_TIMEOUT, to_bytes(body, MAX_REQUEST_BODY)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                let status = if error
+                    .source()
+                    .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+                {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    "Payload Too Large"
+                } else {
+                    "Bad Request"
+                };
+                return close_with_unread_body(plain_response(status, message), parts.version);
+            }
+            Err(_) => {
+                return close_with_unread_body(
+                    plain_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout"),
+                    parts.version,
+                );
+            }
+        }
     };
     if parts.method == axum::http::Method::GET || parts.method == axum::http::Method::HEAD {
         if let Some(path) = static_path(parts.uri.path()) {
@@ -431,6 +472,10 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     .header("content-length", content.len().to_string())
                     .header("cache-control", "public, max-age=31536000, immutable")
                     .header("x-content-type-options", "nosniff")
+                    .header(
+                        "content-security-policy",
+                        "script-src 'self'; object-src 'none'",
+                    )
                     .body(body)
                     .expect("client asset response is valid");
             }
@@ -446,6 +491,10 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     .header("content-length", asset.body.len().to_string())
                     .header("cache-control", "public, max-age=0, must-revalidate")
                     .header("x-content-type-options", "nosniff")
+                    .header(
+                        "content-security-policy",
+                        "script-src 'self'; object-src 'none'",
+                    )
                     .body(body)
                     .expect("public asset response is valid");
             }
@@ -493,6 +542,23 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             }
         }
     }
+    // Static/cache hits never compete with Python handler execution.
+    // Bound queued requests as well as uploads, so a wait never permits an
+    // unlimited number of fully buffered request bodies to accumulate.
+    let waiting = match state.waiting_capacity.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return busy_response(),
+    };
+    let permit = match tokio::time::timeout(
+        state.acquire_timeout,
+        state.capacity.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => return busy_response(),
+    };
+    drop(waiting);
     let method = parts.method.to_string();
     let path = parts.uri.path().to_string();
     let query = parts.uri.query().unwrap_or("").as_bytes().to_vec();
@@ -553,6 +619,7 @@ struct NativeServer {
 impl NativeServer {
     #[new]
     #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, max_concurrent=64, acquire_timeout_ms=1000))]
+    #[allow(clippy::too_many_arguments)] // Preserve the existing Python-facing constructor.
     fn new(
         callback: Py<PyAny>,
         host: &str,
@@ -564,8 +631,10 @@ impl NativeServer {
         max_concurrent: usize,
         acquire_timeout_ms: u64,
     ) -> PyResult<Self> {
-        if max_concurrent == 0 {
-            return Err(PyValueError::new_err("max_concurrent must be at least 1"));
+        if max_concurrent == 0 || max_concurrent > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "max_concurrent is outside the supported range",
+            ));
         }
         let isr_cache = isr_cache.inner.clone();
         let public_assets = public_assets
@@ -603,6 +672,8 @@ impl NativeServer {
                 let state = Arc::new(ServerState {
                     callback,
                     capacity: Arc::new(Semaphore::new(max_concurrent)),
+                    body_capacity: Arc::new(Semaphore::new(64)),
+                    waiting_capacity: Arc::new(Semaphore::new(64)),
                     acquire_timeout: Duration::from_millis(acquire_timeout_ms),
                     static_pages: static_pages
                         .into_iter()

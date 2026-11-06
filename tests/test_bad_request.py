@@ -10,7 +10,7 @@ from pynext.server import start_native
 
 def make_app(root):
     directory = root / "app" / "api" / "input"
-    directory.mkdir(parents=True)
+    directory.mkdir(parents=True, exist_ok=True)
     (directory / "route.py").write_text(
         'from pynext import BadRequest, JSONResponse, route\n'
         '@route("GET")\n'
@@ -107,10 +107,14 @@ def test_axum_concurrency_slot_waits_before_rejecting(tmp_path):
             async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=10) as client:
                 task = asyncio.create_task(client.post("/api/input"))
                 assert await asyncio.to_thread(started.wait, 5)
-                if release_after is not None:
+                async def release_later():
                     await asyncio.sleep(release_after)
                     release.set()
+
+                releaser = asyncio.create_task(release_later()) if release_after is not None else None
                 response = await client.post("/api/input")
+                if releaser is not None:
+                    await releaser
                 assert response.status_code == expect_status
                 if expect_status == 503:
                     assert response.headers["retry-after"] == "1"
