@@ -1,11 +1,15 @@
 import asyncio
-import hashlib
+import importlib.machinery
 import importlib.util
 import inspect
 import json
+import keyword
 import logging
 import re
 import sys
+import threading
+import uuid
+import weakref
 from pathlib import Path
 from urllib.parse import quote, unquote_to_bytes
 
@@ -13,7 +17,7 @@ from . import _native
 from .assets import read_public_artifacts, read_public_sources
 from .cache import CacheBusy, ISRCache
 from .client import compile_client, read_client_artifacts
-from .components import bind_islands
+from .components import _isr_policy, bind_islands
 from .build import discover, load_manifest
 from .http import BadRequest, Request, Response
 
@@ -21,19 +25,111 @@ log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
 
 
-def _load(root, relative):
-    path = root / relative
-    name = "_pynext_" + hashlib.sha256(str(path).encode()).hexdigest()
+class _FreshSourceLoader(importlib.machinery.SourceFileLoader):
+    def get_code(self, fullname):
+        # Timestamp-based bytecode can be stale when an edited file keeps its size.
+        return self.source_to_code(self.get_data(self.path), self.path)
+
+
+class _ProjectSourceFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.partition(".")[0] not in _project_namespaces:
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+        if spec is not None and isinstance(spec.loader, importlib.machinery.SourceFileLoader):
+            spec.loader = _FreshSourceLoader(fullname, spec.loader.path)
+        return spec
+
+
+_project_namespaces = set()
+_project_finder = _ProjectSourceFinder()
+_project_lock = threading.RLock()
+
+
+def _register_project(namespace):
+    with _project_lock:
+        if not _project_namespaces:
+            sys.meta_path.insert(0, _project_finder)
+        _project_namespaces.add(namespace)
+
+
+def _module_part(part):
+    # Route directories can contain characters such as [...slug].
+    if part.isidentifier() and not keyword.iskeyword(part) and not part.startswith("_pynext_encoded_"):
+        return part
+    return "_pynext_encoded_" + part.encode("utf-8").hex()
+
+
+def _clear_project_modules(namespace):
+    with _project_lock:
+        for name in list(sys.modules):
+            if name == namespace or name.startswith(namespace + "."):
+                sys.modules.pop(name, None)
+        _project_namespaces.discard(namespace)
+        if not _project_namespaces and _project_finder in sys.meta_path:
+            sys.meta_path.remove(_project_finder)
+
+
+def _package(name, directory, parent=None, child=None, *, load_initializer=True):
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    initializer = directory / "__init__.py"
+    has_initializer = load_initializer and initializer.is_file()
+    if has_initializer:
+        spec = importlib.util.spec_from_file_location(
+            name, initializer, submodule_search_locations=[str(directory)]
+        )
+    else:
+        spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=True)
+        spec.submodule_search_locations = [str(directory)]
+    if spec is None:
+        raise ValueError(f"Cannot load package {directory}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    if parent is not None:
+        setattr(parent, child, module)
+    try:
+        if has_initializer:
+            exec(compile(initializer.read_bytes(), str(initializer), "exec"), module.__dict__)
+    except BaseException:
+        sys.modules.pop(name, None)
+        if parent is not None and getattr(parent, child, None) is module:
+            delattr(parent, child)
+        raise
+    return module
+
+
+def _load(root, relative, namespace):
+    path = (root / relative).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError(f"Application module escapes project root: {relative}")
+    parts = path.relative_to(root).parts
+    parent = sys.modules[namespace]
+    name = namespace
+    directory = root
+    for part in parts[:-1]:
+        directory /= part
+        child = _module_part(part)
+        name += "." + child
+        parent = _package(name, directory, parent, child)
+    child = _module_part(path.stem)
+    name += "." + child
+    if name in sys.modules:
+        return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise ValueError(f"Cannot load {relative}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
+    setattr(parent, child, module)
     try:
         # Compile the current source rather than potentially stale timestamp-based pyc.
         exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
     except BaseException:
         sys.modules.pop(name, None)
+        if getattr(parent, child, None) is module:
+            delattr(parent, child)
         raise
     return module
 
@@ -69,6 +165,17 @@ def _decode_path(path, raw_path=None):
 
 class App:
     def __init__(self, root, manifest, *, production=False):
+        self._namespace = "_pynext_project_" + uuid.uuid4().hex
+        self._release_modules = weakref.finalize(self, _clear_project_modules, self._namespace)
+        try:
+            _register_project(self._namespace)
+            _package(self._namespace, Path(root).resolve(), load_initializer=False)
+            self._initialize(root, manifest, production=production)
+        except BaseException:
+            self._release_modules()
+            raise
+
+    def _initialize(self, root, manifest, *, production=False):
         self.root = Path(root).resolve()
         self.manifest = manifest
         self.production = production
@@ -83,9 +190,6 @@ class App:
         self.public_assets = {}
         self.client_assets = {}
         self.client_manifest = {}
-        # Application imports are resolved from the project's root.
-        if str(self.root) not in sys.path:
-            sys.path.insert(0, str(self.root))
         for pattern, spec in manifest["routes"].items():
             module = self._module(spec["entry"])
             if spec["kind"] == "page":
@@ -103,6 +207,10 @@ class App:
                     policy = getattr(fn, "__pynext_cache_policy__", None)
                     if not isinstance(policy, dict) or set(policy) != {"revalidate", "stale"}:
                         raise ValueError(f"Invalid ISR policy in {spec['entry']}")
+                    try:
+                        policy = _isr_policy(policy["revalidate"], policy["stale"])
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
                     if getattr(module, "generate_static_params", None) is not None:
                         raise ValueError(f"ISR page {spec['entry']} cannot export generate_static_params yet")
                     self.isr_policies[pattern] = policy
@@ -155,7 +263,7 @@ class App:
     def _module(self, path):
         key = (self.root / path).resolve()
         if key not in self.modules:
-            self.modules[key] = _load(self.root, path)
+            self.modules[key] = _load(self.root, path, self._namespace)
         return self.modules[key]
 
     async def render_page(self, pattern, request, params):

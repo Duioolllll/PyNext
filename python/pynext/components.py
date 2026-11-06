@@ -144,17 +144,19 @@ def bind_islands(tree, manifest):
     return {"kind": "fragment", "children": [bound, runtime]}
 
 
+def _isr_policy(revalidate, stale):
+    for name, value, allow_zero in (("revalidate", revalidate, False), ("stale", stale, True)):
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                value < 0 or (not allow_zero and value == 0) or value > 604_800 or not math.isfinite(value)):
+            raise ValueError(f"{name} must be a finite {'non-negative' if allow_zero else 'positive'} number of seconds, at most 604800")
+    return {"revalidate": float(revalidate), "stale": float(stale)}
+
+
 def page(*, render="ssr", revalidate=None, stale=None):
     if render not in {"ssr", "ssg", "isr"}:
         raise ValueError("render must be 'ssr', 'ssg', or 'isr'")
     if render == "isr":
-        if stale is None:
-            stale = 60.0
-        for name, value, allow_zero in (("revalidate", revalidate, False), ("stale", stale, True)):
-            if (isinstance(value, bool) or not isinstance(value, (int, float)) or
-                    value < 0 or (not allow_zero and value == 0) or value > 604_800 or not math.isfinite(value)):
-                raise ValueError(f"{name} must be a finite {'non-negative' if allow_zero else 'positive'} number of seconds, at most 604800")
-        policy = {"revalidate": float(revalidate), "stale": float(stale)}
+        policy = _isr_policy(revalidate, 60.0 if stale is None else stale)
     else:
         if revalidate is not None or stale is not None:
             raise ValueError("revalidate and stale are only valid for ISR pages")
