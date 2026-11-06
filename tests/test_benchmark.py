@@ -1,13 +1,18 @@
 import asyncio
+import importlib.util
 import os
 import select
 import subprocess
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
 
-from benchmarks.bench import measure, run
+spec = importlib.util.spec_from_file_location("pynext_benchmark", Path(__file__).resolve().parents[1] / "benchmarks/bench.py")
+benchmark = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(benchmark)
+measure, run = benchmark.measure, benchmark.run
 
 
 def test_benchmark_distinguishes_success_from_http_and_transport_errors():
@@ -54,7 +59,7 @@ def test_benchmark_reports_zero_success_without_fabricating_success_latency():
 
 def test_benchmark_does_not_attribute_reused_pid_cpu(monkeypatch):
     values = iter([(2.0, 10), (3.0, 11)])
-    monkeypatch.setattr("benchmarks.bench._linux_process_cpu", lambda pid: next(values))
+    monkeypatch.setattr(benchmark, "_linux_process_cpu", lambda pid: next(values))
 
     async def check():
         transport = httpx.MockTransport(lambda request: httpx.Response(200, content=b"ok"))
