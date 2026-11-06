@@ -26,8 +26,10 @@ class Request:
         try:
             value = self.query_string.decode("utf-8", errors="strict")
             return parse_qs(value, keep_blank_values=True, encoding="utf-8", errors="strict")
-        except UnicodeDecodeError as exc:
-            raise BadRequest("Invalid UTF-8 query string") from exc
+        except (UnicodeDecodeError, ValueError) as exc:
+            # ValueError covers parse_qs refusing more than 1,000 fields;
+            # UnicodeDecodeError is a ValueError subclass, listed for clarity.
+            raise BadRequest("Invalid query string") from exc
 
     async def json(self):
         try:
@@ -44,7 +46,7 @@ class Response:
         self.status = status
         self.headers = [(bytes(k).lower(), bytes(v)) for k, v in headers]
         for key, value in self.headers:
-            if not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9a-z-]+", key) or any(c in value for c in (0, 10, 13)):
+            if not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9a-z-]+", key) or any(c < 32 or c == 127 for c in value):
                 raise ValueError("Invalid response header")
         if media_type and not any(k == b"content-type" for k, _ in self.headers):
             self.headers.append((b"content-type", media_type.encode("ascii")))

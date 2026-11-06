@@ -336,6 +336,7 @@ fn render(py: Python<'_>, tree_json: &str) -> PyResult<String> {
 struct ServerState {
     callback: Py<PyAny>,
     capacity: Arc<Semaphore>,
+    acquire_timeout: Duration,
     static_pages: HashMap<String, Bytes>,
     public_assets: HashMap<String, PublicAsset>,
     client_assets: HashMap<String, Bytes>,
@@ -388,10 +389,28 @@ fn plain_response(status: StatusCode, body: &'static str) -> AxumResponse<Body> 
         .expect("static response is valid")
 }
 
+fn busy_response() -> AxumResponse<Body> {
+    AxumResponse::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header("retry-after", "1")
+        .body(Body::from("Server Busy"))
+        .expect("busy response is valid")
+}
+
 async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> AxumResponse<Body> {
-    let permit = match state.capacity.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Server Busy"),
+    // Wait briefly for a slot instead of rejecting the moment the server is
+    // busy: a burst that clears within the timeout degrades gracefully, and
+    // only sustained overload gets a 503 with Retry-After. Waiting requests
+    // hold a Tokio task, not a Python worker thread.
+    let permit = match tokio::time::timeout(
+        state.acquire_timeout,
+        state.capacity.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => return busy_response(),
     };
     let (parts, body) = request.into_parts();
     let body = match to_bytes(body, 1_048_576).await {
@@ -441,6 +460,8 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     .status(StatusCode::OK)
                     .header("content-type", "text/html; charset=utf-8")
                     .header("content-length", length.to_string())
+                    .header("content-security-policy", "script-src 'self'; object-src 'none'")
+                    .header("vary", "Cookie, Authorization")
                     .body(body)
                     .expect("static response is valid");
             }
@@ -458,6 +479,8 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         .header("content-type", "text/html; charset=utf-8")
                         .header("content-length", length.to_string())
                         .header("cache-control", "public, max-age=0, must-revalidate")
+                        .header("content-security-policy", "script-src 'self'; object-src 'none'")
+                        .header("vary", "Cookie, Authorization")
                         .body(body)
                         .expect("cached response is valid");
                 }
@@ -523,6 +546,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, max_concurrent=64, acquire_timeout_ms=1000))]
     fn new(
         callback: Py<PyAny>,
         host: &str,
@@ -531,7 +555,12 @@ impl NativeServer {
         public_assets: HashMap<String, (Vec<u8>, String)>,
         client_assets: HashMap<String, Vec<u8>>,
         isr_cache: PyRef<'_, PyPageCache>,
+        max_concurrent: usize,
+        acquire_timeout_ms: u64,
     ) -> PyResult<Self> {
+        if max_concurrent == 0 {
+            return Err(PyValueError::new_err("max_concurrent must be at least 1"));
+        }
         let isr_cache = isr_cache.inner.clone();
         let public_assets = public_assets
             .into_iter()
@@ -567,7 +596,8 @@ impl NativeServer {
                     tokio::net::TcpListener::from_std(listener).expect("configured listener");
                 let state = Arc::new(ServerState {
                     callback,
-                    capacity: Arc::new(Semaphore::new(64)),
+                    capacity: Arc::new(Semaphore::new(max_concurrent)),
+                    acquire_timeout: Duration::from_millis(acquire_timeout_ms),
                     static_pages: static_pages
                         .into_iter()
                         .map(|(path, body)| (path, Bytes::from(body)))

@@ -10,6 +10,20 @@ def test_next_source_order_and_parameters():
     assert router.matches("/a/b") == ("/[...rest]", {"rest": ["a", "b"]})
 
 
+def test_trie_matching_prefers_static_and_backtracks():
+    router = _native.Router(["/a/b/c", "/a/[x]/d", "/a/b"])
+    assert router.matches("/a/b/d") == ("/a/[x]/d", {"x": ["b"]})
+    assert router.matches("/a/b/c")[0] == "/a/b/c"
+    assert router.matches("/a/b")[0] == "/a/b"
+    assert router.matches("/a/b/c/d") is None
+
+
+def test_catch_all_requires_a_segment():
+    router = _native.Router(["/[...rest]"])
+    assert router.matches("/") is None
+    assert router.matches("/a") == ("/[...rest]", {"rest": ["a"]})
+
+
 @pytest.mark.parametrize("paths", [
     ["/blog/[id]", "/blog/[slug]"], ["/blog/[...id]/a"], ["/[id]/[id]"],
     ["/[[...id]]"], ["/[..id]"], ["/x", "/x"],

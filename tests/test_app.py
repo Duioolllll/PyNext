@@ -15,6 +15,7 @@ EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "basic"
 async def exercise(client):
     response = await client.get("/")
     assert response.status_code == 200
+    assert response.headers["content-security-policy"] == "script-src 'self'; object-src 'none'"
     assert response.text.startswith("<!DOCTYPE html><html")
     assert "Hello PyNext!" in response.text
     response = await client.get("/blog/%3Cscript%3E")
@@ -72,6 +73,21 @@ def test_axum_end_to_end():
                 await exercise(client)
         finally:
             await asyncio.to_thread(server.stop)
+    asyncio.run(run())
+
+
+def test_page_returning_plain_value_is_server_error(tmp_path):
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "page.py").write_text(
+        'from pynext import page\n'
+        '@page()\n'
+        'def Page(): return "plain text"\n'
+    )
+    async def run():
+        app = create_app(tmp_path)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            assert (await client.get("/")).status_code == 500
     asyncio.run(run())
 
 

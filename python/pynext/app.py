@@ -19,6 +19,11 @@ from .http import BadRequest, Request, Response
 
 log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
+# Pages render no inline scripts, so every HTML response can carry this CSP.
+CSP_HEADER = (b"content-security-policy", b"script-src 'self'; object-src 'none'")
+# ISR/SSG bodies depend on auth state only through the private/public split;
+# Vary keeps shared caches from serving a public body to an authed request.
+VARY_HEADER = (b"vary", b"Cookie, Authorization")
 
 
 def _load(root, relative):
@@ -162,12 +167,14 @@ class App:
         tree = await _invoke(fn, request=request, params=params)
         for layout_fn in reversed(layouts):
             tree = await _invoke(layout_fn, children=tree)
+        if not isinstance(tree, dict):
+            raise TypeError(f"Page {pattern} must return a UI tree built with h() or fragment()")
         tree = bind_islands(tree, self.client_manifest)
         payload = json.dumps(tree, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         html = await asyncio.to_thread(_native.render, payload)
         if isinstance(tree, dict) and tree.get("tag", "").lower() == "html":
             html = "<!DOCTYPE html>" + html
-        return Response(html, media_type="text/html; charset=utf-8")
+        return Response(html, media_type="text/html; charset=utf-8", headers=[CSP_HEADER])
 
     async def dispatch(self, request):
         """Return a buffered response. Exceptions are converted at the transport boundary."""
@@ -232,12 +239,14 @@ class App:
             return Response("Method Not Allowed", status=405, headers=[(b"allow", allow)])
         if spec["kind"] == "page":
             if self.production and self.render_modes[pattern] == "ssg":
-                response = Response(self.static_pages[path], media_type="text/html; charset=utf-8")
+                response = Response(self.static_pages[path], media_type="text/html; charset=utf-8",
+                                    headers=[CSP_HEADER, VARY_HEADER])
             elif self.production and self.render_modes[pattern] == "isr":
                 private = any(name.lower() in {b"authorization", b"cookie"} for name, _ in request.headers)
                 if private:
                     response = await self.render_page(pattern, None, params)
                     response.headers.append((b"cache-control", b"private, no-store"))
+                    response.headers.append(VARY_HEADER)
                 else:
                     try:
                         body = await self.isr.get_or_render(
@@ -245,11 +254,12 @@ class App:
                             lambda: self.render_page(pattern, None, params),
                         )
                     except CacheBusy:
-                        return Response("Server Busy", status=503)
+                        return Response("Server Busy", status=503, headers=[(b"retry-after", b"1")])
                     except TimeoutError:
                         return Response("Gateway Timeout", status=504)
                     response = Response(body, media_type="text/html; charset=utf-8",
-                                        headers=[(b"cache-control", b"public, max-age=0, must-revalidate")])
+                                        headers=[(b"cache-control", b"public, max-age=0, must-revalidate"),
+                                                 CSP_HEADER, VARY_HEADER])
             else:
                 response = await self.render_page(pattern, request, params)
         else:

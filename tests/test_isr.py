@@ -207,10 +207,14 @@ def test_isr_shared_render_does_not_inherit_request_context(tmp_path):
             private = await client.get("/", headers={"cookie": "session=x"})
             assert private.text == "<p>private-data</p>"
             assert private.headers["cache-control"] == "private, no-store"
+            assert private.headers["content-security-policy"] == "script-src 'self'; object-src 'none'"
+            assert private.headers["vary"] == "Cookie, Authorization"
             assert app.isr.store.lookup("/")[0] == "miss"
             public = await client.get("/")
             assert public.text == "<p>public</p>"
             assert public.headers["cache-control"] == "public, max-age=0, must-revalidate"
+            assert public.headers["content-security-policy"] == "script-src 'self'; object-src 'none'"
+            assert public.headers["vary"] == "Cookie, Authorization"
             assert app.isr.store.lookup("/")[1] == b"<p>public</p>"
         await app.isr.close()
     asyncio.run(run())

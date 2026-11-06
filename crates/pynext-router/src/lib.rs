@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Node {
     endpoint: Option<String>,
     static_children: BTreeMap<String, Node>,
@@ -120,6 +120,7 @@ impl Node {
 
 #[derive(Debug)]
 pub struct Router {
+    root: Node,
     routes: Vec<String>,
 }
 
@@ -131,7 +132,7 @@ impl Router {
         }
         let mut routes = Vec::new();
         root.ordered(&mut routes);
-        Ok(Self { routes })
+        Ok(Self { root, routes })
     }
     pub fn routes(&self) -> &[String] {
         &self.routes
@@ -139,39 +140,47 @@ impl Router {
 
     pub fn matches(&self, path: &str) -> Option<(String, HashMap<String, Vec<String>>)> {
         let path_parts = parts(path).ok()?;
-        for route in &self.routes {
-            let route_parts = parts(route).ok()?;
-            let mut params = HashMap::new();
-            let mut i = 0;
-            let mut matches = true;
-            for seg in route_parts {
-                if i >= path_parts.len() {
-                    matches = false;
-                    break;
-                }
-                match parameter(seg).ok()? {
-                    Some((true, name)) => {
-                        params.insert(
-                            name.to_string(),
-                            path_parts[i..].iter().map(|s| (*s).to_string()).collect(),
-                        );
-                        i = path_parts.len();
-                        break;
-                    }
-                    Some((false, name)) => {
-                        params.insert(name.to_string(), vec![path_parts[i].to_string()]);
-                    }
-                    None if seg != path_parts[i] => {
-                        matches = false;
-                        break;
-                    }
-                    None => {}
-                }
-                i += 1;
+        let mut params = HashMap::new();
+        self.match_node(&self.root, &path_parts, 0, &mut params)
+    }
+
+    // Walk the trie instead of re-parsing every route: static segments win over
+    // dynamic ones, which win over catch-alls, and a dead static branch falls
+    // back to the dynamic branch at the same level.
+    fn match_node(
+        &self,
+        node: &Node,
+        path_parts: &[&str],
+        index: usize,
+        params: &mut HashMap<String, Vec<String>>,
+    ) -> Option<(String, HashMap<String, Vec<String>>)> {
+        if index == path_parts.len() {
+            return node.endpoint.clone().map(|route| (route, params.clone()));
+        }
+        let segment = path_parts[index];
+        if let Some(child) = node.static_children.get(segment) {
+            if let Some(hit) = self.match_node(child, path_parts, index + 1, params) {
+                return Some(hit);
             }
-            if matches && i == path_parts.len() {
-                return Some((route.clone(), params));
+        }
+        if let Some((name, child)) = &node.dynamic {
+            params.insert(name.clone(), vec![segment.to_string()]);
+            let hit = self.match_node(child, path_parts, index + 1, params);
+            if hit.is_some() {
+                return hit;
             }
+            params.remove(name);
+        }
+        if let Some((name, child)) = &node.catch_all {
+            params.insert(
+                name.clone(),
+                path_parts[index..].iter().map(|s| s.to_string()).collect(),
+            );
+            let hit = self.match_node(child, path_parts, path_parts.len(), params);
+            if hit.is_some() {
+                return hit;
+            }
+            params.remove(name);
         }
         None
     }
@@ -207,6 +216,21 @@ mod tests {
         assert_eq!(r.matches("/posts/new").unwrap().0, "/posts/new");
         assert_eq!(r.matches("/posts/42").unwrap().1["id"], vec!["42"]);
         assert_eq!(r.matches("/a/b").unwrap().1["rest"], vec!["a", "b"]);
+    }
+    #[test]
+    fn trie_matching_prefers_static_and_backtracks() {
+        let r = router(&["/a/b/c", "/a/[x]/d", "/a/b"]);
+        assert_eq!(r.matches("/a/b/d").unwrap().0, "/a/[x]/d");
+        assert_eq!(r.matches("/a/b/d").unwrap().1["x"], vec!["b"]);
+        assert_eq!(r.matches("/a/b/c").unwrap().0, "/a/b/c");
+        assert_eq!(r.matches("/a/b").unwrap().0, "/a/b");
+        assert!(r.matches("/a/b/c/d").is_none());
+    }
+    #[test]
+    fn catch_all_requires_at_least_one_segment() {
+        let r = router(&["/[...rest]"]);
+        assert!(r.matches("/").is_none());
+        assert_eq!(r.matches("/a").unwrap().1["rest"], vec!["a"]);
     }
     #[test]
     fn rejects_conflicts_and_invalid_patterns() {

@@ -11,7 +11,7 @@ log = logging.getLogger("pynext")
 REQUEST_TIMEOUT = 30
 
 
-def start_native(app, loop, host="127.0.0.1", port=3000):
+def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000):
     async def call(method, raw_path, query, headers, body):
         try:
             path = _decode_path(raw_path, raw_path.encode("ascii"))
@@ -40,11 +40,12 @@ def start_native(app, loop, host="127.0.0.1", port=3000):
             response = Response("Gateway Timeout", status=504)
         return response.status, response.headers, response.body
 
-    return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store)
+    return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store,
+                                max_concurrent=max_concurrent, acquire_timeout_ms=acquire_timeout_ms)
 
 
-async def serve(app, host="127.0.0.1", port=3000):
-    server = start_native(app, asyncio.get_running_loop(), host, port)
+async def serve(app, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000):
+    server = start_native(app, asyncio.get_running_loop(), host, port, max_concurrent, acquire_timeout_ms)
     print(f"PyNext listening on http://{server.address}", flush=True)
     try:
         await asyncio.Event().wait()
