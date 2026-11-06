@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from pynext import create_app
+from pynext.build import MANIFEST
 from pynext.server import start_native
 
 try:
@@ -188,6 +189,8 @@ def main():
     args = parser.parse_args()
     if args.requests < 1 or args.concurrency < 1 or args.warmup < 0:
         parser.error("requests and concurrency must be positive; warmup must be non-negative")
+    if args.production and not args.base_url and not (ROOT / MANIFEST).is_file():
+        parser.error("no example build manifest; run `pynext build --dir examples/basic` first")
     if args.server_pid is not None:
         if args.server_pid < 1 or not args.base_url:
             parser.error("--server-pid requires a positive PID and --base-url")

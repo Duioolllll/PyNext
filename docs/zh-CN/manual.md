@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [日本語](../ja/manual.md)
 
-本手册适用于 **v0.5.0**。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
+本手册适用于 **v0.6.0a1**。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
 
 ## 环境要求与首次运行
 
@@ -11,7 +11,7 @@
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
 cd PyNext
-git checkout v0.5.0
+git checkout v0.6.0a1
 uv sync --extra dev
 npm ci
 uv run pynext build --dir examples/basic
@@ -49,6 +49,10 @@ async def Page(params):
 ~~~
 
 `h(tag, attrs, *children)` 构造 HTML 树并转义字符串。SSR 会缓冲整个响应；框架不提供插入任意原始 HTML 的 API。
+
+## 应用导入与迁移
+
+页面、布局和 API 模块可使用 `from .helpers import title` 等相对导入。每个应用有独立的模块命名空间，框架不再自动将项目根目录加入进程级 `sys.path`。从 v0.5 升级后，如果原先基于根目录的绝对导入失效，请改为相对导入或将项目安装为 Python 包。第三方包需安装在运行环境中。
 
 ## API 请求与错误
 
@@ -88,6 +92,8 @@ def Page(params):
 
 SSG 和 ISR 页面函数不能接收 `request`。它们仅适合公共内容；请确认环境变量和外部数据可以共享。ISR 不把匿名请求的查询字符串计入缓存键。带 Cookie 或 Authorization 的请求会绕过共享 ISR 缓存并返回 `private, no-store`。缓存大小有限，且**只存在于各自进程的内存中**，不在工作进程之间共享或失效。更新 SSG 内容需要重新构建。
 
+SSG 构建最多生成 10,000 个页面；开发模式下每次请求都会渲染 SSG 页面。ISR 页面不能导出 `generate_static_params()`，每个进程最多并发执行 128 个生成任务。
+
 ## 公共文件与 islands
 
 `public/styles/site.css` 通过 `/styles/site.css` 公开。构建时会生成快照并校验完整性，但生产启动时仍需要原始文件。隐藏文件、符号链接和冲突路径会被拒绝。开发模式下修改公共文件后也需要重启服务器。
@@ -122,6 +128,8 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 已构建的应用需使用 `create_app(project_path, production=True)`。ASGI 请求超时由所使用的服务器管理。Axum 适配器等待 Python 最多 30 秒，之后请求取消并返回 504。已经在线程中运行的同步函数可能在 504 之后继续执行并产生写入等副作用。请确保写入操作幂等，并为数据库与外部服务设置单独超时。当前没有强制进程隔离；ISR 取消也有相同限制。
 
 流式响应、WebSocket、分布式 ISR、分布式限流、OpenTelemetry 和生产环境加固尚未实现。请参阅[生产路线图](../PRODUCTION_ROADMAP.md)中的计划与验收条件。
+
+两个适配器的请求体上限均为 1 MiB，超出时返回 413。Axum 最多同时接收 64 个请求体，整体读取期限为 10 秒，超时返回 408；请求体接收池或 Python 执行池满时返回 503。无请求体的静态文件和新鲜的 ISR 缓存命中不占用 Python 执行槽。该期限不限制 HTTP 请求头读取时间或连接总数；外部 ASGI 服务器的超时由该服务器管理。非根路径末尾的 `/` 会以 308 重定向。编译后的 island 单个上限为 2 MiB，总计 32 MiB。
 
 ## 测试与故障排查
 

@@ -2,6 +2,13 @@
 
 All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
 
+## v0.6.0a1
+
+- Bound Axum request-body intake separately from Python execution, apply a 10-second body-read deadline, and allow static and fresh ISR responses while Python slots are busy.
+- Load application modules into separate per-app packages and support relative imports. **Breaking:** the framework no longer prepends the project root to the process-wide `sys.path`; migrate project-local imports to relative imports or install the project as a package.
+- Verify the server's actual CSP and example routes in browser CI, validate CLI ports, and improve benchmark guidance when the example has not been built.
+- Add regression coverage for slow uploads, disconnects, saturated handlers, module isolation, CLI, and ASGI message boundaries.
+
 ## v0.5.0
 
 - Separate attempted and successful request throughput, status and transport errors, and all-request versus success latency in the smoke benchmark.

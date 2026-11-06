@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [日本語](../ja/manual.md) · [简体中文](../zh-CN/manual.md)
 
-이 설명서는 **v0.5.0** 기준입니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
+이 설명서는 **v0.6.0a1** 기준입니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
 
 ## 준비와 첫 실행
 
@@ -11,7 +11,7 @@ CPython 3.13, Rust/Cargo, [uv](https://docs.astral.sh/uv/)가 필요합니다. �
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
 cd PyNext
-git checkout v0.5.0
+git checkout v0.6.0a1
 uv sync --extra dev
 npm ci
 uv run pynext build --dir examples/basic
@@ -49,6 +49,10 @@ async def Page(params):
 ~~~
 
 `h(tag, attrs, *children)`는 HTML 트리를 만들며 문자열을 이스케이프합니다. SSR은 전체 응답을 모아 반환하고 임의의 raw HTML 삽입 API는 제공하지 않습니다.
+
+## 앱 import와 이전 버전에서의 변경
+
+페이지·레이아웃·API 모듈에서 `from .helpers import title`처럼 상대 import를 사용할 수 있습니다. 앱마다 모듈 공간이 분리되며 프로젝트 루트를 전역 `sys.path`에 자동 추가하지 않습니다. v0.5에서 사용하던 루트 기준 절대 import가 실패하면 상대 import로 바꾸거나 프로젝트를 Python 패키지로 설치하세요. 외부 패키지는 실행 환경에 설치해야 합니다.
 
 ## API 요청과 오류
 
@@ -88,6 +92,8 @@ def Page(params):
 
 SSG와 ISR 페이지 함수는 `request`를 받을 수 없습니다. 공개 콘텐츠에만 사용하고 환경 변수와 외부 데이터가 공유 가능한지 확인하세요. ISR은 익명 요청의 쿼리를 캐시 키에 포함하지 않습니다. Cookie 또는 Authorization 헤더가 있으면 공유 ISR 캐시를 우회하고 `private, no-store`로 응답합니다. 캐시는 크기가 제한된 **프로세스별 메모리 캐시**이므로 워커 간 공유·무효화되지 않습니다. SSG 내용을 바꾸려면 재빌드해야 합니다.
 
+SSG 빌드는 최대 10,000페이지를 생성하며 개발 모드에서는 요청마다 SSG 페이지를 렌더링합니다. ISR 페이지는 `generate_static_params()`를 내보낼 수 없고 프로세스별 동시 생성 작업은 최대 128개입니다.
+
 ## 공개 파일과 islands
 
 `public/styles/site.css`는 `/styles/site.css`로 공개됩니다. 빌드는 파일을 스냅샷하고 무결성을 검사하지만 운영 서버 시작에도 원본 파일이 필요합니다. 숨김 파일, 심볼릭 링크, 충돌 경로는 거부합니다. 개발 모드에서 공개 파일을 바꾼 뒤에도 서버를 재시작하세요.
@@ -122,6 +128,8 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 빌드된 앱은 `create_app(project_path, production=True)`로 만듭니다. ASGI 서버의 시간 제한은 해당 서버가 관리합니다. Axum 어댑터는 Python 응답을 최대 30초 기다린 뒤 취소를 요청하고 504를 반환합니다. 이미 스레드에서 실행 중인 동기 함수는 504 이후에도 계속 실행되어 쓰기 등의 부작용을 일으킬 수 있습니다. 쓰기 작업의 멱등성과 데이터베이스·외부 서비스의 별도 시간 제한을 확보하세요. 강제 프로세스 격리는 없으며 ISR 취소에도 같은 제한이 있습니다.
 
 스트리밍, WebSocket, 분산 ISR, 분산 요청 제한, OpenTelemetry와 운영 환경 보안 강화는 미구현입니다. 계획과 완료 기준은 [프로덕션 로드맵](../PRODUCTION_ROADMAP.md)을 참고하세요.
+
+두 어댑터의 요청 본문 상한은 1 MiB이며 초과 시 413입니다. Axum은 본문 수신을 최대 64개로 제한하고 전체 수신에 10초를 허용하며 시간 초과 시 408입니다. 본문 수신 또는 Python 실행 풀이 가득 차면 503입니다. 본문 없는 정적 파일과 신선한 ISR 캐시는 Python 슬롯을 사용하지 않습니다. 이 시간 제한은 HTTP 헤더 수신이나 전체 연결 수를 제한하지 않으며 외부 ASGI 서버의 시간 제한은 해당 서버가 관리합니다. 루트가 아닌 경로의 마지막 `/`는 308로 리디렉션됩니다. 컴파일된 island는 개당 2 MiB, 전체 32 MiB 이하입니다.
 
 ## 테스트와 문제 해결
 

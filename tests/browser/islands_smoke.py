@@ -1,4 +1,4 @@
-"""Optional real-browser check; run with the documented with_server helper."""
+"""Real-browser checks; normally started by tests/browser/run_smoke.py."""
 import json
 import re
 import sys
@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 
 from playwright.sync_api import expect, sync_playwright
 
-base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:3173"
+base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:3000"
 manifest = json.loads((Path(__file__).resolve().parents[2] / "examples/basic/.pynext/manifest.json").read_text())
 counter = manifest["client"]["bundles"]["counter"]
 unused = manifest["client"]["bundles"]["unused"]
@@ -64,14 +64,9 @@ with sync_playwright() as playwright:
 
     page.route(re.compile(r"/_pynext/static/" + hydrated + r"\.js$"), delay_hydration)
 
-    def csp(route):
-        response = route.fetch()
-        headers = dict(response.headers)
-        headers["content-security-policy"] = "script-src 'self'; object-src 'none'"
-        route.fulfill(response=response, headers=headers)
-
-    page.route(base + "/", csp)
-    page.goto(base + "/", wait_until="networkidle")
+    response = page.goto(base + "/", wait_until="networkidle")
+    assert response.status == 200
+    assert response.headers.get("content-security-policy") == "script-src 'self'; object-src 'none'"
     button = page.get_by_role("button", name="Count: 1")
     button.wait_for()
     button.click()

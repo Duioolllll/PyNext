@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [简体中文](../zh-CN/manual.md)
 
-このマニュアルは **v0.5.0** を対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
+このマニュアルは **v0.6.0a1** を対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
 
 ## 必要な環境と起動
 
@@ -11,7 +11,7 @@ CPython 3.13、Rust/Cargo、[uv](https://docs.astral.sh/uv/) が必要です。�
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
 cd PyNext
-git checkout v0.5.0
+git checkout v0.6.0a1
 uv sync --extra dev
 npm ci
 uv run pynext build --dir examples/basic
@@ -49,6 +49,10 @@ async def Page(params):
 ~~~
 
 `h(tag, attrs, *children)` で HTML ツリーを作成し、文字列はエスケープされます。SSR はレスポンス全体をバッファーして返し、任意の raw HTML を挿入する API はありません。
+
+## アプリの import と移行
+
+ページ、レイアウト、API モジュールでは `from .helpers import title` のような相対 import を利用できます。アプリごとにモジュール名前空間を分離し、プロジェクトルートをプロセス全体の `sys.path` に自動追加しません。v0.5 のルート基準の絶対 import が失敗する場合は、相対 import に変更するか、プロジェクトを Python パッケージとしてインストールしてください。外部パッケージは実行環境にインストールします。
 
 ## API リクエストとエラー
 
@@ -88,6 +92,8 @@ def Page(params):
 
 SSG と ISR のページ関数は `request` を受け取れません。公開コンテンツにのみ使用し、環境変数や外部データが共有可能か確認してください。ISR は匿名リクエストのクエリ文字列をキャッシュキーに含めません。Cookie または Authorization があるリクエストは共有 ISR キャッシュを迂回し、`private, no-store` で返します。キャッシュは上限付きの**プロセス内メモリ**であり、ワーカー間で共有・無効化されません。SSG の内容を更新するには再ビルドが必要です。
 
+SSG ビルドの上限は 10,000 ページで、開発モードでは SSG をリクエストごとにレンダリングします。ISR ページは `generate_static_params()` をエクスポートできず、同時生成はプロセスごとに最大 128 件です。
+
 ## 公開ファイルと islands
 
 `public/styles/site.css` は `/styles/site.css` として公開されます。ビルド時にスナップショットと整合性検証を行いますが、本番起動時にも元ファイルが必要です。隠しファイル、シンボリックリンク、衝突するパスは拒否されます。開発モードで公開ファイルを変更した場合もサーバーを再起動してください。
@@ -122,6 +128,8 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 ビルド済みアプリは `create_app(project_path, production=True)` で作成します。ASGI のタイムアウトは使用するサーバーが管理します。Axum アダプターは Python の応答を最大 30 秒待ち、キャンセルを要求して 504 を返します。既にスレッド上で動作中の同期関数は 504 の後も実行を続け、書き込みなどを行う場合があります。書き込みの冪等性と、DB・外部サービス固有のタイムアウトを設定してください。強制的なプロセス分離はなく、ISR のキャンセルにも同じ制限があります。
 
 ストリーミング、WebSocket、分散 ISR、分散レート制限、OpenTelemetry、本番環境向けの安全性強化は未実装です。計画と完了基準は[プロダクションロードマップ](../PRODUCTION_ROADMAP.md)を参照してください。
+
+両アダプターのリクエスト本文は最大 1 MiB で、超過時は 413 を返します。Axum は本文受信を最大 64 件、全体の受信時間を 10 秒に制限し、時間超過時は 408 を返します。本文受信または Python 実行枠が満杯の場合は 503 です。本文のない静的ファイルと有効な ISR キャッシュは Python 実行枠を消費しません。この期限は HTTP ヘッダーの受信時間や接続総数を制限しません。外部 ASGI サーバーの期限はそのサーバーで管理します。ルート以外の末尾 `/` は 308 でリダイレクトします。ビルド済み island は各 2 MiB、合計 32 MiB が上限です。
 
 ## テストとトラブルシューティング
 

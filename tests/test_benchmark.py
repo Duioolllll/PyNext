@@ -106,3 +106,12 @@ server.serve_forever()
     finally:
         server.terminate()
         server.wait(timeout=10)
+
+
+def test_benchmark_production_requires_an_explicit_build(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(benchmark, "ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["bench.py", "--production"])
+    with pytest.raises(SystemExit) as error:
+        benchmark.main()
+    assert error.value.code == 2
+    assert "pynext build --dir examples/basic" in capsys.readouterr().err

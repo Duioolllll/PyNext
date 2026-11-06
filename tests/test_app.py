@@ -63,6 +63,42 @@ def test_asgi_lifespan_and_disconnected_request():
     asyncio.run(run())
 
 
+def test_asgi_rejects_websocket_and_oversized_multichunk_body():
+    async def run():
+        app = create_app(EXAMPLE)
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        async def unused_receive():
+            raise AssertionError("websocket scope should be rejected before receiving")
+
+        with pytest.raises(RuntimeError, match="Unsupported ASGI scope: websocket"):
+            await app({"type": "websocket"}, unused_receive, send)
+        assert not sent
+        messages = iter([
+            {"type": "http.request", "body": b"x" * 600_000, "more_body": True},
+            {"type": "http.request", "body": b"y" * 500_000, "more_body": False},
+        ])
+
+        async def receive():
+            return next(messages)
+
+        await app({"type": "http", "method": "POST", "path": "/api/users", "headers": []}, receive, send)
+        assert sent[0]["status"] == 413
+        assert sent[1]["body"] == b"Payload Too Large"
+        sent.clear()
+        messages = iter([
+            {"type": "http.request", "body": b"partial", "more_body": True},
+            {"type": "http.disconnect"},
+        ])
+        await app({"type": "http", "method": "POST", "path": "/api/users", "headers": []}, receive, send)
+        assert not sent
+        await app.isr.close()
+    asyncio.run(run())
+
+
 def test_axum_end_to_end():
     async def run():
         app = create_app(EXAMPLE)

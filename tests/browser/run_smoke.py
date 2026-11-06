@@ -1,13 +1,45 @@
 """Start the built example and run the Playwright smoke test."""
 import os
+import json
 import socket
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def verify_http(base):
+    pages = {
+        "/": "Hello PyNext!",
+        "/about": "About",
+        "/guides/intro": "intro",
+        "/guides/routing": "routing",
+        "/news/example": "example",
+        "/hydrate": "Hydrated",
+        "/strategies": "Island loading strategies",
+        "/blog/hello": "hello",
+    }
+    for path, expected in pages.items():
+        with urlopen(base + path, timeout=10) as response:
+            assert response.status == 200, path
+            assert response.headers.get("content-security-policy") == "script-src 'self'; object-src 'none'", path
+            assert expected in response.read().decode("utf-8"), path
+    try:
+        urlopen(base + "/guides/missing", timeout=10)
+    except HTTPError as error:
+        assert error.code == 404
+    else:
+        raise AssertionError("Unbuilt SSG page must return 404")
+    request = Request(base + "/api/users", data=b'{"name":"Smoke"}',
+                      headers={"content-type": "application/json"}, method="POST")
+    with urlopen(request, timeout=10) as response:
+        assert response.status == 201
+        assert json.loads(response.read()) == {"name": "Smoke"}
 
 
 def main():
@@ -33,8 +65,10 @@ def main():
                     if time.monotonic() >= deadline:
                         raise TimeoutError("PyNext server did not become ready")
                     time.sleep(0.1)
+            base = f"http://127.0.0.1:{port}"
+            verify_http(base)
             subprocess.run(
-                [sys.executable, str(ROOT / "tests/browser/islands_smoke.py"), f"http://127.0.0.1:{port}"],
+                [sys.executable, str(ROOT / "tests/browser/islands_smoke.py"), base],
                 cwd=ROOT, check=True, timeout=120,
             )
         finally:

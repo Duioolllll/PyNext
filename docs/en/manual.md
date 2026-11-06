@@ -2,7 +2,7 @@
 
 [한국어](../ko/manual.md) · [日本語](../ja/manual.md) · [简体中文](../zh-CN/manual.md)
 
-This manual describes **v0.5.0**. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
+This manual describes **v0.6.0a1**. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
 
 ## Requirements and first run
 
@@ -11,7 +11,7 @@ Use CPython 3.13, a Rust toolchain with Cargo, and [uv](https://docs.astral.sh/u
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
 cd PyNext
-git checkout v0.5.0
+git checkout v0.6.0a1
 uv sync --extra dev
 npm ci
 uv run pynext build --dir examples/basic
@@ -49,6 +49,10 @@ async def Page(params):
 ~~~
 
 `h(tag, attrs, *children)` builds an HTML tree; strings are escaped. It is buffered SSR, not an arbitrary raw-HTML API.
+
+## Application imports and migration
+
+Page, layout and API modules may use package-relative imports, such as `from .helpers import title`. Each app receives its own module namespace; the framework no longer prepends the project root to process-wide `sys.path`. If a root-based absolute import stops working after upgrading from v0.5, change it to a relative import or install your project as a Python package. Third-party packages must be installed in the environment.
 
 ## API requests and errors
 
@@ -88,6 +92,8 @@ def Page(params):
 
 SSG and ISR page functions cannot accept `request`. Use them only for public content: ensure environment variables and external data are safe to share. ISR ignores anonymous query strings in its cache key. Requests with a Cookie or Authorization header bypass the shared ISR cache and receive `private, no-store`. The cache is bounded and **process-local**; workers do not share or invalidate entries. Rebuild SSG pages to update them.
 
+A build produces at most 10,000 SSG pages. Development mode renders SSG pages for each request. ISR pages cannot export `generate_static_params()` and permit at most 128 concurrent generation tasks per process.
+
 ## Public files and islands
 
 Files under `public/` are public at the corresponding URL, e.g. `public/styles/site.css` is `/styles/site.css`. The build snapshots and checks these files; source files are still needed at production startup. Hidden files, symlinks and conflicting paths are rejected. Restart the development server after changing a public file.
@@ -122,6 +128,8 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 For a built app, create the ASGI app with `create_app(project_path, production=True)`. ASGI server timeout settings are managed by that server. The Axum adapter waits up to 30 seconds for Python and requests cancellation before returning 504. A synchronous function already running in a thread can continue after the 504, including writes. Use idempotent writes and explicit database/upstream timeouts; this release provides no forced process isolation. ISR cancellation has the same limitation.
 
 Streaming, WebSockets, distributed ISR, distributed rate limiting, OpenTelemetry and production hardening are not implemented. See [production roadmap](../PRODUCTION_ROADMAP.md) for proposed work and its acceptance criteria.
+
+Both adapters limit request bodies to 1 MiB and return 413 for oversized bodies. Axum bounds active body reads to 64, with a 10-second total read deadline (408); an exhausted body or Python execution pool returns 503. Bodyless static files and fresh ISR cache hits do not consume a Python slot. This deadline does not limit HTTP header reading or the total number of connections; an external ASGI server manages its own timeouts. Non-root paths ending in a slash redirect with 308. Each compiled island is limited to 2 MiB, with 32 MiB total.
 
 ## Tests and troubleshooting
 
