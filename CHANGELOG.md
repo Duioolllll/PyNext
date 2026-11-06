@@ -1,6 +1,12 @@
 # Changelog
 
-All versions below are experimental. The feature-stage snapshots were reconstructed from preserved development source distributions when these releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
+All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
+
+## v0.5.0
+
+- Separate attempted and successful request throughput, status and transport errors, and all-request versus success latency in the smoke benchmark.
+- Add optional separate Linux server-process CPU sampling and label the shared-process CPU and peak RSS measurements.
+- Expand CI to Linux, macOS and Windows; verify packaged wheels, record a bounded benchmark, and run Chromium smoke checks on Linux.
 
 ## v0.4.0
 

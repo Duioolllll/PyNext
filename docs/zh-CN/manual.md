@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [日本語](../ja/manual.md)
 
-本手册适用于 **v0.4.0**。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
+本手册适用于 **v0.5.0**。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
 
 ## 环境要求与首次运行
 
@@ -11,7 +11,7 @@
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
 cd PyNext
-git checkout v0.4.0
+git checkout v0.5.0
 uv sync --extra dev
 npm ci
 uv run pynext build --dir examples/basic
@@ -129,6 +129,15 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 cargo test -p pynext-router -p pynext-cache
 uv run --extra dev pytest -q
 ~~~
+
+构建示例后，可运行 Chromium 检查：
+
+~~~bash
+uv run --with playwright==1.62.0 python -m playwright install chromium
+uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
+~~~
+
+运行 `uv run --extra dev python benchmarks/bench.py --mode axum --requests 100 --concurrency 4` 可执行小规模闭环负载检查。结果分别记录所有尝试和成功的 2xx 请求每秒数量、错误与状态码、全部及成功请求的 p50/p95/p99、响应大小、CPU 和峰值 RSS。默认模式的 CPU 和进程生命周期峰值 RSS 同时包含服务器与负载生成器，并非仅服务器数据。对单独运行的本地服务器可指定 `--base-url http://127.0.0.1:3000`；在 Linux 上还可用 `--server-pid <PID>` 单独采样该进程及其线程的 CPU，不包括子工作进程。CI 会保存小规模负载结果，但尚未设置性能或内存回归自动阈值。
 
 - 若提示源码已更改，请重新执行 `pynext build`。
 - 若找不到 esbuild，请在仓库根目录运行 `npm ci`，或通过 `PYNEXT_ESBUILD` 指定可执行文件。

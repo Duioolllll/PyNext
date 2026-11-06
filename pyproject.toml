@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pynext-framework"
-version = "0.4.0"
+version = "0.5.0"
 description = "An experimental Python and Rust full-stack web framework"
 license = { file = "LICENSE" }
 requires-python = ">=3.13,<3.14"

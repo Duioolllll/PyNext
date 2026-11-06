@@ -2,7 +2,7 @@
 
 [한국어](../ko/manual.md) · [日本語](../ja/manual.md) · [简体中文](../zh-CN/manual.md)
 
-This manual describes **v0.4.0**. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
+This manual describes **v0.5.0**. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
 
 ## Requirements and first run
 
@@ -11,7 +11,7 @@ Use CPython 3.13, a Rust toolchain with Cargo, and [uv](https://docs.astral.sh/u
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
 cd PyNext
-git checkout v0.4.0
+git checkout v0.5.0
 uv sync --extra dev
 npm ci
 uv run pynext build --dir examples/basic
@@ -129,6 +129,15 @@ Streaming, WebSockets, distributed ISR, distributed rate limiting, OpenTelemetry
 cargo test -p pynext-router -p pynext-cache
 uv run --extra dev pytest -q
 ~~~
+
+After building the example, run the Chromium check with:
+
+~~~bash
+uv run --with playwright==1.62.0 python -m playwright install chromium
+uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
+~~~
+
+Run `uv run --extra dev python benchmarks/bench.py --mode axum --requests 100 --concurrency 4` for a small closed-loop smoke benchmark. It reports attempted and successful 2xx requests per second separately, error and status counts, p50/p95/p99 for all attempts and successes, response sizes, CPU and peak RSS. In the default mode the CPU and lifetime peak RSS cover both the server and the load generator; they are not server-only measurements. For a separately running local server, use `--base-url http://127.0.0.1:3000`. On Linux, add `--server-pid <PID>` to sample that process and its threads, excluding child workers. CI saves a bounded benchmark result but does not yet enforce performance or memory regression thresholds.
 
 - If startup says sources changed, rerun `pynext build`.
 - If esbuild is missing, run `npm ci` at the repository root or set `PYNEXT_ESBUILD` to an executable.

@@ -2,7 +2,7 @@
 
 **Manual:** [English](docs/en/manual.md) · [한국어](docs/ko/manual.md) · [日本語](docs/ja/manual.md) · [简体中文](docs/zh-CN/manual.md)
 
-**Version:** v0.4.0 · [변경 이력](CHANGELOG.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
+**Version:** v0.5.0 · [변경 이력](CHANGELOG.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
 
 PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust로 구현하는 실험적 풀스택 프레임워크입니다. 이 저장소는 구현의 출발점이며, Next.js나 React의 호환 구현은 아닙니다.
 
@@ -195,12 +195,29 @@ cargo test -p pynext-router -p pynext-cache
 uv run --extra dev pytest
 ```
 
-실제 Chromium에서의 mount·클릭·CSP·정리 동작 검사는 Playwright와 브라우저가 설치된 환경에서 `tests/browser/islands_smoke.py`를 예제 서버와 함께 실행할 수 있습니다.
+예제를 빌드한 뒤 다음 명령으로 실제 Chromium에서 mount·hydration·CSP·정리 동작을 검사할 수 있습니다.
+
+```bash
+uv run --with playwright==1.62.0 python -m playwright install chromium
+uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
+```
 
 기초 부하 측정은 `uv run --extra dev python benchmarks/bench.py --mode axum` 또는
 `--mode asgi`로 실행합니다. 이 스크립트는 같은 프로세스에서 클라이언트도
 실행하는 간단한 회귀 측정 도구이며, 프레임워크 간 성능 비교 결과가 아닙니다.
 빌드 후 `--production --path /about`을 추가하면 SSG 경로를 측정합니다.
+
+결과에는 전체 시도와 성공한 2xx 요청의 초당 처리량, 오류 비율, 상태 코드별 건수,
+전체·성공 요청의 p50/p95/p99, 응답 크기가 별도로 표시됩니다. `--warmup`으로
+준비 요청 수를 바꿀 수 있으며 준비 요청 오류도 따로 집계합니다. 기본 모드의
+프로세스 CPU 시간과 최대 RSS에는 부하 생성기와 서버가 함께 포함됩니다. RSS는
+측정 구간만이 아닌 프로세스 생애 동안의 최대값입니다.
+
+별도로 실행한 로컬 서버를 측정할 때는 `--base-url http://127.0.0.1:3000`을
+지정합니다. Linux에서는 `--server-pid <PID>`를 더해 해당 서버 프로세스의 CPU
+시간과 단일 코어 기준 사용률을 따로 확인할 수 있습니다. 이는 지정한 한 프로세스와
+그 스레드만 포함하며 자식 워커는 포함하지 않습니다. CI는 작은 동시 요청 실험의
+측정값을 저장하지만, 환경에 민감한 성능·메모리 회귀의 자동 임계값은 아직 없습니다.
 
 벤치마크 수치는 최소 비교 앱과 부분적으로 이식된 경로를 기준으로 하며,
 데이터베이스·실제 사용자 트래픽·완성된 클라이언트 기능을 포함한 운영 서비스의

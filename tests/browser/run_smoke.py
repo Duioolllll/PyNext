@@ -1,0 +1,55 @@
+"""Start the built example and run the Playwright smoke test."""
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def main():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as log:
+        server = subprocess.Popen(
+            [os.environ.get("PYNEXT_SERVER_PYTHON", sys.executable), "-m", "pynext.cli", "start", "--dir", str(ROOT / "examples/basic"),
+             "--host", "127.0.0.1", "--port", str(port)],
+            cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while True:
+                if server.poll() is not None:
+                    raise RuntimeError(f"PyNext server exited with status {server.returncode}")
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                        break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("PyNext server did not become ready")
+                    time.sleep(0.1)
+            subprocess.run(
+                [sys.executable, str(ROOT / "tests/browser/islands_smoke.py"), f"http://127.0.0.1:{port}"],
+                cwd=ROOT, check=True, timeout=120,
+            )
+        finally:
+            if server.poll() is None:
+                server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait(timeout=10)
+            log.seek(0)
+            output = log.read()
+            if output:
+                print("PyNext server output:\n" + output, flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [简体中文](../zh-CN/manual.md)
 
-このマニュアルは **v0.4.0** を対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
+このマニュアルは **v0.5.0** を対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
 
 ## 必要な環境と起動
 
@@ -11,7 +11,7 @@ CPython 3.13、Rust/Cargo、[uv](https://docs.astral.sh/uv/) が必要です。�
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
 cd PyNext
-git checkout v0.4.0
+git checkout v0.5.0
 uv sync --extra dev
 npm ci
 uv run pynext build --dir examples/basic
@@ -129,6 +129,15 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 cargo test -p pynext-router -p pynext-cache
 uv run --extra dev pytest -q
 ~~~
+
+サンプルをビルドした後、Chromium で検証します。
+
+~~~bash
+uv run --with playwright==1.62.0 python -m playwright install chromium
+uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
+~~~
+
+`uv run --extra dev python benchmarks/bench.py --mode axum --requests 100 --concurrency 4` で小規模な閉ループ負荷テストを実行できます。全試行と成功した 2xx リクエストの秒間処理数、エラー・ステータス、全試行と成功分の p50/p95/p99、応答サイズ、CPU、最大 RSS を分けて記録します。既定モードの CPU とプロセス生存期間中の最大 RSS にはサーバーと負荷生成側の両方が含まれます。別のローカルサーバーには `--base-url http://127.0.0.1:3000` を指定し、Linux では `--server-pid <PID>` でそのプロセスとスレッドの CPU を個別に測定できます。子ワーカーは含みません。CI は小規模負荷の結果を保存しますが、性能・メモリ回帰の自動しきい値はまだありません。
 
 - ソースの変更を指摘されたら `pynext build` を再実行します。
 - esbuild が見つからない場合はリポジトリのルートで `npm ci` を実行するか、`PYNEXT_ESBUILD` に実行ファイルを指定します。
