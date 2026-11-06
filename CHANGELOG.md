@@ -6,6 +6,7 @@ All versions below are experimental. The feature-stage snapshots were reconstruc
 
 - Add load, visible, and idle island activation, cancellation and fallback scheduling.
 - Return HTTP 400 for malformed query UTF-8 and JSON through the ASGI and Axum adapters.
+- Limit parsed query fields, validate response headers and render nodes, and add default CSP and cache-variation headers.
 - Document synchronous handler timeout limitations; add regression coverage.
 - Provide English, Korean, Japanese and Simplified Chinese manuals and a production roadmap.
 

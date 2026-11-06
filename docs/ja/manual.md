@@ -64,7 +64,9 @@ async def echo(request):
     return JSONResponse({"name": data["name"]}, status=201)
 ~~~
 
-`request.query` の各値はリストです。たとえば `request.query.get("q", [""])[0]` で最初の値を取得します。元のバイト列やパーセントデコード後の不正な UTF-8、不正な JSON、非有限 JSON 定数は `BadRequest` となり、ASGI と Axum は詳細を含まない HTTP 400 を返します。解析は対象を**読み取った時だけ**行います。その他の未処理例外は HTTP 500 になります。
+`request.query` の各値はリストです。たとえば `request.query.get("q", [""])[0]` で最初の値を取得します。元のバイト列やパーセントデコード後の不正な UTF-8、1,000 個を超えるクエリフィールド、不正な JSON、非有限 JSON 定数は `BadRequest` となり、ASGI と Axum は詳細を含まない HTTP 400 を返します。解析は対象を**読み取った時だけ**行います。その他の未処理例外は HTTP 500 になります。
+
+レスポンスの既定 Content Security Policy は `script-src 'self'; object-src 'none'` です。ブラウザーが読み込めるスクリプトが制限されるため、クライアントコードの追加時に考慮してください。レスポンスヘッダーとメディアタイプの制御文字は拒否されます。
 
 ## SSR、SSG、ISR
 

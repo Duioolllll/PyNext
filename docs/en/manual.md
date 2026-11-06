@@ -64,7 +64,9 @@ async def echo(request):
     return JSONResponse({"name": data["name"]}, status=201)
 ~~~
 
-`request.query` returns a mapping to lists of values, for example `request.query.get("q", [""])[0]`. Reading it rejects invalid UTF-8, including malformed percent-decoded UTF-8. `await request.json()` rejects invalid JSON and non-finite JSON constants. These operations raise `BadRequest`, which the ASGI and Axum adapters return as HTTP 400 with a generic body. Parsing is lazy: a handler that never reads the value does not trigger validation. Other unhandled errors become HTTP 500.
+`request.query` returns a mapping to lists of values, for example `request.query.get("q", [""])[0]`. Reading it rejects invalid UTF-8, including malformed percent-decoded UTF-8, and more than 1,000 query fields. `await request.json()` rejects invalid JSON and non-finite JSON constants. These operations raise `BadRequest`, which the ASGI and Axum adapters return as HTTP 400 with a generic body. Parsing is lazy: a handler that never reads the value does not trigger validation. Other unhandled errors become HTTP 500.
+
+Responses default to the Content Security Policy `script-src 'self'; object-src 'none'`. This limits which scripts a browser may load; account for it when adding client code. Response headers and media types reject control characters.
 
 ## SSR, SSG and ISR
 

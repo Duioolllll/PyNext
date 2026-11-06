@@ -64,7 +64,9 @@ async def echo(request):
     return JSONResponse({"name": data["name"]}, status=201)
 ~~~
 
-`request.query` 中每个键对应一个值列表，例如 `request.query.get("q", [""])[0]`。原始查询和百分号解码结果中的无效 UTF-8、无效 JSON 及非有限 JSON 常量会引发 `BadRequest`；ASGI 和 Axum 返回不含内部详情的 HTTP 400。只有在**读取对应值时**才进行解析。其他未处理异常返回 HTTP 500。
+`request.query` 中每个键对应一个值列表，例如 `request.query.get("q", [""])[0]`。原始查询和百分号解码结果中的无效 UTF-8、超过 1,000 个查询字段、无效 JSON 及非有限 JSON 常量会引发 `BadRequest`；ASGI 和 Axum 返回不含内部详情的 HTTP 400。只有在**读取对应值时**才进行解析。其他未处理异常返回 HTTP 500。
+
+响应默认使用 Content Security Policy `script-src 'self'; object-src 'none'`。该策略限制浏览器可加载的脚本，添加客户端代码时应予以考虑。响应头和媒体类型中的控制字符会被拒绝。
 
 ## SSR、SSG 与 ISR
 
