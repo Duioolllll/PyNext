@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/pynext-logo-refracted-light.png" alt="PyNext" width="640" />
+  <img src="assets/pynext-logo-refracted-light.gif" alt="PyNext" width="640" />
 </p>
 
 # PyNext — 초기 프로토타입
