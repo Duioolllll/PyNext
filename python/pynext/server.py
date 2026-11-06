@@ -22,7 +22,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000):
                 request = Request(method.upper(), path, bytes(query),
                                   tuple((bytes(k), bytes(v)) for k, v in headers), bytes(body))
                 response = await app.dispatch(request)
-            except BadRequest:
+            except BadRequest as exc:
+                log.info("Bad request: %s", exc)
                 response = Response("Bad Request", status=400)
             except Exception:
                 log.exception("Request failed")
