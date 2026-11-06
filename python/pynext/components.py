@@ -68,13 +68,17 @@ def _validate_props(props):
         raise ValueError("Island props exceed 16384 bytes")
 
 
-def island(name, *, props=None, fallback=None):
+def island(name, *, props=None, fallback=None, hydrate=False):
     if not isinstance(name, str) or not _ISLAND_NAME.fullmatch(name):
         raise ValueError("Invalid island name")
+    if not isinstance(hydrate, bool):
+        raise TypeError("hydrate must be a boolean")
+    if hydrate and fallback is None:
+        raise ValueError("A hydrated island requires server-rendered fallback content")
     props = {} if props is None else props
     _validate_props(props)
     return {"kind": "island", "name": name, "props": props,
-            "children": [] if fallback is None else [_node(fallback)]}
+            "hydrate": hydrate, "children": [] if fallback is None else [_node(fallback)]}
 
 
 def bind_islands(tree, manifest):
@@ -97,9 +101,17 @@ def bind_islands(tree, manifest):
             children = node.get("children")
             if not isinstance(children, list):
                 raise ValueError("Island children must be an array")
+            hydrate = node.get("hydrate", False)
+            if not isinstance(hydrate, bool):
+                raise TypeError("hydrate must be a boolean")
+            if hydrate and not children:
+                raise ValueError("A hydrated island requires server-rendered fallback content")
+            if hydrate and not manifest.get("hydration", {}).get(name, False):
+                raise ValueError(f"Hydrated island {name!r} must export render and hydrate")
             bound = [bind(child, True, depth + 1)[0] for child in children]
             return {"kind": "island", "name": name, "props": props,
-                    "module": PREFIX + manifest["bundles"][name] + ".js", "children": bound}, True
+                    "module": PREFIX + manifest["bundles"][name] + ".js",
+                    "hydrate": hydrate, "children": bound}, True
         result = dict(node)
         found = False
         if kind in {"element", "fragment"}:

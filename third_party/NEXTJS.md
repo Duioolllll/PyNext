@@ -31,6 +31,12 @@ independent and does not implement React Server Components or React hydration:
 - https://github.com/vercel/next.js/blob/6100e81e314f7aad0c94e189bbae87820d7efb37/packages/next/src/build/webpack/loaders/next-flight-loader/index.ts
 - https://github.com/vercel/next.js/blob/6100e81e314f7aad0c94e189bbae87820d7efb37/packages/next/src/build/webpack/plugins/flight-manifest-plugin.ts
 
+The hydration lifecycle was informed by Next.js's client entrypoint, which
+uses React's hydration APIs. PyNext uses its own explicit DOM comparison and
+island contract; it is not React hydration or React Server Components:
+
+- https://github.com/vercel/next.js/blob/6100e81e314f7aad0c94e189bbae87820d7efb37/packages/next/src/client/app-index.tsx
+
 PyNext supports a deliberately smaller route grammar; see the README. It does
 not include or implement Next.js, React, or the React Server Components protocol.
 

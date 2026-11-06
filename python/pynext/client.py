@@ -102,7 +102,7 @@ def _esbuild(root):
 def compile_client(root, sources):
     entries = _entries(sources)
     if not entries:
-        return {"runtime": None, "bundles": {}, "esbuild_version": None}, {}
+        return {"runtime": None, "bundles": {}, "hydration": {}, "esbuild_version": None}, {}
     executable = _esbuild(root)
     try:
         version = subprocess.run([executable, "--version"], check=True, text=True,
@@ -116,6 +116,7 @@ def compile_client(root, sources):
     runtime_hash = _digest(runtime)
     assets = {PREFIX + runtime_hash + ".js": runtime}
     bundles = {}
+    hydration = {}
     total = len(runtime)
     with tempfile.TemporaryDirectory(prefix="pynext-client-") as temp:
         output = Path(temp) / "bundle.js"
@@ -144,20 +145,23 @@ def compile_client(root, sources):
                 raise ValueError("Island bundle size limit exceeded")
             digest = _digest(data)
             bundles[name] = digest
+            hydration[name] = {"render", "hydrate"}.issubset(outputs[0].get("exports", []))
             assets[PREFIX + digest + ".js"] = data
-    return {"runtime": runtime_hash, "bundles": bundles, "esbuild_version": version}, assets
+    return {"runtime": runtime_hash, "bundles": bundles, "hydration": hydration, "esbuild_version": version}, assets
 
 
 def read_client_artifacts(root, manifest):
     entries = _entries(manifest["client_sources"])
     info = manifest.get("client")
-    if not isinstance(info, dict) or set(info) != {"runtime", "bundles", "esbuild_version"}:
+    if not isinstance(info, dict) or set(info) != {"runtime", "bundles", "hydration", "esbuild_version"}:
         raise ValueError("Invalid client manifest; rebuild the application")
     if not entries:
-        if info != {"runtime": None, "bundles": {}, "esbuild_version": None}:
+        if info != {"runtime": None, "bundles": {}, "hydration": {}, "esbuild_version": None}:
             raise ValueError("Invalid empty client manifest; rebuild the application")
         return info, {}
     if (not isinstance(info["bundles"], dict) or set(info["bundles"]) != set(entries) or
+            not isinstance(info["hydration"], dict) or set(info["hydration"]) != set(entries) or
+            any(not isinstance(value, bool) for value in info["hydration"].values()) or
             not isinstance(info["esbuild_version"], str) or
             not re.fullmatch(r"\d+\.\d+\.\d+", info["esbuild_version"]) or
             info["runtime"] != _digest(_runtime_bytes())):

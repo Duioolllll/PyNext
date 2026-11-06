@@ -179,10 +179,16 @@ fn render_node(node: &Value, output: &mut String, depth: usize) -> Result<(), St
             if props.len() > 16_384 {
                 return Err("Island props exceed maximum size".into());
             }
+            let hydrate = obj
+                .get("hydrate")
+                .and_then(Value::as_bool)
+                .ok_or("Island hydrate must be a boolean")?;
             output.push_str("<div data-pynext-island=\"");
             escape(name, output);
             output.push_str("\" data-pynext-module=\"");
             escape(module, output);
+            output.push_str("\" data-pynext-mode=\"");
+            output.push_str(if hydrate { "hydrate" } else { "mount" });
             output.push_str("\" data-pynext-props=\"");
             escape(&props, output);
             output.push_str("\">");

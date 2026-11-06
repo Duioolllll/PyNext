@@ -12,7 +12,7 @@ from .assets import discover_public
 from .client import discover_client
 
 MANIFEST = ".pynext/manifest.json"
-VERSION = 5
+VERSION = 6
 MAX_STATIC_PAGES = 10_000
 
 

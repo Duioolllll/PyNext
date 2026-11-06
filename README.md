@@ -1,4 +1,4 @@
-# PyNext v0.2.0
+# PyNext v0.3.0
 
 This experimental release was reconstructed from a preserved development build; the later request-validation fix was backported. It is not Next.js or React compatible. Do not expose it directly to the internet.
 

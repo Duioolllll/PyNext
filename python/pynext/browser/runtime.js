@@ -1,5 +1,17 @@
-// An island owns its element's children. Its module exports mount(element, props).
+// An island owns its element's children. Hydration preserves matching server DOM.
 const instances = new WeakMap();
+
+function matchesServerDOM(element, expected) {
+  if (!(expected instanceof Node) || expected.isConnected) {
+    throw new Error("Island render must return a detached DOM node");
+  }
+  const container = document.createElement("div");
+  container.append(expected);
+  const actualChildren = Array.from(element.childNodes);
+  const expectedChildren = Array.from(container.childNodes);
+  return actualChildren.length === expectedChildren.length &&
+    actualChildren.every((node, index) => node.isEqualNode(expectedChildren[index]));
+}
 
 function dispose(element) {
   const state = instances.get(element);
@@ -25,14 +37,37 @@ async function mountIsland(element) {
     const module = await import(moduleUrl);
     if (typeof module.mount !== "function") throw new Error("Island must export mount");
     if (!element.isConnected || state.removed) return;
-    const cleanup = await module.mount(element, props);
+    const mode = element.getAttribute("data-pynext-mode");
+    let cleanup, status;
+    if (mode === "hydrate") {
+      if (typeof module.render !== "function" || typeof module.hydrate !== "function") {
+        throw new Error("Hydrated island must export render and hydrate");
+      }
+      const expected = await module.render(props);
+      if (!element.isConnected || state.removed) return;
+      if (matchesServerDOM(element, expected)) {
+        cleanup = await module.hydrate(element, props);
+        status = "hydrated";
+      } else {
+        element.setAttribute("data-pynext-mismatch", "true");
+        console.warn("PyNext island DOM mismatch; mounting a fresh island", element);
+        cleanup = await module.mount(element, props);
+        status = "mounted";
+      }
+    } else if (mode === "mount") {
+      cleanup = await module.mount(element, props);
+      status = "mounted";
+    } else {
+      throw new Error("Invalid island mode");
+    }
+    if (!state.removed && element.isConnected) element.setAttribute("data-pynext-state", status);
     if (typeof cleanup === "function") {
       if (state.removed || !element.isConnected) cleanup();
       else state.cleanup = cleanup;
     }
   } catch (error) {
-    element.setAttribute("data-pynext-error", "mount-failed");
-    console.error("PyNext island failed to mount", error);
+    element.setAttribute("data-pynext-error", "activation-failed");
+    console.error("PyNext island failed to activate", error);
   }
 }
 
