@@ -384,6 +384,10 @@ fn plain_response(status: StatusCode, body: &'static str) -> AxumResponse<Body> 
     AxumResponse::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
+        .header(
+            "content-security-policy",
+            "script-src 'self'; object-src 'none'",
+        )
         .body(Body::from(body))
         .expect("static response is valid")
 }
@@ -412,6 +416,10 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     .header("content-length", content.len().to_string())
                     .header("cache-control", "public, max-age=31536000, immutable")
                     .header("x-content-type-options", "nosniff")
+                    .header(
+                        "content-security-policy",
+                        "script-src 'self'; object-src 'none'",
+                    )
                     .body(body)
                     .expect("client asset response is valid");
             }
@@ -427,6 +435,10 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     .header("content-length", asset.body.len().to_string())
                     .header("cache-control", "public, max-age=0, must-revalidate")
                     .header("x-content-type-options", "nosniff")
+                    .header(
+                        "content-security-policy",
+                        "script-src 'self'; object-src 'none'",
+                    )
                     .body(body)
                     .expect("public asset response is valid");
             }
@@ -441,6 +453,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     .status(StatusCode::OK)
                     .header("content-type", "text/html; charset=utf-8")
                     .header("content-length", length.to_string())
+                    .header(
+                        "content-security-policy",
+                        "script-src 'self'; object-src 'none'",
+                    )
+                    .header("vary", "Cookie, Authorization")
                     .body(body)
                     .expect("static response is valid");
             }
@@ -458,6 +475,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         .header("content-type", "text/html; charset=utf-8")
                         .header("content-length", length.to_string())
                         .header("cache-control", "public, max-age=0, must-revalidate")
+                        .header(
+                            "content-security-policy",
+                            "script-src 'self'; object-src 'none'",
+                        )
+                        .header("vary", "Cookie, Authorization")
                         .body(body)
                         .expect("cached response is valid");
                 }

@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from pynext import _native, create_app, h
+from pynext import _native, Response, create_app, h
 from pynext.build import write_manifest
 from pynext.server import start_native
 
@@ -80,6 +80,47 @@ def test_renderer_escapes_and_rejects_dangerous_attributes():
     for tree in [h("a", {"href": "java\nscript:alert(1)"}, "x"), h("p", {"onclick": "evil()"}), h("script", {}, "x")]:
         with pytest.raises(ValueError):
             _native.render(json.dumps(tree))
+
+
+def test_invalid_request_data_is_bad_request_and_headers_are_safe(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "route.py").write_text(
+        'from pynext import JSONResponse, route\n'
+        '@route("GET")\n'
+        'async def get(request): return JSONResponse(request.query)\n'
+        '@route("POST")\n'
+        'async def post(request): return JSONResponse(await request.json())\n'
+    )
+    (app / "bad").mkdir()
+    (app / "bad" / "page.py").write_text(
+        'from pynext import page\n'
+        '@page()\n'
+        'def Page(): return None\n'
+    )
+
+    async def run():
+        application = create_app(tmp_path)
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            assert (await client.get("/?x=%FF")).status_code == 400
+            query = "&".join(f"x{i}=1" for i in range(1001))
+            assert (await client.get("/?" + query)).status_code == 400
+            assert (await client.post("/", content=b"{")).status_code == 400
+            assert (await client.get("/bad")).status_code == 500
+            response = await client.get("/")
+            assert response.headers["content-security-policy"] == "script-src 'self'; object-src 'none'"
+        await application.isr.close()
+
+    asyncio.run(run())
+
+
+def test_response_rejects_control_characters_in_media_type():
+    with pytest.raises(ValueError, match="media type"):
+        Response("ok", media_type="text/plain\r\nx-injected: yes")
+
+    with pytest.raises(ValueError, match="response header"):
+        Response("ok", headers=[(b"x-test", b"bad\x01value")])
 
 
 def test_build_rejects_stale_sources(tmp_path):

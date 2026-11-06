@@ -160,8 +160,12 @@ class App:
     async def render_page(self, pattern, request, params):
         fn, layouts = self.entries[pattern]
         tree = await _invoke(fn, request=request, params=params)
+        if not isinstance(tree, dict):
+            raise TypeError(f"Page {pattern} must return a render node dict, got {type(tree).__name__}")
         for layout_fn in reversed(layouts):
             tree = await _invoke(layout_fn, children=tree)
+            if not isinstance(tree, dict):
+                raise TypeError(f"Layout for {pattern} must return a render node dict, got {type(tree).__name__}")
         tree = bind_islands(tree, self.client_manifest)
         payload = json.dumps(tree, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         html = await asyncio.to_thread(_native.render, payload)
@@ -232,12 +236,16 @@ class App:
             return Response("Method Not Allowed", status=405, headers=[(b"allow", allow)])
         if spec["kind"] == "page":
             if self.production and self.render_modes[pattern] == "ssg":
-                response = Response(self.static_pages[path], media_type="text/html; charset=utf-8")
+                response = Response(self.static_pages[path], media_type="text/html; charset=utf-8",
+                                    headers=[(b"vary", b"Cookie, Authorization")])
             elif self.production and self.render_modes[pattern] == "isr":
                 private = any(name.lower() in {b"authorization", b"cookie"} for name, _ in request.headers)
                 if private:
                     response = await self.render_page(pattern, None, params)
-                    response.headers.append((b"cache-control", b"private, no-store"))
+                    response.headers.extend([
+                        (b"cache-control", b"private, no-store"),
+                        (b"vary", b"Cookie, Authorization"),
+                    ])
                 else:
                     try:
                         body = await self.isr.get_or_render(
@@ -249,7 +257,10 @@ class App:
                     except TimeoutError:
                         return Response("Gateway Timeout", status=504)
                     response = Response(body, media_type="text/html; charset=utf-8",
-                                        headers=[(b"cache-control", b"public, max-age=0, must-revalidate")])
+                                        headers=[
+                                            (b"cache-control", b"public, max-age=0, must-revalidate"),
+                                            (b"vary", b"Cookie, Authorization"),
+                                        ])
             else:
                 response = await self.render_page(pattern, request, params)
         else:
@@ -298,7 +309,8 @@ class App:
                                           tuple(scope.get("headers", [])), b"".join(chunks))
                         response = await self.dispatch(request)
                         break
-            except BadRequest:
+            except BadRequest as exc:
+                log.info("Bad request: %s", exc)
                 response = Response("Bad Request", status=400)
             except Exception:
                 log.exception("Request failed")
