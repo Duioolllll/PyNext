@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlencode
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
 
 base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:3173"
 manifest = json.loads((Path(__file__).resolve().parents[2] / "examples/basic/.pynext/manifest.json").read_text())
@@ -141,8 +141,8 @@ with sync_playwright() as playwright:
     page.wait_for_timeout(50)
     assert page.evaluate("window.pendingIdleCount()") == 2
     page.evaluate("window.flushIdle()")
-    page.wait_for_function("document.querySelector('[data-pynext-island=\"idle-counter\"]').dataset.pynextState === 'mounted'")
-    page.wait_for_function("document.querySelector('[data-pynext-island=\"hydrated-counter\"]').dataset.pynextState === 'hydrated'")
+    expect(idle).to_have_attribute("data-pynext-state", "mounted")
+    expect(lazy_hydrated).to_have_attribute("data-pynext-state", "hydrated")
     assert page.evaluate("window.serverHydratedButton === document.querySelector('[data-pynext-island=\"hydrated-counter\"] button')")
     page.get_by_role("button", name="Idle: 1").click()
     assert page.get_by_role("button", name="Idle: 2").count() == 1
@@ -151,7 +151,7 @@ with sync_playwright() as playwright:
     assert any(idle_counter in url for url in requested)
     assert not any(visible_counter in url or unused in url for url in requested)
     visible.scroll_into_view_if_needed()
-    page.wait_for_function("document.querySelector('[data-pynext-island=\"visible-counter\"]').dataset.pynextState === 'hydrated'")
+    expect(visible).to_have_attribute("data-pynext-state", "hydrated")
     page.get_by_role("button", name="Visible: 3").click()
     assert page.get_by_role("button", name="Visible: 4").count() == 1
     assert any(visible_counter in url for url in requested)
@@ -163,9 +163,9 @@ with sync_playwright() as playwright:
       copy.setAttribute('data-pynext-props', JSON.stringify({ initial: 10 }));
       document.querySelector('main').append(copy);
     }""")
-    page.wait_for_function("document.querySelector('#dynamic-idle').dataset.pynextState === 'waiting'")
+    expect(page.locator("#dynamic-idle")).to_have_attribute("data-pynext-state", "waiting")
     page.evaluate("window.flushIdle()")
-    page.wait_for_function("document.querySelector('#dynamic-idle').dataset.pynextState === 'mounted'")
+    expect(page.locator("#dynamic-idle")).to_have_attribute("data-pynext-state", "mounted")
     page.get_by_role("button", name="Idle: 10").click()
     page.evaluate("window.dynamicButton = document.querySelector('#dynamic-idle button'); document.querySelector('#dynamic-idle').remove()")
     page.wait_for_timeout(50)
@@ -177,14 +177,14 @@ with sync_playwright() as playwright:
         page = fallback.new_page()
         page.add_init_script(observer)
         page.goto(base + "/strategies", wait_until="networkidle")
-        page.wait_for_function("document.querySelector('[data-pynext-island=\"visible-counter\"]').dataset.pynextState === 'hydrated'", timeout=6000)
+        expect(page.locator('[data-pynext-island="visible-counter"]')).to_have_attribute("data-pynext-state", "hydrated", timeout=6000)
         fallback.close()
     for idle_api in ("delete window.requestIdleCallback; delete window.cancelIdleCallback", "window.requestIdleCallback = () => { throw new Error('blocked') }"):
         fallback = browser.new_context()
         page = fallback.new_page()
         page.add_init_script(idle_api)
         page.goto(base + "/strategies", wait_until="networkidle")
-        page.wait_for_function("document.querySelector('[data-pynext-island=\"idle-counter\"]').dataset.pynextState === 'mounted'", timeout=6000)
+        expect(page.locator('[data-pynext-island="idle-counter"]')).to_have_attribute("data-pynext-state", "mounted", timeout=6000)
         fallback.close()
 
     no_js = browser.new_context(java_script_enabled=False)
