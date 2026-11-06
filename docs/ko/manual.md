@@ -141,6 +141,7 @@ uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 
 - 소스가 변경되었다는 오류가 나면 `pynext build`를 다시 실행합니다.
 - esbuild가 없으면 저장소 루트에서 `npm ci`를 실행하거나 `PYNEXT_ESBUILD`에 실행 파일을 지정합니다.
+- Windows에서는 npm esbuild를 Node로 실행합니다. `PYNEXT_ESBUILD`를 직접 설정할 때는 `.cmd`·`.bat` 대신 네이티브 `esbuild.exe`를 지정하세요.
 - 동적 SSG 경로가 404이면 `generate_static_params()`에 경로를 추가하고 재빌드합니다.
 - hydration이 일치하지 않으면 서버 fallback과 클라이언트 `render` 결과를 결정적으로 동일하게 만듭니다.
 - ISR 결과가 워커마다 다르면 프로세스별 캐시인지 확인합니다.

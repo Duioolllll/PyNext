@@ -153,9 +153,10 @@ class App:
             self.client_manifest, self.client_assets = compile_client(self.root, manifest["client_sources"])
 
     def _module(self, path):
-        if path not in self.modules:
-            self.modules[path] = _load(self.root, path)
-        return self.modules[path]
+        key = (self.root / path).resolve()
+        if key not in self.modules:
+            self.modules[key] = _load(self.root, path)
+        return self.modules[key]
 
     async def render_page(self, pattern, request, params):
         fn, layouts = self.entries[pattern]

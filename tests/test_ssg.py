@@ -19,7 +19,8 @@ def make_app(root):
     (app / "blog" / "[slug]" / "page.py").write_text(
         'from pynext import page, h\n'
         'def generate_static_params(): return [{"slug": "hello"}, {"slug": "한글"}]\n'
-        '@page(render="ssg")\nasync def Page(params): return h("p", {}, params["slug"])\n'
+        '@page(render="ssg")\nasync def Page(params): return h("p", {}, params["slug"])\n',
+        encoding="utf-8",
     )
     (app / "docs" / "[...path]" / "page.py").write_text(
         'from pynext import page, h\n'
@@ -89,14 +90,14 @@ def test_ssg_artifacts_integrity_and_failed_build_is_atomic(tmp_path):
     original_blobs = {entry["sha256"]: (tmp_path / ".pynext" / "static" / (entry["sha256"] + ".html")).read_bytes()
                       for entry in manifest["static_pages"].values()}
     source = app / "blog" / "[slug]" / "page.py"
-    source.write_text(source.read_text().replace('return [{"slug": "hello"}, {"slug": "한글"}]', 'raise RuntimeError("build failed")'))
+    source.write_text(source.read_text(encoding="utf-8").replace('return [{"slug": "hello"}, {"slug": "한글"}]', 'raise RuntimeError("build failed")'), encoding="utf-8")
     with pytest.raises(RuntimeError, match="build failed"):
         write_manifest(tmp_path)
     assert path.read_bytes() == original
     for digest, content in original_blobs.items():
         assert (tmp_path / ".pynext" / "static" / (digest + ".html")).read_bytes() == content
     # Restore the input and deliberately corrupt a published artifact.
-    source.write_text(source.read_text().replace('raise RuntimeError("build failed")', 'return [{"slug": "hello"}, {"slug": "한글"}]'))
+    source.write_text(source.read_text(encoding="utf-8").replace('raise RuntimeError("build failed")', 'return [{"slug": "hello"}, {"slug": "한글"}]'), encoding="utf-8")
     digest = manifest["static_pages"]["/"]["sha256"]
     (tmp_path / ".pynext" / "static" / (digest + ".html")).write_text("corrupted")
     with pytest.raises(ValueError, match="integrity check"):
@@ -114,7 +115,7 @@ def test_ssg_artifacts_integrity_and_failed_build_is_atomic(tmp_path):
 def test_invalid_static_params_fail_build(tmp_path, generated):
     app = make_app(tmp_path)
     source = app / "blog" / "[slug]" / "page.py"
-    source.write_text(source.read_text().replace('[{"slug": "hello"}, {"slug": "한글"}]', generated))
+    source.write_text(source.read_text(encoding="utf-8").replace('[{"slug": "hello"}, {"slug": "한글"}]', generated), encoding="utf-8")
     with pytest.raises(ValueError):
         write_manifest(tmp_path)
 

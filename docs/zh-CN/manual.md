@@ -141,6 +141,7 @@ uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 
 - 若提示源码已更改，请重新执行 `pynext build`。
 - 若找不到 esbuild，请在仓库根目录运行 `npm ci`，或通过 `PYNEXT_ESBUILD` 指定可执行文件。
+- Windows 上的 npm esbuild 通过 Node 运行。直接设置 `PYNEXT_ESBUILD` 时，请指定原生 `esbuild.exe`，不要使用 `.cmd` 或 `.bat` 文件。
 - 若动态 SSG 路径返回 404，请将其加入 `generate_static_params()` 并重新构建。
 - 若 hydration 不匹配，请确保服务端 fallback 与客户端 `render` 产生一致且确定的结果。
 - 若工作进程之间的 ISR 结果不同，请检查进程内缓存的限制。

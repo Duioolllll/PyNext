@@ -149,6 +149,7 @@ island("chart", props={"value": 42}, strategy="visible",
 - island 진입점은 최대 256개, 소스 파일은 10,000개·총 10 MiB 이하이며 파일 하나는 1 MiB 이하입니다.
 - `props`는 공개되는 JSON 객체입니다. 비밀 값을 넣지 마세요. 크기는 16 KiB 이하이고 숫자는 JavaScript에서 안전하게 표현할 수 있어야 합니다.
 - islands가 있는 앱을 빌드하거나 개발 서버로 시작할 때 esbuild가 필요합니다. 프로젝트의 `node_modules/.bin/esbuild`, PATH 또는 `PYNEXT_ESBUILD` 환경 변수에서 찾습니다. 빌드가 끝난 운영 서버에는 esbuild가 필요하지 않습니다.
+- Windows에서는 npm의 esbuild를 Node로 실행합니다. `PYNEXT_ESBUILD`를 직접 설정할 때는 `.cmd`나 `.bat` 대신 네이티브 `esbuild.exe`를 지정해야 합니다.
 - 별도의 앱 프로젝트에서는 `npm install --save-dev --save-exact esbuild@0.28.1`로 예제와 같은 버전을 설치할 수 있습니다.
 - `/_pynext`는 프레임워크 내부 경로로 예약되어 있습니다. 앱과 공개 파일에는 사용할 수 없습니다.
 

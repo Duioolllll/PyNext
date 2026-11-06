@@ -141,6 +141,7 @@ Run `uv run --extra dev python benchmarks/bench.py --mode axum --requests 100 --
 
 - If startup says sources changed, rerun `pynext build`.
 - If esbuild is missing, run `npm ci` at the repository root or set `PYNEXT_ESBUILD` to an executable.
+- On Windows, npm's esbuild wrapper runs through Node. If setting `PYNEXT_ESBUILD` directly, use the native `esbuild.exe`, not a `.cmd` or `.bat` file.
 - If an SSG dynamic path returns 404, add it to `generate_static_params()` and rebuild.
 - If hydration reports a mismatch, make server fallback and client `render` output deterministic and equivalent.
 - If an ISR page looks different across workers, remember each process has its own cache.

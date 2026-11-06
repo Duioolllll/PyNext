@@ -7,6 +7,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Separate attempted and successful request throughput, status and transport errors, and all-request versus success latency in the smoke benchmark.
 - Add optional separate Linux server-process CPU sampling and label the shared-process CPU and peak RSS measurements.
 - Expand CI to Linux, macOS and Windows; verify packaged wheels, record a bounded benchmark, and run Chromium smoke checks on Linux.
+- Normalize equivalent module paths and run the npm esbuild wrapper safely on Windows.
 
 ## v0.4.0
 

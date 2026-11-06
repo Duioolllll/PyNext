@@ -82,6 +82,15 @@ def test_renderer_escapes_and_rejects_dangerous_attributes():
             _native.render(json.dumps(tree))
 
 
+def test_equivalent_module_paths_share_one_loaded_module(tmp_path):
+    directory = tmp_path / "app"
+    directory.mkdir()
+    (directory / "page.py").write_text('from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "ok")\n')
+    app = create_app(tmp_path)
+    assert app._module("app/page.py") is app._module("app/./page.py")
+    assert app._module("app/page.py") is app._module(str(Path("app") / "page.py"))
+
+
 def test_invalid_request_data_is_bad_request_and_headers_are_safe(tmp_path):
     app = tmp_path / "app"
     app.mkdir()

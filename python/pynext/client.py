@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -87,16 +88,31 @@ def _esbuild(root):
         executable = shutil.which(explicit) or (str(candidate.resolve()) if candidate.is_file() else None)
         if not executable or not os.access(executable, os.X_OK):
             raise ValueError("PYNEXT_ESBUILD does not point to an executable")
-        return str(executable)
+        if sys.platform == "win32" and Path(executable).suffix.lower() in {".bat", ".cmd"}:
+            raise ValueError("PYNEXT_ESBUILD must point to a native esbuild executable on Windows")
+        return [str(executable)]
+    node = shutil.which("node") if sys.platform == "win32" else None
     for parent in (root, *root.parents):
-        for name in ("esbuild", "esbuild.cmd"):
-            candidate = parent / "node_modules" / ".bin" / name
+        if sys.platform == "win32":
+            wrapper = parent / "node_modules" / "esbuild" / "bin" / "esbuild"
+            if node and wrapper.is_file():
+                return [node, str(wrapper)]
+        else:
+            candidate = parent / "node_modules" / ".bin" / "esbuild"
             if candidate.is_file():
-                return str(candidate)
+                return [str(candidate)]
     executable = shutil.which("esbuild")
     if not executable:
         raise ValueError("esbuild is required for islands; install esbuild in the project or set PYNEXT_ESBUILD")
-    return executable
+    if sys.platform == "win32" and Path(executable).suffix.lower() in {".bat", ".cmd"}:
+        parent = Path(executable).parent
+        wrappers = (parent.parent / "esbuild" / "bin" / "esbuild",
+                    parent / "node_modules" / "esbuild" / "bin" / "esbuild")
+        for wrapper in wrappers:
+            if node and wrapper.is_file():
+                return [node, str(wrapper)]
+        raise ValueError("Set PYNEXT_ESBUILD to a native esbuild executable on Windows")
+    return [executable]
 
 
 def compile_client(root, sources):
@@ -105,7 +121,7 @@ def compile_client(root, sources):
         return {"runtime": None, "bundles": {}, "hydration": {}, "esbuild_version": None}, {}
     executable = _esbuild(root)
     try:
-        version = subprocess.run([executable, "--version"], check=True, text=True,
+        version = subprocess.run([*executable, "--version"], check=True, encoding="utf-8", errors="replace",
                                  capture_output=True, timeout=10).stdout.strip()
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError("Cannot run esbuild") from exc
@@ -122,11 +138,12 @@ def compile_client(root, sources):
         output = Path(temp) / "bundle.js"
         metadata = Path(temp) / "meta.json"
         for name, entry in entries.items():
-            command = [executable, entry, "--bundle", "--format=esm", "--platform=browser", "--target=es2020",
+            command = [*executable, entry, "--bundle", "--format=esm", "--platform=browser", "--target=es2020",
                        "--charset=utf8", "--log-level=error", "--log-override:unsupported-dynamic-import=error",
                        f"--outfile={output}", f"--metafile={metadata}"]
             try:
-                subprocess.run(command, cwd=directory, check=True, text=True, capture_output=True, timeout=30)
+                subprocess.run(command, cwd=directory, check=True, encoding="utf-8", errors="replace",
+                               capture_output=True, timeout=30)
             except subprocess.CalledProcessError as exc:
                 raise ValueError(f"Could not bundle island {name}: {exc.stderr[:4000]}") from exc
             except (OSError, subprocess.SubprocessError) as exc:
