@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/pynext-logo-refracted-light.png" alt="PyNext" width="640" />
+</p>
+
 # PyNext — 초기 프로토타입
 
 **Manual:** [English](docs/en/manual.md) · [한국어](docs/ko/manual.md) · [日本語](docs/ja/manual.md) · [简体中文](docs/zh-CN/manual.md)
