@@ -2,7 +2,7 @@
 
 PyNext의 `benchmarks/bench.py`는 주로 성능 회귀와 오류율을 확인하는 작은 부하 측정 도구입니다. 공식적인 Next.js/FastAPI 성능 순위나 운영 환경 처리량 보증이 아닙니다.
 
-## 세 가지 실행 모드
+## 네 가지 실행 모드
 
 먼저 `uv sync --locked --extra dev`, `npm ci`, `uv run pynext build --dir examples/basic`를 실행합니다.
 
@@ -10,13 +10,48 @@ PyNext의 `benchmarks/bench.py`는 주로 성능 회귀와 오류율을 확인�
 uv run python benchmarks/bench.py --mode axum --production --path /api/users --requests 1000 --concurrency 10
 uv run python benchmarks/bench.py --mode uvicorn --production --path /api/users --requests 1000 --concurrency 10
 uv run python benchmarks/bench.py --mode asgi --production --path /api/users --requests 1000 --concurrency 10
+uv run python benchmarks/bench.py --mode starlette --path /api/users --requests 1000 --concurrency 10
 ```
 
 - **axum**: Rust/Axum 서버에 실제 TCP loopback HTTP 요청을 보냅니다. 출력 `transport=loopback_http`.
 - **uvicorn**: 같은 PyNext ASGI 앱을 Uvicorn으로 서비스하고 실제 TCP loopback HTTP 요청을 보냅니다. 출력 `transport=loopback_http`.
 - **asgi**: `httpx.ASGITransport`를 통해 네트워크 없이 앱을 직접 호출합니다. 출력 `transport=in_process_asgi`. Axum/Uvicorn의 HTTP 수치와 직접 비교하지 마세요.
+- **starlette**: 동일 기능을 구현한 Starlette 참조 앱(`benchmarks/starlette_app.py`, `/`·`/about`·`/blog/{slug}`·`/api/users`)을 Uvicorn으로 서비스하고 실제 TCP loopback HTTP 요청을 보냅니다. 출력 `transport=loopback_http`. PyNext 앱을 빌드하지 않으므로 `--production`은 이 그룹에 적용되지 않습니다.
 
-세 모드는 모두 클라이언트가 서버와 **같은 프로세스**에 있습니다. HTTP 경로가 같아진다고 해서 CPU 사용량, 이벤트 루프 경쟁, 코어 배치 등 모든 조건이 같아지는 것은 아닙니다. 운영 성능 비교에는 별도 서버·부하 생성 프로세스(가능하면 별도 머신)가 필요합니다.
+네 모드는 모두 클라이언트가 서버와 **같은 프로세스**에 있습니다. HTTP 경로가 같아진다고 해서 CPU 사용량, 이벤트 루프 경쟁, 코어 배치 등 모든 조건이 같아지는 것은 아닙니다. 운영 성능 비교에는 별도 서버·부하 생성 프로세스(가능하면 별도 머신)가 필요합니다.
+
+## `--compare`: 동일 조건 비교
+
+`--compare`는 loopback HTTP 그룹 세 가지(axum, uvicorn, starlette)를 동일한
+경로·요청 수·동시성·워밍업으로 차례로 실행해 하나의 결합 결과를 출력합니다.
+인프로세스 `asgi` 모드는 네트워크를 거치지 않으므로 비교에서 제외합니다.
+
+```bash
+uv run python benchmarks/bench.py --compare --production --path /api/users --requests 1000 --concurrency 10 --warmup 10
+```
+
+각 그룹 결과에는 성공 요청의 p50/p95/p99, CPU 시간, 최대 RSS가 모두
+포함됩니다. 단, `--compare`는 한 프로세스에서 세 그룹을 차례로 실행하므로
+`process_peak_rss_bytes`는 그룹별 서버 메모리가 아니라 해당 시점까지의
+프로세스 생애 최대값이라 뒤 그룹일수록 커지는 경향이 있습니다.
+`process_cpu_seconds`는 각 그룹 측정 구간에 대해서만 잰 값입니다.
+
+### 기록된 비교 (2026-11-08, 1회 측정)
+
+조건: `--compare --production --path /api/users --requests 1000
+--concurrency 10 --warmup 10`, Python 3.13.18, Uvicorn 0.54.0, Starlette
+1.10.0, httpx 0.28.1, Linux x86_64, loopback HTTP, 부하 생성기와 같은
+프로세스. 전체 결과는 `benchmarks/results-2026-11-08.json`에 있습니다.
+
+| 그룹 | 성공 요청 | 오류 | 성공 처리량(초당) | p50/p95/p99(ms) | CPU(초) | 응답 크기 |
+|---|---:|---:|---:|---|---:|---:|
+| axum (PyNext 독립 실행) | 1000 | 0 | 281.21 | 17.2 / 100.9 / 183.0 | 2.491 | 25 B |
+| uvicorn (PyNext ASGI) | 1000 | 0 | 215.95 | 43.6 / 62.8 / 87.6 | 2.037 | 25 B |
+| starlette (참조 앱) | 1000 | 0 | 227.06 | 42.7 / 51.4 / 58.7 | 1.840 | 25 B |
+
+1회 측정이라 배율이나 순위를 단정하지 마세요. 특히 axum의 p95/p99 꼬리는
+같은 조건에서 다시 측정하면 달라질 수 있습니다. Next.js 비교군은 이
+스크립트에 포함되지 않았습니다(이전 Next.js 비교는 별도 측정입니다).
 
 ## 외부 HTTP 서버로 측정
 

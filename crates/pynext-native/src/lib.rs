@@ -1,11 +1,15 @@
 use axum::{
     body::{Body, Bytes, HttpBody},
-    extract::{Request, State},
+    extract::{
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
+        FromRequestParts, Request, State,
+    },
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Version},
-    response::Response as AxumResponse,
+    response::{IntoResponse, Response as AxumResponse},
     routing::any,
     Router as AxumRouter,
 };
+use futures_util::SinkExt as _;
 use http_body_util::BodyExt as _;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
@@ -16,6 +20,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -136,7 +141,12 @@ fn client_asset_url(value: &str) -> bool {
         })
 }
 
-fn render_node(node: &Value, output: &mut String, depth: usize) -> Result<(), String> {
+fn render_node(
+    node: &Value,
+    output: &mut String,
+    depth: usize,
+    nonce: Option<&str>,
+) -> Result<(), String> {
     if depth > 256 {
         return Err("Render tree exceeds maximum depth".into());
     }
@@ -158,7 +168,7 @@ fn render_node(node: &Value, output: &mut String, depth: usize) -> Result<(), St
                 .and_then(Value::as_array)
                 .ok_or("Fragment children must be an array")?
             {
-                render_node(child, output, depth + 1)?;
+                render_node(child, output, depth + 1, nonce)?;
             }
         }
         "island" => {
@@ -219,7 +229,7 @@ fn render_node(node: &Value, output: &mut String, depth: usize) -> Result<(), St
                 .and_then(Value::as_array)
                 .ok_or("Island children must be an array")?
             {
-                render_node(child, output, depth + 1)?;
+                render_node(child, output, depth + 1, nonce)?;
             }
             output.push_str("</div>");
         }
@@ -233,7 +243,17 @@ fn render_node(node: &Value, output: &mut String, depth: usize) -> Result<(), St
             }
             output.push_str("<script type=\"module\" src=\"");
             escape(src, output);
-            output.push_str("\"></script>");
+            output.push('"');
+            // A per-request nonce lets the CSP header allow this script
+            // without opening script-src to every inline script. The nonce
+            // is validated in render(); only the token characters produced
+            // by the Python helper are accepted.
+            if let Some(nonce) = nonce {
+                output.push_str(" nonce=\"");
+                escape(nonce, output);
+                output.push('"');
+            }
+            output.push_str("></script>");
         }
         "element" => {
             let tag = obj
@@ -322,7 +342,7 @@ fn render_node(node: &Value, output: &mut String, depth: usize) -> Result<(), St
                 return Err(format!("Void element {tag} cannot have children"));
             }
             for child in children {
-                render_node(child, output, depth + 1)?;
+                render_node(child, output, depth + 1, nonce)?;
             }
             if !void {
                 output.push_str("</");
@@ -336,12 +356,22 @@ fn render_node(node: &Value, output: &mut String, depth: usize) -> Result<(), St
 }
 
 #[pyfunction]
-fn render(py: Python<'_>, tree_json: &str) -> PyResult<String> {
+#[pyo3(signature = (tree_json, nonce=None))]
+fn render(py: Python<'_>, tree_json: &str, nonce: Option<&str>) -> PyResult<String> {
+    if let Some(nonce) = nonce {
+        if nonce.is_empty()
+            || !nonce
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'+' | b'/' | b'='))
+        {
+            return Err(PyValueError::new_err("Invalid CSP nonce"));
+        }
+    }
     py.allow_threads(|| {
         let node: Value =
             serde_json::from_str(tree_json).map_err(|e| PyValueError::new_err(e.to_string()))?;
         let mut result = String::new();
-        render_node(&node, &mut result, 0).map_err(PyValueError::new_err)?;
+        render_node(&node, &mut result, 0, nonce).map_err(PyValueError::new_err)?;
         Ok(result)
     })
 }
@@ -358,6 +388,8 @@ struct ServerState {
     client_assets: HashMap<String, Bytes>,
     asset_etags: HashMap<String, HeaderValue>,
     isr_cache: Arc<PageCache>,
+    websocket_paths: std::collections::HashSet<String>,
+    ws_callback: Option<Py<PyAny>>,
 }
 
 #[pyclass(name = "_RequestCancellation")]
@@ -785,8 +817,279 @@ fn close_with_unread_body(
     response
 }
 
+/// Maximum size of one WebSocket message (text in UTF-8 bytes, or binary),
+/// matching the Python `MAX_WS_MESSAGE` limit. Larger messages are refused
+/// with close code 1009 on both adapters.
+const MAX_WS_MESSAGE: usize = 65_536;
+
+enum WsOutgoing {
+    Accept,
+    Text(String),
+    Bytes(Vec<u8>),
+    Close(u16, String),
+    Done,
+}
+
+enum WsPush {
+    Text(String),
+    Bytes(Vec<u8>),
+    None,
+}
+
+/// Run one short Python call on a blocking thread and wait for it. Used for
+/// the session queue operations, which must not run on a Tokio worker thread
+/// (they take the GIL and, for `_take_outgoing`, wait on the Python loop).
+async fn ws_call(session: &Arc<Py<PyAny>>, method: &'static str, arg: WsPush) {
+    let session = Arc::clone(session);
+    let _ = tokio::task::spawn_blocking(move || {
+        Python::with_gil(|py| {
+            let bound = session.bind(py);
+            let _ = match arg {
+                WsPush::Text(text) => bound.call_method1(method, (text,)),
+                WsPush::Bytes(data) => bound.call_method1(method, (data,)),
+                WsPush::None => bound.call_method0(method),
+            };
+        })
+    })
+    .await;
+}
+
+async fn ws_is_done(session: &Arc<Py<PyAny>>) -> bool {
+    let session = Arc::clone(session);
+    tokio::task::spawn_blocking(move || {
+        Python::with_gil(|py| {
+            session
+                .bind(py)
+                .call_method0("_is_done")
+                .and_then(|value| value.extract::<bool>())
+                .unwrap_or(false)
+        })
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn ws_cancel(session: &Arc<Py<PyAny>>) {
+    ws_call(session, "_cancel", WsPush::None).await;
+}
+
+/// Take the next outgoing WebSocket item from the Python session, waiting at
+/// most `timeout` for the handler to produce one. Runs on a blocking thread
+/// because it waits on the Python event loop from outside it.
+async fn ws_take_outgoing(session: &Arc<Py<PyAny>>, timeout: Duration) -> Option<WsOutgoing> {
+    let session = Arc::clone(session);
+    let millis = timeout.as_millis() as u64;
+    tokio::task::spawn_blocking(move || {
+        Python::with_gil(|py| {
+            let item = session.bind(py).call_method1("_take_outgoing", (millis,))?;
+            let item = item.extract::<Option<(
+                String,
+                Option<String>,
+                Option<Vec<u8>>,
+                Option<u16>,
+                Option<String>,
+            )>>()?;
+            Ok::<_, PyErr>(
+                item.map(|(kind, text, data, code, reason)| match kind.as_str() {
+                    "text" => WsOutgoing::Text(text.unwrap_or_default()),
+                    "bytes" => WsOutgoing::Bytes(data.unwrap_or_default()),
+                    "close" => WsOutgoing::Close(code.unwrap_or(1000), reason.unwrap_or_default()),
+                    "done" => WsOutgoing::Done,
+                    _ => WsOutgoing::Accept,
+                }),
+            )
+        })
+        .unwrap_or(None)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn ws_close_frame(code: u16, reason: &str) -> Message {
+    Message::Close(Some(CloseFrame {
+        code,
+        reason: reason.into(),
+    }))
+}
+
+/// Drive one upgraded WebSocket connection: forward frames to the Python
+/// handler's session inbox and forward the handler's outbox items as frames.
+/// The Python handler owns the application logic; this task only translates
+/// between the socket and the session queues. It ends when the peer closes,
+/// the handler finishes, or either side fails.
+async fn run_ws_session(
+    state: Arc<ServerState>,
+    path: String,
+    query: Vec<u8>,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    mut socket: WebSocket,
+) {
+    let Some(ws_callback) =
+        Python::with_gil(|py| state.ws_callback.as_ref().map(|cb| cb.clone_ref(py)))
+    else {
+        let _ = socket
+            .send(ws_close_frame(1011, "websocket setup failed"))
+            .await;
+        return;
+    };
+    let session = tokio::task::spawn_blocking(move || {
+        Python::with_gil(|py| {
+            let session = ws_callback.bind(py).call1((path, query, headers))?;
+            Ok::<_, PyErr>(session.unbind())
+        })
+    })
+    .await;
+    let session = match session {
+        Ok(Ok(session)) => Arc::new(session),
+        _ => {
+            let _ = socket
+                .send(ws_close_frame(1011, "websocket setup failed"))
+                .await;
+            return;
+        }
+    };
+    let mut sent_close = false;
+    // Hold one outgoing wait across loop iterations. Recreating the wait
+    // inside `select!` would drop it whenever a socket message wins, but
+    // the dropped wait's blocking task keeps waiting on the outbox and can
+    // steal the next item. The wait has a bounded timeout as a safety net;
+    // the Python side also enqueues a "done" item when the handler ends,
+    // so a finished handler is noticed promptly.
+    let mut outgoing_wait = Box::pin(ws_take_outgoing(&session, Duration::from_secs(5)));
+    loop {
+        tokio::select! {
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        if text.len() > MAX_WS_MESSAGE {
+                            let _ = socket.send(ws_close_frame(1009, "message too large")).await;
+                            sent_close = true;
+                            ws_call(&session, "_push_disconnect", WsPush::None).await;
+                            break;
+                        }
+                        ws_call(&session, "_push_text", WsPush::Text(text.to_string())).await;
+                    }
+                    Some(Ok(Message::Binary(data))) => {
+                        if data.len() > MAX_WS_MESSAGE {
+                            let _ = socket.send(ws_close_frame(1009, "message too large")).await;
+                            sent_close = true;
+                            ws_call(&session, "_push_disconnect", WsPush::None).await;
+                            break;
+                        }
+                        ws_call(&session, "_push_bytes", WsPush::Bytes(data.to_vec())).await;
+                    }
+                    Some(Ok(Message::Close(_frame))) => {
+                        // Tungstenite queues an automatic close reply when
+                        // a close frame arrives; SinkExt::close flushes it.
+                        // Sending a second close frame here would fail and
+                        // skip that flush, so the peer would see EOF.
+                        let _ = socket.close().await;
+                        sent_close = true;
+                        ws_call(&session, "_push_disconnect", WsPush::None).await;
+                        break;
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = socket.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Err(_)) | None => {
+                        // Tungstenite rejects an over-limit message at the
+                        // protocol level before it is delivered, so the
+                        // length check above never sees it: answer with
+                        // 1009 here. For other errors the peer is usually
+                        // gone and this send is best-effort.
+                        let _ = socket.send(ws_close_frame(1009, "message too large")).await;
+                        sent_close = true;
+                        ws_call(&session, "_push_disconnect", WsPush::None).await;
+                        break;
+                    }
+                }
+            }
+            outgoing = &mut outgoing_wait => {
+                match outgoing {
+                    Some(WsOutgoing::Accept) => {}
+                    Some(WsOutgoing::Text(text)) => {
+                        let sent = socket.send(Message::Text(text.into())).await;
+                        if sent.is_err() {
+                            break;
+                        }
+                    }
+                    Some(WsOutgoing::Bytes(data)) => {
+                        if socket.send(Message::Binary(data.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(WsOutgoing::Close(code, reason)) => {
+                        let _ = socket.send(ws_close_frame(code, &reason)).await;
+                        sent_close = true;
+                        break;
+                    }
+                    Some(WsOutgoing::Done) => {
+                        break;
+                    }
+                    None => {
+                        if ws_is_done(&session).await {
+                            break;
+                        }
+                    }
+                }
+                outgoing_wait = Box::pin(ws_take_outgoing(&session, Duration::from_secs(5)));
+            }
+        }
+    }
+    ws_cancel(&session).await;
+    if !sent_close {
+        let _ = socket.send(ws_close_frame(1000, "closing")).await;
+    }
+}
+
 async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> AxumResponse<Body> {
     let (parts, body) = request.into_parts();
+    // A WebSocket upgrade is decided here, before any body handling: the
+    // upgrade handshake must not compete for a Python execution slot, and a
+    // request that is not a WebSocket route must not reach the HTTP bridge
+    // (which would answer a handshake with an unrelated HTTP response).
+    let upgrade_headers = parts.method == axum::http::Method::GET
+        && parts.headers.get(header::CONNECTION).is_some_and(|v| {
+            v.to_str()
+                .unwrap_or_default()
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        })
+        && parts
+            .headers
+            .get(header::UPGRADE)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    if upgrade_headers {
+        let Some(path) = static_path(parts.uri.path()) else {
+            return plain_response(StatusCode::NOT_FOUND, "Not Found");
+        };
+        if !state.websocket_paths.contains(&path) {
+            return plain_response(StatusCode::NOT_FOUND, "Not Found");
+        }
+        let mut parts = parts;
+        let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+            Ok(upgrade) => upgrade,
+            Err(rejection) => {
+                return rejection.into_response();
+            }
+        };
+        // Bound the protocol-level message size as well as the application
+        // limit enforced in run_ws_session; tungstenite otherwise allows
+        // up to 64 MiB per message.
+        let upgrade = upgrade.max_message_size(MAX_WS_MESSAGE);
+        let query = parts.uri.query().unwrap_or("").as_bytes().to_vec();
+        let headers: Vec<(Vec<u8>, Vec<u8>)> = parts
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str().as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect();
+        let state = Arc::clone(&state);
+        return upgrade.on_upgrade(move |socket| async move {
+            run_ws_session(state, path, query, headers, socket).await;
+        });
+    }
     if conflicting_content_length(&parts.headers) {
         return close_with_unread_body(
             plain_response(StatusCode::BAD_REQUEST, "Bad Request"),
@@ -922,6 +1225,10 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         .collect();
     let cancellation = Arc::new(AtomicBool::new(false));
     let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancellation));
+    let client_ip = parts
+        .extensions
+        .get::<PeerAddr>()
+        .map(|peer| peer.0.ip().to_string());
     let result = tokio::task::spawn_blocking(move || {
         let result = Python::with_gil(|py| {
             let cb = state.callback.bind(py);
@@ -938,6 +1245,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 headers,
                 PyBytes::new(py, &body),
                 token,
+                client_ip,
             ))?;
             let (status, headers, body) =
                 result.extract::<(u16, Vec<(Vec<u8>, Vec<u8>)>, Py<PyAny>)>()?;
@@ -989,11 +1297,19 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     }
 }
 
+/// The peer address of the TCP connection a request arrived on, carried in
+/// request extensions so dispatch can hand the client IP to the Python
+/// bridge. The Python rate limiter keys buckets on it (spec §11); without
+/// this the bridge would have no trustworthy per-client key at all.
+#[derive(Clone)]
+struct PeerAddr(SocketAddr);
+
 /// Bridge from hyper's connection service to the axum router: the router is a
 /// tower service, so each connection polls it ready and then calls it with the
 /// request body converted to axum's `Body`.
 struct HyperService {
     router: AxumRouter,
+    peer_addr: Option<SocketAddr>,
 }
 
 impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for HyperService {
@@ -1005,12 +1321,16 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for HyperSer
 
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
         let mut router = self.router.clone();
+        let peer_addr = self.peer_addr;
         Box::pin(async move {
             std::future::poll_fn(|cx| {
                 <AxumRouter as TowerService<Request>>::poll_ready(&mut router, cx)
             })
             .await?;
-            let req = req.map(Body::new);
+            let mut req = req.map(Body::new);
+            if let Some(addr) = peer_addr {
+                req.extensions_mut().insert(PeerAddr(addr));
+            }
             router.call(req).await
         })
     }
@@ -1021,6 +1341,37 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for HyperSer
 // hold a slot in the accept loop forever. This is separate from the body read
 // timeout, which only starts once headers are complete.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bind a listener with SO_REUSEPORT so several supervisor workers can
+/// share one port and the kernel load-balances connections between them
+/// (finding #52). SO_REUSEPORT is Unix-only: on other platforms the
+/// supervisor cannot share a port this way and `reuse_port` is rejected
+/// instead of silently falling back to a bind that would fail on the
+/// second worker with "address already in use".
+#[cfg(unix)]
+fn bind_reuse_port(host: &str, port: u16) -> std::io::Result<std::net::TcpListener> {
+    use std::net::ToSocketAddrs;
+    let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "could not resolve host")
+    })?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        None,
+    )?;
+    socket.set_reuse_port(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    Ok(std::net::TcpListener::from(socket))
+}
+
+#[cfg(not(unix))]
+fn bind_reuse_port(_host: &str, _port: u16) -> std::io::Result<std::net::TcpListener> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "reuse_port (multi-worker mode) is only supported on Unix",
+    ))
+}
 
 #[pyclass]
 struct NativeServer {
@@ -1033,7 +1384,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         callback: Py<PyAny>,
@@ -1048,6 +1399,9 @@ impl NativeServer {
         acquire_timeout_ms: u64,
         body_capacity: usize,
         body_timeout_ms: u64,
+        websocket_paths: Option<Vec<String>>,
+        websocket_callback: Option<Py<PyAny>>,
+        reuse_port: bool,
     ) -> PyResult<Self> {
         if max_concurrent == 0 || max_concurrent > Semaphore::MAX_PERMITS {
             return Err(PyValueError::new_err(
@@ -1100,8 +1454,13 @@ impl NativeServer {
                 ))
             })
             .collect::<PyResult<HashMap<_, _>>>()?;
-        let listener = std::net::TcpListener::bind((host, port))
-            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+        let listener = if reuse_port {
+            bind_reuse_port(host, port)
+                .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?
+        } else {
+            std::net::TcpListener::bind((host, port))
+                .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?
+        };
         listener
             .set_nonblocking(true)
             .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
@@ -1159,6 +1518,8 @@ impl NativeServer {
                         .collect(),
                     asset_etags,
                     isr_cache,
+                    websocket_paths: websocket_paths.unwrap_or_default().into_iter().collect(),
+                    ws_callback: websocket_callback,
                 });
                 let app = AxumRouter::new().fallback(any(dispatch)).with_state(state);
                 let mut shutdown = std::pin::pin!(async {
@@ -1169,7 +1530,7 @@ impl NativeServer {
                     tokio::select! {
                         _ = &mut shutdown => break,
                         accepted = listener.accept() => {
-                            let (stream, _) = match accepted {
+                            let (stream, peer_addr) = match accepted {
                                 Ok(pair) => pair,
                                 Err(_) => {
                                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1178,6 +1539,7 @@ impl NativeServer {
                             };
                             let service = HyperService {
                                 router: app.clone(),
+                                peer_addr: Some(peer_addr),
                             };
                             // Auto-detect the protocol per connection: a
                             // client that opens with the HTTP/2
@@ -1193,8 +1555,12 @@ impl NativeServer {
                                     .http1()
                                     .timer(TokioTimer::new())
                                     .header_read_timeout(HEADER_READ_TIMEOUT);
+                                // Upgrades (WebSocket) need the upgradable
+                                // connection: plain serve_connection leaves
+                                // the upgrade future failing with "upgrade
+                                // expected but low level API in use".
                                 let _ = builder
-                                    .serve_connection(TokioIo::new(stream), service)
+                                    .serve_connection_with_upgrades(TokioIo::new(stream), service)
                                     .await;
                             });
                         }
@@ -1255,4 +1621,57 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RequestCancellation>()?;
     m.add_function(wrap_pyfunction!(render, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    // Property-based coverage for the HTML serializer (finding #48, spec §13).
+    // These tests call the pure-Rust render_node directly; the same renderer
+    // is also exercised from Python by tests/test_property_router_render.py.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn rendered_text_never_leaks_raw_specials(text in proptest::arbitrary::any::<String>()) {
+            let node = json!({"kind": "text", "value": text});
+            let mut output = String::new();
+            render_node(&node, &mut output, 0, None).unwrap();
+            prop_assert!(!output.contains('<') && !output.contains('>'));
+        }
+        #[test]
+        fn void_elements_never_render_a_closing_tag(
+            tag in prop::sample::select(vec![
+                "area", "base", "br", "col", "hr", "img", "input",
+                "link", "meta", "param", "source", "track", "wbr",
+            ])
+        ) {
+            let node = json!({"kind": "element", "tag": tag, "attrs": {}, "children": []});
+            let mut output = String::new();
+            render_node(&node, &mut output, 0, None).unwrap();
+            prop_assert_eq!(output, format!("<{tag}>"));
+            let with_child = json!({"kind": "element", "tag": tag, "attrs": {},
+                                    "children": [{"kind": "text", "value": "x"}]});
+            let mut output = String::new();
+            prop_assert!(render_node(&with_child, &mut output, 0, None).is_err());
+        }
+        #[test]
+        fn arbitrary_attribute_values_do_not_panic(value in proptest::arbitrary::any::<String>()) {
+            let node = json!({"kind": "element", "tag": "a",
+                              "attrs": {"title": value}, "children": []});
+            let mut output = String::new();
+            let _ = render_node(&node, &mut output, 0, None);
+        }
+        #[test]
+        fn malformed_nodes_fail_cleanly(value in proptest::arbitrary::any::<String>()) {
+            // Arbitrary JSON that is not a render tree must fail with an error
+            // string, never panic.
+            let node: Value = serde_json::from_str(&value)
+                .unwrap_or(Value::String(value));
+            let mut output = String::new();
+            let _ = render_node(&node, &mut output, 0, None);
+        }
+    }
 }

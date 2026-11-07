@@ -4,14 +4,21 @@ build-backend = "maturin"
 
 [project]
 name = "pynext-framework"
-version = "0.6.0a2"
+version = "0.7.0a1"
 description = "An experimental Python and Rust full-stack web framework"
 license = { file = "LICENSE" }
 requires-python = ">=3.13,<3.14"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "httpx>=0.27", "uvicorn>=0.30", "h2>=4.1,<5"]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",
+    "uvicorn>=0.30",
+    "h2>=4.1,<5",
+    "hypothesis>=6",
+    "starlette>=0.46",
+]
 
 [project.scripts]
 pynext = "pynext.cli:main"

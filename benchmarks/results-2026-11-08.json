@@ -1,0 +1,159 @@
+{
+  "comparison": "pynext-vs-starlette",
+  "conditions": {
+    "path": "/api/users",
+    "requests": 1000,
+    "concurrency": 10,
+    "warmup": 10,
+    "production": true,
+    "transport": "loopback_http (same process as load generator)",
+    "python": "3.13.18",
+    "platform": "Linux-7.0.0-43-generic-x86_64-with-glibc2.39",
+    "uvicorn": "0.54.0",
+    "starlette": "1.10.0",
+    "httpx": "0.28.1"
+  },
+  "groups": [
+    {
+      "mode": "axum",
+      "transport": "loopback_http",
+      "path": "/api/users",
+      "production": true,
+      "framework": "pynext",
+      "python": "3.13.18",
+      "platform": "Linux-7.0.0-43-generic-x86_64-with-glibc2.39",
+      "requests": 1000,
+      "concurrency": 10,
+      "warmup_requests": 10,
+      "warmup_errors": 0,
+      "successful_requests": 1000,
+      "errors": 0,
+      "error_rate": 0.0,
+      "http_status_counts": {
+        "200": 1000
+      },
+      "http_status_class_counts": {
+        "2xx": 1000
+      },
+      "transport_error_counts": {},
+      "elapsed_seconds": 3.556,
+      "attempted_requests_per_second": 281.21,
+      "successful_requests_per_second": 281.21,
+      "latency_ms": {
+        "p50": 17.232,
+        "p95": 100.904,
+        "p99": 183.004
+      },
+      "successful_latency_ms": {
+        "p50": 17.232,
+        "p95": 100.904,
+        "p99": 183.004
+      },
+      "response_bytes": {
+        "total": 25000,
+        "mean_per_response": 25.0
+      },
+      "process_cpu_seconds": 2.491,
+      "process_cpu_scope": "load_generator_and_server",
+      "process_peak_rss_bytes": 47034368,
+      "server_pid": null,
+      "server_cpu_seconds": null,
+      "server_cpu_percent_one_core": null,
+      "server_cpu_error": null
+    },
+    {
+      "mode": "uvicorn",
+      "transport": "loopback_http",
+      "path": "/api/users",
+      "production": true,
+      "framework": "pynext",
+      "python": "3.13.18",
+      "platform": "Linux-7.0.0-43-generic-x86_64-with-glibc2.39",
+      "requests": 1000,
+      "concurrency": 10,
+      "warmup_requests": 10,
+      "warmup_errors": 0,
+      "successful_requests": 1000,
+      "errors": 0,
+      "error_rate": 0.0,
+      "http_status_counts": {
+        "200": 1000
+      },
+      "http_status_class_counts": {
+        "2xx": 1000
+      },
+      "transport_error_counts": {},
+      "elapsed_seconds": 4.631,
+      "attempted_requests_per_second": 215.95,
+      "successful_requests_per_second": 215.95,
+      "latency_ms": {
+        "p50": 43.564,
+        "p95": 62.77,
+        "p99": 87.645
+      },
+      "successful_latency_ms": {
+        "p50": 43.564,
+        "p95": 62.77,
+        "p99": 87.645
+      },
+      "response_bytes": {
+        "total": 25000,
+        "mean_per_response": 25.0
+      },
+      "process_cpu_seconds": 2.037,
+      "process_cpu_scope": "load_generator_and_server",
+      "process_peak_rss_bytes": 50573312,
+      "server_pid": null,
+      "server_cpu_seconds": null,
+      "server_cpu_percent_one_core": null,
+      "server_cpu_error": null
+    },
+    {
+      "mode": "starlette",
+      "transport": "loopback_http",
+      "path": "/api/users",
+      "production": null,
+      "framework": "starlette",
+      "python": "3.13.18",
+      "platform": "Linux-7.0.0-43-generic-x86_64-with-glibc2.39",
+      "requests": 1000,
+      "concurrency": 10,
+      "warmup_requests": 10,
+      "warmup_errors": 0,
+      "successful_requests": 1000,
+      "errors": 0,
+      "error_rate": 0.0,
+      "http_status_counts": {
+        "200": 1000
+      },
+      "http_status_class_counts": {
+        "2xx": 1000
+      },
+      "transport_error_counts": {},
+      "elapsed_seconds": 4.404,
+      "attempted_requests_per_second": 227.06,
+      "successful_requests_per_second": 227.06,
+      "latency_ms": {
+        "p50": 42.668,
+        "p95": 51.448,
+        "p99": 58.692
+      },
+      "successful_latency_ms": {
+        "p50": 42.668,
+        "p95": 51.448,
+        "p99": 58.692
+      },
+      "response_bytes": {
+        "total": 25000,
+        "mean_per_response": 25.0
+      },
+      "process_cpu_seconds": 1.84,
+      "process_cpu_scope": "load_generator_and_server",
+      "process_peak_rss_bytes": 52334592,
+      "server_pid": null,
+      "server_cpu_seconds": null,
+      "server_cpu_percent_one_core": null,
+      "server_cpu_error": null
+    }
+  ]
+}

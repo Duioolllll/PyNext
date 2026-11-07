@@ -43,7 +43,9 @@ def test_cli_accepts_boundary_limits(tmp_path, monkeypatch):
     root = tmp_path.resolve()
     seen = []
     app = object()
-    monkeypatch.setattr(cli, "create_app", lambda path, production: seen.append(("app", path, production)) or app)
+    monkeypatch.setattr(cli, "create_app", lambda path, production, cache_backend="memory", cache_path=None,
+                        rate_limit=None, **kwargs:
+                        seen.append(("app", path, production, cache_backend, cache_path)) or app)
 
     async def serve(received_app, host, port, max_concurrent, acquire_timeout_ms,
                    body_capacity, body_timeout_ms):
@@ -55,7 +57,7 @@ def test_cli_accepts_boundary_limits(tmp_path, monkeypatch):
                                       "--max-concurrent", "1", "--acquire-timeout-ms", "0",
                                       "--body-capacity", "1", "--body-timeout-ms", "0"])
     cli.main()
-    assert seen == [("app", root, True),
+    assert seen == [("app", root, True, "memory", None),
                     ("serve", app, "127.0.0.1", 3000, 1, 0, 1, 0)]
 
 
@@ -69,7 +71,9 @@ def test_cli_builds_and_starts_with_requested_settings(tmp_path, monkeypatch, ca
     assert "Built 1 routes" in capsys.readouterr().out
 
     app = object()
-    monkeypatch.setattr(cli, "create_app", lambda path, production: seen.append(("app", path, production)) or app)
+    monkeypatch.setattr(cli, "create_app", lambda path, production, cache_backend="memory", cache_path=None,
+                        rate_limit=None, **kwargs:
+                        seen.append(("app", path, production, cache_backend, cache_path)) or app)
 
     async def serve(received_app, host, port, max_concurrent, acquire_timeout_ms,
                    body_capacity, body_timeout_ms):
@@ -77,6 +81,8 @@ def test_cli_builds_and_starts_with_requested_settings(tmp_path, monkeypatch, ca
                      acquire_timeout_ms, body_capacity, body_timeout_ms))
 
     monkeypatch.setattr(cli, "serve", serve)
-    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--host", "localhost", "--port", "0"])
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--host", "localhost", "--port", "0",
+                                      "--cache-backend", "sqlite", "--cache-path", str(root / "cache.sqlite3")])
     cli.main()
-    assert seen[-2:] == [("app", root, True), ("serve", app, "localhost", 0, 64, 1000, 16, 10000)]
+    assert seen[-2:] == [("app", root, True, "sqlite", str(root / "cache.sqlite3")),
+                         ("serve", app, "localhost", 0, 64, 1000, 16, 10000)]

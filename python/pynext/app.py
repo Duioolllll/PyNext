@@ -9,6 +9,7 @@ import logging
 import re
 import sys
 import threading
+import time
 import uuid
 import weakref
 from pathlib import Path
@@ -18,9 +19,23 @@ from . import _native
 from .assets import read_public_artifacts, read_public_sources
 from .cache import CacheBusy, ISRCache
 from .client import compile_client, read_client_artifacts
-from .components import _isr_policy, bind_islands
+from .components import _isr_policy, _node, bind_islands
 from .build import discover, load_manifest
-from .http import BadRequest, Request, Response, StreamingResponse
+from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, Request, Response, SecurityConfig,
+                   StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
+                   cors_preflight_response, new_csp_nonce, validate_csrf)
+from .observability import (
+    MetricsCollector,
+    ObservabilityConfig,
+    begin_request_context,
+    configure_logging,
+    get_request_id,
+    queue_wait_var,
+    render_ms_var,
+    route_var,
+    span,
+)
+from .ratelimit import rate_limited_response
 from .static import asset_response
 
 log = logging.getLogger("pynext")
@@ -217,27 +232,51 @@ def _module_key(root, relative):
 
 
 class App:
-    def __init__(self, root, manifest, *, production=False):
+    def __init__(self, root, manifest, *, production=False, security=None, cache_backend="memory",
+                 cache_path=None, observability=None, rate_limit=None):
         self._namespace = "_pynext_project_" + uuid.uuid4().hex
         self._release_modules = weakref.finalize(self, _clear_project_modules, self._namespace)
+        if security is None:
+            security = SecurityConfig()
+        if not isinstance(security, SecurityConfig):
+            raise TypeError("security must be a SecurityConfig")
+        self.security = security
+        self.observability_config = observability or ObservabilityConfig.from_env()
+        self.metrics = MetricsCollector(enabled=self.observability_config.metrics)
+        configure_logging(self.observability_config)
+        # Per-process token-bucket limiter (spec §11, finding #49). None
+        # disables it. The Axum adapter reads the same attribute in
+        # server.start_native; see ratelimit.py for the trust rules.
+        self.rate_limit = rate_limit
         try:
             _register_project(self._namespace)
             _package(self._namespace, Path(root).resolve(), load_initializer=False)
-            self._initialize(root, manifest, production=production)
+            self._initialize(root, manifest, production=production,
+                             cache_backend=cache_backend, cache_path=cache_path)
         except BaseException:
             self._release_modules()
             raise
 
-    def _initialize(self, root, manifest, *, production=False):
+    def configure_observability(self, config):
+        """Apply a new observability config to this app (logging + metrics)."""
+        self.observability_config = config
+        self.metrics.enabled = config.metrics
+        configure_logging(config)
+        return self
+
+    def _initialize(self, root, manifest, *, production=False, cache_backend="memory", cache_path=None):
         self.root = Path(root).resolve()
         self.manifest = manifest
         self.production = production
         self.router = _native.Router(list(manifest["routes"]))
         self.entries = {}
+        self.websocket_entries = {}
         self.modules = {}
         self.render_modes = {}
         self.isr_policies = {}
-        self.isr = ISRCache()
+        if cache_backend == "sqlite" and cache_path is None:
+            cache_path = self.root / ".pynext" / "isr-cache.sqlite3"
+        self.isr = ISRCache(cache_backend=cache_backend, cache_path=cache_path)
         self.static_generators = {}
         self.static_pages = {}
         self.public_assets = {}
@@ -287,16 +326,23 @@ class App:
                 self.entries[pattern] = (fn, layouts)
             else:
                 handlers = {}
+                ws_handler = None
                 for _, fn in inspect.getmembers(module, inspect.isfunction):
                     method = getattr(fn, "__pynext_method__", None)
-                    if not method or fn.__module__ != module.__name__:
-                        continue
-                    if method in handlers:
-                        raise ValueError(f"Duplicate {method} handler in {spec['entry']}")
-                    _check_signature(fn, {"request", "params"}, spec["entry"])
-                    handlers[method] = fn
-                if not handlers:
+                    if method and fn.__module__ == module.__name__:
+                        if method in handlers:
+                            raise ValueError(f"Duplicate {method} handler in {spec['entry']}")
+                        _check_signature(fn, {"request", "params"}, spec["entry"])
+                        handlers[method] = fn
+                    if getattr(fn, "__pynext_websocket__", False) and fn.__module__ == module.__name__:
+                        if ws_handler is not None:
+                            raise ValueError(f"Duplicate WebSocket handler in {spec['entry']}")
+                        _check_signature(fn, {"websocket", "params"}, spec["entry"])
+                        ws_handler = fn
+                if not handlers and ws_handler is None:
                     raise ValueError(f"{spec['entry']} has no @route handlers")
+                if ws_handler is not None:
+                    self.websocket_entries[pattern] = ws_handler
                 self.entries[pattern] = handlers
         if production:
             from .build import read_static_pages
@@ -315,6 +361,8 @@ class App:
         assets = {**self.static_pages, **self.client_assets,
                   **{path: body for path, (body, _) in self.public_assets.items()}}
         self.asset_etags = {path: f'"{hashlib.sha256(body).hexdigest()}"' for path, body in assets.items()}
+        for path, body in self.client_assets.items():
+            self.metrics.observe_island_bundle(path, len(body))
 
     def _module(self, path):
         key = _module_key(self.root, path)
@@ -335,9 +383,82 @@ class App:
             raise ValueError("Path does not match an ISR page")
         return await self.isr.invalidate(path)
 
-    async def render_page(self, pattern, request, params):
+    async def _render_stream_chunk(self, node):
+        """Serialize one streamed UI node to HTML on a worker thread."""
+        bound = bind_islands(_node(node), self.client_manifest)
+        payload = json.dumps(bound, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        return await asyncio.to_thread(_native.render, payload)
+
+    async def _streaming_page_response(self, pattern, chunks, layouts):
+        """Wrap an async iterable of UI nodes in a StreamingResponse.
+
+        The layout shell is rendered once with a marker in place of the page
+        children, then split into a prefix and a suffix around the marker.
+        The prefix is sent first, each page chunk is serialized and sent as
+        it arrives, and the suffix closes the document. Layouts must render
+        their children exactly once; anything else fails before headers are
+        sent. Streaming is SSR-only: SSG and ISR need a complete body.
+        """
+        if self.render_modes.get(pattern) != "ssr":
+            close = getattr(chunks, "aclose", None)
+            if close is not None:
+                await close()
+            raise TypeError(
+                f"Streaming page {pattern} must use render='ssr'; "
+                f"it uses render='{self.render_modes.get(pattern)}'"
+            )
+        marker = "__pynext_stream_" + uuid.uuid4().hex + "__"
+        shell = {"kind": "text", "value": marker}
+        for layout_fn in reversed(layouts):
+            shell = await _invoke(layout_fn, children=shell)
+            if not isinstance(shell, dict):
+                raise TypeError(
+                    f"Layout for {pattern} must return a render node dict, "
+                    f"got {type(shell).__name__}"
+                )
+        shell = bind_islands(shell, self.client_manifest)
+        payload = json.dumps(shell, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        html = await asyncio.to_thread(_native.render, payload)
+        parts = html.split(marker)
+        if len(parts) != 2:
+            raise ValueError(
+                f"Layout for streaming page {pattern} must render its children exactly once"
+            )
+        prefix, suffix = parts
+        if shell.get("tag", "").lower() == "html":
+            prefix = "<!DOCTYPE html>" + prefix
+
+        async def page_stream():
+            try:
+                if prefix:
+                    yield prefix
+                async for node in chunks:
+                    html = await self._render_stream_chunk(node)
+                    if html:
+                        yield html
+                if suffix:
+                    yield suffix
+            finally:
+                close = getattr(chunks, "aclose", None)
+                if close is not None:
+                    await close()
+
+        return StreamingResponse(page_stream(), media_type="text/html; charset=utf-8")
+
+    async def render_page(self, pattern, request, params, *, csp_nonce=True):
         fn, layouts = self.entries[pattern]
-        tree = await _invoke(fn, request=request, params=params)
+        if inspect.isasyncgenfunction(fn):
+            # Calling an async generator function only creates the iterator;
+            # its body runs when the stream is first pulled. Call it directly
+            # instead of _invoke, which would run it on a worker thread.
+            kwargs = {key: value for key, value in (("request", request), ("params", params))
+                      if key in inspect.signature(fn).parameters}
+            result = fn(**kwargs)
+        else:
+            result = await _invoke(fn, request=request, params=params)
+        if hasattr(result, "__aiter__"):
+            return await self._streaming_page_response(pattern, result, layouts)
+        tree = result
         if not isinstance(tree, dict):
             raise TypeError(f"Page {pattern} must return a render node dict, got {type(tree).__name__}")
         for layout_fn in reversed(layouts):
@@ -346,15 +467,83 @@ class App:
                 raise TypeError(f"Layout for {pattern} must return a render node dict, got {type(tree).__name__}")
         tree = bind_islands(tree, self.client_manifest)
         payload = json.dumps(tree, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        html = await asyncio.to_thread(_native.render, payload)
+        # One fresh nonce per rendered response. Cached renders must not get
+        # one: a nonce baked into shared HTML would be reused across
+        # responses, which defeats the point of the nonce, so the ISR cache
+        # path passes csp_nonce=False and keeps the static CSP policy.
+        nonce = new_csp_nonce() if csp_nonce and self.security.csp_nonce_enabled else None
+        started = time.monotonic()
+        with span("pynext.render", {"http.route": pattern},
+                  enabled=self.observability_config.tracing):
+            html = await asyncio.to_thread(_native.render, payload, nonce)
+        render_ms = (time.monotonic() - started) * 1000
+        render_ms_var.set((render_ms_var.get() or 0.0) + render_ms)
         if isinstance(tree, dict) and tree.get("tag", "").lower() == "html":
             html = "<!DOCTYPE html>" + html
-        return Response(html, media_type="text/html; charset=utf-8")
+        return Response(html, media_type="text/html; charset=utf-8", csp_nonce=nonce)
 
     async def dispatch(self, request):
-        """Return a buffered response. Exceptions are converted at the transport boundary."""
+        """Return a response. Exceptions are converted at the transport boundary."""
+        preflight = cors_preflight_response(request, config=self.security)
+        if preflight is not None:
+            return preflight
+        response = await self._dispatch_timed(request)
+        apply_cors_headers(request, response, config=self.security)
+        return response
+
+    async def _dispatch_timed(self, request):
+        """Timed wrapper around :meth:`_dispatch`: records metrics + access log.
+
+        The request id is attached to the response as ``x-request-id``. Route
+        labels are patterns (never raw URLs); streaming bodies report 0 bytes
+        because their total size is unknown when dispatch returns.
+        """
+        started = time.monotonic()
+        status, response = 500, None
+        tracing = self.observability_config.tracing
+        with span("pynext.request", {"http.method": request.method},
+                  enabled=tracing) as request_span:
+            try:
+                response = await self._dispatch(request)
+                status = response.status
+                request_id = get_request_id()
+                if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
+                    response.headers.append((b"x-request-id", request_id.encode("ascii")))
+                return response
+            except BadRequest:
+                status = 400
+                raise
+            except Exception:
+                status = 500
+                raise
+            finally:
+                request_span.set_attribute("http.status_code", status)
+                latency_ms = (time.monotonic() - started) * 1000
+                route = route_var.get() or "__unmatched__"
+                request_span.set_attribute("http.route", route)
+                rust_ms = render_ms_var.get() or 0.0
+                queue_wait_ms = queue_wait_var.get()
+                response_bytes = (len(response.body) if response is not None
+                                  and not isinstance(response, StreamingResponse) else 0)
+                self.metrics.observe_request(
+                    route, request.method, status, latency_ms,
+                    response_bytes=response_bytes, queue_wait_ms=queue_wait_ms,
+                    python_ms=max(0.0, latency_ms - rust_ms), rust_ms=rust_ms or None,
+                )
+                log.info("request", extra={
+                    "method": request.method, "route": route, "status": status,
+                    "latency_ms": round(latency_ms, 3),
+                    "response_bytes": response_bytes,
+                    "queue_wait_ms": round(queue_wait_ms, 3) if queue_wait_ms is not None else None,
+                    "python_ms": round(max(0.0, latency_ms - rust_ms), 3),
+                    "rust_ms": round(rust_ms, 3) if rust_ms else None,
+                })
+
+    async def _dispatch(self, request):
+        """Return a response. Streaming pages return a StreamingResponse."""
         path = request.path
         if path != "/" and path.endswith("/"):
+            route_var.set("__redirect__")
             location = quote(path.rstrip("/"), safe="/!$&'()*+,;=:@-._~").encode("ascii")
             if request.query_string:
                 if any(c < 32 or c == 127 for c in request.query_string):
@@ -362,6 +551,7 @@ class App:
                 location += b"?" + request.query_string
             return Response("", status=308, headers=[(b"location", location)])
         if path == "/_pynext" or path.startswith("/_pynext/"):
+            route_var.set("__client__")
             if path not in self.client_assets:
                 return Response("Not Found", status=404)
             allow = b"GET, HEAD, OPTIONS"
@@ -373,6 +563,7 @@ class App:
                                   self.asset_etags[path], cache_control=b"public, max-age=31536000, immutable",
                                   extra_headers=[(b"x-content-type-options", b"nosniff")])
         if path in self.public_assets:
+            route_var.set("__public__")
             allow = b"GET, HEAD, OPTIONS"
             if request.method == "OPTIONS":
                 return Response(b"", status=204, headers=[(b"allow", allow)], media_type=None)
@@ -384,8 +575,10 @@ class App:
                                   extra_headers=[(b"x-content-type-options", b"nosniff")])
         match = self.router.matches(path)
         if match is None:
+            route_var.set("__not_found__")
             return Response("Not Found", status=404)
         pattern, raw_params = match
+        route_var.set(pattern)
         params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
         request = Request(request.method, request.path, request.query_string, request.headers, request.body, params, self)
         spec = self.manifest["routes"][pattern]
@@ -418,16 +611,28 @@ class App:
                         (b"vary", b"Cookie, Authorization"),
                     ])
                 else:
+                    # Classify the outcome before rendering: a fresh entry is
+                    # a hit, a stale entry is served while one regeneration
+                    # runs in the background, a miss renders synchronously.
+                    cache_before = self.isr.store.lookup(path)[0]
+                    self.metrics.observe_cache(cache_before)
                     try:
                         body = await self.isr.get_or_render(
                             path, self.isr_policies[pattern],
-                            lambda: self.render_page(pattern, None, params),
+                            lambda: self.render_page(pattern, None, params, csp_nonce=False),
                         )
                     except CacheBusy:
+                        self.metrics.observe_cache("busy")
+                        self.metrics.observe_regeneration("failure")
                         return Response("Server Busy", status=503,
                                         headers=[(b"retry-after", b"1")])
                     except TimeoutError:
+                        self.metrics.observe_regeneration("failure")
                         return Response("Gateway Timeout", status=504)
+                    if cache_before == "miss":
+                        self.metrics.observe_regeneration("success")
+                    elif cache_before == "stale":
+                        self.metrics.observe_regeneration("started")
                     response = Response(body, media_type="text/html; charset=utf-8",
                                         headers=[
                                             (b"cache-control", b"public, max-age=0, must-revalidate"),
@@ -437,6 +642,11 @@ class App:
                 response = await self.render_page(pattern, request, params)
         else:
             method = "GET" if request.method == "HEAD" and "HEAD" not in entry else request.method
+            if (method not in SAFE_METHODS
+                    and (self.security.csrf_enabled
+                         or getattr(entry[method], "__pynext_csrf__", False))
+                    and not validate_csrf(request, config=self.security)):
+                return Response("Forbidden", status=403)
             response = await _invoke(entry[method], request=request, params=params)
             if not isinstance(response, Response):
                 raise TypeError("API handlers must return a Response")
@@ -447,19 +657,152 @@ class App:
             response.body = b""
         return response
 
+    @property
+    def websocket_routes(self):
+        """URL patterns that export a WebSocket handler (for the Axum adapter)."""
+        return frozenset(self.websocket_entries)
+
+    async def _handle_websocket(self, scope, receive, send):
+        try:
+            path = _decode_path(scope["path"], scope.get("raw_path"))
+        except (ValueError, UnicodeError):
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        match = self.router.matches(path)
+        handler = None
+        params = {}
+        if match is not None:
+            pattern, raw_params = match
+            handler = self.websocket_entries.get(pattern)
+            if handler is not None:
+                params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
+        if handler is None:
+            # No route, or a route with no WebSocket handler: refuse the
+            # handshake with a policy-violation close instead of hanging.
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        try:
+            first = await receive()
+        except Exception:
+            return
+        if first.get("type") == "websocket.disconnect":
+            return
+        if first.get("type") != "websocket.connect":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        state = {"accepted": False, "closed": False, "peer_gone": False}
+
+        async def asgi_receive():
+            while True:
+                message = await receive()
+                if message["type"] == "websocket.disconnect":
+                    state["peer_gone"] = True
+                    raise WebSocketDisconnect(message.get("code", 1000), message.get("reason", ""))
+                if message["type"] != "websocket.receive":
+                    continue
+                if message.get("text") is not None:
+                    data = message["text"]
+                    if len(data.encode("utf-8")) > MAX_WS_MESSAGE:
+                        await asgi_send(("close", 1009, "message too large"))
+                        raise WebSocketDisconnect(1009, "message too large")
+                    return ("text", data)
+                if message.get("bytes") is not None:
+                    data = message["bytes"]
+                    if len(data) > MAX_WS_MESSAGE:
+                        await asgi_send(("close", 1009, "message too large"))
+                        raise WebSocketDisconnect(1009, "message too large")
+                    return ("bytes", bytes(data))
+
+        async def asgi_send(item):
+            kind = item[0]
+            if kind == "accept":
+                if state["accepted"]:
+                    raise RuntimeError("WebSocket is already accepted")
+                state["accepted"] = True
+                await send({"type": "websocket.accept"})
+            elif kind == "text":
+                await send({"type": "websocket.send", "text": item[1]})
+            elif kind == "bytes":
+                await send({"type": "websocket.send", "bytes": item[1]})
+            elif kind == "close":
+                if state["closed"]:
+                    return
+                state["closed"] = True
+                await send({"type": "websocket.close", "code": item[1], "reason": item[2]})
+
+        ws = WebSocket(receive=asgi_receive, send=asgi_send, path=path, params=params,
+                       headers=tuple(scope.get("headers", [])),
+                       query_string=scope.get("query_string", b""))
+        try:
+            await _invoke(handler, websocket=ws, params=params)
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            log.exception("WebSocket handler failed")
+            if state["accepted"] and not state["closed"] and not state["peer_gone"]:
+                try:
+                    await ws.close(1011)
+                except Exception:
+                    pass
+        finally:
+            if not state["closed"] and not state["peer_gone"]:
+                try:
+                    await send({"type": "websocket.close", "code": 1000})
+                except Exception:
+                    pass
+
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
             while True:
                 message = await receive()
                 if message["type"] == "lifespan.startup":
-                    self.isr.open()
+                    try:
+                        self.isr.open()
+                    except Exception as exc:
+                        # ASGI requires startup.failed instead of a bare
+                        # exception so the server can shut the app down.
+                        await send({"type": "lifespan.startup.failed",
+                                    "message": str(exc) or exc.__class__.__name__})
+                        return
                     await send({"type": "lifespan.startup.complete"})
                 elif message["type"] == "lifespan.shutdown":
-                    await self.isr.close()
+                    try:
+                        await self.isr.close()
+                    except Exception as exc:
+                        await send({"type": "lifespan.shutdown.failed",
+                                    "message": str(exc) or exc.__class__.__name__})
+                        return
                     await send({"type": "lifespan.shutdown.complete"})
                     return
+        if scope["type"] == "websocket":
+            if "path" not in scope:
+                # A websocket scope without a path cannot be routed; reject
+                # it the same way as an unknown scope type, before receiving.
+                raise RuntimeError(f"Unsupported ASGI scope: {scope['type']}")
+            await self._handle_websocket(scope, receive, send)
+            return
         if scope["type"] != "http":
             raise RuntimeError(f"Unsupported ASGI scope: {scope['type']}")
+        _, _reset_request_context = begin_request_context(scope.get("headers", []))
+        try:
+            await self._handle_http(scope, receive, send)
+        finally:
+            _reset_request_context()
+
+    async def _handle_http(self, scope, receive, send):
+        if self.rate_limit is not None:
+            # Check before reading the body: an over-limit request is
+            # rejected without handler execution or body intake.
+            client = scope.get("client")
+            client_ip = client[0] if client else None
+            key = self.rate_limit.key_for(client_ip, scope.get("headers", []))
+            allowed, retry_after = self.rate_limit.allow(key)
+            if not allowed:
+                response = rate_limited_response(retry_after)
+                if scope["method"].upper() == "HEAD":
+                    response.body = b""
+                await _send_response(response, send)
+                return
         request = None
         try:
             path = _decode_path(scope["path"], scope.get("raw_path"))
@@ -508,9 +851,15 @@ class App:
             return
         if scope["method"].upper() == "HEAD":
             response.body = b""
+        request_id = get_request_id()
+        if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
+            response.headers.append((b"x-request-id", request_id.encode("ascii")))
         await _send_response(response, send)
 
 
-def create_app(root=".", *, production=False):
+def create_app(root=".", *, production=False, security=None, cache_backend="memory", cache_path=None,
+               observability=None, rate_limit=None):
     root = Path(root).resolve()
-    return App(root, load_manifest(root) if production else discover(root), production=production)
+    return App(root, load_manifest(root) if production else discover(root), production=production,
+               security=security, cache_backend=cache_backend, cache_path=cache_path,
+               observability=observability, rate_limit=rate_limit)

@@ -137,7 +137,7 @@ def main():
             )
             base = f"http://127.0.0.1:{port}"
             verify_http(base)
-            for script in ("islands_smoke.py", "interaction_smoke.py"):
+            for script in ("islands_smoke.py", "interaction_smoke.py", "navigation_smoke.py"):
                 subprocess.run(
                     [sys.executable, str(ROOT / "tests/browser" / script), base],
                     cwd=ROOT, check=True, timeout=120,

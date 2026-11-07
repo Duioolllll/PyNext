@@ -13,12 +13,19 @@ pynext-router = { path = "../pynext-router" }
 pynext-cache = { path = "../pynext-cache" }
 pyo3 = { version = "0.25", features = ["extension-module"] }
 serde_json = "1"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 http-body-util = "0.1"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 hyper = { version = "1", features = ["http2"] }
 # hyper-util's auto builder supports HTTP/1.1 and h2c prior knowledge.
 # Cargo.lock includes the HTTP/2 dependencies and is verified by CI.
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 tower-service = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
+# Only used for the supervisor's SO_REUSEPORT listener (finding #52), so
+# several worker processes can share one port; the single-process path
+# keeps the plain std bind.
+socket2 = "0.6"
+
+[dev-dependencies]
+proptest = "1"
