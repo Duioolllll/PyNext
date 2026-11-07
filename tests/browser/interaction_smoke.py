@@ -90,6 +90,15 @@ with sync_playwright() as playwright:
     label.click()
     expect(label).to_have_text("Interaction: 3")
 
+    # Keyboard activation produces a trusted click and follows the same path.
+    first, _ = visit()
+    hold_hydration(page, first)
+    first.locator('button[type="button"]').focus()
+    page.keyboard.press("Enter")
+    expect(page.locator("html")).to_have_attribute("data-test-hydration-delay", "ready")
+    page.evaluate("window.releaseIslandDelay()")
+    expect(first.locator("[data-count]")).to_have_text("Interaction: 1")
+
     # An identical replacement tree must not receive a stale target's click.
     first, _ = visit()
     hold_hydration(page, first)
@@ -161,6 +170,14 @@ with sync_playwright() as playwright:
     assert page.evaluate("window.bubbledAfterFailure") == 1
     assert first.locator("[data-count]").inner_text() == "Interaction: 0"
     context.close()
+
+    no_js = browser.new_context(java_script_enabled=False)
+    page = no_js.new_page()
+    page.goto(base + "/interaction", wait_until="load")
+    assert page.locator("#first [data-count]").inner_text() == "Interaction: 0"
+    page.locator("#first").get_by_role("link", name="Normal link").click()
+    page.wait_for_url(re.compile(r"/about$"))
+    no_js.close()
     browser.close()
 
 print("Browser: interaction hydration, safe replay, limits, failures, cleanup, and navigation passed")
