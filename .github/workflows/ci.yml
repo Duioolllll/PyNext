@@ -69,7 +69,7 @@ jobs:
 
       - name: Run bounded load smoke test
         run: |
-          uv run python benchmarks/bench.py --mode axum --requests 40 --concurrency 4 --warmup 2 --path /api/users > benchmark.json
+          uv run python benchmarks/bench.py --mode axum --production --requests 40 --concurrency 4 --warmup 2 --path /api/users > benchmark.json
           uv run python -c "import json; result = json.load(open('benchmark.json', encoding='utf-8')); assert result['successful_requests'] == 40 and result['errors'] == 0"
 
       - name: Save benchmark measurements
@@ -78,10 +78,14 @@ jobs:
           name: benchmark-${{ runner.os }}
           path: benchmark.json
 
-      - name: Install Chromium
+      - name: Install Chromium (Linux)
         if: runner.os == 'Linux'
         run: uv run --with playwright==1.62.0 python -m playwright install --with-deps chromium
 
+      - name: Install Chromium (macOS and Windows)
+        if: runner.os != 'Linux'
+        run: uv run --with playwright==1.62.0 python -m playwright install chromium
+
       - name: Browser end-to-end checks
-        if: runner.os == 'Linux'
         run: uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
+
