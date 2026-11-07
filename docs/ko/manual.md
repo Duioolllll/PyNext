@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [日本語](../ja/manual.md) · [简体中文](../zh-CN/manual.md)
 
-이 설명서는 현재 체크아웃한 코드인 **v0.7.0a1** 실험판을 기준으로 합니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
+이 설명서는 현재 체크아웃한 코드인 **v0.7.0a1** 미출시 실험판 후보를 기준으로 합니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
 
 ## 준비와 첫 실행
 
@@ -182,7 +182,7 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG와 ISR 페이지 함수는 `request`를 받을 수 없습니다. 공개 콘텐츠에만 사용하고 환경 변수와 외부 데이터가 공유 가능한지 확인하세요. ISR은 익명 요청의 쿼리를 캐시 키에 포함하지 않습니다. Cookie 또는 Authorization 헤더가 있으면 공유 ISR 캐시를 우회하고 `private, no-store`로 응답합니다. 기본 캐시는 크기가 제한된 **프로세스별 메모리 캐시**이므로 워커 간 공유·무효화되지 않습니다. `--cache-backend sqlite`로 시작하거나 `create_app(..., cache_backend="sqlite", cache_path=...)`로 만들면 모든 워커가 하나의 SQLite 파일(WAL)을 공유합니다. stale 재생성은 만료·소유 토큰이 있는 lease로 키마다 한 워커만 수행하고, 버전 fencing으로 느린 생성이 새 결과를 덮지 못합니다. 각 워커는 공유 파일 앞에 프로세스별 캐시를 두므로, 다른 워커의 무효화는 공유 항목에 즉시 반영되지만 로컬 복사본은 남은 TTL 동안 유지될 수 있습니다. `Set-Cookie`나 `Cache-Control: private/no-store` 응답은 공유 캐시에 저장하지 않습니다. Redis 어댑터는 이후 과제이며 미구현입니다. SSG 내용을 바꾸려면 재빌드해야 합니다.
+SSG와 ISR 페이지 함수는 `request`를 받을 수 없습니다. 공개 콘텐츠에만 사용하고 환경 변수와 외부 데이터가 공유 가능한지 확인하세요. ISR은 익명 요청의 쿼리를 캐시 키에 포함하지 않습니다. Cookie 또는 Authorization 헤더가 있으면 공유 ISR 캐시를 우회하고 `private, no-store`로 응답합니다. 기본 캐시는 크기가 제한된 **프로세스별 메모리 캐시**이므로 워커 간 공유·무효화되지 않습니다. `--cache-backend sqlite`로 시작하거나 `create_app(..., cache_backend="sqlite", cache_path=...)`로 만들면 모든 워커가 하나의 SQLite 파일(WAL)을 공유합니다. stale 재생성은 만료·소유 토큰이 있는 lease로 키마다 한 워커만 수행하고, 저장할 때 버전과 유효한 lease 소유권을 원자적으로 확인합니다. 공유 저장소 장애 시 워커별 로컬 캐시로 대체합니다. 각 워커는 공유 파일 앞에 프로세스별 캐시를 두므로, 다른 워커의 무효화는 공유 항목에 즉시 반영되지만 로컬 복사본은 남은 TTL 동안 유지될 수 있습니다. `Set-Cookie`나 `Cache-Control: private/no-store` 응답은 공유 캐시에 저장하지 않습니다. Redis 어댑터는 이후 과제이며 미구현입니다. SSG 내용을 바꾸려면 재빌드해야 합니다.
 
 SSG 빌드는 최대 10,000페이지를 생성하며 개발 모드에서는 요청마다 SSG 페이지를 렌더링합니다. ISR 페이지는 `generate_static_params()`를 내보낼 수 없고 프로세스별 동시 생성 작업은 최대 128개입니다.
 
@@ -252,6 +252,8 @@ CLI 플래그 `--structured-logs` / `--no-structured-logs`, `--metrics` / `--no-
 ## 요청 속도 제한
 
 요청 속도 제한은 선택 사항이며 프로세스별 토큰 버킷입니다. `pynext start --rate-limit 100 --rate-limit-window 60`은 클라이언트 IP당 60초에 100요청을 허용합니다(버스트가 곧 제한). 제한을 초과한 동적 요청은 초 단위 `Retry-After` 헤더와 함께 429를 받습니다. 키는 클라이언트 IP이며, `X-Forwarded-For`는 `--trusted-proxy`(IP 또는 CIDR, 반복 가능)로 지정한 피어에서만 신뢰합니다. 신뢰하지 않는 프록시의 헤더는 위조가 가능하므로 무시합니다. 코드에서는 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`처럼 사용합니다. 버킷은 프로세스별이며 재시작 시 사라지고, 분산 속도 제한은 아직 미구현입니다. 정적 파일과 신선한 ISR 페이지는 Python 브리지에 도달하기 전에 Rust 계층에서 제공되므로 속도 제한이 적용되지 않습니다.
+
+전달된 주소는 오른쪽부터 신뢰하는 프록시를 거슬러 가장 가까운 비신뢰 주소를 사용합니다. 모든 중간 프록시를 정확히 등록해야 합니다. 프로세스당 버킷은 최대 10,000개이며 모두 사용 중이면 버킷이 완전히 충전될 때까지 새 주소에 429를 반환합니다.
 
 여러 워커: `pynext start --workers 4`는 한 포트를 공유하는 워커 프로세스 4개를 띄우는 수퍼바이저를 실행합니다(SO_REUSEPORT, Unix 전용, 고정 `--port` 필요). 수퍼바이저는 종료된 워커나 하트비트가 멈춘 워커를 재시작하고, SIGINT/SIGTERM을 모든 워커에 전달해 정상 종료합니다(최대 5초, 이후 SIGKILL). 각 워커는 별도 프로세스로 인터프리터·이벤트 루프·ISR 캐시·속도 제한 버킷을 따로 가지며 상태를 공유하지 않습니다. 워커가 요청 처리 중 죽으면 그 요청은 실패하고 클라이언트가 재시도해야 합니다. 기본값은 워커 1개로 기존 단일 프로세스와 동일합니다. 이벤트 루프를 막는 핸들러는 하트비트 스레드를 멈추지 않으므로, 멈춘 핸들러는 재시작이 아니라 30초 요청 시간 제한으로 처리됩니다.
 

@@ -4,7 +4,12 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
-## v0.7.0a1
+- Fix Windows watcher path normalization, SQLite ISR generation races and failure fallback, and exercise the correct Axum/Uvicorn browser server in CI.
+- Match dynamic WebSocket routes on the native server using the same route priority as ASGI.
+- Bound rate-limit bucket storage and select forwarded client addresses from the nearest untrusted proxy hop.
+- Document the unreleased architecture, observed limitations, and verification criteria.
+
+## v0.7.0a1 (unreleased candidate)
 
 - Add a shared SQLite ISR cache backend (`--cache-backend sqlite`, `create_app(..., cache_backend="sqlite", cache_path=...)`, default file `<project>/.pynext/isr-cache.sqlite3`) so multiple workers share ISR entries with no external service. Stale regeneration is single-flight per key through an expiring owner-token lease, shared writes are fenced by entry version so a slow generation cannot overwrite a newer result, failures preserve the old entry, and first-generation requests wait for the worker holding the lease. Responses with `Set-Cookie` or `Cache-Control: private`/`no-store` are never stored in the shared cache. The memory backend stays the default, and a Redis adapter is documented as a future option.
 - Add streaming SSR: a page function may return an async iterable of UI nodes; the layout shell is sent first, each chunk is serialized and sent as produced, and the layout suffix closes the document. Buffered rendering stays the default, streaming is SSR-only, a disconnect closes the generator, and a mid-stream error ends the stream without changing its status. See `examples/basic/app/stream/page.py`.

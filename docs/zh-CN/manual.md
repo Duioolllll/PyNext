@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [日本語](../ja/manual.md)
 
-本手册适用于当前检出的 **v0.7.0a1** 实验版代码。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
+本手册适用于当前检出的 **v0.7.0a1** 尚未发布的实验候选代码。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
 
 ## 环境要求与首次运行
 
@@ -182,7 +182,7 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG 和 ISR 页面函数不能接收 `request`。它们仅适合公共内容；请确认环境变量和外部数据可以共享。ISR 不把匿名请求的查询字符串计入缓存键。带 Cookie 或 Authorization 的请求会绕过共享 ISR 缓存并返回 `private, no-store`。默认缓存大小有限，且**只存在于各自进程的内存中**，不在工作进程之间共享或失效。使用 `--cache-backend sqlite` 启动，或用 `create_app(..., cache_backend="sqlite", cache_path=...)` 创建，即可让所有工作进程共享一个 SQLite 文件（WAL）：过期内容的重新生成通过带过期时间和属主令牌的租约实现每个键仅一个进程执行，版本围栏可防止缓慢的生成覆盖较新的结果。每个工作进程在共享文件前仍保留一份进程内缓存，因此其他进程的失效会立即作用于共享条目，但本地副本可能保留至剩余 TTL 结束。带 `Set-Cookie` 或 `Cache-Control: private/no-store` 的响应不会存入共享缓存。Redis 适配器是未来的可选方案，尚未实现。更新 SSG 内容需要重新构建。
+SSG 和 ISR 页面函数不能接收 `request`。它们仅适合公共内容；请确认环境变量和外部数据可以共享。ISR 不把匿名请求的查询字符串计入缓存键。带 Cookie 或 Authorization 的请求会绕过共享 ISR 缓存并返回 `private, no-store`。默认缓存大小有限，且**只存在于各自进程的内存中**，不在工作进程之间共享或失效。使用 `--cache-backend sqlite` 启动，或用 `create_app(..., cache_backend="sqlite", cache_path=...)` 创建，即可让所有工作进程共享一个 SQLite 文件（WAL）：过期内容的重新生成通过带过期时间和属主令牌的租约实现每个键仅一个进程执行，写入时原子检查版本和有效租约的所有权。共享存储故障时，工作进程回退到本地缓存。每个工作进程在共享文件前仍保留一份进程内缓存，因此其他进程的失效会立即作用于共享条目，但本地副本可能保留至剩余 TTL 结束。带 `Set-Cookie` 或 `Cache-Control: private/no-store` 的响应不会存入共享缓存。Redis 适配器是未来的可选方案，尚未实现。更新 SSG 内容需要重新构建。
 
 SSG 构建最多生成 10,000 个页面；开发模式下每次请求都会渲染 SSG 页面。ISR 页面不能导出 `generate_static_params()`，每个进程最多并发执行 128 个生成任务。
 
@@ -252,6 +252,8 @@ OpenTelemetry 追踪默认关闭且为可选项：安装 `opentelemetry-api`（�
 ## 限流
 
 限流是可选项，采用按进程的令牌桶：`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的动态请求返回 429，并带有以秒为单位的 `Retry-After` 头。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失；分布式限流尚未实现。静态文件和新鲜的 ISR 页面在到达 Python 桥接之前已由 Rust 层返回，因此不受限流。
+
+转发链从右向左遍历受信任的代理，使用最近的不受信任地址。必须准确配置所有中间代理。每个进程最多保留 10,000 个桶；全部处于活跃状态时，新地址会收到 429，直到某个桶完全补充。
 
 多工作进程：`pynext start --workers 4` 会运行一个监管器，启动 4 个共享同一端口的工作进程（SO_REUSEPORT，仅限 Unix，需要固定 `--port`）。监管器会重启已退出或心跳停止的工作进程，并将 SIGINT/SIGTERM 转发给全部工作进程以实现优雅关闭（最多 5 秒，之后 SIGKILL）。每个工作进程都是独立进程，拥有各自的解释器、事件循环、ISR 缓存和限流桶，状态不在进程间共享。若工作进程在处理请求中途死亡，该请求会失败，客户端需要重试。默认为 1 个工作进程，与此前的单进程行为完全相同。阻塞事件循环的处理函数不会停止工作进程的心跳线程，因此卡住的处理函数由 30 秒请求超时处理，而不会触发重启。
 
