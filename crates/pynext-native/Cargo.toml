@@ -15,6 +15,7 @@ pyo3 = { version = "0.25", features = ["extension-module"] }
 serde_json = "1"
 axum = "0.8"
 http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hyper = { version = "1", features = ["http2"] }
 # hyper-util's auto builder sniffs the HTTP/2 prior-knowledge preface and
 # otherwise serves HTTP/1.1; it needs hyper's http2 feature above (which

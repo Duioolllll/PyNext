@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [简体中文](../zh-CN/manual.md)
 
-このマニュアルは **v0.6.0a1** を対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
+このマニュアルは開発ブランチを対象とし、最新の公開リリースは **v0.6.0a1** です。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
 
 ## 必要な環境と起動
 
@@ -11,7 +11,7 @@ CPython 3.13、Rust/Cargo、[uv](https://docs.astral.sh/uv/) が必要です。�
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
 cd PyNext
-git checkout v0.6.0a1
+git checkout main
 uv sync --extra dev
 npm ci
 uv run pynext build --dir examples/basic
@@ -72,6 +72,21 @@ async def echo(request):
 
 レスポンスの既定 Content Security Policy は `script-src 'self'; object-src 'none'` です。ブラウザーが読み込めるスクリプトが制限されるため、クライアントコードの追加時に考慮してください。レスポンスヘッダーとメディアタイプの制御文字は拒否されます。
 
+## API レスポンスのストリーミング
+
+`StreamingResponse` に文字列またはバイト列を返す非同期 iterable を渡します。ASGI と Axum はチャンクを順に送信し、完了・切断・エラー時に iterator を閉じます。各チャンクは最大 1 MiB です。`Content-Length` と `Transfer-Encoding` はサーバーが管理します。Axum の待機チャンクは 1 個で、次のチャンク生成と送信待機にはそれぞれ 30 秒の制限があります。ヘッダー送信後のエラーはステータスを変更せずストリームを中断します。HEAD はストリームを消費しません。ページ SSR は引き続きバッファリングされ、React/RSC ストリーミングは未対応です。
+
+~~~python
+from pynext import StreamingResponse, route
+
+@route("GET")
+async def stream():
+    async def chunks():
+        yield "first\n"
+        yield "second\n"
+    return StreamingResponse(chunks(), media_type="text/plain; charset=utf-8")
+~~~
+
 ## SSR、SSG、ISR
 
 - `@page()` はリクエストごとにレンダリングします。
@@ -127,9 +142,9 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 ビルド済みアプリは `create_app(project_path, production=True)` で作成します。ASGI のタイムアウトは使用するサーバーが管理します。Axum アダプターは Python の応答を最大 30 秒待ち、キャンセルを要求して 504 を返します。既にスレッド上で動作中の同期関数は 504 の後も実行を続け、書き込みなどを行う場合があります。書き込みの冪等性と、DB・外部サービス固有のタイムアウトを設定してください。強制的なプロセス分離はなく、ISR のキャンセルにも同じ制限があります。
 
-ストリーミング、WebSocket、分散 ISR、分散レート制限、OpenTelemetry、本番環境向けの安全性強化は未実装です。計画と完了基準は[プロダクションロードマップ](../PRODUCTION_ROADMAP.md)を参照してください。
+ストリーミング SSR、WebSocket、分散 ISR、分散レート制限、OpenTelemetry、本番環境向けの安全性強化は未実装です。計画と完了基準は[プロダクションロードマップ](../PRODUCTION_ROADMAP.md)を参照してください。
 
-両アダプターのリクエスト本文は最大 1 MiB で、超過時は 413 を返します。Axum は本文受信を最大 64 件、全体の受信時間を 10 秒に制限し、時間超過時は 408 を返します。本文受信または Python 実行枠が満杯の場合は 503 です。本文のない静的ファイルと有効な ISR キャッシュは Python 実行枠を消費しません。この期限は HTTP ヘッダーの受信時間や接続総数を制限しません。外部 ASGI サーバーの期限はそのサーバーで管理します。ルート以外の末尾 `/` は 308 でリダイレクトします。ビルド済み island は各 2 MiB、合計 32 MiB が上限です。
+両アダプターのリクエスト本文は最大 1 MiB で、超過時は 413 です。Axum の既定値は本文受信 16 件、受信期限 10 秒（408）、Python 実行 64 件で、待機列は実行枠数と 64 の小さい方に制限され、満杯なら 503 です。実行数と本文設定は CLI で変更できます。HTTP/1.1 ヘッダー受信期限は 10 秒ですが、接続総数は制限しません。外部 ASGI サーバーの期限はそのサーバーで管理します。ルート以外の末尾 `/` は 308 でリダイレクトします。ビルド済み island は各 2 MiB、合計 32 MiB が上限です。
 
 ## テストとトラブルシューティング
 

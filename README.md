@@ -6,7 +6,9 @@
 
 **Manual:** [English](docs/en/manual.md) · [한국어](docs/ko/manual.md) · [日本語](docs/ja/manual.md) · [简体中文](docs/zh-CN/manual.md)
 
-**Version:** v0.6.0a1 · [변경 이력](CHANGELOG.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
+**최신 릴리스:** v0.6.0a1 · [변경 이력](CHANGELOG.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
+
+이 문서는 미릴리스 개발 브랜치의 기능을 포함합니다.
 
 PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust로 구현하는 실험적 풀스택 프레임워크입니다. 이 저장소는 구현의 출발점이며, Next.js나 React의 호환 구현은 아닙니다.
 
@@ -69,6 +71,23 @@ async def users():
 ```
 
 `request.query`를 읽을 때 잘못된 UTF-8 쿼리 문자열과 `await request.json()`을 읽을 때 잘못된 JSON 본문은 `BadRequest` 예외가 발생하며 HTTP 400으로 응답합니다. 쿼리의 퍼센트 인코딩을 푼 결과도 UTF-8로 검사합니다. JSON의 `NaN`과 `Infinity`도 허용하지 않습니다. 파싱은 해당 속성이나 메서드를 읽을 때 이루어지므로, 읽지 않는 요청에는 적용되지 않습니다. 앱에서 직접 `from pynext import BadRequest`로 불러와 입력 검증 오류에 사용할 수도 있습니다. 클라이언트에는 예외의 상세 내용 대신 `Bad Request`만 전송합니다. 요청 본문은 최대 1 MiB이며 초과하면 413입니다.
+
+### 비동기 응답 스트리밍
+
+API 핸들러는 `StreamingResponse`에 비동기 iterable을 전달할 수 있습니다. 아래 예제와 [실행 가능한 NDJSON 예제](examples/basic/app/api/stream/route.py)는 ASGI와 Axum에서 청크를 순서대로 전송합니다.
+
+```python
+from pynext import StreamingResponse, route
+
+@route("GET")
+async def stream():
+    async def chunks():
+        yield "first\n"
+        yield "second\n"
+    return StreamingResponse(chunks(), media_type="text/plain; charset=utf-8")
+```
+
+청크는 문자열이나 바이트이며 개당 최대 1 MiB입니다. 프레이밍은 HTTP 서버가 처리하므로 `Content-Length`와 `Transfer-Encoding`을 직접 지정할 수 없습니다. 클라이언트 연결이 끊기거나 송신이 실패하면 비동기 생성기를 닫습니다. Axum은 청크 하나를 대기시키며 다음 청크 생성과 송신 대기 각각에 30초 제한을 둡니다. 헤더를 보낸 뒤 생성 중 오류가 나면 응답을 중단하며 이미 보낸 상태 코드를 바꿀 수 없습니다. 페이지 SSR은 여전히 전체 버퍼를 만든 뒤 보냅니다.
 
 경로는 정적 경로, `[slug]`, 마지막 위치의 `[...path]`를 지원합니다. 우선순위는 정적 > 단일 동적 > catch-all입니다. catch-all 파라미터는 문자열 리스트이고 단일 동적 파라미터는 문자열입니다. 선택적 catch-all, 라우트 그룹, 병렬·인터셉트 라우트는 아직 지원하지 않습니다. 빌드 시 경로 충돌과 잘못된 핸들러를 검사하고 `.pynext/manifest.json`에 소스 해시를 기록합니다. `start`는 빌드 후 소스가 바뀌면 재빌드를 요구합니다.
 
@@ -186,8 +205,8 @@ ISR은 **공개 콘텐츠 전용**입니다. 페이지 함수는 `request`를 �
 ## 현재 상태와 제한
 
 - SSR은 Python에서 UI 트리를 만들고 Rust가 이스케이프해 직렬화하는 buffered 렌더링입니다. 문자열을 raw HTML로 삽입하는 API는 없습니다.
-- Axum 서버는 본문 수신과 Python 실행에 각각 최대 64개 슬롯을 사용합니다. 본문 수신은 전체 10초를 넘으면 408이며, 해당 풀이 가득 차면 503입니다. 본문 없는 정적 파일과 신선한 ISR 캐시는 Python 실행 슬롯이 가득 차도 제공됩니다. 이 제한은 HTTP 헤더를 받는 시간이나 총 연결 수를 제한하지 않습니다. Python 응답을 30초 동안 기다린 뒤에는 504를 반환하고 해당 코루틴의 취소를 요청합니다. 이미 스레드에서 실행 중인 동기 핸들러나 렌더링 함수는 강제로 중단되지 않아 504 이후에도 쓰기 등의 부작용을 일으키거나 자원을 점유할 수 있습니다. ISR 생성의 시간 초과나 취소에도 같은 제한이 있습니다. 쓰기 작업은 멱등성을 보장하고 DB·외부 서비스에 별도의 시간 제한을 설정해야 합니다. 강제 종료가 필요하면 별도의 프로세스 격리가 필요하며 현재 구현되어 있지 않습니다. 외부 ASGI 서버의 요청 시간 제한은 해당 서버가 관리합니다.
-- ASGI HTTP와 기본 lifespan을 지원합니다. WebSocket, 스트리밍, 요청 처리 중 연결 해제 감지와 완전한 ASGI 적합성 검증은 아직 구현되지 않았습니다.
+- Axum의 기본 본문 수신 슬롯은 16개, Python 실행 슬롯은 64개이며 CLI에서 조정합니다. 본문 수신 제한은 기본 10초이고 HTTP/1.1 헤더 수신에도 10초 제한이 있습니다. 실행 대기열은 최대 실행 슬롯 수와 64 중 작은 값으로 제한합니다. 정적 파일과 신선한 ISR 캐시는 Python 슬롯을 건너뜁니다. 연결 총수는 제한하지 않으며 동기 함수는 504 또는 연결 해제 후에도 스레드에서 계속 실행될 수 있습니다. DB·외부 서비스 시간 제한과 쓰기 멱등성을 별도로 확보해야 합니다. 외부 ASGI 서버의 시간 제한은 해당 서버가 관리합니다.
+- ASGI HTTP와 기본 lifespan, 비동기 API 응답 스트리밍과 연결 해제 시 비동기 작업 취소를 지원합니다. WebSocket, 스트리밍 SSR, 완전한 ASGI 적합성 검증과 강제 프로세스 격리는 아직 구현되지 않았습니다.
 - ISR은 단일 프로세스 메모리 구현입니다. 워커 간 공유 캐시·무효화, 상호작용 시 island 로딩과 hydration 전 이벤트 재생, 자동 리로드, 프로덕션 보안·관측성 기능은 **미구현**입니다. PyNext의 hydration은 React나 React Server Components와 호환되지 않습니다. 현재 버전을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하는 데 사용하지 마세요.
 - 빌드할 때 앱 모듈을 import하므로 개발자가 작성한 Python 코드가 실행됩니다. 프로젝트를 신뢰할 수 있는 환경에서 빌드해야 합니다.
 - 페이지·레이아웃·API 파일에서 `from .helpers import name` 같은 상대 import를 사용할 수 있습니다. **0.6 변경:** 프로젝트 루트를 전역 `sys.path`에 자동 추가하지 않습니다. 기존 루트 기준 절대 import가 실패하면 상대 import로 바꾸거나 프로젝트를 Python 패키지로 설치하세요.

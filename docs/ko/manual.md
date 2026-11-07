@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [日本語](../ja/manual.md) · [简体中文](../zh-CN/manual.md)
 
-이 설명서는 **v0.6.0a1** 기준입니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
+이 설명서는 개발 브랜치 기준이며 최신 공개 릴리스는 **v0.6.0a1**입니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
 
 ## 준비와 첫 실행
 
@@ -11,7 +11,7 @@ CPython 3.13, Rust/Cargo, [uv](https://docs.astral.sh/uv/)가 필요합니다. �
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
 cd PyNext
-git checkout v0.6.0a1
+git checkout main
 uv sync --extra dev
 npm ci
 uv run pynext build --dir examples/basic
@@ -72,6 +72,21 @@ async def echo(request):
 
 응답의 기본 Content Security Policy는 `script-src 'self'; object-src 'none'`입니다. 브라우저에서 불러올 수 있는 스크립트가 제한되므로 클라이언트 코드를 추가할 때 이를 고려하세요. 응답 헤더와 미디어 타입의 제어 문자는 거부합니다.
 
+## API 응답 스트리밍
+
+`StreamingResponse`에 문자열 또는 바이트를 내보내는 비동기 iterable을 전달합니다. ASGI와 Axum이 청크를 순서대로 전송하며 완료·연결 해제·오류 시 반복자를 닫습니다. 청크당 최대 1 MiB이며 `Content-Length`와 `Transfer-Encoding`은 직접 지정하지 않습니다. Axum은 청크 하나를 대기시키고 다음 청크 생성과 송신 대기에 각각 30초 제한을 적용합니다. 헤더 전송 후 오류는 상태 코드를 바꾸지 못하고 스트림을 중단합니다. HEAD 요청은 스트림을 소비하지 않습니다. 페이지 SSR은 여전히 버퍼링하며 React/RSC 스트리밍은 미구현입니다.
+
+~~~python
+from pynext import StreamingResponse, route
+
+@route("GET")
+async def stream():
+    async def chunks():
+        yield "first\n"
+        yield "second\n"
+    return StreamingResponse(chunks(), media_type="text/plain; charset=utf-8")
+~~~
+
 ## SSR, SSG, ISR
 
 - `@page()`: 요청할 때마다 렌더링합니다.
@@ -127,9 +142,9 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 빌드된 앱은 `create_app(project_path, production=True)`로 만듭니다. ASGI 서버의 시간 제한은 해당 서버가 관리합니다. Axum 어댑터는 Python 응답을 최대 30초 기다린 뒤 취소를 요청하고 504를 반환합니다. 이미 스레드에서 실행 중인 동기 함수는 504 이후에도 계속 실행되어 쓰기 등의 부작용을 일으킬 수 있습니다. 쓰기 작업의 멱등성과 데이터베이스·외부 서비스의 별도 시간 제한을 확보하세요. 강제 프로세스 격리는 없으며 ISR 취소에도 같은 제한이 있습니다.
 
-스트리밍, WebSocket, 분산 ISR, 분산 요청 제한, OpenTelemetry와 운영 환경 보안 강화는 미구현입니다. 계획과 완료 기준은 [프로덕션 로드맵](../PRODUCTION_ROADMAP.md)을 참고하세요.
+스트리밍 SSR, WebSocket, 분산 ISR, 분산 요청 제한, OpenTelemetry와 운영 환경 보안 강화는 미구현입니다. 계획과 완료 기준은 [프로덕션 로드맵](../PRODUCTION_ROADMAP.md)을 참고하세요.
 
-두 어댑터의 요청 본문 상한은 1 MiB이며 초과 시 413입니다. Axum은 본문 수신을 최대 64개로 제한하고 전체 수신에 10초를 허용하며 시간 초과 시 408입니다. 본문 수신 또는 Python 실행 풀이 가득 차면 503입니다. 본문 없는 정적 파일과 신선한 ISR 캐시는 Python 슬롯을 사용하지 않습니다. 이 시간 제한은 HTTP 헤더 수신이나 전체 연결 수를 제한하지 않으며 외부 ASGI 서버의 시간 제한은 해당 서버가 관리합니다. 루트가 아닌 경로의 마지막 `/`는 308로 리디렉션됩니다. 컴파일된 island는 개당 2 MiB, 전체 32 MiB 이하입니다.
+두 어댑터의 요청 본문은 최대 1 MiB이며 초과 시 413입니다. Axum의 기본 본문 수신 슬롯은 16개, 본문 수신 제한은 10초(408), Python 실행 슬롯은 64개입니다. 대기열은 실행 슬롯 수와 64 중 작은 값으로 제한하며 가득 차면 503입니다. 실행 및 본문 설정은 CLI에서 조정할 수 있습니다. HTTP/1.1 헤더 수신은 10초로 제한하지만 전체 연결 수는 제한하지 않습니다. 외부 ASGI 서버의 시간 제한은 해당 서버가 관리합니다. 루트가 아닌 경로의 마지막 `/`는 308로 리디렉션됩니다. 컴파일된 island는 개당 2 MiB, 전체 32 MiB 이하입니다.
 
 ## 테스트와 문제 해결
 

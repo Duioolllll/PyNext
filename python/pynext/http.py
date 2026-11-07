@@ -72,3 +72,47 @@ class JSONResponse(Response):
     def __init__(self, value, *, status=200, headers=()):
         super().__init__(json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")),
                          status=status, headers=headers, media_type="application/json; charset=utf-8")
+
+
+MAX_STREAM_CHUNK = 1_048_576
+
+
+class StreamingResponse(Response):
+    """A response produced by an asynchronous iterable, one bounded chunk at a time."""
+
+    def __init__(self, content, *, status=200, headers=(), media_type="application/octet-stream"):
+        if status < 200 or status in (204, 304):
+            raise ValueError("Streaming responses require a status that permits a body")
+        headers = list(headers)
+        if any(bytes(key).lower() in {b"content-length", b"transfer-encoding"} for key, _ in headers):
+            raise ValueError("Streaming response framing is managed by the server")
+        super().__init__(b"", status=status, headers=headers, media_type=media_type)
+        self.headers = [(key, value) for key, value in self.headers if key != b"content-length"]
+        self._iterator = aiter(content)
+        self._closed = False
+        self._head_only = False
+
+    async def _next_chunk(self):
+        if self._closed:
+            return None
+        try:
+            chunk = await anext(self._iterator)
+        except StopAsyncIteration:
+            return None
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8")
+        elif isinstance(chunk, (bytes, bytearray, memoryview)):
+            chunk = bytes(chunk)
+        else:
+            raise TypeError(f"Streaming response chunks must be str or bytes, got {type(chunk).__name__}")
+        if len(chunk) > MAX_STREAM_CHUNK:
+            raise ValueError(f"Streaming response chunk exceeds {MAX_STREAM_CHUNK} bytes")
+        return chunk
+
+    async def aclose(self):
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self._iterator, "aclose", None)
+        if close is not None:
+            await close()

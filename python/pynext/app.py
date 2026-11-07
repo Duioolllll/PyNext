@@ -19,7 +19,7 @@ from .cache import CacheBusy, ISRCache
 from .client import compile_client, read_client_artifacts
 from .components import _isr_policy, bind_islands
 from .build import discover, load_manifest
-from .http import BadRequest, Request, Response
+from .http import BadRequest, Request, Response, StreamingResponse
 
 log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
@@ -152,6 +152,47 @@ async def _invoke(fn, **values):
         return await fn(**kwargs)
     result = await asyncio.to_thread(fn, **kwargs)
     return await result if inspect.isawaitable(result) else result
+
+
+async def _send_response(response, send):
+    if not isinstance(response, StreamingResponse):
+        await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
+        await send({"type": "http.response.body", "body": response.body})
+        return
+    try:
+        await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
+        if not response._head_only:
+            while (chunk := await response._next_chunk()) is not None:
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+    finally:
+        await response.aclose()
+
+
+async def _wait_for_disconnect(receive):
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return
+        # A conforming server blocks here after the request body is complete.
+        # Yield defensively if a custom ASGI receive returns extra messages.
+        await asyncio.sleep(0.001)
+
+
+async def _run_while_connected(work, receive):
+    task = asyncio.create_task(work)
+    disconnect = asyncio.create_task(_wait_for_disconnect(receive))
+    try:
+        done, _ = await asyncio.wait((task, disconnect), return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            await task
+        else:
+            await disconnect
+    finally:
+        for pending in (task, disconnect):
+            if not pending.done():
+                pending.cancel()
+        await asyncio.gather(task, disconnect, return_exceptions=True)
 
 
 def _decode_path(path, raw_path=None):
@@ -389,6 +430,9 @@ class App:
             if not isinstance(response, Response):
                 raise TypeError("API handlers must return a Response")
         if request.method == "HEAD":
+            if isinstance(response, StreamingResponse):
+                await response.aclose()
+                response._head_only = True
             response.body = b""
         return response
 
@@ -405,6 +449,7 @@ class App:
                     return
         if scope["type"] != "http":
             raise RuntimeError(f"Unsupported ASGI scope: {scope['type']}")
+        request = None
         try:
             path = _decode_path(scope["path"], scope.get("raw_path"))
         except (ValueError, UnicodeError):
@@ -427,7 +472,6 @@ class App:
                     if not message.get("more_body", False):
                         request = Request(scope["method"].upper(), path, scope.get("query_string", b""),
                                           tuple(scope.get("headers", [])), b"".join(chunks))
-                        response = await self.dispatch(request)
                         break
             except BadRequest as exc:
                 log.info("Bad request: %s", exc)
@@ -435,10 +479,25 @@ class App:
             except Exception:
                 log.exception("Request failed")
                 response = Response("Internal Server Error", status=500)
+        if request is not None:
+            async def dispatch_and_send():
+                try:
+                    result = await self.dispatch(request)
+                except BadRequest as exc:
+                    log.info("Bad request: %s", exc)
+                    result = Response("Bad Request", status=400)
+                except Exception:
+                    log.exception("Request failed")
+                    result = Response("Internal Server Error", status=500)
+                if scope["method"].upper() == "HEAD":
+                    result.body = b""
+                await _send_response(result, send)
+
+            await _run_while_connected(dispatch_and_send(), receive)
+            return
         if scope["method"].upper() == "HEAD":
             response.body = b""
-        await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
-        await send({"type": "http.response.body", "body": response.body})
+        await _send_response(response, send)
 
 
 def create_app(root=".", *, production=False):

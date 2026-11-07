@@ -43,6 +43,12 @@ def verify_http(base):
     with urlopen(request, timeout=10) as response:
         assert response.status == 201
         assert json.loads(response.read()) == {"name": "Smoke"}
+    with urlopen(base + "/api/stream", timeout=10) as response:
+        assert response.status == 200
+        assert response.headers.get("content-type") == "application/x-ndjson"
+        assert [json.loads(line) for line in response.read().splitlines()] == [
+            {"phase": "started"}, {"phase": "finished"}
+        ]
 
 
 def _free_port():

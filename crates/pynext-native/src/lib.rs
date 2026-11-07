@@ -16,11 +16,12 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{mpsc as tokio_mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tower_service::Service as TowerService;
 
 #[pyclass(name = "Router")]
@@ -341,6 +342,7 @@ fn render(py: Python<'_>, tree_json: &str) -> PyResult<String> {
 struct ServerState {
     callback: Py<PyAny>,
     capacity: Arc<Semaphore>,
+    waiting_capacity: Arc<Semaphore>,
     acquire_timeout: Duration,
     body_capacity: Arc<Semaphore>,
     body_timeout: Duration,
@@ -348,6 +350,92 @@ struct ServerState {
     public_assets: HashMap<String, PublicAsset>,
     client_assets: HashMap<String, Bytes>,
     isr_cache: Arc<PageCache>,
+}
+
+#[pyclass(name = "_RequestCancellation")]
+struct RequestCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+#[pymethods]
+impl RequestCancellation {
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+enum BridgeBody {
+    Buffered(Vec<u8>),
+    Streaming(Py<PyAny>),
+}
+
+fn close_stream(stream: Arc<Py<PyAny>>) {
+    tokio::task::spawn_blocking(move || {
+        Python::with_gil(|py| {
+            let _ = stream.bind(py).call_method0("close");
+        });
+    });
+}
+
+fn streaming_body(stream: Py<PyAny>, permit: OwnedSemaphorePermit) -> Body {
+    let stream = Arc::new(stream);
+    let (sender, receiver) = tokio_mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+    let failed = Arc::new(AtomicBool::new(false));
+    let producer_failed = Arc::clone(&failed);
+    tokio::spawn(async move {
+        let _permit = permit;
+        loop {
+            let slot = match tokio::time::timeout(Duration::from_secs(30), sender.reserve()).await {
+                Ok(Ok(slot)) => slot,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    producer_failed.store(true, Ordering::Release);
+                    break;
+                }
+            };
+            let next_stream = Arc::clone(&stream);
+            let next = tokio::task::spawn_blocking(move || {
+                Python::with_gil(|py| {
+                    next_stream
+                        .bind(py)
+                        .call_method0("next_chunk")?
+                        .extract::<Option<Vec<u8>>>()
+                })
+            });
+            tokio::select! {
+                _ = sender.closed() => break,
+                result = next => match result {
+                    Ok(Ok(Some(chunk))) => { slot.send(Ok(Bytes::from(chunk))); }
+                    Ok(Ok(None)) => break,
+                    _ => {
+                        slot.send(Err(std::io::Error::other("PyNext response stream failed")));
+                        break;
+                    }
+                }
+            }
+        }
+        close_stream(stream);
+    });
+    let body =
+        futures_util::stream::unfold((receiver, failed), |(mut receiver, failed)| async move {
+            match receiver.recv().await {
+                Some(item) => Some((item, (receiver, failed))),
+                None if failed.swap(false, Ordering::AcqRel) => Some((
+                    Err(std::io::Error::other("PyNext response stream stalled")),
+                    (receiver, failed),
+                )),
+                None => None,
+            }
+        });
+    Body::from_stream(body)
 }
 
 const MAX_REQUEST_BODY: usize = 1_048_576;
@@ -613,8 +701,12 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     // Wait briefly for a slot instead of rejecting the moment the server is
     // busy: a burst that clears within the timeout degrades gracefully, and
     // only sustained overload gets a 503 with Retry-After. Waiting requests
-    // hold a Tokio task, not a Python worker thread, and the body permit was
-    // already released above, so waiting cannot starve body intake.
+    // hold a Tokio task, not a Python worker thread. Bound this queue too:
+    // each waiter can already hold a fully buffered request body.
+    let waiting = match state.waiting_capacity.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return busy_response(),
+    };
     let permit = match tokio::time::timeout(
         state.acquire_timeout,
         state.capacity.clone().acquire_owned(),
@@ -624,6 +716,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         Ok(Ok(permit)) => permit,
         _ => return busy_response(),
     };
+    drop(waiting);
     let method = parts.method.to_string();
     let path = parts.uri.path().to_string();
     let query = parts.uri.query().unwrap_or("").as_bytes().to_vec();
@@ -632,33 +725,55 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         .iter()
         .map(|(k, v)| (k.as_str().as_bytes().to_vec(), v.as_bytes().to_vec()))
         .collect();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancellation));
     let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        Python::with_gil(|py| {
+        let result = Python::with_gil(|py| {
             let cb = state.callback.bind(py);
+            let token = Py::new(
+                py,
+                RequestCancellation {
+                    cancelled: cancellation,
+                },
+            )?;
             let result = cb.call1((
                 method,
                 path,
                 PyBytes::new(py, &query),
                 headers,
                 PyBytes::new(py, &body),
+                token,
             ))?;
-            result.extract::<(u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)>()
-        })
+            let (status, headers, body) =
+                result.extract::<(u16, Vec<(Vec<u8>, Vec<u8>)>, Py<PyAny>)>()?;
+            let body = if body.bind(py).is_instance_of::<PyBytes>() {
+                BridgeBody::Buffered(body.bind(py).extract::<Vec<u8>>()?)
+            } else {
+                BridgeBody::Streaming(body)
+            };
+            Ok::<_, PyErr>((status, headers, body))
+        });
+        (result, permit)
     })
     .await;
     match result {
-        Ok(Ok((status, headers, body))) => {
+        Ok((Ok((status, headers, body)), permit)) => {
             let Ok(status) = StatusCode::from_u16(status) else {
+                if let BridgeBody::Streaming(stream) = body {
+                    close_stream(Arc::new(stream));
+                }
                 return plain_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
             };
-            let mut response = AxumResponse::new(Body::from(body));
+            let mut response = AxumResponse::new(Body::empty());
             *response.status_mut() = status;
             for (key, value) in headers {
                 let (Ok(key), Ok(value)) = (
                     HeaderName::from_bytes(&key),
                     HeaderValue::from_bytes(&value),
                 ) else {
+                    if let BridgeBody::Streaming(stream) = body {
+                        close_stream(Arc::new(stream));
+                    }
                     return plain_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Internal Server Error",
@@ -666,6 +781,13 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 };
                 response.headers_mut().append(key, value);
             }
+            *response.body_mut() = match body {
+                BridgeBody::Buffered(body) => {
+                    drop(permit);
+                    Body::from(body)
+                }
+                BridgeBody::Streaming(stream) => streaming_body(stream, permit),
+            };
             response
         }
         _ => plain_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
@@ -731,11 +853,15 @@ impl NativeServer {
         body_capacity: usize,
         body_timeout_ms: u64,
     ) -> PyResult<Self> {
-        if max_concurrent == 0 {
-            return Err(PyValueError::new_err("max_concurrent must be at least 1"));
+        if max_concurrent == 0 || max_concurrent > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "max_concurrent is outside the supported range",
+            ));
         }
-        if body_capacity == 0 {
-            return Err(PyValueError::new_err("body_capacity must be at least 1"));
+        if body_capacity == 0 || body_capacity > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "body_capacity is outside the supported range",
+            ));
         }
         let isr_cache = isr_cache.inner.clone();
         let public_assets = public_assets
@@ -789,6 +915,7 @@ impl NativeServer {
                 let state = Arc::new(ServerState {
                     callback,
                     capacity: Arc::new(Semaphore::new(max_concurrent)),
+                    waiting_capacity: Arc::new(Semaphore::new(max_concurrent.min(64))),
                     acquire_timeout: Duration::from_millis(acquire_timeout_ms),
                     // Body intake gets fewer slots than Python execution on
                     // purpose: a flood of slow uploads can then only take the
@@ -902,6 +1029,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRouter>()?;
     m.add_class::<PyPageCache>()?;
     m.add_class::<NativeServer>()?;
+    m.add_class::<RequestCancellation>()?;
     m.add_function(wrap_pyfunction!(render, m)?)?;
     Ok(())
 }

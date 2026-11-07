@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [日本語](../ja/manual.md)
 
-本手册适用于 **v0.6.0a1**。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
+本手册适用于开发分支；最新公开版本为 **v0.6.0a1**。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
 
 ## 环境要求与首次运行
 
@@ -11,7 +11,7 @@
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
 cd PyNext
-git checkout v0.6.0a1
+git checkout main
 uv sync --extra dev
 npm ci
 uv run pynext build --dir examples/basic
@@ -72,6 +72,21 @@ async def echo(request):
 
 响应默认使用 Content Security Policy `script-src 'self'; object-src 'none'`。该策略限制浏览器可加载的脚本，添加客户端代码时应予以考虑。响应头和媒体类型中的控制字符会被拒绝。
 
+## API 响应流
+
+向 `StreamingResponse` 传入产生字符串或字节的异步 iterable。ASGI 和 Axum 会依次发送数据块，并在完成、断开或出错时关闭迭代器。单块最多 1 MiB；不要手动设置 `Content-Length` 或 `Transfer-Encoding`，协议帧由服务器管理。Axum 最多排队一个数据块，下一块生成与发送等待分别有 30 秒超时。响应头发出后出错会中断流，无法更改状态码。HEAD 不会消费流。页面 SSR 仍为缓冲式，尚不支持 React/RSC 流式渲染。
+
+~~~python
+from pynext import StreamingResponse, route
+
+@route("GET")
+async def stream():
+    async def chunks():
+        yield "first\n"
+        yield "second\n"
+    return StreamingResponse(chunks(), media_type="text/plain; charset=utf-8")
+~~~
+
 ## SSR、SSG 与 ISR
 
 - `@page()`：每次请求时渲染。
@@ -127,9 +142,9 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 已构建的应用需使用 `create_app(project_path, production=True)`。ASGI 请求超时由所使用的服务器管理。Axum 适配器等待 Python 最多 30 秒，之后请求取消并返回 504。已经在线程中运行的同步函数可能在 504 之后继续执行并产生写入等副作用。请确保写入操作幂等，并为数据库与外部服务设置单独超时。当前没有强制进程隔离；ISR 取消也有相同限制。
 
-流式响应、WebSocket、分布式 ISR、分布式限流、OpenTelemetry 和生产环境加固尚未实现。请参阅[生产路线图](../PRODUCTION_ROADMAP.md)中的计划与验收条件。
+流式 SSR、WebSocket、分布式 ISR、分布式限流、OpenTelemetry 和生产环境加固尚未实现。请参阅[生产路线图](../PRODUCTION_ROADMAP.md)中的计划与验收条件。
 
-两个适配器的请求体上限均为 1 MiB，超出时返回 413。Axum 最多同时接收 64 个请求体，整体读取期限为 10 秒，超时返回 408；请求体接收池或 Python 执行池满时返回 503。无请求体的静态文件和新鲜的 ISR 缓存命中不占用 Python 执行槽。该期限不限制 HTTP 请求头读取时间或连接总数；外部 ASGI 服务器的超时由该服务器管理。非根路径末尾的 `/` 会以 308 重定向。编译后的 island 单个上限为 2 MiB，总计 32 MiB。
+两个适配器的请求体上限均为 1 MiB，超出返回 413。Axum 默认同时接收 16 个请求体、接收期限 10 秒（408），Python 执行槽为 64 个，等待队列上限是执行槽数与 64 中较小的值；队列满返回 503。执行和请求体设置可通过 CLI 调整。HTTP/1.1 请求头读取期限为 10 秒，但连接总数没有限制。外部 ASGI 服务器的超时由其自身管理。非根路径末尾的 `/` 会以 308 重定向。编译后的 island 单个上限为 2 MiB，总计 32 MiB。
 
 ## 测试与故障排查
 

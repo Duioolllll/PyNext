@@ -4,6 +4,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Add async-iterable API streaming for ASGI and Axum, bounded chunks and native backpressure, HTTP/2 framing, disconnect cancellation, and a bounded execution wait queue.
 - Follow the main version line (currently v0.6.0a1); the 0.1.0a0 release line and the v0.1.0-alpha.prealpha tag plan are dropped (see docs/RELEASE_PLAN.md).
 - Route with a trie (static > dynamic > catch-all, backtracking) instead of a linear scan, and wait up to a bounded timeout for a concurrency slot before returning 503 with Retry-After: 1.
 - Make concurrency limits configurable (--max-concurrent, --acquire-timeout-ms, --body-capacity, --body-timeout-ms) with CLI range validation; limit body intake to 16 slots and apply a 10-second header-read deadline.
