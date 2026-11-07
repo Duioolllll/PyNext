@@ -48,6 +48,8 @@ Rust→Python→upstream의 trace 연결과 취소, exporter 중단 시 bounded 
 
 ## 4. 분산 ISR 및 저장소
 
+개발 브랜치는 같은 앱 인스턴스의 ISR 경로를 명시적으로 무효화할 수 있다. 이 기능은 프로세스 로컬이며 아래 분산 저장소·워커 간 무효화의 완료를 뜻하지 않는다.
+
 Redis 등에서 경로·빌드·로케일·정책 버전이 반영된 키, 소유자가 확인 가능한 재생성 lease, 만료·갱신, 무효화와 장애 시 동작을 설계한다. 콘텐츠는 크기 제한·무결성 해시를 적용하고, 필요하면 S3/GCS 같은 객체 저장소의 immutable blob과 원자적 버전 포인터를 분리한다. 오래된 워커가 lease 만료 후 새 결과를 덮어쓰지 못하도록 저장소에서 fencing 또는 조건부 갱신을 검증해야 한다. [Redis 분산 잠금의 안전성](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/).
 
 ### 완료 기준

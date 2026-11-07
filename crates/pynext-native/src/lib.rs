@@ -75,6 +75,10 @@ impl PyPageCache {
         }
     }
 
+    fn remove(&self, key: &str) -> bool {
+        self.inner.remove(key)
+    }
+
     fn insert(
         &self,
         key: &str,

@@ -322,6 +322,19 @@ class App:
             self.modules[key] = _load(self.root, path, self._namespace)
         return self.modules[key]
 
+    async def revalidate(self, path):
+        """Invalidate one decoded ISR path for this app instance."""
+        if not isinstance(path, str):
+            raise TypeError("ISR path must be a string")
+        path = _decode_path(path)
+        if path != "/" and path.endswith("/"):
+            raise ValueError("ISR path must not have a trailing slash")
+        match = self.router.matches(path)
+        if (match is None or self.render_modes.get(match[0]) != "isr" or
+                path in self.public_assets or path in self.static_pages or path in self.client_assets):
+            raise ValueError("Path does not match an ISR page")
+        return await self.isr.invalidate(path)
+
     async def render_page(self, pattern, request, params):
         fn, layouts = self.entries[pattern]
         tree = await _invoke(fn, request=request, params=params)
@@ -374,7 +387,7 @@ class App:
             return Response("Not Found", status=404)
         pattern, raw_params = match
         params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
-        request = Request(request.method, request.path, request.query_string, request.headers, request.body, params)
+        request = Request(request.method, request.path, request.query_string, request.headers, request.body, params, self)
         spec = self.manifest["routes"][pattern]
         entry = self.entries[pattern]
         if self.production and self.render_modes.get(pattern) == "ssg" and path not in self.static_pages:

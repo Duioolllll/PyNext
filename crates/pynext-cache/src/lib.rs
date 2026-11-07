@@ -48,6 +48,16 @@ impl PageCache {
         self.lookup_at(key, Instant::now())
     }
 
+    pub fn remove(&self, key: &str) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = state.entries.remove(key) {
+            state.total_bytes -= entry.body.len();
+            true
+        } else {
+            false
+        }
+    }
+
     fn lookup_at(&self, key: &str, now: Instant) -> CacheResult {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.clock = state.clock.wrapping_add(1);
@@ -136,6 +146,30 @@ impl PageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_updates_capacity_and_is_idempotent() {
+        let cache = PageCache::new(1, 3, 3);
+        assert!(cache.insert(
+            "a".into(),
+            Bytes::from_static(b"one"),
+            Duration::from_secs(10),
+            Duration::ZERO
+        ));
+        assert!(cache.remove("a"));
+        assert!(!cache.remove("a"));
+        assert_eq!(cache.lookup("a"), CacheResult::Miss);
+        assert!(cache.insert(
+            "b".into(),
+            Bytes::from_static(b"two"),
+            Duration::from_secs(10),
+            Duration::ZERO
+        ));
+        assert_eq!(
+            cache.lookup("b"),
+            CacheResult::Fresh(Bytes::from_static(b"two"))
+        );
+    }
 
     #[test]
     fn freshness_transitions_without_sleep() {

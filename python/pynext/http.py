@@ -20,6 +20,13 @@ class Request:
     headers: tuple[tuple[bytes, bytes], ...] = ()
     body: bytes = b""
     params: dict = field(default_factory=dict)
+    _app: object = field(default=None, repr=False, compare=False)
+
+    async def revalidate(self, path):
+        """Invalidate an ISR path in the current app's process-local cache."""
+        if self._app is None:
+            raise RuntimeError("This request is not attached to an app")
+        return await self._app.revalidate(path)
 
     @property
     def query(self):

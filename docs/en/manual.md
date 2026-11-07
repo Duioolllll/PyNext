@@ -109,6 +109,8 @@ SSG and ISR page functions cannot accept `request`. Use them only for public con
 
 A build produces at most 10,000 SSG pages. Development mode renders SSG pages for each request. ISR pages cannot export `generate_static_params()` and permit at most 128 concurrent generation tasks per process.
 
+An authorized API handler can call `await request.revalidate("/news/example")`; code holding an app instance can call `await app.revalidate(path)`. Pass a decoded ISR path without a query string. The result is `True` if a cached entry or in-flight generation was invalidated. Existing requests may still receive an older in-flight result, but that result cannot repopulate the cache. Invalidation is process-local and is not sent to other workers. Authenticate and authorize any endpoint that exposes it.
+
 ## Public files and islands
 
 Public files, SSG pages, and island bundles have a strong SHA-256-based ETag. GET/HEAD support `If-Match` and `If-None-Match`; GET supports one byte `Range` and strong-ETag `If-Range`, returning 206 or 416 when applicable. Multiple or malformed ranges are ignored and return the full representation. Date-based validators and ranges for ISR responses are not implemented.

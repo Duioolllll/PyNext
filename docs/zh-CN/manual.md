@@ -109,6 +109,8 @@ SSG 和 ISR 页面函数不能接收 `request`。它们仅适合公共内容；�
 
 SSG 构建最多生成 10,000 个页面；开发模式下每次请求都会渲染 SSG 页面。ISR 页面不能导出 `generate_static_params()`，每个进程最多并发执行 128 个生成任务。
 
+已授权的 API 处理函数可调用 `await request.revalidate("/news/example")`；持有应用实例的代码可调用 `await app.revalidate(path)`。请传入不含查询字符串、已解码的 ISR 路径。如果移除了缓存或使进行中的生成失效，返回 `True`。已有请求仍可能收到旧生成结果，但该结果不会重新覆盖缓存。失效只作用于当前进程，不会传播到其他工作进程。对外提供此操作的端点需要认证和授权。
+
 ## 公共文件与 islands
 
 公共文件、SSG 页面和 island 包使用基于 SHA-256 内容哈希的强 ETag。GET/HEAD 支持 `If-Match` 与 `If-None-Match`；GET 支持单个字节 `Range` 和强 ETag `If-Range`，适用时返回 206 或 416。多个或格式错误的范围会被忽略并返回完整内容。暂不支持基于日期的验证或 ISR 响应的范围请求。
