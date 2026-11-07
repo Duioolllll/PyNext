@@ -17,6 +17,37 @@
 - 현재 island는 명시적 JS/TS 번들이다. `client_dsl.py`는 제한된 Python 부분집합을 직접 JS로 출력하는 실험이며, 아래의 버전 있는 공통 IR이나 React 컴파일러는 **아직 없다**.
 - 앱은 신뢰하는 코드로 실행한다. 현재 설계는 신뢰할 수 없는 Python/JS 코드 격리 또는 인터넷에 직접 공개 가능한 운영 환경을 제공하지 않는다.
 
+### 현재 Python API 예
+
+`app/catalog/[slug]/page.py`는 경로 매개변수와 서버 렌더링 결과를 사용한다. 참조하는 island의 JS 번들은 앱에서 별도로 제공해야 한다.
+
+```python
+from pynext import h, island, page
+
+@page()
+async def Page(params):
+    return h("main", {}, h("h1", {}, params["slug"]),
+             island("cart", props={"slug": params["slug"]},
+                    fallback=h("p", {}, "Loading cart")))
+```
+
+`app/api/items/route.py`의 예는 JSON 입력 오류를 `BadRequest`로 처리하는 현재 API를 사용한다.
+
+```python
+from pynext import JSONResponse, route
+
+@route("POST")
+async def create(request):
+    payload = await request.json()
+    return JSONResponse({"name": payload["name"]}, status=201)
+```
+
+공개 ISR 페이지에는 `@page(render="isr", revalidate=60, stale=120)`을 사용하고 페이지 매개변수로 `request`를 받지 않는다. `await request.revalidate("/catalog/example")`을 호출하는 관리 API는 앱에서 인증·권한을 검사해야 한다.
+
+### 후속 모듈 경계 — 제안
+
+현행 3개 crate와 Python API를 유지하면서 필요할 때만 분리한다. `pynext-ir`은 버전·제한·직렬화/검증만 소유하고 컴파일러가 디스크나 네트워크를 직접 다루지 않게 한다. `pynext-router`는 경로 정규화와 충돌·매칭, `pynext-cache`는 L1 및 조건부 쓰기 인터페이스, 장래 `pynext-transport`는 연결·본문·역압력, `pynext-observability`는 bounded 계측 경계를 소유한다. PyO3 공개 경계는 `pynext-native`에 모으고 Python 쪽 ASGI·개발 서버는 공통 계약을 사용한다. 이 이름과 분리는 구현 전 제안이며 현재 존재하지 않는 crate가 있다.
+
 ## 2. 요청과 실행 계약
 
 1. 전송 계층은 유효하지 않은 경로와 과도한 본문을 거부한다. Axum은 기본적으로 본문 1 MiB, 본문 수신 16개/10초, Python 실행 64개, 제한된 실행 대기열을 사용한다. 실제 ASGI 서버의 연결·수신 제한은 그 서버 설정으로 따로 적용한다.

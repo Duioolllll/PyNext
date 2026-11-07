@@ -183,7 +183,7 @@ class _RawWSClient:
             if not chunk:
                 raise AssertionError("handshake closed early")
             response += chunk
-        head, _, _ = response.partition(b"\r\n\r\n")
+        head, _, self._pending = response.partition(b"\r\n\r\n")
         assert head.startswith(b"HTTP/1.1 101"), head
         expected = base64.b64encode(
             hashlib.sha1((self.key + self.GUID).encode("ascii")).digest()).decode("ascii")
@@ -214,7 +214,9 @@ class _RawWSClient:
         self.send(2, bytes(data))
 
     def _read_exact(self, count):
-        data = b""
+        # The server may send its first frame in the same TCP read as the
+        # upgrade response, especially when a handler sends immediately.
+        data, self._pending = self._pending[:count], self._pending[count:]
         while len(data) < count:
             chunk = self.sock.recv(count - len(data))
             if not chunk:
