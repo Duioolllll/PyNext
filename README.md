@@ -229,9 +229,12 @@ uv run --with playwright==1.62.0 python -m playwright install chromium
 uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 ```
 
-기초 부하 측정은 `uv run --extra dev python benchmarks/bench.py --mode axum` 또는
-`--mode asgi`로 실행합니다. 이 스크립트는 같은 프로세스에서 클라이언트도
-실행하는 간단한 회귀 측정 도구이며, 프레임워크 간 성능 비교 결과가 아닙니다.
+기초 부하 측정은 `uv run --extra dev python benchmarks/bench.py --mode axum`,
+`--mode uvicorn` 또는 `--mode asgi`로 실행합니다. Axum과 Uvicorn 모드는 모두
+실제 loopback HTTP를 사용하지만 클라이언트와 서버가 같은 프로세스에서 실행됩니다.
+`asgi` 모드는 네트워크를 거치지 않는 ASGITransport이므로 두 HTTP 모드와 수치를
+직접 비교하면 안 됩니다. 이 스크립트는 회귀 측정 도구이며 프레임워크 간 성능 비교
+결과가 아닙니다. 측정 조건과 별도 프로세스 사용법은 [벤치마크 가이드](docs/BENCHMARKING.md)를 참고하세요.
 빌드 후 `--production --path /about`을 추가하면 SSG 경로를 측정합니다.
 
 결과에는 전체 시도와 성공한 2xx 요청의 초당 처리량, 오류 비율, 상태 코드별 건수,
@@ -243,7 +246,8 @@ uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 별도로 실행한 로컬 서버를 측정할 때는 `--base-url http://127.0.0.1:3000`을
 지정합니다. Linux에서는 `--server-pid <PID>`를 더해 해당 서버 프로세스의 CPU
 시간과 단일 코어 기준 사용률을 따로 확인할 수 있습니다. 이는 지정한 한 프로세스와
-그 스레드만 포함하며 자식 워커는 포함하지 않습니다. CI는 프로덕션 모드(`--production`, 빌드된 예제 사용)로 측정한 작은 동시 요청 실험의 측정값을 저장하지만, 환경에 민감한 성능·메모리 회귀의 자동 임계값은 아직 없습니다.
+그 스레드만 포함하며 자식 워커는 포함하지 않습니다. CI는 프로덕션 모드(`--production`, 빌드된 예제 사용)의 Axum/Uvicorn loopback HTTP
+스모크 측정값을 각각 저장하지만, 환경에 민감한 성능·메모리 회귀의 자동 임계값은 아직 없습니다.
 
 벤치마크 수치는 최소 비교 앱과 부분적으로 이식된 경로를 기준으로 하며,
 데이터베이스·실제 사용자 트래픽·완성된 클라이언트 기능을 포함한 운영 서비스의

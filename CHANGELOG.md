@@ -4,6 +4,9 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Add a Uvicorn loopback HTTP benchmark mode alongside Axum, label direct ASGITransport results separately, and test both modes.
+- Verify Python/Rust lockfiles in CI and save separate Axum/Uvicorn HTTP smoke measurements.
+
 ## v0.6.0a2
 
 - Add an interaction-triggered hydration strategy with bounded replay of supported button clicks, plus browser coverage for navigation, mismatch, cleanup, and failures.

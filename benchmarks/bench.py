@@ -6,6 +6,7 @@ import json
 import math
 import os
 import platform
+import socket
 import statistics
 import sys
 import time
@@ -143,6 +144,37 @@ async def measure(client, path, count, concurrency, *, warmup=10, server_pid=Non
     }
 
 
+async def _start_uvicorn_http(app):
+    """Run the same ASGI app over real loopback HTTP rather than ASGITransport."""
+    import uvicorn
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(128)
+        listener.setblocking(False)
+        server = uvicorn.Server(uvicorn.Config(
+            app, host="127.0.0.1", port=listener.getsockname()[1],
+            loop="asyncio", lifespan="off", access_log=False, log_level="error",
+        ))
+        task = asyncio.create_task(server.serve(sockets=[listener]))
+        try:
+            async with asyncio.timeout(10):
+                while not server.started:
+                    if task.done():
+                        await task
+                        raise RuntimeError("Uvicorn stopped before startup")
+                    await asyncio.sleep(0.01)
+        except BaseException:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        return server, task, listener
+    except BaseException:
+        listener.close()
+        raise
+
+
 async def run(mode, count, concurrency, path, production, *, warmup=10, base_url=None, server_pid=None):
     if server_pid is not None:
         if server_pid < 1 or base_url is None:
@@ -153,6 +185,7 @@ async def run(mode, count, concurrency, path, production, *, warmup=10, base_url
 
     app = None
     server = None
+    uvicorn_server = uvicorn_task = uvicorn_socket = None
     if base_url:
         client = httpx.AsyncClient(base_url=base_url, timeout=30)
     else:
@@ -160,16 +193,30 @@ async def run(mode, count, concurrency, path, production, *, warmup=10, base_url
         if mode == "axum":
             server = start_native(app, asyncio.get_running_loop(), port=0)
             client = httpx.AsyncClient(base_url=f"http://{server.address}", timeout=30)
-        else:
+        elif mode == "uvicorn":
+            uvicorn_server, uvicorn_task, uvicorn_socket = await _start_uvicorn_http(app)
+            client = httpx.AsyncClient(
+                base_url=f"http://127.0.0.1:{uvicorn_socket.getsockname()[1]}", timeout=30)
+        elif mode == "asgi":
             client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+        else:
+            raise ValueError(f"Unsupported benchmark mode: {mode}")
     try:
         async with client:
             result = await measure(client, path, count, concurrency, warmup=warmup,
                                    server_pid=server_pid, external=bool(base_url))
-        return {"mode": "external" if base_url else mode, "path": path,
+        transport = ("external_http" if base_url else
+                     "in_process_asgi" if mode == "asgi" else "loopback_http")
+        return {"mode": "external" if base_url else mode, "transport": transport, "path": path,
                 "production": None if base_url else production,
                 "python": platform.python_version(), "platform": platform.platform(), **result}
     finally:
+        if uvicorn_task is not None:
+            uvicorn_server.should_exit = True
+            try:
+                await asyncio.wait_for(uvicorn_task, timeout=15)
+            finally:
+                uvicorn_socket.close()
         if server is not None:
             await asyncio.to_thread(server.stop)
         if app is not None:
@@ -178,7 +225,8 @@ async def run(mode, count, concurrency, path, production, *, warmup=10, base_url
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("asgi", "axum"), default="axum")
+    parser.add_argument("--mode", choices=("asgi", "axum", "uvicorn"), default="axum",
+                        help="asgi uses in-process ASGITransport; axum/uvicorn use loopback HTTP")
     parser.add_argument("--requests", type=int, default=1000)
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=10)

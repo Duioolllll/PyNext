@@ -41,7 +41,7 @@ jobs:
           enable-cache: true
 
       - name: Install Python dependencies
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
 
       - name: Install JavaScript dependencies
         run: npm ci
@@ -50,10 +50,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Rust lint
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Run Rust tests
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
 
       - name: Run Python tests
         run: uv run pytest -q
@@ -76,16 +76,17 @@ jobs:
             dist/*.tar.gz
           if-no-files-found: error
 
-      - name: Run bounded load smoke test
+      - name: Run bounded HTTP load smoke tests
         run: |
-          uv run python benchmarks/bench.py --mode axum --production --requests 40 --concurrency 4 --warmup 2 --path /api/users > benchmark.json
-          uv run python -c "import json; result = json.load(open('benchmark.json', encoding='utf-8')); assert result['successful_requests'] == 40 and result['errors'] == 0"
+          uv run python benchmarks/bench.py --mode axum --production --requests 40 --concurrency 4 --warmup 2 --path /api/users > benchmark-axum.json
+          uv run python benchmarks/bench.py --mode uvicorn --production --requests 40 --concurrency 4 --warmup 2 --path /api/users > benchmark-uvicorn.json
+          uv run python -c "import json; results = [json.load(open(name, encoding='utf-8')) for name in ('benchmark-axum.json', 'benchmark-uvicorn.json')]; assert all(r['successful_requests'] == 40 and r['errors'] == 0 and r['transport'] == 'loopback_http' for r in results)"
 
       - name: Save benchmark measurements
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-${{ runner.os }}
-          path: benchmark.json
+          path: benchmark-*.json
 
       - name: Install Chromium (Linux)
         if: runner.os == 'Linux'
