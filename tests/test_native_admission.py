@@ -45,13 +45,39 @@ def test_slow_request_bodies_do_not_hold_execution_or_static_capacity(tmp_path):
                 assert (await client.get("/health.txt")).text == "healthy"
                 response = await client.get("/api/input")
                 assert response.status_code == 200 and response.json() == {"ok": True}
+                # Which partials actually hold a body slot is a scheduling
+                # race: the server dispatches the 64 connections in no
+                # guaranteed order, so connections[0] may have been
+                # rejected with an immediate 503 instead of holding a
+                # slot. A rejected connection already has its 503 status
+                # line buffered; a slot holder has sent nothing yet. Probe
+                # the earliest connections to find two confirmed holders:
+                # one to close (frees its slot) and one to keep open for
+                # the 408 assertion below.
+                async def holds_slot(index):
+                    reader, _ = connections[index]
+                    try:
+                        await asyncio.wait_for(reader.readline(), timeout=0.5)
+                        return False
+                    except asyncio.TimeoutError:
+                        return True
+
+                holders = []
+                probe = 0
+                while len(holders) < 2 and probe < len(connections):
+                    batch = list(range(probe, min(probe + 8, len(connections))))
+                    results = await asyncio.gather(
+                        *(holds_slot(i) for i in batch)
+                    )
+                    holders.extend(
+                        i for i, held in zip(batch, results) if held
+                    )
+                    probe += 8
+                assert len(holders) >= 2, holders
+                close_index, timeout_index = holders[0], holders[1]
                 # Closing a partial upload must promptly return its intake slot.
-                # Only the earliest partials hold a body slot (body_capacity
-                # defaults to 16), so close one of those: the last connection
-                # never acquired a slot and closing it would free nothing.
-                # connections[0] stays open for the 408 assertion below.
-                connections[1][1].close()
-                await connections[1][1].wait_closed()
+                connections[close_index][1].close()
+                await connections[close_index][1].wait_closed()
                 deadline = asyncio.get_running_loop().time() + 3
                 while True:
                     response = await client.post("/api/input", content=b"x")
@@ -59,9 +85,9 @@ def test_slow_request_bodies_do_not_hold_execution_or_static_capacity(tmp_path):
                         break
                     assert response.status_code == 503 and asyncio.get_running_loop().time() < deadline
                     await asyncio.sleep(0.05)
-                first_line = await asyncio.wait_for(connections[0][0].readline(), timeout=15)
+                first_line = await asyncio.wait_for(connections[timeout_index][0].readline(), timeout=15)
                 assert first_line.startswith(b"HTTP/1.1 408 "), first_line
-                headers = await asyncio.wait_for(connections[0][0].readuntil(b"\r\n\r\n"), timeout=2)
+                headers = await asyncio.wait_for(connections[timeout_index][0].readuntil(b"\r\n\r\n"), timeout=2)
                 assert b"connection: close\r\n" in headers.lower()
                 assert (await client.post("/api/input", content=b"x" * 1_048_577)).status_code == 413
                 assert (await client.request("GET", "/health.txt", content=b"x" * 1_048_577)).status_code == 413
