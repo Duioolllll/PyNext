@@ -182,7 +182,10 @@ mod tests {
         );
         // The expired entry is gone: a later lookup is a miss, its bytes no
         // longer count, and it cannot be evicted in place of a live entry.
-        assert_eq!(cache.lookup_at("/a", now + Duration::from_secs(5)), CacheResult::Miss);
+        assert_eq!(
+            cache.lookup_at("/a", now + Duration::from_secs(5)),
+            CacheResult::Miss
+        );
         let state = cache.state.lock().unwrap();
         assert!(!state.entries.contains_key("/a"));
         assert_eq!(state.total_bytes, 3);

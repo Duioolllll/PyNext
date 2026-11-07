@@ -3,12 +3,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// Parameter names compare after stripping `-`: `[my-id]` and `[my_id]` name
-/// the same slot, so they must not be reported as different slug names.
+/// Parameter names compare after stripping `-` and `_`: `[my-id]` and
+/// `[my_id]` name the same slot, so they must not be reported as different
+/// slug names.
 fn comparable(name: &str) -> String {
-    name.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect()
+    name.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
 }
 
 #[derive(Debug, Default)]

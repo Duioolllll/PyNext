@@ -7,7 +7,7 @@ use axum::{
     Router as AxumRouter,
 };
 use http_body_util::BodyExt as _;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use pynext_cache::{CacheResult, PageCache};
 use pynext_router::Router;
@@ -16,8 +16,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::{oneshot, Semaphore};
@@ -420,15 +420,16 @@ fn busy_response() -> AxumResponse<Body> {
 /// connection. Identical duplicates are one value and pass; anything
 /// unparsable or disagreeing is a conflict.
 ///
-/// This check is NOT dead code even though hyper rejects the plain case
-/// itself: for an ordinary request hyper's parser turns conflicting
-/// `Content-Length` values into an automatic 400 before dispatch ever runs.
-/// The check only becomes the deciding layer when `Transfer-Encoding:
-/// chunked` comes first — then hyper skips its `Content-Length` framing
-/// check and leaves the headers in the map, so a TE+CL mismatch (a classic
-/// request-smuggling shape) would otherwise reach the handler. Keep this
-/// check even if the plain-case test below looks like it only exercises
-/// hyper: see `test_transfer_encoding_first_conflicting_content_length_is_bad_request`.
+/// This check is a backstop, not the deciding layer in the cases the tests
+/// cover: for an ordinary request hyper's parser turns conflicting
+/// `Content-Length` values into an automatic 400 before dispatch ever runs,
+/// and when `Transfer-Encoding: chunked` is present hyper drops
+/// `Content-Length` entirely (it removes earlier CL headers and skips later
+/// ones), so the request is framed as chunked and the conflicting values
+/// never reach dispatch — see
+/// `test_transfer_encoding_wins_over_conflicting_content_length`. Keep the
+/// check anyway: it is the layer that catches conflicting values if hyper's
+/// parsing ever lets them through.
 fn conflicting_content_length(headers: &HeaderMap) -> bool {
     let mut values = std::collections::HashSet::new();
     for value in headers.get_all(header::CONTENT_LENGTH).iter() {
@@ -500,15 +501,16 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 return close_with_unread_body(busy_response(), parts.version);
             }
         };
-        match tokio::time::timeout(state.body_timeout, read_limited_body(body, MAX_REQUEST_BODY))
-            .await
+        match tokio::time::timeout(
+            state.body_timeout,
+            read_limited_body(body, MAX_REQUEST_BODY),
+        )
+        .await
         {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
                 let (status, message) = match error {
-                    BodyReadError::TooLarge => {
-                        (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large")
-                    }
+                    BodyReadError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
                     BodyReadError::BadRequest => (StatusCode::BAD_REQUEST, "Bad Request"),
                 };
                 return close_with_unread_body(plain_response(status, message), parts.version);
@@ -715,6 +717,7 @@ struct NativeServer {
 impl NativeServer {
     #[new]
     #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         callback: Py<PyAny>,
         host: &str,
@@ -836,7 +839,10 @@ impl NativeServer {
                             // applies to the HTTP/1.1 side via `.http1()`.
                             connections.spawn(async move {
                                 let mut builder = AutoBuilder::new(TokioExecutor::new());
-                                builder.http1().header_read_timeout(HEADER_READ_TIMEOUT);
+                                builder
+                                    .http1()
+                                    .timer(TokioTimer::new())
+                                    .header_read_timeout(HEADER_READ_TIMEOUT);
                                 let _ = builder
                                     .serve_connection(TokioIo::new(stream), service)
                                     .await;

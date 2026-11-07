@@ -252,9 +252,10 @@ def test_static_pages_carry_cache_control(tmp_path):
 # NOTE: this plain conflicting-Content-Length case is rejected by hyper's
 # parser with an automatic 400 before dispatch ever runs, so it verifies
 # hyper's behaviour, not the dispatch check. The dispatch check
-# (conflicting_content_length) is the backstop for the Transfer-Encoding
-# first edge case covered by the next test, where hyper skips its own
-# framing check and leaves the headers in the map.
+# (conflicting_content_length) is a backstop for the case where conflicting
+# values ever reach dispatch; when Transfer-Encoding is present hyper drops
+# Content-Length entirely (see the next test), so the check never sees them
+# there either.
 def test_conflicting_content_length_is_bad_request(tmp_path):
     route = tmp_path / "app" / "api" / "input"
     route.mkdir(parents=True)
@@ -288,14 +289,14 @@ def test_conflicting_content_length_is_bad_request(tmp_path):
     asyncio.run(run())
 
 
-def test_transfer_encoding_first_conflicting_content_length_is_bad_request(tmp_path):
-    # When Transfer-Encoding comes first, hyper skips its own
-    # Content-Length framing check and leaves both headers in the map, so
-    # the dispatch check (conflicting_content_length) is the only layer
-    # that turns this TE+CL mismatch — a request-smuggling shape — into a
-    # clean 400 instead of letting it reach the handler. The `connection:
-    # close` header is added by dispatch's close_with_unread_body, which
-    # is how this 400 is told apart from hyper's automatic parse-error 400.
+def test_transfer_encoding_wins_over_conflicting_content_length(tmp_path):
+    # RFC 7230 section 3.3.3: Transfer-Encoding overrides Content-Length.
+    # hyper implements that by dropping Content-Length entirely when
+    # Transfer-Encoding is present (it removes earlier CL headers and skips
+    # later ones), so the conflicting values never reach dispatch and the
+    # request is framed as chunked. The handler therefore runs normally —
+    # there is no request-smuggling ambiguity to reject, and a 400 here
+    # would be wrong.
     route = tmp_path / "app" / "api" / "input"
     route.mkdir(parents=True)
     (route / "route.py").write_text(
@@ -319,9 +320,21 @@ def test_transfer_encoding_first_conflicting_content_length_is_bad_request(tmp_p
                 )
                 await writer.drain()
                 first_line = await asyncio.wait_for(reader.readline(), timeout=5)
-                assert first_line.startswith(b"HTTP/1.1 400 "), first_line
-                headers = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
-                assert b"connection: close\r\n" in headers.lower()
+                assert first_line.startswith(b"HTTP/1.1 200 "), first_line
+                headers = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=5
+                )
+                length = int(
+                    next(
+                        line.split(b":", 1)[1].strip()
+                        for line in headers.split(b"\r\n")
+                        if line.lower().startswith(b"content-length:")
+                    )
+                )
+                body = await asyncio.wait_for(
+                    reader.readexactly(length), timeout=5
+                )
+                assert b'"ok":true' in body, body
             finally:
                 writer.close()
                 await writer.wait_closed()
