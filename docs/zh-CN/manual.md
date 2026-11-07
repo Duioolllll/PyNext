@@ -145,7 +145,7 @@ uv run --with playwright==1.62.0 python -m playwright install chromium
 uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 ~~~
 
-运行 `uv run --extra dev python benchmarks/bench.py --mode axum --requests 100 --concurrency 4` 可执行小规模闭环负载检查。结果分别记录所有尝试和成功的 2xx 请求每秒数量、错误与状态码、全部及成功请求的 p50/p95/p99、响应大小、CPU 和峰值 RSS。默认模式的 CPU 和进程生命周期峰值 RSS 同时包含服务器与负载生成器，并非仅服务器数据。对单独运行的本地服务器可指定 `--base-url http://127.0.0.1:3000`；在 Linux 上还可用 `--server-pid <PID>` 单独采样该进程及其线程的 CPU，不包括子工作进程。CI 会保存小规模负载结果，但尚未设置性能或内存回归自动阈值。
+运行 `uv run --extra dev python benchmarks/bench.py --mode axum --requests 100 --concurrency 4` 可执行小规模闭环负载检查。结果分别记录所有尝试和成功的 2xx 请求每秒数量、错误与状态码、全部及成功请求的 p50/p95/p99、响应大小、CPU 和峰值 RSS。默认模式的 CPU 和进程生命周期峰值 RSS 同时包含服务器与负载生成器，并非仅服务器数据。对单独运行的本地服务器可指定 `--base-url http://127.0.0.1:3000`；在 Linux 上还可用 `--server-pid <PID>` 单独采样该进程及其线程的 CPU，不包括子工作进程。CI 会保存以生产模式（`--production`，使用已构建的示例）测得的小规模负载结果，但尚未设置性能或内存回归自动阈值。
 
 - 若提示源码已更改，请重新执行 `pynext build`。
 - 若找不到 esbuild，请在仓库根目录运行 `npm ci`，或通过 `PYNEXT_ESBUILD` 指定可执行文件。

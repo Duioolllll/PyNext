@@ -145,7 +145,7 @@ uv run --with playwright==1.62.0 python -m playwright install chromium
 uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 ~~~
 
-`uv run --extra dev python benchmarks/bench.py --mode axum --requests 100 --concurrency 4`로 작은 폐쇄형 부하 검사를 실행합니다. 전체 시도와 성공한 2xx 요청의 초당 처리량, 오류·상태 코드, 전체·성공 요청의 p50/p95/p99, 응답 크기, CPU와 최대 RSS를 따로 기록합니다. 기본 모드의 CPU와 프로세스 생애 최대 RSS에는 서버와 부하 생성기가 모두 포함됩니다. 별도 로컬 서버는 `--base-url http://127.0.0.1:3000`으로 지정하며 Linux에서는 `--server-pid <PID>`로 해당 프로세스와 스레드의 CPU를 따로 측정할 수 있습니다. 자식 워커는 포함되지 않습니다. CI는 작은 부하 결과를 저장하지만 성능·메모리 회귀의 자동 임계값은 아직 적용하지 않습니다.
+`uv run --extra dev python benchmarks/bench.py --mode axum --requests 100 --concurrency 4`로 작은 폐쇄형 부하 검사를 실행합니다. 전체 시도와 성공한 2xx 요청의 초당 처리량, 오류·상태 코드, 전체·성공 요청의 p50/p95/p99, 응답 크기, CPU와 최대 RSS를 따로 기록합니다. 기본 모드의 CPU와 프로세스 생애 최대 RSS에는 서버와 부하 생성기가 모두 포함됩니다. 별도 로컬 서버는 `--base-url http://127.0.0.1:3000`으로 지정하며 Linux에서는 `--server-pid <PID>`로 해당 프로세스와 스레드의 CPU를 따로 측정할 수 있습니다. 자식 워커는 포함되지 않습니다. CI는 프로덕션 모드(`--production`, 빌드된 예제 사용)로 측정한 작은 부하 결과를 저장하지만 성능·메모리 회귀의 자동 임계값은 아직 적용하지 않습니다.
 
 - 소스가 변경되었다는 오류가 나면 `pynext build`를 다시 실행합니다.
 - esbuild가 없으면 저장소 루트에서 `npm ci`를 실행하거나 `PYNEXT_ESBUILD`에 실행 파일을 지정합니다.

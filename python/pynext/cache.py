@@ -52,7 +52,8 @@ class ISRCache:
                     response = await render()
                     if response.status != 200:
                         raise ValueError("ISR can cache only successful page responses")
-                    self.store.insert(key, response.body, policy["revalidate"], policy["stale"])
+                    if not self.store.insert(key, response.body, policy["revalidate"], policy["stale"]):
+                        log.warning("ISR cache insert failed for %s; page was served but not cached", key)
                     return response.body
             # Request-local context must not leak into a publicly shared render.
             task = asyncio.create_task(generate(), context=contextvars.Context())

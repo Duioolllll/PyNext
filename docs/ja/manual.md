@@ -145,7 +145,7 @@ uv run --with playwright==1.62.0 python -m playwright install chromium
 uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 ~~~
 
-`uv run --extra dev python benchmarks/bench.py --mode axum --requests 100 --concurrency 4` で小規模な閉ループ負荷テストを実行できます。全試行と成功した 2xx リクエストの秒間処理数、エラー・ステータス、全試行と成功分の p50/p95/p99、応答サイズ、CPU、最大 RSS を分けて記録します。既定モードの CPU とプロセス生存期間中の最大 RSS にはサーバーと負荷生成側の両方が含まれます。別のローカルサーバーには `--base-url http://127.0.0.1:3000` を指定し、Linux では `--server-pid <PID>` でそのプロセスとスレッドの CPU を個別に測定できます。子ワーカーは含みません。CI は小規模負荷の結果を保存しますが、性能・メモリ回帰の自動しきい値はまだありません。
+`uv run --extra dev python benchmarks/bench.py --mode axum --requests 100 --concurrency 4` で小規模な閉ループ負荷テストを実行できます。全試行と成功した 2xx リクエストの秒間処理数、エラー・ステータス、全試行と成功分の p50/p95/p99、応答サイズ、CPU、最大 RSS を分けて記録します。既定モードの CPU とプロセス生存期間中の最大 RSS にはサーバーと負荷生成側の両方が含まれます。別のローカルサーバーには `--base-url http://127.0.0.1:3000` を指定し、Linux では `--server-pid <PID>` でそのプロセスとスレッドの CPU を個別に測定できます。子ワーカーは含みません。CI は本番モード（`--production`、ビルド済みサンプルを使用）で測定した小規模負荷の結果を保存しますが、性能・メモリ回帰の自動しきい値はまだありません。
 
 - ソースの変更を指摘されたら `pynext build` を再実行します。
 - esbuild が見つからない場合はリポジトリのルートで `npm ci` を実行するか、`PYNEXT_ESBUILD` に実行ファイルを指定します。

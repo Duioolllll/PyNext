@@ -7,7 +7,7 @@ import pytest
 
 from pynext import _native, Response, create_app, h
 from pynext.build import write_manifest
-from pynext.server import start_native
+from pynext.server import serve, start_native
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "basic"
 
@@ -178,6 +178,67 @@ def test_build_rejects_stale_sources(tmp_path):
     source.write_text(source.read_text().replace("one", "two"))
     with pytest.raises(ValueError, match="changed since build"):
         create_app(tmp_path, production=True)
+
+
+def test_serve_stops_server_and_closes_isr_when_cancelled(tmp_path, monkeypatch):
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "page.py").write_text('from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "ok")\n')
+    app = create_app(tmp_path)
+    servers = []
+
+    def capture_start_native(*args, **kwargs):
+        server = start_native(*args, **kwargs)
+        servers.append(server)
+        return server
+
+    monkeypatch.setattr("pynext.server.start_native", capture_start_native)
+
+    async def run():
+        task = asyncio.create_task(serve(app, "127.0.0.1", 0))
+        for _ in range(100):
+            if servers:
+                break
+            await asyncio.sleep(0.05)
+        assert servers, "serve did not start a server"
+        address = servers[0].address
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{address}", timeout=5) as client:
+                assert (await client.get("/")).status_code == 200
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert app.isr._closed
+        with pytest.raises(httpx.ConnectError):
+            async with httpx.AsyncClient(base_url=f"http://{address}", timeout=5) as client:
+                await client.get("/")
+
+    asyncio.run(run())
+
+
+def test_native_rejects_query_with_more_than_1000_fields(tmp_path):
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "route.py").write_text(
+        'from pynext import JSONResponse, route\n'
+        '@route("GET")\n'
+        'async def get(request): return JSONResponse(request.query)\n'
+    )
+
+    async def run():
+        app = create_app(tmp_path)
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=5) as client:
+                query = "&".join(f"x{i}=1" for i in range(1001))
+                assert (await client.get("/?" + query)).status_code == 400
+                assert (await client.get("/?x=1")).status_code == 200
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+
+    asyncio.run(run())
 
 
 def test_page_and_api_path_conflict_fails_build(tmp_path):

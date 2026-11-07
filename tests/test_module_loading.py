@@ -1,6 +1,9 @@
 import asyncio
 import gc
+import importlib
+import importlib.util
 import os
+import py_compile
 import sys
 import weakref
 
@@ -76,6 +79,43 @@ def test_new_app_reads_changed_helper_even_when_timestamp_and_size_match(tmp_pat
     second = create_app(tmp_path)
     assert first._module("app/page.py").MESSAGE == "one"
     assert second._module("app/page.py").MESSAGE == "two"
+
+
+def test_reload_of_directly_loaded_module_reads_fresh_source(tmp_path):
+    directory = tmp_path / "app"
+    directory.mkdir()
+    source = directory / "page.py"
+    source.write_text('from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "one")\n', encoding="utf-8")
+    app = create_app(tmp_path)
+    module = app._module("app/page.py")
+    assert module.Page()["children"][0]["value"] == "one"
+    before = source.stat()
+    # Plant a bytecode cache for the old source, then rewrite the source with
+    # the same size and mtime: a timestamp-based loader would reuse the stale
+    # bytecode, while the fresh loader must recompile the new source.
+    py_compile.compile(str(source), cfile=importlib.util.cache_from_source(str(source)), doraise=True)
+    source.write_text('from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "two")\n', encoding="utf-8")
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    reloaded = importlib.reload(module)
+    assert reloaded.Page()["children"][0]["value"] == "two"
+
+
+def test_module_cache_key_ignores_letter_case(tmp_path):
+    from pynext.app import _module_key
+    assert _module_key(tmp_path, "app/page.py") == _module_key(tmp_path, "APP/Page.py")
+    assert _module_key(tmp_path, "app/page.py") == _module_key(tmp_path, "app/./page.py")
+
+
+def test_case_variant_module_paths_share_one_loaded_module(tmp_path):
+    probe = tmp_path / "caseprobe"
+    probe.write_text("x", encoding="utf-8")
+    if not (tmp_path / "CASEPROBE").is_file():
+        pytest.skip("filesystem is case-sensitive")
+    directory = tmp_path / "app"
+    directory.mkdir()
+    (directory / "page.py").write_text('from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "ok")\n', encoding="utf-8")
+    app = create_app(tmp_path)
+    assert app._module("app/page.py") is app._module("APP/page.py")
 
 
 def test_modules_are_removed_when_app_is_collected(tmp_path):

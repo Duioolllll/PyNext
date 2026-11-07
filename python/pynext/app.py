@@ -120,6 +120,9 @@ def _load(root, relative, namespace):
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise ValueError(f"Cannot load {relative}")
+    # Keep the fresh loader on the spec so importlib.reload() also recompiles
+    # the current source instead of reusing a timestamp-based bytecode cache.
+    spec.loader = _FreshSourceLoader(name, str(path))
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     setattr(parent, child, module)
@@ -161,6 +164,13 @@ def _decode_path(path, raw_path=None):
             any(part in (".", "..") for part in path.split("/"))):
         raise ValueError("Invalid request path")
     return path
+
+
+def _module_key(root, relative):
+    # Casefold so the same file reached through a different case (e.g.
+    # App/Page.py vs app/page.py on a case-insensitive filesystem) maps to
+    # one cached module instead of being loaded twice.
+    return str((root / relative).resolve()).casefold()
 
 
 class App:
@@ -261,7 +271,7 @@ class App:
             self.client_manifest, self.client_assets = compile_client(self.root, manifest["client_sources"])
 
     def _module(self, path):
-        key = (self.root / path).resolve()
+        key = _module_key(self.root, path)
         if key not in self.modules:
             self.modules[key] = _load(self.root, path, self._namespace)
         return self.modules[key]
@@ -362,7 +372,8 @@ class App:
                             lambda: self.render_page(pattern, None, params),
                         )
                     except CacheBusy:
-                        return Response("Server Busy", status=503)
+                        return Response("Server Busy", status=503,
+                                        headers=[(b"retry-after", b"1")])
                     except TimeoutError:
                         return Response("Gateway Timeout", status=504)
                     response = Response(body, media_type="text/html; charset=utf-8",
