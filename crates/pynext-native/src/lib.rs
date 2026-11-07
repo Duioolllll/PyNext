@@ -388,6 +388,7 @@ struct ServerState {
     client_assets: HashMap<String, Bytes>,
     asset_etags: HashMap<String, HeaderValue>,
     isr_cache: Arc<PageCache>,
+    websocket_router: Router,
     websocket_paths: std::collections::HashSet<String>,
     ws_callback: Option<Py<PyAny>>,
 }
@@ -1065,7 +1066,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         let Some(path) = static_path(parts.uri.path()) else {
             return plain_response(StatusCode::NOT_FOUND, "Not Found");
         };
-        if !state.websocket_paths.contains(&path) {
+        let is_websocket_route = state
+            .websocket_router
+            .matches(&path)
+            .is_some_and(|(pattern, _)| state.websocket_paths.contains(&pattern));
+        if !is_websocket_route {
             return plain_response(StatusCode::NOT_FOUND, "Not Found");
         }
         let mut parts = parts;
@@ -1384,7 +1389,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         callback: Py<PyAny>,
@@ -1402,7 +1407,14 @@ impl NativeServer {
         websocket_paths: Option<Vec<String>>,
         websocket_callback: Option<Py<PyAny>>,
         reuse_port: bool,
+        route_patterns: Option<Vec<String>>,
     ) -> PyResult<Self> {
+        let websocket_paths = websocket_paths.unwrap_or_default();
+        // Route against the complete application trie first. A static HTTP
+        // route must still shadow a dynamic WebSocket route.
+        let websocket_router =
+            Router::new(route_patterns.unwrap_or_else(|| websocket_paths.clone()))
+                .map_err(PyValueError::new_err)?;
         if max_concurrent == 0 || max_concurrent > Semaphore::MAX_PERMITS {
             return Err(PyValueError::new_err(
                 "max_concurrent is outside the supported range",
@@ -1518,7 +1530,8 @@ impl NativeServer {
                         .collect(),
                     asset_etags,
                     isr_cache,
-                    websocket_paths: websocket_paths.unwrap_or_default().into_iter().collect(),
+                    websocket_router,
+                    websocket_paths: websocket_paths.into_iter().collect(),
                     ws_callback: websocket_callback,
                 });
                 let app = AxumRouter::new().fallback(any(dispatch)).with_state(state);

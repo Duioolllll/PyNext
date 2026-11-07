@@ -330,7 +330,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 body_capacity=body_capacity, body_timeout_ms=body_timeout_ms,
                                 websocket_paths=sorted(app.websocket_routes),
                                 websocket_callback=ws_callback,
-                                reuse_port=reuse_port)
+                                reuse_port=reuse_port,
+                                route_patterns=app.router.ordered_routes())
 
 
 async def serve(app, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,

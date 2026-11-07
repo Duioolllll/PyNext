@@ -304,3 +304,74 @@ def test_axum_websocket_echo_and_oversized_close():
             await app.isr.close()
 
     _run(run())
+
+
+def test_dynamic_websocket_route_matches_asgi_and_native(tmp_path):
+    dynamic = tmp_path / "app" / "ws" / "[room]"
+    dynamic.mkdir(parents=True)
+    (dynamic / "route.py").write_text(
+        "from pynext import websocket\n"
+        "@websocket\n"
+        "async def handler(websocket, params):\n"
+        "    await websocket.accept()\n"
+        "    await websocket.send_text(params['room'])\n"
+    )
+    static = tmp_path / "app" / "ws" / "reserved"
+    static.mkdir()
+    (static / "route.py").write_text(
+        "from pynext import route, Response\n"
+        "@route('GET')\n"
+        "def handler():\n"
+        "    return Response('ordinary HTTP route')\n"
+    )
+    catch_all = tmp_path / "app" / "events" / "[[...parts]]"
+    catch_all.mkdir(parents=True)
+    (catch_all / "route.py").write_text(
+        "from pynext import websocket\n"
+        "@websocket\n"
+        "async def handler(websocket, params):\n"
+        "    await websocket.accept()\n"
+        "    await websocket.send_text('/'.join(params['parts']))\n"
+    )
+
+    async def run():
+        app = create_app(tmp_path)
+        conn = _ScriptedConnection([{"type": "websocket.connect"}])
+        await app({"type": "websocket", "path": "/ws/abc", "headers": [],
+                   "query_string": b""}, conn.receive, conn.send)
+        assert conn.sent[:2] == [{"type": "websocket.accept"},
+                                 {"type": "websocket.send", "text": "abc"}]
+        for path, expected in (("/events", ""), ("/events/one/two", "one/two")):
+            catch_conn = _ScriptedConnection([{"type": "websocket.connect"}])
+            await app({"type": "websocket", "path": path, "headers": [],
+                       "query_string": b""}, catch_conn.receive, catch_conn.send)
+            assert catch_conn.sent[:2] == [{"type": "websocket.accept"},
+                                           {"type": "websocket.send", "text": expected}]
+        reserved = _ScriptedConnection([{"type": "websocket.connect"}])
+        await app({"type": "websocket", "path": "/ws/reserved", "headers": [],
+                   "query_string": b""}, reserved.receive, reserved.send)
+        assert reserved.sent == [{"type": "websocket.close", "code": 1008}]
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            def client_checks():
+                client = _RawWSClient(server.address, "/ws/abc")
+                try:
+                    assert client.recv() == (1, b"abc")
+                finally:
+                    client.shutdown()
+                for path, expected in (("/events", b""), ("/events/one/two", b"one/two"),
+                                       ("/ws/%E2%9C%93", "✓".encode())):
+                    client = _RawWSClient(server.address, path)
+                    try:
+                        assert client.recv() == (1, expected)
+                    finally:
+                        client.shutdown()
+                with pytest.raises(AssertionError, match="HTTP/1.1 404"):
+                    _RawWSClient(server.address, "/ws/reserved")
+
+            await asyncio.to_thread(client_checks)
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+
+    _run(run())
