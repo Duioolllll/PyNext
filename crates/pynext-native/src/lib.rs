@@ -349,6 +349,7 @@ struct ServerState {
     static_pages: HashMap<String, Bytes>,
     public_assets: HashMap<String, PublicAsset>,
     client_assets: HashMap<String, Bytes>,
+    asset_etags: HashMap<String, HeaderValue>,
     isr_cache: Arc<PageCache>,
 }
 
@@ -443,6 +444,212 @@ const MAX_REQUEST_BODY: usize = 1_048_576;
 struct PublicAsset {
     body: Bytes,
     content_type: HeaderValue,
+}
+
+fn trim_ows(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t'))
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t'))
+        .map_or(start, |i| i + 1);
+    &value[start..end]
+}
+
+fn tags_match(headers: &HeaderMap, name: HeaderName, etag: &[u8], weak: bool) -> bool {
+    for value in headers.get_all(name).iter() {
+        let input = value.as_bytes();
+        let mut quoted = false;
+        let mut start = 0;
+        let mut parts = Vec::new();
+        for (index, byte) in input.iter().enumerate() {
+            match byte {
+                b'"' => quoted = !quoted,
+                b',' if !quoted => {
+                    parts.push(trim_ows(&input[start..index]));
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        if quoted {
+            continue;
+        }
+        parts.push(trim_ows(&input[start..]));
+        for part in parts {
+            let part = if weak {
+                part.strip_prefix(b"W/").unwrap_or(part)
+            } else {
+                part
+            };
+            if part == b"*" || part == etag {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+enum ByteRange {
+    Ignore,
+    Unsatisfiable,
+    Partial(usize, usize),
+}
+
+fn bounded_number(value: &[u8], ceiling: usize) -> Option<usize> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let maximum = ceiling.saturating_add(1);
+    Some(value.iter().fold(0usize, |number, digit| {
+        number
+            .saturating_mul(10)
+            .saturating_add((digit - b'0') as usize)
+            .min(maximum)
+    }))
+}
+
+fn single_range(value: &[u8], length: usize) -> ByteRange {
+    let Some(equals) = value.iter().position(|b| *b == b'=') else {
+        return ByteRange::Ignore;
+    };
+    let unit = trim_ows(&value[..equals]);
+    let fields = trim_ows(&value[equals + 1..]);
+    if !unit.eq_ignore_ascii_case(b"bytes") || fields.contains(&b',') {
+        return ByteRange::Ignore;
+    }
+    let Some(dash) = fields.iter().position(|b| *b == b'-') else {
+        return ByteRange::Ignore;
+    };
+    let (first, last) = (&fields[..dash], &fields[dash + 1..]);
+    if last.contains(&b'-') || (first.is_empty() && last.is_empty()) {
+        return ByteRange::Ignore;
+    }
+    let start = if first.is_empty() {
+        None
+    } else {
+        bounded_number(first, length)
+    };
+    let end = if last.is_empty() {
+        None
+    } else {
+        bounded_number(last, length)
+    };
+    if (!first.is_empty() && start.is_none()) || (!last.is_empty() && end.is_none()) {
+        return ByteRange::Ignore;
+    }
+    if let Some(start) = start {
+        if end.is_some_and(|end| end < start) {
+            return ByteRange::Ignore;
+        }
+        if start >= length {
+            return ByteRange::Unsatisfiable;
+        }
+        return ByteRange::Partial(start, end.unwrap_or(length - 1).min(length - 1));
+    }
+    let suffix = end.expect("a suffix was validated above");
+    if suffix == 0 || length == 0 {
+        return ByteRange::Unsatisfiable;
+    }
+    ByteRange::Partial(length.saturating_sub(suffix), length - 1)
+}
+
+struct AssetPolicy<'a> {
+    content_type: &'a HeaderValue,
+    etag: &'a HeaderValue,
+    cache_control: &'static str,
+    nosniff: bool,
+    vary: bool,
+}
+
+fn static_response(
+    parts: &axum::http::request::Parts,
+    content: &Bytes,
+    policy: AssetPolicy<'_>,
+) -> AxumResponse<Body> {
+    let length = content.len();
+    let mut status = StatusCode::OK;
+    let mut range = None;
+    let mut content_range = None;
+    if parts.headers.contains_key(header::IF_MATCH)
+        && !tags_match(
+            &parts.headers,
+            header::IF_MATCH,
+            policy.etag.as_bytes(),
+            false,
+        )
+    {
+        status = StatusCode::PRECONDITION_FAILED;
+    } else if parts.headers.contains_key(header::IF_NONE_MATCH)
+        && tags_match(
+            &parts.headers,
+            header::IF_NONE_MATCH,
+            policy.etag.as_bytes(),
+            true,
+        )
+    {
+        status = StatusCode::NOT_MODIFIED;
+    } else if parts.method == axum::http::Method::GET {
+        let ranges: Vec<_> = parts.headers.get_all(header::RANGE).iter().collect();
+        let validators: Vec<_> = parts.headers.get_all(header::IF_RANGE).iter().collect();
+        if ranges.len() == 1
+            && (validators.is_empty()
+                || (validators.len() == 1
+                    && trim_ows(validators[0].as_bytes()) == policy.etag.as_bytes()))
+        {
+            match single_range(ranges[0].as_bytes(), length) {
+                ByteRange::Ignore => {}
+                ByteRange::Unsatisfiable => {
+                    status = StatusCode::RANGE_NOT_SATISFIABLE;
+                    content_range = Some(format!("bytes */{length}"));
+                }
+                ByteRange::Partial(start, end) => {
+                    status = StatusCode::PARTIAL_CONTENT;
+                    range = Some((start, end));
+                    content_range = Some(format!("bytes {start}-{end}/{length}"));
+                }
+            }
+        }
+    }
+    let response_length = match range {
+        Some((start, end)) => end - start + 1,
+        None if status == StatusCode::OK => length,
+        None => 0,
+    };
+    let body = if parts.method == axum::http::Method::HEAD
+        || !matches!(status, StatusCode::OK | StatusCode::PARTIAL_CONTENT)
+    {
+        Body::empty()
+    } else if let Some((start, end)) = range {
+        Body::from(content.slice(start..end + 1))
+    } else {
+        Body::from(content.clone())
+    };
+    let mut builder = AxumResponse::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, policy.content_type.clone())
+        .header(header::ETAG, policy.etag.clone())
+        .header(header::CACHE_CONTROL, policy.cache_control)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(
+            "content-security-policy",
+            "script-src 'self'; object-src 'none'",
+        );
+    if status != StatusCode::NOT_MODIFIED {
+        builder = builder.header(header::CONTENT_LENGTH, response_length.to_string());
+    }
+    if let Some(content_range) = content_range {
+        builder = builder.header(header::CONTENT_RANGE, content_range);
+    }
+    if policy.nosniff {
+        builder = builder.header("x-content-type-options", "nosniff");
+    }
+    if policy.vary {
+        builder = builder.header(header::VARY, "Cookie, Authorization");
+    }
+    builder.body(body).expect("static response is valid")
 }
 
 // Follow the Python adapter's strict single-pass path decoding. Invalid paths
@@ -615,62 +822,43 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     if parts.method == axum::http::Method::GET || parts.method == axum::http::Method::HEAD {
         if let Some(path) = static_path(parts.uri.path()) {
             if let Some(content) = state.client_assets.get(&path) {
-                let body = if parts.method == axum::http::Method::HEAD {
-                    Body::empty()
-                } else {
-                    Body::from(content.clone())
-                };
-                return AxumResponse::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/javascript; charset=utf-8")
-                    .header("content-length", content.len().to_string())
-                    .header("cache-control", "public, max-age=31536000, immutable")
-                    .header("x-content-type-options", "nosniff")
-                    .header(
-                        "content-security-policy",
-                        "script-src 'self'; object-src 'none'",
-                    )
-                    .body(body)
-                    .expect("client asset response is valid");
+                return static_response(
+                    &parts,
+                    content,
+                    AssetPolicy {
+                        content_type: &HeaderValue::from_static("text/javascript; charset=utf-8"),
+                        etag: &state.asset_etags[&path],
+                        cache_control: "public, max-age=31536000, immutable",
+                        nosniff: true,
+                        vary: false,
+                    },
+                );
             }
             if let Some(asset) = state.public_assets.get(&path) {
-                let body = if parts.method == axum::http::Method::HEAD {
-                    Body::empty()
-                } else {
-                    Body::from(asset.body.clone())
-                };
-                return AxumResponse::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", asset.content_type.clone())
-                    .header("content-length", asset.body.len().to_string())
-                    .header("cache-control", "public, max-age=0, must-revalidate")
-                    .header("x-content-type-options", "nosniff")
-                    .header(
-                        "content-security-policy",
-                        "script-src 'self'; object-src 'none'",
-                    )
-                    .body(body)
-                    .expect("public asset response is valid");
+                return static_response(
+                    &parts,
+                    &asset.body,
+                    AssetPolicy {
+                        content_type: &asset.content_type,
+                        etag: &state.asset_etags[&path],
+                        cache_control: "public, max-age=0, must-revalidate",
+                        nosniff: true,
+                        vary: false,
+                    },
+                );
             }
             if let Some(content) = state.static_pages.get(&path) {
-                let length = content.len();
-                let body = if parts.method == axum::http::Method::HEAD {
-                    Body::empty()
-                } else {
-                    Body::from(content.clone())
-                };
-                return AxumResponse::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/html; charset=utf-8")
-                    .header("content-length", length.to_string())
-                    .header("cache-control", "public, max-age=0, must-revalidate")
-                    .header(
-                        "content-security-policy",
-                        "script-src 'self'; object-src 'none'",
-                    )
-                    .header("vary", "Cookie, Authorization")
-                    .body(body)
-                    .expect("static response is valid");
+                return static_response(
+                    &parts,
+                    content,
+                    AssetPolicy {
+                        content_type: &HeaderValue::from_static("text/html; charset=utf-8"),
+                        etag: &state.asset_etags[&path],
+                        cache_control: "public, max-age=0, must-revalidate",
+                        nosniff: false,
+                        vary: true,
+                    },
+                );
             }
             if !parts.headers.contains_key("authorization") && !parts.headers.contains_key("cookie")
             {
@@ -838,7 +1026,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         callback: Py<PyAny>,
@@ -848,6 +1036,7 @@ impl NativeServer {
         public_assets: HashMap<String, (Vec<u8>, String)>,
         client_assets: HashMap<String, Vec<u8>>,
         isr_cache: PyRef<'_, PyPageCache>,
+        asset_etags: HashMap<String, String>,
         max_concurrent: usize,
         acquire_timeout_ms: u64,
         body_capacity: usize,
@@ -863,6 +1052,32 @@ impl NativeServer {
                 "body_capacity is outside the supported range",
             ));
         }
+        if static_pages
+            .keys()
+            .chain(public_assets.keys())
+            .chain(client_assets.keys())
+            .any(|path| !asset_etags.contains_key(path))
+        {
+            return Err(PyValueError::new_err("Missing static asset ETag"));
+        }
+        let asset_etags = asset_etags
+            .into_iter()
+            .map(|(path, etag)| {
+                let bytes = etag.as_bytes();
+                if bytes.len() != 66
+                    || bytes[0] != b'"'
+                    || bytes[65] != b'"'
+                    || !bytes[1..65]
+                        .iter()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+                {
+                    return Err(PyValueError::new_err("Invalid static asset ETag"));
+                }
+                let value = HeaderValue::from_bytes(bytes)
+                    .map_err(|_| PyValueError::new_err("Invalid static asset ETag"))?;
+                Ok((path, value))
+            })
+            .collect::<PyResult<HashMap<_, _>>>()?;
         let isr_cache = isr_cache.inner.clone();
         let public_assets = public_assets
             .into_iter()
@@ -935,6 +1150,7 @@ impl NativeServer {
                         .into_iter()
                         .map(|(path, body)| (path, Bytes::from(body)))
                         .collect(),
+                    asset_etags,
                     isr_cache,
                 });
                 let app = AxumRouter::new().fallback(any(dispatch)).with_state(state);

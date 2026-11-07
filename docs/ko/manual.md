@@ -111,6 +111,8 @@ SSG 빌드는 최대 10,000페이지를 생성하며 개발 모드에서는 요�
 
 ## 공개 파일과 islands
 
+공개 파일·SSG 페이지·island 번들은 SHA-256 내용 해시 기반 강한 ETag를 사용합니다. GET/HEAD는 `If-Match`와 `If-None-Match`를, GET은 단일 바이트 `Range`와 강한 ETag `If-Range`를 지원하며 필요한 경우 206 또는 416을 반환합니다. 다중 또는 잘못된 범위는 무시하고 전체를 반환합니다. 날짜 기반 검증과 ISR 응답의 범위 요청은 미구현입니다.
+
 `public/styles/site.css`는 `/styles/site.css`로 공개됩니다. 빌드는 파일을 스냅샷하고 무결성을 검사하지만 운영 서버 시작에도 원본 파일이 필요합니다. 숨김 파일, 심볼릭 링크, 충돌 경로는 거부합니다. 개발 모드에서 공개 파일을 바꾼 뒤에도 서버를 재시작하세요.
 
 Island는 Python 선언과 `islands/`의 JavaScript 또는 TypeScript 모듈을 연결합니다.

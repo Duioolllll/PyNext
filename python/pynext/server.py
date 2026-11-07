@@ -155,7 +155,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                 else response.body)
         return response.status, response.headers, body
 
-    return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store,
+    return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store, app.asset_etags,
                                 max_concurrent=max_concurrent, acquire_timeout_ms=acquire_timeout_ms,
                                 body_capacity=body_capacity, body_timeout_ms=body_timeout_ms)
 

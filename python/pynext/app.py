@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib.machinery
 import importlib.util
 import inspect
@@ -20,6 +21,7 @@ from .client import compile_client, read_client_artifacts
 from .components import _isr_policy, bind_islands
 from .build import discover, load_manifest
 from .http import BadRequest, Request, Response, StreamingResponse
+from .static import asset_response
 
 log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
@@ -310,6 +312,9 @@ class App:
         else:
             self.public_assets = read_public_sources(self.root, manifest["public_sources"])
             self.client_manifest, self.client_assets = compile_client(self.root, manifest["client_sources"])
+        assets = {**self.static_pages, **self.client_assets,
+                  **{path: body for path, (body, _) in self.public_assets.items()}}
+        self.asset_etags = {path: f'"{hashlib.sha256(body).hexdigest()}"' for path, body in assets.items()}
 
     def _module(self, path):
         key = _module_key(self.root, path)
@@ -351,13 +356,9 @@ class App:
                 return Response(b"", status=204, headers=[(b"allow", allow)], media_type=None)
             if request.method not in {"GET", "HEAD"}:
                 return Response("Method Not Allowed", status=405, headers=[(b"allow", allow)])
-            response = Response(self.client_assets[path], media_type="text/javascript; charset=utf-8", headers=[
-                (b"cache-control", b"public, max-age=31536000, immutable"),
-                (b"x-content-type-options", b"nosniff"),
-            ])
-            if request.method == "HEAD":
-                response.body = b""
-            return response
+            return asset_response(request, self.client_assets[path], "text/javascript; charset=utf-8",
+                                  self.asset_etags[path], cache_control=b"public, max-age=31536000, immutable",
+                                  extra_headers=[(b"x-content-type-options", b"nosniff")])
         if path in self.public_assets:
             allow = b"GET, HEAD, OPTIONS"
             if request.method == "OPTIONS":
@@ -365,13 +366,9 @@ class App:
             if request.method not in {"GET", "HEAD"}:
                 return Response("Method Not Allowed", status=405, headers=[(b"allow", allow)])
             body, media_type = self.public_assets[path]
-            response = Response(body, media_type=media_type, headers=[
-                (b"cache-control", b"public, max-age=0, must-revalidate"),
-                (b"x-content-type-options", b"nosniff"),
-            ])
-            if request.method == "HEAD":
-                response.body = b""
-            return response
+            return asset_response(request, body, media_type, self.asset_etags[path],
+                                  cache_control=b"public, max-age=0, must-revalidate",
+                                  extra_headers=[(b"x-content-type-options", b"nosniff")])
         match = self.router.matches(path)
         if match is None:
             return Response("Not Found", status=404)
@@ -396,8 +393,9 @@ class App:
             return Response("Method Not Allowed", status=405, headers=[(b"allow", allow)])
         if spec["kind"] == "page":
             if self.production and self.render_modes[pattern] == "ssg":
-                response = Response(self.static_pages[path], media_type="text/html; charset=utf-8",
-                                    headers=[(b"vary", b"Cookie, Authorization")])
+                response = asset_response(request, self.static_pages[path], "text/html; charset=utf-8",
+                                          self.asset_etags[path], cache_control=b"public, max-age=0, must-revalidate",
+                                          extra_headers=[(b"vary", b"Cookie, Authorization")])
             elif self.production and self.render_modes[pattern] == "isr":
                 private = any(name.lower() in {b"authorization", b"cookie"} for name, _ in request.headers)
                 if private:

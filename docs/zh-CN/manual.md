@@ -111,6 +111,8 @@ SSG 构建最多生成 10,000 个页面；开发模式下每次请求都会渲�
 
 ## 公共文件与 islands
 
+公共文件、SSG 页面和 island 包使用基于 SHA-256 内容哈希的强 ETag。GET/HEAD 支持 `If-Match` 与 `If-None-Match`；GET 支持单个字节 `Range` 和强 ETag `If-Range`，适用时返回 206 或 416。多个或格式错误的范围会被忽略并返回完整内容。暂不支持基于日期的验证或 ISR 响应的范围请求。
+
 `public/styles/site.css` 通过 `/styles/site.css` 公开。构建时会生成快照并校验完整性，但生产启动时仍需要原始文件。隐藏文件、符号链接和冲突路径会被拒绝。开发模式下修改公共文件后也需要重启服务器。
 
 Island 将 Python 声明与 `islands/` 内的 JavaScript 或 TypeScript 模块结合：

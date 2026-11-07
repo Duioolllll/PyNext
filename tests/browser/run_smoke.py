@@ -49,6 +49,11 @@ def verify_http(base):
         assert [json.loads(line) for line in response.read().splitlines()] == [
             {"phase": "started"}, {"phase": "finished"}
         ]
+    request = Request(base + "/styles/site.css", headers={"Range": "bytes=0-3"})
+    with urlopen(request, timeout=10) as response:
+        assert response.status == 206 and response.headers.get("etag")
+        assert response.headers.get("content-range", "").startswith("bytes 0-3/")
+        assert len(response.read()) == 4
 
 
 def _free_port():

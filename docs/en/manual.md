@@ -111,6 +111,8 @@ A build produces at most 10,000 SSG pages. Development mode renders SSG pages fo
 
 ## Public files and islands
 
+Public files, SSG pages, and island bundles have a strong SHA-256-based ETag. GET/HEAD support `If-Match` and `If-None-Match`; GET supports one byte `Range` and strong-ETag `If-Range`, returning 206 or 416 when applicable. Multiple or malformed ranges are ignored and return the full representation. Date-based validators and ranges for ISR responses are not implemented.
+
 Files under `public/` are public at the corresponding URL, e.g. `public/styles/site.css` is `/styles/site.css`. The build snapshots and checks these files; source files are still needed at production startup. Hidden files, symlinks and conflicting paths are rejected. Restart the development server after changing a public file.
 
 An island pairs a Python declaration with a JavaScript or TypeScript module in `islands/`:
