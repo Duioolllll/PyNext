@@ -197,8 +197,11 @@ fn render_node(node: &Value, output: &mut String, depth: usize) -> Result<(), St
                 .get("strategy")
                 .and_then(Value::as_str)
                 .ok_or("Island has no loading strategy")?;
-            if !matches!(strategy, "load" | "visible" | "idle") {
+            if !matches!(strategy, "load" | "visible" | "idle" | "interaction") {
                 return Err("Invalid island loading strategy".into());
+            }
+            if strategy == "interaction" && !hydrate {
+                return Err("Interaction strategy requires a hydrated island".into());
             }
             output.push_str("<div data-pynext-island=\"");
             escape(name, output);

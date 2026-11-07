@@ -25,6 +25,7 @@ def verify_http(base):
         "/news/example": "example",
         "/hydrate": "Hydrated",
         "/strategies": "Island loading strategies",
+        "/interaction": "Interaction example",
         "/blog/hello": "hello",
     }
     for path, expected in pages.items():
@@ -136,10 +137,11 @@ def main():
             )
             base = f"http://127.0.0.1:{port}"
             verify_http(base)
-            subprocess.run(
-                [sys.executable, str(ROOT / "tests/browser/islands_smoke.py"), base],
-                cwd=ROOT, check=True, timeout=120,
-            )
+            for script in ("islands_smoke.py", "interaction_smoke.py"):
+                subprocess.run(
+                    [sys.executable, str(ROOT / "tests/browser" / script), base],
+                    cwd=ROOT, check=True, timeout=120,
+                )
         finally:
             if server is not None:
                 _terminate(server)

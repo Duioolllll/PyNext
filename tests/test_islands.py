@@ -230,7 +230,7 @@ def test_deferred_strategy_in_both_servers_and_render_modes(tmp_path, esbuild, m
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("strategy", ["interaction", "", None, [], 1])
+@pytest.mark.parametrize("strategy", ["", None, [], 1])
 def test_invalid_island_loading_strategy_is_rejected(strategy):
     with pytest.raises(ValueError, match="strategy"):
         island("counter", strategy=strategy)
@@ -245,4 +245,18 @@ def test_loading_strategy_is_checked_at_binding_and_native_boundary():
     forged = {"kind": "island", "name": "counter", "props": {}, "children": [],
               "module": "/_pynext/static/" + "a" * 64 + ".js", "hydrate": False, "strategy": "unexpected"}
     with pytest.raises(ValueError, match="strategy"):
+        _native.render(json.dumps(forged))
+
+
+def test_interaction_strategy_requires_hydration_at_every_boundary():
+    with pytest.raises(ValueError, match="requires a hydrated island"):
+        island("counter", strategy="interaction", fallback=h("button", {"type": "button"}, "Count"))
+    manifest = {"runtime": "a" * 64, "bundles": {"counter": "b" * 64}}
+    node = island("counter")
+    node["strategy"] = "interaction"
+    with pytest.raises(ValueError, match="requires a hydrated island"):
+        bind_islands(node, manifest)
+    forged = {"kind": "island", "name": "counter", "props": {}, "children": [],
+              "module": "/_pynext/static/" + "a" * 64 + ".js", "hydrate": False, "strategy": "interaction"}
+    with pytest.raises(ValueError, match="requires a hydrated island"):
         _native.render(json.dumps(forged))

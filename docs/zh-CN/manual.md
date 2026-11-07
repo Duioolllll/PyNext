@@ -134,7 +134,9 @@ def Page():
 
 如需复用现有服务端 DOM，请提供服务端 fallback、设置 `hydrate=True`，并在模块中导出 `render`、`hydrate` 和 `mount`。参见 [hydrated-counter.ts](../../examples/basic/islands/hydrated-counter.ts)。如果两侧的树不一致，框架会重新 mount 该 island，输入状态或焦点可能丢失。
 
-默认激活策略为 `load`。`visible` 在进入视口时激活；`idle` 请求空闲回调，并请求 2 秒 timeout，但实际执行可能更晚。相关 API 不可用时会退回 idle 或定时器。激活前的点击或输入事件**不会重放**。
+默认激活策略为 `load`。`visible` 在进入视口时激活；`idle` 请求空闲回调，并请求 2 秒 timeout，但实际执行可能更晚。相关 API 不可用时会退回 idle 或定时器。这三种策略不会重放激活前的事件。
+
+设置 `hydrate=True, strategy="interaction"` 后，用户点击 `<button type="button">` 会激活 island。参见[示例页面](../../examples/basic/app/interaction/page.py)和[模块](../../examples/basic/islands/interaction-counter.js)。加载器为该 island 注册监听器后，最多缓存 16 次受支持的点击，在 hydration 成功后按顺序重放；超出的点击会被丢弃并产生警告。链接、表单提交、输入、label 和可编辑区域的事件不会被拦截或重放；监听器注册前的事件也不会被捕获。DOM 不匹配、元素被移除或激活失败时会丢弃待处理事件。重放事件是 `isTrusted=false` 的合成事件，不能保证需要浏览器用户激活的操作；island 外的捕获监听器可能同时观察到原始事件和重放事件。
 
 ## ASGI、超时与安全性
 

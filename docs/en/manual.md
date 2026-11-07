@@ -134,7 +134,9 @@ The matching `islands/counter.ts` exports `mount(element, props)` and may return
 
 Use `hydrate=True` with server-rendered fallback and a module exporting `render`, `hydrate` and `mount` to reuse matching DOM. See [hydrated-counter.ts](../../examples/basic/islands/hydrated-counter.ts). If the trees differ, the island is mounted again and input state or focus can be lost.
 
-The default activation strategy is `load`. `visible` activates when the island enters the viewport; `idle` requests an idle callback with a 2-second timeout. Unsupported observer/idle APIs fall back to idle/timer scheduling. An idle callback can run later than requested, and clicks or input before activation are **not replayed**.
+The default activation strategy is `load`. `visible` activates when the island enters the viewport; `idle` requests an idle callback with a 2-second timeout. Unsupported observer/idle APIs fall back to idle/timer scheduling. An idle callback can run later than requested. These three strategies do not replay earlier events.
+
+With `hydrate=True, strategy="interaction"`, a user click on a `<button type="button">` activates the island. See the [example page](../../examples/basic/app/interaction/page.py) and [module](../../examples/basic/islands/interaction-counter.js). After the loader registers the island's listener, up to 16 supported clicks are queued and replayed in order when hydration succeeds; extra clicks are dropped with a warning. Links, form submissions, input, labels and editable regions are not intercepted or replayed. Events before listener registration are not captured. Pending clicks are discarded on a DOM mismatch, removal or activation failure. Replayed events are synthetic with `isTrusted=false` and do not guarantee operations requiring browser user activation; capture listeners outside the island may observe both the original and replayed events.
 
 ## ASGI, timeouts and safety
 

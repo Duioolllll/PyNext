@@ -35,7 +35,7 @@ class IslandParser(HTMLParser):
 
 
 @pytest.mark.parametrize("mode", ["ssr", "ssg", "isr"])
-@pytest.mark.parametrize("strategy", ["load", "visible", "idle"])
+@pytest.mark.parametrize("strategy", ["load", "visible", "idle", "interaction"])
 def test_hydrated_markup_in_both_servers(tmp_path, esbuild, mode, strategy):
     make_project(tmp_path, mode, strategy)
     manifest = write_manifest(tmp_path)

@@ -134,7 +134,9 @@ def Page():
 
 기존 서버 DOM을 재사용하려면 서버 fallback과 `hydrate=True`를 지정하고 모듈에서 `render`, `hydrate`, `mount`를 모두 내보냅니다. [hydrated-counter.ts](../../examples/basic/islands/hydrated-counter.ts)를 참고하세요. 서버와 클라이언트 트리가 다르면 해당 island를 다시 mount하며 입력 상태나 포커스를 잃을 수 있습니다.
 
-활성화 기본 전략은 `load`입니다. `visible`은 화면에 들어올 때, `idle`은 유휴 콜백을 요청해 활성화합니다. idle 콜백에는 2초 timeout을 요청하지만 실제 실행은 더 늦을 수 있습니다. 관련 API가 없으면 idle 또는 타이머로 대체합니다. 활성화 전 클릭·입력 이벤트는 **재생되지 않습니다**.
+활성화 기본 전략은 `load`입니다. `visible`은 화면에 들어올 때, `idle`은 유휴 콜백을 요청해 활성화합니다. idle 콜백에는 2초 timeout을 요청하지만 실제 실행은 더 늦을 수 있습니다. 관련 API가 없으면 idle 또는 타이머로 대체합니다. 이 세 전략은 활성화 전 이벤트를 재생하지 않습니다.
+
+`hydrate=True, strategy="interaction"`은 사용자가 `<button type="button">`을 클릭할 때 활성화합니다. [예제 페이지](../../examples/basic/app/interaction/page.py)와 [모듈](../../examples/basic/islands/interaction-counter.js)을 참고하세요. 로더가 해당 island에 리스너를 등록한 뒤 들어온 지원 클릭은 최대 16개를 보관해 hydration 성공 후 순서대로 재생하고 초과분은 경고 후 버립니다. 링크, 폼 제출, 입력, label 및 편집 영역의 이벤트는 가로채거나 재생하지 않습니다. 리스너 등록 전 이벤트도 보관하지 않습니다. DOM 불일치, 요소 제거 또는 활성화 실패 시 대기 이벤트는 버립니다. 재생 이벤트는 `isTrusted=false`인 합성 이벤트로 브라우저 사용자 제스처가 필요한 동작을 보장하지 않으며, island 밖 캡처 리스너는 원본과 재생 이벤트를 모두 볼 수 있습니다.
 
 ## ASGI, 시간 초과와 안전성
 

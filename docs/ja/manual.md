@@ -134,7 +134,9 @@ def Page():
 
 サーバー DOM を再利用するには、サーバーの fallback と `hydrate=True` を指定し、モジュールから `render`、`hydrate`、`mount` をエクスポートします。[hydrated-counter.ts](../../examples/basic/islands/hydrated-counter.ts) を参照してください。ツリーが一致しない場合はその island を再 mount するため、入力状態やフォーカスが失われる場合があります。
 
-有効化の既定値は `load` です。`visible` は画面内に入った時、`idle` はアイドルコールバックを要求して有効化します。アイドルコールバックには 2 秒の timeout を要求しますが、実行が遅れる場合があります。対応 API がない場合は idle またはタイマーに切り替わります。有効化前のクリック・入力イベントは**再生されません**。
+有効化の既定値は `load` です。`visible` は画面内に入った時、`idle` はアイドルコールバックを要求して有効化します。アイドルコールバックには 2 秒の timeout を要求しますが、実行が遅れる場合があります。対応 API がない場合は idle またはタイマーに切り替わります。この 3 戦略は有効化前のイベントを再生しません。
+
+`hydrate=True, strategy="interaction"` は、ユーザーが `<button type="button">` をクリックすると有効化します。[サンプルページ](../../examples/basic/app/interaction/page.py)と[モジュール](../../examples/basic/islands/interaction-counter.js)を参照してください。ローダーがその island にリスナーを登録した後の対応クリックは最大 16 件を保持し、hydration 成功後に順番に再生します。超過分は警告して破棄します。リンク、フォーム送信、入力、label、編集領域は捕捉・再生しません。リスナー登録前のイベントも捕捉できません。DOM の不一致、要素の削除、有効化の失敗時には待機イベントを破棄します。再生イベントは `isTrusted=false` の合成イベントで、ブラウザーのユーザー操作が必要な動作を保証しません。island 外のキャプチャリスナーは元と再生の両方を観測する場合があります。
 
 ## ASGI、タイムアウト、安全性
 

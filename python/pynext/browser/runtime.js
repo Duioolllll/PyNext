@@ -1,6 +1,7 @@
 // An island owns its element's children. Hydration preserves matching server DOM.
 const instances = new WeakMap();
 let visibilityObserver = null;
+const MAX_INTERACTION_EVENTS = 16;
 
 function cancelPending(state) {
   const cancel = state.cancelPending;
@@ -22,12 +23,35 @@ function matchesServerDOM(element, expected) {
     actualChildren.every((node, index) => node.isEqualNode(expectedChildren[index]));
 }
 
+function interactionButton(element, target) {
+  if (!(target instanceof Element) || !element.contains(target)) return null;
+  // Navigation, form submission, labels and editable regions retain their
+  // browser behavior instead of being captured and replayed.
+  if (target.closest("a[href], label, [contenteditable]:not([contenteditable='false'])")) return null;
+  const button = target.closest("button");
+  if (!button || !element.contains(button) || button.type !== "button" || button.matches(":disabled")) return null;
+  return button;
+}
+
+function releaseInteraction(element, state, replay = false) {
+  const interaction = state.interaction;
+  state.interaction = null;
+  if (!interaction) return;
+  element.removeEventListener("click", interaction.listener, true);
+  if (!replay) return;
+  for (const event of interaction.events) {
+    if (!element.isConnected || interactionButton(element, event.target) !== event.button) continue;
+    event.target.dispatchEvent(new MouseEvent("click", event.options));
+  }
+}
+
 function dispose(element) {
   const state = instances.get(element);
   if (!state) return;
   instances.delete(element);
   state.removed = true;
   cancelPending(state);
+  releaseInteraction(element, state);
   if (typeof state.cleanup === "function") {
     try { state.cleanup(); } catch (error) { console.error("PyNext island cleanup failed", error); }
     state.cleanup = null;
@@ -72,7 +96,9 @@ async function mountIsland(element, state) {
       if (state.removed || !element.isConnected) cleanup();
       else state.cleanup = cleanup;
     }
+    releaseInteraction(element, state, status === "hydrated" && !state.removed && element.isConnected);
   } catch (error) {
+    releaseInteraction(element, state);
     element.setAttribute("data-pynext-error", "activation-failed");
     console.error("PyNext island failed to activate", error);
   }
@@ -83,6 +109,43 @@ function activate(element, state) {
   state.started = true;
   cancelPending(state);
   void mountIsland(element, state);
+}
+
+function scheduleInteraction(element, state) {
+  if (element.getAttribute("data-pynext-mode") !== "hydrate") {
+    element.setAttribute("data-pynext-error", "invalid-strategy");
+    console.error("Interaction strategy requires a hydrated island");
+    return;
+  }
+  const interaction = { events: [], overflow: false, listener: null };
+  interaction.listener = (event) => {
+    if (!event.isTrusted || event.defaultPrevented || event.button !== 0 || state.removed) return;
+    const button = interactionButton(element, event.target);
+    if (!button) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (interaction.events.length < MAX_INTERACTION_EVENTS) {
+      interaction.events.push({
+        target: event.target,
+        button,
+        options: {
+          bubbles: true, cancelable: true, composed: true,
+          button: event.button, buttons: event.buttons, detail: event.detail,
+          clientX: event.clientX, clientY: event.clientY,
+          screenX: event.screenX, screenY: event.screenY,
+          ctrlKey: event.ctrlKey, altKey: event.altKey,
+          shiftKey: event.shiftKey, metaKey: event.metaKey,
+        },
+      });
+    } else if (!interaction.overflow) {
+      interaction.overflow = true;
+      console.warn("PyNext island interaction buffer is full; additional clicks are dropped");
+    }
+    element.setAttribute("data-pynext-state", "activating");
+    activate(element, state);
+  };
+  state.interaction = interaction;
+  element.addEventListener("click", interaction.listener, true);
 }
 
 function scheduleIdle(element, state) {
@@ -105,7 +168,7 @@ function scheduleIdle(element, state) {
 
 function scheduleIsland(element) {
   if (instances.has(element)) return;
-  const state = { removed: false, started: false, cleanup: null, cancelPending: null };
+  const state = { removed: false, started: false, cleanup: null, cancelPending: null, interaction: null };
   instances.set(element, state);
   const strategy = element.getAttribute("data-pynext-strategy");
   if (strategy === "load") {
@@ -113,6 +176,9 @@ function scheduleIsland(element) {
   } else if (strategy === "idle") {
     element.setAttribute("data-pynext-state", "waiting");
     scheduleIdle(element, state);
+  } else if (strategy === "interaction") {
+    element.setAttribute("data-pynext-state", "waiting");
+    scheduleInteraction(element, state);
   } else if (strategy === "visible") {
     element.setAttribute("data-pynext-state", "waiting");
     if (typeof window.IntersectionObserver !== "function") {

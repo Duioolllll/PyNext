@@ -4,6 +4,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Add an interaction-triggered hydration strategy with bounded replay of supported button clicks, plus browser coverage for navigation, mismatch, cleanup, and failures.
 - Add async-iterable API streaming for ASGI and Axum, bounded chunks and native backpressure, HTTP/2 framing, disconnect cancellation, and a bounded execution wait queue.
 - Add content-based ETags, conditional requests, and single byte ranges for public files, SSG pages, and island bundles on ASGI and Axum.
 - Add process-local ISR path invalidation with protection against older in-flight generations overwriting newer cache entries.

@@ -25,7 +25,7 @@ uv run pynext build --dir examples/basic
 uv run pynext start --dir examples/basic
 ```
 
-브라우저에서 `http://127.0.0.1:3000/`, `/blog/hello`, `/about`, `/guides/intro`, `/news/example`, `/hydrate`, `/strategies`, `/api/users`를 확인할 수 있습니다. `dev` 명령은 빌드 없이 소스에서 시작합니다. **현재 파일 변경 자동 반영은 없으므로 변경 후 재시작해야 합니다.**
+브라우저에서 `http://127.0.0.1:3000/`, `/blog/hello`, `/about`, `/guides/intro`, `/news/example`, `/hydrate`, `/strategies`, `/interaction`, `/api/users`를 확인할 수 있습니다. `dev` 명령은 빌드 없이 소스에서 시작합니다. **현재 파일 변경 자동 반영은 없으므로 변경 후 재시작해야 합니다.**
 
 ```bash
 uv run pynext dev --dir examples/basic
@@ -152,7 +152,7 @@ island("hydrated-counter", props={"initial": 3}, hydrate=True,
 
 브라우저는 기존 DOM과 `render` 결과를 비교합니다. 일치하면 기존 노드를 보존하고 `hydrate`를 호출합니다. 다르면 경고와 `data-pynext-mismatch` 표시를 남기고 `mount`로 해당 island만 다시 그립니다. 이 복구는 해당 영역의 입력 상태나 포커스를 잃을 수 있습니다. 시간·난수·로케일 등에 의한 차이가 생기지 않도록 양쪽 출력을 결정적으로 작성해야 합니다. 활성화 중 예외가 나면 `data-pynext-error="activation-failed"`를 표시합니다.
 
-`strategy`로 각 island의 활성화 시점을 선택할 수 있습니다. mount와 hydration 모두에서 사용할 수 있습니다.
+`strategy`로 각 island의 활성화 시점을 선택할 수 있습니다. `interaction`은 hydration 전용입니다.
 
 ```python
 island("chart", props={"value": 42}, strategy="visible",
@@ -164,8 +164,9 @@ island("chart", props={"value": 42}, strategy="visible",
 | `load` | 기본값. 문서가 준비되면 활성화합니다. |
 | `visible` | 요소가 화면에 들어오면 모듈을 불러옵니다. IntersectionObserver를 사용할 수 없으면 idle 방식으로 대체합니다. |
 | `idle` | 브라우저가 한가할 때 활성화하며, idle 콜백에 2초 timeout을 요청합니다. 실제 실행은 브라우저 상황에 따라 늦어질 수 있고, 해당 API가 없으면 타이머를 사용합니다. |
+| `interaction` | `hydrate=True`인 island의 `<button type="button">`에 사용자가 클릭하면 활성화합니다. [예제](examples/basic/app/interaction/page.py)를 참고하세요. |
 
-대기 중인 요소가 제거되면 예약을 취소합니다. 지연된 island는 활성화 전의 클릭이나 입력 이벤트를 재생하지 않으므로 중요한 상호작용에는 기본 `load` 전략을 사용하세요.
+`interaction`은 로더가 해당 island의 리스너를 등록한 후 들어온 지원 클릭을 최대 16개 보관하고 DOM이 일치해 hydration이 끝나면 순서대로 재생합니다. 넘치는 클릭은 버리고 경고합니다. 재생 이벤트는 합성 이벤트여서 `isTrusted`가 `false`이며, 브라우저의 사용자 제스처가 필요한 동작을 보장하지 않습니다. 외부 캡처 리스너는 원본과 재생 이벤트를 모두 볼 수 있습니다. 링크·폼 제출·입력 등은 가로채거나 재생하지 않습니다. DOM 불일치, 요소 제거 또는 활성화 실패 시 대기 중인 클릭을 버립니다. 리스너 등록 전 이벤트는 보관할 수 없습니다. `load`, `visible`, `idle`은 이벤트를 재생하지 않습니다.
 
 - 프로젝트 루트의 `islands`에 최상위 `.js` 또는 `.ts` 파일을 두고 이름이 `mount`인 함수를 내보냅니다. 보조 모듈은 하위 디렉터리에 둘 수 있습니다.
 - 초기 버전은 `islands` 밖의 모듈, npm 패키지, 외부 URL과 동적 경로 import를 묶지 않습니다. CSS import와 중첩 island도 지원하지 않습니다.
@@ -209,7 +210,7 @@ ISR은 **공개 콘텐츠 전용**입니다. 페이지 함수는 `request`를 �
 - SSR은 Python에서 UI 트리를 만들고 Rust가 이스케이프해 직렬화하는 buffered 렌더링입니다. 문자열을 raw HTML로 삽입하는 API는 없습니다.
 - Axum의 기본 본문 수신 슬롯은 16개, Python 실행 슬롯은 64개이며 CLI에서 조정합니다. 본문 수신 제한은 기본 10초이고 HTTP/1.1 헤더 수신에도 10초 제한이 있습니다. 실행 대기열은 최대 실행 슬롯 수와 64 중 작은 값으로 제한합니다. 정적 파일과 신선한 ISR 캐시는 Python 슬롯을 건너뜁니다. 연결 총수는 제한하지 않으며 동기 함수는 504 또는 연결 해제 후에도 스레드에서 계속 실행될 수 있습니다. DB·외부 서비스 시간 제한과 쓰기 멱등성을 별도로 확보해야 합니다. 외부 ASGI 서버의 시간 제한은 해당 서버가 관리합니다.
 - ASGI HTTP와 기본 lifespan, 비동기 API 응답 스트리밍과 연결 해제 시 비동기 작업 취소를 지원합니다. WebSocket, 스트리밍 SSR, 완전한 ASGI 적합성 검증과 강제 프로세스 격리는 아직 구현되지 않았습니다.
-- ISR은 단일 프로세스 메모리 구현입니다. 워커 간 공유 캐시·무효화, 상호작용 시 island 로딩과 hydration 전 이벤트 재생, 자동 리로드, 프로덕션 보안·관측성 기능은 **미구현**입니다. PyNext의 hydration은 React나 React Server Components와 호환되지 않습니다. 현재 버전을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하는 데 사용하지 마세요.
+- ISR은 단일 프로세스 메모리 구현입니다. 워커 간 공유 캐시·무효화, 버튼 이외의 상호작용 재생, 클라이언트 탐색, 자동 리로드, 프로덕션 보안·관측성 기능은 **미구현**입니다. PyNext의 hydration은 React나 React Server Components와 호환되지 않습니다. 현재 버전을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하는 데 사용하지 마세요.
 - 빌드할 때 앱 모듈을 import하므로 개발자가 작성한 Python 코드가 실행됩니다. 프로젝트를 신뢰할 수 있는 환경에서 빌드해야 합니다.
 - 페이지·레이아웃·API 파일에서 `from .helpers import name` 같은 상대 import를 사용할 수 있습니다. **0.6 변경:** 프로젝트 루트를 전역 `sys.path`에 자동 추가하지 않습니다. 기존 루트 기준 절대 import가 실패하면 상대 import로 바꾸거나 프로젝트를 Python 패키지로 설치하세요.
 - `start`의 manifest는 앱 디렉터리의 Python 파일과 `public`·`islands` 파일 변화를 검사하지만 앱 밖 의존성, 외부 데이터나 환경 변수 변화까지 추적하지 않습니다. 현재 운영 시작에도 원본 `public`과 `islands` 디렉터리가 필요합니다. 정적 산출물은 프로세스마다 메모리에 적재하며, 이전 빌드의 사용하지 않는 파일을 자동 정리하지 않습니다.

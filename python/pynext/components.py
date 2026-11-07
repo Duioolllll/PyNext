@@ -79,8 +79,10 @@ def island(name, *, props=None, fallback=None, hydrate=False, strategy="load"):
         raise TypeError("hydrate must be a boolean")
     if hydrate and fallback is None:
         raise ValueError("A hydrated island requires server-rendered fallback content")
-    if not isinstance(strategy, str) or strategy not in {"load", "visible", "idle"}:
-        raise ValueError("Island strategy must be 'load', 'visible', or 'idle'")
+    if not isinstance(strategy, str) or strategy not in {"load", "visible", "idle", "interaction"}:
+        raise ValueError("Island strategy must be 'load', 'visible', 'idle', or 'interaction'")
+    if strategy == "interaction" and not hydrate:
+        raise ValueError("Interaction strategy requires a hydrated island")
     props = {} if props is None else props
     _validate_props(props)
     return {"kind": "island", "name": name, "props": props,
@@ -116,8 +118,10 @@ def bind_islands(tree, manifest):
             if hydrate and not manifest.get("hydration", {}).get(name, False):
                 raise ValueError(f"Hydrated island {name!r} must export render and hydrate")
             strategy = node.get("strategy", "load")
-            if not isinstance(strategy, str) or strategy not in {"load", "visible", "idle"}:
-                raise ValueError("Island strategy must be 'load', 'visible', or 'idle'")
+            if not isinstance(strategy, str) or strategy not in {"load", "visible", "idle", "interaction"}:
+                raise ValueError("Island strategy must be 'load', 'visible', 'idle', or 'interaction'")
+            if strategy == "interaction" and not hydrate:
+                raise ValueError("Interaction strategy requires a hydrated island")
             bound = [bind(child, True, depth + 1)[0] for child in children]
             return {"kind": "island", "name": name, "props": props,
                     "module": PREFIX + manifest["bundles"][name] + ".js",
