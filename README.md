@@ -6,9 +6,9 @@
 
 **Manual:** [English](docs/en/manual.md) · [한국어](docs/ko/manual.md) · [日本語](docs/ja/manual.md) · [简体中文](docs/zh-CN/manual.md)
 
-**최신 릴리스:** v0.6.0a1 · [변경 이력](CHANGELOG.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
+**최신 릴리스:** [v0.6.0a2](https://github.com/Duioolllll/PyNext/releases/tag/v0.6.0a2) · [변경 이력](CHANGELOG.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
 
-이 문서는 미릴리스 개발 브랜치의 기능을 포함합니다.
+이 문서는 현재 체크아웃한 저장소의 코드를 설명합니다.
 
 PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust로 구현하는 실험적 풀스택 프레임워크입니다. 이 저장소는 구현의 출발점이며, Next.js나 React의 호환 구현은 아닙니다.
 

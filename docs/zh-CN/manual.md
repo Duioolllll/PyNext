@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [日本語](../ja/manual.md)
 
-本手册适用于开发分支；最新公开版本为 **v0.6.0a1**。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
+本手册适用于当前检出的 **v0.6.0a2** 实验版代码。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
 
 ## 环境要求与首次运行
 

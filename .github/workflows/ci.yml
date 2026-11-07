@@ -67,6 +67,15 @@ jobs:
       - name: Verify isolated wheel
         run: uv run python tests/smoke_wheel.py
 
+      - name: Save verified distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributions-${{ runner.os }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+
       - name: Run bounded load smoke test
         run: |
           uv run python benchmarks/bench.py --mode axum --production --requests 40 --concurrency 4 --warmup 2 --path /api/users > benchmark.json

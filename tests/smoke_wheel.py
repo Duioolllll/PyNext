@@ -1,4 +1,5 @@
 """Verify built distributions and run the example using an isolated wheel."""
+import importlib.util
 import os
 import subprocess
 import sys
@@ -42,4 +43,26 @@ with tempfile.TemporaryDirectory(prefix="pynext-wheel-check-") as directory:
     subprocess.run([sys.executable, "-c", check, directory], cwd=ROOT, env=env, check=True)
     subprocess.run([sys.executable, "-m", "pynext.cli", "build", "--dir", str(ROOT / "examples/basic")],
                    cwd=ROOT, env=env, check=True)
-print("Source distribution and isolated wheel verified")
+    # Serve the example from the installed wheel as well as building it. Reuse
+    # the browser smoke runner's bounded port retry and HTTP checks without
+    # installing or launching a browser in this packaging test.
+    spec = importlib.util.spec_from_file_location("pynext_browser_smoke", ROOT / "tests/browser/run_smoke.py")
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as log:
+        server = None
+        try:
+            server, port = smoke._start_server(
+                lambda port: [sys.executable, "-m", "pynext.cli", "start", "--dir", str(ROOT / "examples/basic"),
+                              "--host", "127.0.0.1", "--port", str(port)],
+                log, popen=lambda *args, **kwargs: subprocess.Popen(*args, env=env, **kwargs),
+            )
+            smoke.verify_http(f"http://127.0.0.1:{port}")
+        except Exception:
+            log.seek(0)
+            print(log.read(), file=sys.stderr, flush=True)
+            raise
+        finally:
+            if server is not None:
+                smoke._terminate(server)
+print("Source distribution and isolated wheel build and HTTP serving verified")

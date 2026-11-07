@@ -4,11 +4,14 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+## v0.6.0a2
+
 - Add an interaction-triggered hydration strategy with bounded replay of supported button clicks, plus browser coverage for navigation, mismatch, cleanup, and failures.
 - Add async-iterable API streaming for ASGI and Axum, bounded chunks and native backpressure, HTTP/2 framing, disconnect cancellation, and a bounded execution wait queue.
 - Add content-based ETags, conditional requests, and single byte ranges for public files, SSG pages, and island bundles on ASGI and Axum.
 - Add process-local ISR path invalidation with protection against older in-flight generations overwriting newer cache entries.
-- Follow the main version line (currently v0.6.0a1); the 0.1.0a0 release line and the v0.1.0-alpha.prealpha tag plan are dropped (see docs/RELEASE_PLAN.md).
+- Verify installed wheels by building and serving the example, and save platform-specific distributions from CI.
+- Follow the v0.6.0 version line; the 0.1.0a0 release line and the v0.1.0-alpha.prealpha tag plan are dropped (see docs/RELEASE_PLAN.md).
 - Route with a trie (static > dynamic > catch-all, backtracking) instead of a linear scan, and wait up to a bounded timeout for a concurrency slot before returning 503 with Retry-After: 1.
 - Make concurrency limits configurable (--max-concurrent, --acquire-timeout-ms, --body-capacity, --body-timeout-ms) with CLI range validation; limit body intake to 16 slots and apply a 10-second header-read deadline.
 - Restore HTTP/2 prior-knowledge (h2c) support via the hyper auto builder while keeping the header-read timeout.
@@ -53,4 +56,4 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Introduce the Python/Rust runtime, file routing, buffered SSR, API handlers, ASGI and Axum.
 - Add SSG, public file snapshots and process-local ISR caching.
 
-Later production features, including distributed ISR, React/RSC, streaming, OpenTelemetry, standalone packaging and worker isolation, are not included. See [the roadmap](docs/PRODUCTION_ROADMAP.md).
+Later production features, including distributed ISR, React/RSC, streaming SSR, OpenTelemetry, standalone packaging and worker isolation, are not included. See [the roadmap](docs/PRODUCTION_ROADMAP.md).
