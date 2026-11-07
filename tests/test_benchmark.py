@@ -44,6 +44,19 @@ def test_benchmark_distinguishes_success_from_http_and_transport_errors():
     asyncio.run(check())
 
 
+@pytest.mark.parametrize("mode, transport", [
+    ("axum", "loopback_http"),
+    ("uvicorn", "loopback_http"),
+    ("asgi", "in_process_asgi"),
+])
+def test_benchmark_mode_transport_labels_and_success(mode, transport):
+    result = asyncio.run(run(mode, 4, 2, "/api/users", False, warmup=1))
+    assert result["mode"] == mode
+    assert result["transport"] == transport
+    assert result["successful_requests"] == 4
+    assert result["errors"] == 0
+
+
 def test_benchmark_reports_zero_success_without_fabricating_success_latency():
     async def check():
         transport = httpx.MockTransport(lambda request: httpx.Response(503, content=b"busy"))
@@ -97,6 +110,7 @@ server.serve_forever()
         result = asyncio.run(run("axum", 4, 2, "/", False, warmup=0,
                                  base_url=f"http://127.0.0.1:{port}", server_pid=server.pid))
         assert result["mode"] == "external"
+        assert result["transport"] == "external_http"
         assert result["successful_requests"] == 4 and result["errors"] == 0
         assert result["process_cpu_scope"] == "load_generator_only"
         assert result["server_pid"] == server.pid
