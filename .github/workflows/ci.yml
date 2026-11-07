@@ -9,11 +9,29 @@ permissions:
 
 jobs:
   test:
-    name: Python, Rust, and JavaScript checks (${{ matrix.os }})
+    name: Python, Rust, and JavaScript checks (${{ matrix.os }}, Python ${{ matrix.python-version }}, ${{ matrix.deploy }})
     strategy:
       fail-fast: false
       matrix:
+        # Compatibility matrix (finding #54, spec v0.2 section 13):
+        # supported OS x supported Python version x deploy mode.
+        # requires-python is >=3.13,<3.14, so 3.13 is the only Python in
+        # the matrix; 3.14 support is unverified, not merely untested, so
+        # it is not listed until the project claims it.
+        # The ASGI in-process mode (httpx ASGITransport) is not a matrix
+        # axis: pytest covers it in every job (see
+        # test_benchmark_mode_transport_labels_and_success). The two
+        # loopback-HTTP deploy modes, standalone Axum and ASGI under
+        # Uvicorn, each get their own matrix leg instead.
+        # Browser smoke runs on all three OSes: Playwright installs
+        # without --with-deps on macOS and Windows.
+        # Tradeoff: every leg runs the full check suite (6 legs total),
+        # not a smoke-only subset, because the suite takes minutes and
+        # the matrix is small; splitting it would save little and hide
+        # OS/mode-specific failures.
         os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.13"]
+        deploy: [axum, uvicorn]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
@@ -22,7 +40,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -70,7 +88,7 @@ jobs:
       - name: Save verified distributions
         uses: actions/upload-artifact@v4
         with:
-          name: distributions-${{ runner.os }}
+          name: distributions-${{ runner.os }}-${{ matrix.deploy }}
           path: |
             dist/*.whl
             dist/*.tar.gz
@@ -78,14 +96,13 @@ jobs:
 
       - name: Run bounded HTTP load smoke tests
         run: |
-          uv run python benchmarks/bench.py --mode axum --production --requests 40 --concurrency 4 --warmup 2 --path /api/users > benchmark-axum.json
-          uv run python benchmarks/bench.py --mode uvicorn --production --requests 40 --concurrency 4 --warmup 2 --path /api/users > benchmark-uvicorn.json
-          uv run python -c "import json; results = [json.load(open(name, encoding='utf-8')) for name in ('benchmark-axum.json', 'benchmark-uvicorn.json')]; assert all(r['successful_requests'] == 40 and r['errors'] == 0 and r['transport'] == 'loopback_http' for r in results)"
+          uv run python benchmarks/bench.py --mode ${{ matrix.deploy }} --production --requests 40 --concurrency 4 --warmup 2 --path /api/users > benchmark-${{ matrix.deploy }}.json
+          uv run python -c "import json; r = json.load(open('benchmark-${{ matrix.deploy }}.json', encoding='utf-8')); assert r['successful_requests'] == 40 and r['errors'] == 0 and r['transport'] == 'loopback_http'"
 
       - name: Save benchmark measurements
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-${{ runner.os }}
+          name: benchmark-${{ runner.os }}-${{ matrix.deploy }}
           path: benchmark-*.json
 
       - name: Install Chromium (Linux)
@@ -98,4 +115,3 @@ jobs:
 
       - name: Browser end-to-end checks
         run: uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
-
