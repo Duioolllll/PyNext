@@ -687,7 +687,10 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for HyperSer
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
         let mut router = self.router.clone();
         Box::pin(async move {
-            std::future::poll_fn(|cx| router.poll_ready(cx)).await?;
+            std::future::poll_fn(|cx| {
+                <AxumRouter as TowerService<Request>>::poll_ready(&mut router, cx)
+            })
+            .await?;
             let req = req.map(Body::new);
             router.call(req).await
         })
