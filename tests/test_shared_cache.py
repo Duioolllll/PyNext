@@ -168,6 +168,51 @@ def test_sqlite_lease_is_single_flight_across_connections(tmp_path):
         second.close()
 
 
+def test_expired_lookup_does_not_delete_concurrent_fresh_write(tmp_path):
+    path = tmp_path / "cache.sqlite3"
+    first = SQLiteCacheBackend(path)
+    second = SQLiteCacheBackend(path)
+    try:
+        assert first.insert("k", b"old", 1, 0)
+        first._conn.execute("UPDATE entries SET generated_at = 0 WHERE key = ?", ("k",))
+        first._conn.commit()
+
+        class InterleavedConnection:
+            def __init__(self, connection):
+                self.connection = connection
+                self.ran = False
+
+            def execute(self, sql, *args):
+                if sql.startswith("DELETE FROM entries") and not self.ran:
+                    self.ran = True
+                    assert second.insert("k", b"new", 30, 0)
+                return self.connection.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+        first._conn = InterleavedConnection(first._conn)
+        assert first.lookup("k") == ("fresh", b"new")
+        assert second.lookup("k") == ("fresh", b"new")
+    finally:
+        first.close()
+        second.close()
+
+
+def test_expired_entry_keeps_version_while_live_lease_regenerates(tmp_path):
+    backend = SQLiteCacheBackend(tmp_path / "cache.sqlite3")
+    try:
+        assert backend.insert("k", b"old", 1, 0)
+        assert backend.acquire_lease("k", "worker") == 1
+        backend._conn.execute("UPDATE entries SET generated_at = 0 WHERE key = ?", ("k",))
+        backend._conn.commit()
+        assert backend.lookup("k")[0] in {"expired", "miss"}
+        assert backend.insert_fenced("k", b"new", 30, 0, 1, "worker")
+        assert backend.lookup("k") == ("fresh", b"new")
+    finally:
+        backend.close()
+
+
 def test_shared_cache_rejects_private_responses(tmp_path):
     async def run():
         cache = ISRCache(cache_backend="sqlite", cache_path=tmp_path / "cache.sqlite3")
@@ -188,6 +233,14 @@ def test_shared_cache_rejects_private_responses(tmp_path):
             assert cache.store.lookup("/cookie")[0] == "miss"
             assert await cache.get_or_render("/private", POLICY, private_render) == b"<p>private</p>"
             assert cache.shared.lookup("/private") == ("miss", None)
+
+            async def conflicting_headers():
+                return Response(b"<p>secret</p>", headers=[
+                    (b"cache-control", b"no-store"), (b"cache-control", b"public")])
+
+            assert await cache.get_or_render("/secret", POLICY, conflicting_headers) == b"<p>secret</p>"
+            assert cache.shared.lookup("/secret") == ("miss", None)
+            assert cache.store.lookup("/secret")[0] == "miss"
         finally:
             await cache.close()
     asyncio.run(run())
@@ -241,7 +294,7 @@ def test_broken_shared_backend_degrades_to_local_generation(tmp_path):
             async def render():
                 return Response(b"<p>ok</p>")
 
-            assert await cache.get_or_render("/page", POLICY, render) == b"<p>ok</p>"
+            assert await asyncio.wait_for(cache.get_or_render("/page", POLICY, render), 2) == b"<p>ok</p>"
             # The page was still served and cached locally.
             assert cache.store.lookup("/page") == ("fresh", b"<p>ok</p>")
         finally:
@@ -342,6 +395,77 @@ def test_late_lease_acquisition_reuses_fresh_result(tmp_path):
         finally:
             continue_after_generation.set()
             await asyncio.gather(delayed, return_exceptions=True)
+            await first.close()
+            await second.close()
+    asyncio.run(run())
+
+
+def test_other_worker_invalidation_fences_inflight_generation(tmp_path):
+    async def run():
+        path = tmp_path / "shared.sqlite3"
+        first = ISRCache(cache_backend="sqlite", cache_path=path)
+        second = ISRCache(cache_backend="sqlite", cache_path=path)
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def render():
+            started.set()
+            await finish.wait()
+            return Response(b"old")
+
+        task = asyncio.create_task(first.get_or_render("/page", POLICY, render))
+        try:
+            await asyncio.wait_for(started.wait(), 5)
+            invalidated = await second.invalidate("/page")
+            finish.set()
+            assert await asyncio.wait_for(task, 5) == b"old"
+            assert second.shared.lookup("/page") == ("miss", None)
+            assert first.store.lookup("/page")[0] == "miss"
+            assert invalidated is True
+        finally:
+            finish.set()
+            await asyncio.gather(task, return_exceptions=True)
+            await first.close()
+            await second.close()
+    asyncio.run(run())
+
+
+def test_expired_lease_owner_cannot_publish_after_takeover(tmp_path):
+    async def run():
+        path = tmp_path / "shared.sqlite3"
+        first = ISRCache(cache_backend="sqlite", cache_path=path)
+        second = ISRCache(cache_backend="sqlite", cache_path=path)
+        old_started, new_started = asyncio.Event(), asyncio.Event()
+        finish_old, finish_new = asyncio.Event(), asyncio.Event()
+
+        async def old_render():
+            old_started.set()
+            await finish_old.wait()
+            return Response(b"old")
+
+        async def new_render():
+            new_started.set()
+            await finish_new.wait()
+            return Response(b"new")
+
+        old_task = asyncio.create_task(first.get_or_render("/page", POLICY, old_render))
+        new_task = None
+        try:
+            await asyncio.wait_for(old_started.wait(), 5)
+            with sqlite3.connect(path) as conn:
+                conn.execute("UPDATE leases SET expires_at = 0 WHERE key = ?", ("/page",))
+            new_task = asyncio.create_task(second.get_or_render("/page", POLICY, new_render))
+            await asyncio.wait_for(new_started.wait(), 5)
+            finish_old.set()
+            assert await asyncio.wait_for(old_task, 5) == b"old"
+            assert second.shared.lookup("/page") == ("miss", None)
+            assert first.store.lookup("/page")[0] == "miss"
+            finish_new.set()
+            assert await asyncio.wait_for(new_task, 5) == b"new"
+            assert second.shared.lookup("/page") == ("fresh", b"new")
+        finally:
+            finish_old.set()
+            finish_new.set()
+            await asyncio.gather(*(t for t in (old_task, new_task) if t), return_exceptions=True)
             await first.close()
             await second.close()
     asyncio.run(run())

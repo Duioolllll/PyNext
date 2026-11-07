@@ -11,9 +11,9 @@ Two layers:
 The shared backend adds cross-process single-flight: a worker that
 regenerates a stale entry first takes a lease on the key (owner token +
 expiry). Other workers serve the stale entry while the lease is held.
-Every shared write is fenced by the entry version observed when the
-lease was taken, so a slow generation can never overwrite a newer
-result (spec section 9.3 item 7).
+Every shared write atomically checks both the observed entry version and
+the live lease owner. Invalidation removes the lease with the entry, so
+an old generation cannot refill the shared cache after invalidation.
 
 Private responses are never stored in the shared cache: a response
 with ``Set-Cookie`` or ``Cache-Control: private``/``no-store`` is served
@@ -43,10 +43,15 @@ LEASE_WAIT_INTERVAL = 0.05
 MAX_CACHE_KEY_BYTES = 4096
 MAX_CACHE_BODY_BYTES = 2_097_152
 MAX_CACHE_SECONDS = 604_800.0
+_SHARED_UNAVAILABLE = object()
 
 
 class CacheBusy(Exception):
     pass
+
+
+class SharedCacheUnavailable(Exception):
+    """A shared backend operation failed rather than observing a cache miss."""
 
 
 class CacheBackend:
@@ -156,21 +161,39 @@ class SQLiteCacheBackend(CacheBackend):
             raise ValueError(f"Cannot open SQLite cache at {path}: {exc}") from exc
 
     def _read_entry(self, key, now):
-        row = self._conn.execute(
-            "SELECT body, generated_at, fresh_for, stale_for, version"
-            " FROM entries WHERE key = ?", (key,)
-        ).fetchone()
-        if row is None:
-            return None
-        body, generated_at, fresh_for, stale_for, version = row
-        age = now - generated_at
-        if age >= fresh_for + stale_for:
-            self._conn.execute("DELETE FROM entries WHERE key = ?", (key,))
-            self._conn.commit()
-            return SharedEntry("expired", None, version, 0.0, 0.0)
-        if age < fresh_for:
-            return SharedEntry("fresh", body, version, fresh_for - age, stale_for)
-        return SharedEntry("stale", body, version, 0.0, fresh_for + stale_for - age)
+        for _ in range(3):
+            row = self._conn.execute(
+                "SELECT body, generated_at, fresh_for, stale_for, version"
+                " FROM entries WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                return None
+            body, generated_at, fresh_for, stale_for, version = row
+            age = now - generated_at
+            if age >= fresh_for + stale_for:
+                lease = self._conn.execute(
+                    "SELECT 1 FROM leases WHERE key = ? AND expires_at > ?", (key, now)
+                ).fetchone()
+                if lease is not None:
+                    return SharedEntry("expired", None, version, 0.0, 0.0)
+                # Another connection can replace the row between the read
+                # and delete, or take a lease. Delete only the exact expired
+                # version seen, and only if no live generation owns it.
+                deleted = self._conn.execute(
+                    "DELETE FROM entries WHERE key = ? AND version = ? AND generated_at = ?"
+                    " AND NOT EXISTS (SELECT 1 FROM leases WHERE key = ? AND expires_at > ?)",
+                    (key, version, generated_at, key, now),
+                ).rowcount
+                self._conn.commit()
+                if deleted:
+                    return SharedEntry("expired", None, version, 0.0, 0.0)
+                now = time.time()
+                continue
+            if age < fresh_for:
+                return SharedEntry("fresh", body, version, fresh_for - age, stale_for)
+            return SharedEntry("stale", body, version, 0.0, fresh_for + stale_for - age)
+        # A heavily contended key is retried on the next lookup.
+        return None
 
     def lookup(self, key):
         with self._lock:
@@ -190,27 +213,33 @@ class SQLiteCacheBackend(CacheBackend):
         with self._lock:
             try:
                 return self._read_entry(key, time.time())
-            except sqlite3.Error:
-                log.warning("Shared cache lookup failed for %s", key, exc_info=True)
-                return None
+            except sqlite3.Error as exc:
+                raise SharedCacheUnavailable("Shared cache lookup failed") from exc
 
     def insert(self, key, body, fresh_seconds, stale_seconds):
         return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None)
 
-    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version):
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
         """Store ``body`` only if the entry version still equals
         ``expected_version`` (``0`` when no entry existed, ``None`` for an
-        unfenced write). Returns False when the version moved, so a stale
-        generation never overwrites a newer result."""
+        unfenced write). When an owner is given, its lease must still be live
+        in the same transaction. Returns False when either fence has moved."""
         if len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES or len(body) > MAX_CACHE_BODY_BYTES:
             return False
         if not _valid_durations(fresh_seconds, stale_seconds):
             return False
         with self._lock:
             try:
-                now = time.time()
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
+                    now = time.time()
+                    if owner is not None:
+                        lease = self._conn.execute(
+                            "SELECT owner, expires_at FROM leases WHERE key = ?", (key,)
+                        ).fetchone()
+                        if lease is None or lease[0] != owner or lease[1] <= now:
+                            self._conn.execute("ROLLBACK")
+                            return False
                     row = self._conn.execute(
                         "SELECT version FROM entries WHERE key = ?", (key,)
                     ).fetchone()
@@ -247,9 +276,16 @@ class SQLiteCacheBackend(CacheBackend):
     def remove(self, key):
         with self._lock:
             try:
-                cursor = self._conn.execute("DELETE FROM entries WHERE key = ?", (key,))
-                self._conn.commit()
-                return cursor.rowcount > 0
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    entry = self._conn.execute("DELETE FROM entries WHERE key = ?", (key,)).rowcount
+                    lease = self._conn.execute("DELETE FROM leases WHERE key = ?", (key,)).rowcount
+                    self._conn.execute("COMMIT")
+                    return entry > 0 or lease > 0
+                except BaseException:
+                    if self._conn.in_transaction:
+                        self._conn.execute("ROLLBACK")
+                    raise
             except sqlite3.Error:
                 log.warning("Shared cache remove failed for %s", key, exc_info=True)
                 return False
@@ -264,9 +300,9 @@ class SQLiteCacheBackend(CacheBackend):
         """
         with self._lock:
             try:
-                now = time.time()
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
+                    now = time.time()
                     row = self._conn.execute(
                         "SELECT owner, expires_at FROM leases WHERE key = ?", (key,)
                     ).fetchone()
@@ -289,9 +325,8 @@ class SQLiteCacheBackend(CacheBackend):
                         self._conn.execute("ROLLBACK")
                     raise
                 return version
-            except sqlite3.Error:
-                log.warning("Shared cache lease failed for %s", key, exc_info=True)
-                return None
+            except sqlite3.Error as exc:
+                raise SharedCacheUnavailable("Shared cache lease failed") from exc
 
     def release_lease(self, key, owner):
         """Release a lease, but only the one this worker owns."""
@@ -317,11 +352,15 @@ class SQLiteCacheBackend(CacheBackend):
 def _is_storable(response):
     """A response with Set-Cookie or Cache-Control: private/no-store must
     never land in a cache shared between users (spec section 10.2)."""
-    headers = {name: value for name, value in response.headers}
-    if b"set-cookie" in headers:
-        return False
-    cache_control = headers.get(b"cache-control", b"").lower()
-    return b"private" not in cache_control and b"no-store" not in cache_control
+    for name, value in response.headers:
+        name = name.lower()
+        if name == b"set-cookie":
+            return False
+        if name == b"cache-control":
+            value = value.lower()
+            if b"private" in value or b"no-store" in value:
+                return False
+    return True
 
 
 class ISRCache:
@@ -370,19 +409,18 @@ class ISRCache:
         return loop
 
     async def _shared_entry(self, key):
-        """Best-effort shared lookup: a backend failure degrades to a
-        miss so the page is generated locally instead of failing."""
+        """Return an entry, a miss, or a distinct backend-failure sentinel."""
         try:
             return await asyncio.to_thread(self.shared.lookup_entry, key)
         except Exception:
             log.warning("Shared cache lookup failed for %s", key, exc_info=True)
-            return None
+            return _SHARED_UNAVAILABLE
 
-    async def _shared_store(self, key, body, policy, expected_version):
+    async def _shared_store(self, key, body, policy, expected_version, owner):
         try:
             return await asyncio.to_thread(
                 self.shared.insert_fenced, key, body,
-                policy["revalidate"], policy["stale"], expected_version,
+                policy["revalidate"], policy["stale"], expected_version, owner,
             )
         except Exception:
             log.warning("Shared cache insert failed for %s", key, exc_info=True)
@@ -393,7 +431,7 @@ class ISRCache:
             return await asyncio.to_thread(self.shared.acquire_lease, key, owner)
         except Exception:
             log.warning("Shared cache lease failed for %s", key, exc_info=True)
-            return None
+            return _SHARED_UNAVAILABLE
 
     async def _shared_release(self, key, owner):
         try:
@@ -443,11 +481,15 @@ class ISRCache:
         owner = f"{os.getpid()}:{uuid.uuid4().hex}"
         while True:
             entry = await self._shared_entry(key)
+            if entry is _SHARED_UNAVAILABLE:
+                return ("unavailable", None)
             if entry is not None and entry.status == "fresh":
                 return ("fresh", entry)
             if time.monotonic() >= deadline:
                 return ("timeout", None)
             version = await self._shared_acquire(key, owner)
+            if version is _SHARED_UNAVAILABLE:
+                return ("unavailable", None)
             if version is not None:
                 return ("lease", (version, owner))
             await asyncio.sleep(LEASE_WAIT_INTERVAL)
@@ -467,18 +509,16 @@ class ISRCache:
             return await self._get_or_render_local(key, policy, render, status, body)
         return await self._get_or_render_shared(key, policy, render, status, body)
 
-    async def _generate(self, key, policy, render, lease=None, expected_version=None):
+    async def _generate(self, key, policy, render, lease=None):
         """Render once and store the result, fenced by the lease version.
 
         ``lease`` is ``(expected_version, owner)`` for a shared-cache
-        generation that holds the cross-process lease; ``expected_version``
-        alone fences a local fallback render that holds no lease. A stale
-        generation that lost its fencing check still serves its own caller,
-        it just cannot overwrite the newer entry.
+        generation that holds the cross-process lease. A fallback without a
+        lease is stored only locally. A fenced-out generation still serves
+        its own caller, but cannot replace either cache layer.
         """
         owner = lease[1] if lease is not None else None
-        if lease is not None:
-            expected_version = lease[0]
+        expected_version = lease[0] if lease is not None else None
         try:
             async with asyncio.timeout(GENERATION_TIMEOUT):
                 if lease is not None:
@@ -486,7 +526,7 @@ class ISRCache:
                     # miss but before we obtained the now-free lease. Check
                     # again while holding the lease before rendering.
                     entry = await self._shared_entry(key)
-                    if entry is not None and entry.status == "fresh":
+                    if entry is not _SHARED_UNAVAILABLE and entry is not None and entry.status == "fresh":
                         if self._inflight.get(key) is asyncio.current_task():
                             self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
                         return entry.body
@@ -497,13 +537,17 @@ class ISRCache:
                 # but must never repopulate the cache after invalidation.
                 if self._inflight.get(key) is asyncio.current_task():
                     if _is_storable(response):
-                        if not self.store.insert(key, response.body, policy["revalidate"], policy["stale"]):
-                            log.warning("ISR cache insert failed for %s; page was served but not cached", key)
-                        if self.shared is not None:
-                            if not await self._shared_store(key, response.body, policy, expected_version):
-                                log.warning(
-                                    "Shared ISR insert for %s was fenced out by a newer entry;"
-                                    " page was served but not stored in the shared cache", key)
+                        shared_stored = True
+                        if self.shared is not None and owner is not None:
+                            shared_stored = await self._shared_store(key, response.body, policy, expected_version, owner)
+                            if not shared_stored:
+                                log.warning("Shared ISR insert for %s failed or was fenced out;"
+                                            " page was served but not cached", key)
+                        # Do not populate L1 after a shared write was rejected
+                        # or after this app invalidated the running task.
+                        if shared_stored and self._inflight.get(key) is asyncio.current_task():
+                            if not self.store.insert(key, response.body, policy["revalidate"], policy["stale"]):
+                                log.warning("ISR cache insert failed for %s; page was served but not cached", key)
                     else:
                         log.info("ISR response for %s is private; served but not cached", key)
                 return response.body
@@ -525,6 +569,8 @@ class ISRCache:
 
     async def _get_or_render_shared(self, key, policy, render, status, body):
         entry = await self._shared_entry(key)
+        if entry is _SHARED_UNAVAILABLE:
+            return await self._get_or_render_local(key, policy, render, status, body)
         if entry is not None and entry.status == "fresh":
             # Repopulate the process-local cache with the remaining windows
             # so the next hit is served without touching the shared store.
@@ -537,6 +583,8 @@ class ISRCache:
                 # the worker that wins the cross-process lease renders.
                 owner = f"{os.getpid()}:{uuid.uuid4().hex}"
                 version = await self._shared_acquire(key, owner)
+                if version is _SHARED_UNAVAILABLE:
+                    return await self._get_or_render_local(key, policy, render, "stale", entry.body)
                 if version is not None:
                     task = self._register(key, asyncio.create_task(
                         self._generate(key, policy, render, lease=(version, owner)),
@@ -546,6 +594,8 @@ class ISRCache:
             # lease is free, otherwise wait for the worker that holds it.
             owner = f"{os.getpid()}:{uuid.uuid4().hex}"
             version = await self._shared_acquire(key, owner)
+            if version is _SHARED_UNAVAILABLE:
+                return await self._get_or_render_local(key, policy, render, status, body)
             if version is not None:
                 task = self._register(key, asyncio.create_task(
                     self._generate(key, policy, render, lease=(version, owner)),
@@ -563,15 +613,13 @@ class ISRCache:
                         context=contextvars.Context()))
                 else:
                     # The other worker is still generating after the wait.
-                    # Render locally rather than failing the request; the
-                    # fenced write keeps a stale result from overwriting
-                    # whatever the other worker stores first.
-                    log.warning("ISR first generation for %s is still running in another worker;"
-                                " rendering locally", key)
-                    current = await self._shared_entry(key)
-                    version = current.version if current is not None else 0
+                    # Render locally rather than failing the request, but
+                    # never write to the shared store without a lease.
+                    if outcome == "timeout":
+                        log.warning("ISR first generation for %s is still running in another worker;"
+                                    " rendering locally", key)
                     task = self._register(key, asyncio.create_task(
-                        self._generate(key, policy, render, expected_version=version),
+                        self._generate(key, policy, render),
                         context=contextvars.Context()))
         if entry is not None and entry.status == "stale":
             return entry.body

@@ -24,6 +24,7 @@ import ipaddress
 import math
 import threading
 import time
+from collections import OrderedDict
 
 from .http import Response
 
@@ -69,7 +70,7 @@ class RateLimiter:
         self.trusted_proxies = _parse_trusted_proxies(trusted_proxies)
         self._lock = threading.Lock()
         # key -> [tokens, last_seen_monotonic]
-        self._buckets = {}
+        self._buckets = OrderedDict()
 
     def _is_trusted(self, client_ip):
         if not self.trusted_proxies or client_ip is None:
@@ -83,26 +84,38 @@ class RateLimiter:
     def key_for(self, client_ip, headers=()):
         """Derive the bucket key for a request.
 
-        ``headers`` is an iterable of ``(name, value)`` byte pairs. When
-        the direct peer is trusted, the leftmost ``X-Forwarded-For`` entry
-        (the original client) is the key; otherwise the peer address is.
+        ``headers`` is an iterable of ``(name, value)`` byte pairs. Starting
+        at the direct peer, walk ``X-Forwarded-For`` right-to-left only while
+        each hop is trusted. The nearest untrusted address is the key.
         A request with no known peer address shares the ``"unknown"``
         bucket.
         """
-        if client_ip is not None and self._is_trusted(client_ip):
-            for name, value in headers:
-                if name.lower() == b"x-forwarded-for":
-                    for candidate in value.decode("latin-1").split(","):
-                        candidate = candidate.strip().strip("[]")
-                        if not candidate:
-                            continue
-                        try:
-                            ipaddress.ip_address(candidate)
-                        except ValueError:
-                            continue
-                        return candidate
-                    break
-        return client_ip if client_ip is not None else "unknown"
+        if client_ip is None:
+            return "unknown"
+        try:
+            address = ipaddress.ip_address(client_ip)
+            current = str(address.ipv4_mapped or address) if isinstance(address, ipaddress.IPv6Address) else str(address)
+        except ValueError:
+            return client_ip
+        if not self._is_trusted(current):
+            return current
+        forwarded = []
+        for name, value in headers:
+            if name.lower() == b"x-forwarded-for":
+                forwarded.extend(value.decode("latin-1").split(","))
+        for candidate in reversed(forwarded):
+            if not self._is_trusted(current):
+                break
+            candidate = candidate.strip()
+            if candidate.startswith("[") and candidate.endswith("]"):
+                candidate = candidate[1:-1]
+            try:
+                address = ipaddress.ip_address(candidate)
+            except ValueError:
+                # Do not trust any hop to the left of malformed input.
+                break
+            current = str(address.ipv4_mapped or address) if isinstance(address, ipaddress.IPv6Address) else str(address)
+        return current
 
     def allow(self, key, *, now=None):
         """Consume one token for ``key``.
@@ -116,20 +129,25 @@ class RateLimiter:
         with self._lock:
             bucket = self._buckets.get(key)
             if bucket is None:
+                while len(self._buckets) >= _MAX_BUCKETS:
+                    _, (_, oldest_seen) = next(iter(self._buckets.items()))
+                    remaining = self.window_seconds - max(0.0, now - oldest_seen)
+                    if remaining > 0:
+                        # Fail closed for new keys instead of evicting an
+                        # active bucket or allowing unbounded memory growth.
+                        return False, max(1, math.ceil(remaining))
+                    self._buckets.popitem(last=False)
                 bucket = [float(self.limit), now]
                 self._buckets[key] = bucket
             else:
                 elapsed = max(0.0, now - bucket[1])
                 bucket[0] = min(float(self.limit), bucket[0] + elapsed * self._refill_per_second)
                 bucket[1] = now
+                self._buckets.move_to_end(key)
             if bucket[0] >= 1.0:
                 bucket[0] -= 1.0
                 return True, None
             retry_after = max(1, math.ceil((1.0 - bucket[0]) / self._refill_per_second))
-            if len(self._buckets) > _MAX_BUCKETS:
-                cutoff = now - 2 * self.window_seconds
-                for old_key in [k for k, (_, seen) in self._buckets.items() if seen < cutoff]:
-                    del self._buckets[old_key]
             return False, retry_after
 
     def reset(self):

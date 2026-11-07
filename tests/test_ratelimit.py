@@ -57,10 +57,10 @@ def test_key_for_ignores_forwarded_headers_without_a_trusted_proxy():
 def test_key_for_honours_forwarded_headers_from_a_trusted_proxy():
     limiter = RateLimiter(10, 60, trusted_proxies=["127.0.0.1"])
     headers = ((b"x-forwarded-for", b"203.0.113.7, 198.51.100.2"),)
-    assert limiter.key_for("127.0.0.1", headers) == "203.0.113.7"
+    assert limiter.key_for("127.0.0.1", headers) == "198.51.100.2"
     # An untrusted peer's header is still ignored.
     assert limiter.key_for("192.0.2.9", headers) == "192.0.2.9"
-    # Garbage entries are skipped; a header with no valid IP falls back.
+    # A malformed hop stops the walk and falls back to the trusted peer.
     assert limiter.key_for("127.0.0.1", ((b"x-forwarded-for", b"not-an-ip"),)) == "127.0.0.1"
 
 
@@ -70,6 +70,38 @@ def test_key_for_supports_cidr_trusted_proxies_and_rejects_bad_entries():
     assert limiter.key_for("192.0.2.9", ((b"x-forwarded-for", b"203.0.113.7"),)) == "192.0.2.9"
     with pytest.raises(ValueError, match="Invalid trusted proxy"):
         RateLimiter(10, 60, trusted_proxies=["not-an-ip"])
+
+
+def test_forwarded_chain_stops_at_nearest_untrusted_hop():
+    limiter = RateLimiter(1, 60, trusted_proxies=["127.0.0.1", "10.0.0.0/8"])
+    # The client controls the left side of an appended X-Forwarded-For.
+    first = ((b"x-forwarded-for", b"192.0.2.1, 198.51.100.7, 10.1.2.3"),)
+    second = ((b"x-forwarded-for", b"192.0.2.2, 198.51.100.7, 10.1.2.3"),)
+    assert limiter.key_for("127.0.0.1", first) == "198.51.100.7"
+    assert limiter.key_for("127.0.0.1", second) == "198.51.100.7"
+    assert limiter.allow(limiter.key_for("127.0.0.1", first))[0]
+    assert not limiter.allow(limiter.key_for("127.0.0.1", second))[0]
+    split = ((b"x-forwarded-for", b"192.0.2.1, 198.51.100.7"),
+             (b"x-forwarded-for", b"10.1.2.3"))
+    assert limiter.key_for("127.0.0.1", split) == "198.51.100.7"
+    malformed = ((b"x-forwarded-for", b"192.0.2.1, not-an-ip, 10.1.2.3"),)
+    assert limiter.key_for("127.0.0.1", malformed) == "10.1.2.3"
+    assert limiter.key_for("127.0.0.1", ((b"x-forwarded-for", b"[2001:0DB8::1]"),)) == "2001:db8::1"
+
+
+def test_limiter_bounds_new_keys_without_evicting_active_buckets(monkeypatch):
+    import pynext.ratelimit as ratelimit
+
+    monkeypatch.setattr(ratelimit, "_MAX_BUCKETS", 2)
+    limiter = RateLimiter(1, 60)
+    assert limiter.allow("a", now=1000)[0]
+    assert limiter.allow("b", now=1000)[0]
+    assert not limiter.allow("c", now=1000)[0]
+    assert len(limiter._buckets) <= 2
+    assert not limiter.allow("a", now=1000)[0]
+    # Once the oldest buckets have fully refilled, new keys can enter.
+    assert limiter.allow("c", now=1061)[0]
+    assert len(limiter._buckets) <= 2
 
 
 def test_rate_limited_response_carries_429_and_retry_after():
@@ -90,6 +122,31 @@ def _write_api_app(tmp_path):
     public = tmp_path / "public"
     public.mkdir()
     (public / "health.txt").write_text("healthy", encoding="utf-8")
+
+
+@pytest.mark.parametrize("mode", ["asgi", "axum"])
+def test_forwarded_client_cannot_rotate_spoofed_prefix_to_bypass_limit(tmp_path, mode):
+    _write_api_app(tmp_path)
+
+    async def run():
+        app = create_app(tmp_path, rate_limit=RateLimiter(1, 60, trusted_proxies=["127.0.0.1"]))
+        server = None
+        if mode == "asgi":
+            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+        else:
+            server = start_native(app, asyncio.get_running_loop(), port=0)
+            client = httpx.AsyncClient(base_url=f"http://{server.address}", timeout=5, trust_env=False)
+        try:
+            async with client:
+                first = await client.get("/api/ok", headers={"X-Forwarded-For": "192.0.2.1, 198.51.100.7"})
+                second = await client.get("/api/ok", headers={"X-Forwarded-For": "192.0.2.2, 198.51.100.7"})
+                assert first.status_code == 200
+                assert second.status_code == 429
+        finally:
+            if server is not None:
+                await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())
 
 
 def test_native_rate_limit_returns_429_with_retry_after(tmp_path):
