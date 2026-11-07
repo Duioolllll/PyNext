@@ -130,14 +130,19 @@ def test_static_files_bypass_saturated_python_execution(tmp_path):
         module = app._module("app/api/wait/route.py")
         module.release = asyncio.Event()
         assert app.isr.store.insert("/cached", b"<p>cached</p>", 30, 1)
-        server = start_native(app, asyncio.get_running_loop(), port=0)
+        capacity = 4
+        server = start_native(app, asyncio.get_running_loop(), port=0, max_concurrent=capacity)
         tasks = []
         try:
             async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=20) as client:
-                tasks = [asyncio.create_task(client.get("/api/wait")) for _ in range(64)]
-                async with asyncio.timeout(15):
-                    while module.started < 64:
-                        await asyncio.sleep(0.02)
+                # Admit each request before starting the next. A burst can
+                # legitimately time out in the bounded wait queue on a
+                # loaded runner, leaving fewer than capacity handlers active.
+                for expected in range(1, capacity + 1):
+                    tasks.append(asyncio.create_task(client.get("/api/wait")))
+                    async with asyncio.timeout(15):
+                        while module.started < expected:
+                            await asyncio.sleep(0.02)
                 assert (await client.get("/api/wait")).status_code == 503
                 assert (await client.get("/health.txt")).text == "healthy"
                 assert (await client.get("/cached")).text == "<p>cached</p>"

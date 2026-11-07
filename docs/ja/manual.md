@@ -22,6 +22,8 @@ http://127.0.0.1:3000/、/about、/guides/intro、/news/example、/hydrate、/st
 
 `pynext dev --dir examples/basic` はビルドなしでソースを提供し、`app/`・`islands/`・`public/`・`pynext.config.py` の変更時に同じポートでサーバーを再起動します。`pynext start` はビルド manifest を使い、追跡対象のソースが変わると再ビルドを要求します。Island を使わないアプリには Node と esbuild は不要です。上記はリポジトリからのインストールであり、PyPI 公開を意味しません。
 
+開発時の監視はサイズと更新日時が同じ変更も検知できるよう、監視ファイルを各ポーリングでハッシュします。対象が大きいほどディスク I/O が増えます。
+
 ## プロジェクト構造とルーティング
 
 ~~~text

@@ -22,6 +22,8 @@ http://127.0.0.1:3000/, /about, /guides/intro, /news/example, /hydrate, /strateg
 
 `pynext dev --dir examples/basic`는 빌드 없이 소스를 제공하며 `app/`·`islands/`·`public/`·`pynext.config.py` 변경 시 같은 포트로 서버를 다시 시작합니다. `pynext start`는 빌드 manifest를 사용하며 추적하는 소스가 바뀌면 재빌드를 요구합니다. island가 없는 앱에는 Node와 esbuild가 필요하지 않습니다. 설치 안내의 기준은 저장소 소스이며 PyPI 배포를 의미하지 않습니다.
 
+개발 감시기는 크기와 수정 시간이 같은 변경도 감지하도록 매번 파일 내용을 해시합니다. 감시 디렉터리가 크면 디스크 사용량이 늘어납니다.
+
 ## 프로젝트 구조와 라우팅
 
 ~~~text

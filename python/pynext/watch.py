@@ -1,6 +1,6 @@
 """Stdlib-only polling file watcher for ``pynext dev``.
 
-The watcher snapshots the modification time and size of every file under
+The watcher snapshots the modification time, size and contents of every regular file under
 the watched roots (``app/``, ``islands/``, ``public/`` and
 ``pynext.config.py``) and reports when the snapshot changes. Polling keeps
 the dev command dependency-free and portable; watchdog is not a project
@@ -8,7 +8,9 @@ dependency. Changes are debounced so one save that touches several files
 restarts the server once.
 """
 import asyncio
+import hashlib
 import os
+import stat
 import time
 from pathlib import Path
 
@@ -42,25 +44,32 @@ class Watcher:
         return roots
 
     def snapshot(self):
-        """Map each watched file, relative to the project root, to (mtime, size)."""
+        """Map each readable regular file to its metadata and content digest."""
         result = {}
+
+        def record(path):
+            try:
+                info = path.stat()
+                if not stat.S_ISREG(info.st_mode):
+                    return
+                # Timestamp resolution varies by filesystem. Hash the content
+                # too, so same-size saves with identical mtimes are detected.
+                with path.open("rb") as source:
+                    digest = hashlib.file_digest(source, "sha256").digest()
+                result[path.relative_to(self.root).as_posix()] = (info.st_mtime_ns, info.st_size, digest)
+            except OSError:
+                # An editor may replace or delete a file while it is read.
+                return
+
         for watched in self.watch_roots():
             if watched.is_file():
-                try:
-                    stat = watched.stat()
-                except OSError:
-                    continue
-                result[watched.relative_to(self.root).as_posix()] = (stat.st_mtime_ns, stat.st_size)
+                record(watched)
                 continue
             for current, dirs, files in os.walk(watched, followlinks=False):
                 dirs[:] = [name for name in dirs if name not in IGNORED_DIRS]
                 for name in files:
                     path = Path(current) / name
-                    try:
-                        stat = path.stat()
-                    except OSError:
-                        continue
-                    result[path.relative_to(self.root).as_posix()] = (stat.st_mtime_ns, stat.st_size)
+                    record(path)
         return result
 
     @staticmethod
@@ -80,7 +89,8 @@ class Watcher:
         last_snapshot = self._baseline
         stable_since = None
         while True:
-            current = self.snapshot()
+            # Digesting public assets must not block the serving event loop.
+            current = await asyncio.to_thread(self.snapshot)
             found = self.changed(self._baseline, current)
             now = time.monotonic()
             if found:

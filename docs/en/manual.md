@@ -22,6 +22,8 @@ Open http://127.0.0.1:3000/, /about, /guides/intro, /news/example, /hydrate, /st
 
 `pynext dev --dir examples/basic` serves source without a build and reloads when `app/`, `islands/`, `public/` or `pynext.config.py` change, restarting the server on the same port. `pynext start` uses the build manifest and fails if tracked source files changed; rebuild first. For an app without islands, Node and esbuild are not required. The repository is the installation source; no PyPI publication is implied.
 
+The dev watcher hashes watched files on each poll to detect same-size edits with unchanged timestamps. Large watched directories increase disk I/O.
+
 ## Project structure and routing
 
 ~~~text

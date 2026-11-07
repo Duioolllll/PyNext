@@ -22,6 +22,8 @@ uv run pynext start --dir examples/basic
 
 `pynext dev --dir examples/basic` 不经构建直接运行源码，并在 `app/`、`islands/`、`public/` 或 `pynext.config.py` 变化时在同一端口重启服务器。`pynext start` 使用构建 manifest；受跟踪的源码发生变化后必须重新构建。不使用 island 的应用不需要 Node 和 esbuild。以上说明通过仓库源码安装，并不表示项目已发布到 PyPI。
 
+开发监视器每次轮询都会对受监视文件计算哈希，以检测大小和修改时间未变的编辑。目录较大时会增加磁盘 I/O。
+
 ## 项目结构和路由
 
 ~~~text

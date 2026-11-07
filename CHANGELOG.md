@@ -4,7 +4,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
-- Fix Windows watcher path normalization, SQLite ISR generation races and failure fallback, and exercise the correct Axum/Uvicorn browser server in CI.
+- Fix cross-platform watcher paths and same-timestamp edits, SQLite ISR generation races and failure fallback, and exercise the correct Axum/Uvicorn browser server in CI.
 - Match dynamic WebSocket routes on the native server using the same route priority as ASGI.
 - Bound rate-limit bucket storage and select forwarded client addresses from the nearest untrusted proxy hop.
 - Document the unreleased architecture, observed limitations, and verification criteria.

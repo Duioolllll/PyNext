@@ -1,5 +1,6 @@
 """Dev-mode file watching: stdlib polling watcher plus `pynext dev` reload."""
 import asyncio
+import os
 import queue
 import re
 import subprocess
@@ -42,6 +43,18 @@ def test_watcher_detects_content_new_and_deleted_files(tmp_path):
     assert changed == ["app/new.py", "app/page.py"]
     page.unlink()
     assert watcher.changed(watcher._baseline, watcher.snapshot()) == ["app/new.py", "app/page.py"]
+
+
+def test_watcher_detects_same_size_edit_with_unchanged_timestamp(tmp_path):
+    (tmp_path / "app").mkdir()
+    page = tmp_path / "app" / "page.py"
+    page.write_bytes(b"one")
+    watcher = Watcher(tmp_path)
+    before = page.stat()
+    page.write_bytes(b"two")
+    os.utime(page, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert page.stat().st_mtime_ns == before.st_mtime_ns
+    assert watcher.changed(watcher._baseline, watcher.snapshot()) == ["app/page.py"]
 
 
 def test_watcher_ignores_unwatched_and_generated_files(tmp_path):
