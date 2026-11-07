@@ -6,6 +6,8 @@
 
 **Manual:** [English](docs/en/manual.md) · [한국어](docs/ko/manual.md) · [日本語](docs/ja/manual.md) · [简体中文](docs/zh-CN/manual.md)
 
+**Wiki:** [English](docs/wiki/en/Home.md) · [한국어](docs/wiki/ko/Home.md) · [Wiki index](docs/wiki/README.md)
+
 **최신 릴리스:** [v0.6.0a2](https://github.com/Duioolllll/PyNext/releases/tag/v0.6.0a2) · [변경 이력](CHANGELOG.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
 
 이 문서는 현재 체크아웃한 저장소의 코드를 설명합니다.
