@@ -1,5 +1,6 @@
 """Start the built example and run the Playwright smoke test."""
 import os
+import argparse
 import json
 import socket
 import subprocess
@@ -126,14 +127,23 @@ def _start_server(argv_for_port, log, *, attempts=MAX_SERVER_START_ATTEMPTS, tim
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Run browser smoke tests against a built example")
+    parser.add_argument("--mode", choices=("axum", "uvicorn"), default="axum")
+    mode = parser.parse_args().mode
+    server_python = os.environ.get("PYNEXT_SERVER_PYTHON", sys.executable)
+
+    def command(port):
+        if mode == "uvicorn":
+            return [server_python, "-m", "uvicorn", "--app-dir", str(ROOT / "tests/browser"),
+                    "production_asgi:app", "--host", "127.0.0.1", "--port", str(port), "--no-access-log"]
+        return [server_python, "-m", "pynext.cli", "start", "--dir", str(ROOT / "examples/basic"),
+                "--host", "127.0.0.1", "--port", str(port)]
+
     with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as log:
         server = None
         try:
             server, port = _start_server(
-                lambda port: [os.environ.get("PYNEXT_SERVER_PYTHON", sys.executable), "-m", "pynext.cli", "start",
-                              "--dir", str(ROOT / "examples/basic"),
-                              "--host", "127.0.0.1", "--port", str(port)],
-                log,
+                command, log,
             )
             base = f"http://127.0.0.1:{port}"
             verify_http(base)

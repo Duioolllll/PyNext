@@ -481,6 +481,15 @@ class ISRCache:
             expected_version = lease[0]
         try:
             async with asyncio.timeout(GENERATION_TIMEOUT):
+                if lease is not None:
+                    # Another worker may have populated the cache after our
+                    # miss but before we obtained the now-free lease. Check
+                    # again while holding the lease before rendering.
+                    entry = await self._shared_entry(key)
+                    if entry is not None and entry.status == "fresh":
+                        if self._inflight.get(key) is asyncio.current_task():
+                            self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                        return entry.body
                 response = await render()
                 if response.status != 200:
                     raise ValueError("ISR can cache only successful page responses")

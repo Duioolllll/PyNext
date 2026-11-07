@@ -50,7 +50,7 @@ class Watcher:
                     stat = watched.stat()
                 except OSError:
                     continue
-                result[str(watched.relative_to(self.root))] = (stat.st_mtime_ns, stat.st_size)
+                result[watched.relative_to(self.root).as_posix()] = (stat.st_mtime_ns, stat.st_size)
                 continue
             for current, dirs, files in os.walk(watched, followlinks=False):
                 dirs[:] = [name for name in dirs if name not in IGNORED_DIRS]
@@ -60,7 +60,7 @@ class Watcher:
                         stat = path.stat()
                     except OSError:
                         continue
-                    result[str(path.relative_to(self.root))] = (stat.st_mtime_ns, stat.st_size)
+                    result[path.relative_to(self.root).as_posix()] = (stat.st_mtime_ns, stat.st_size)
         return result
 
     @staticmethod

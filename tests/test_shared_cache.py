@@ -305,6 +305,48 @@ def test_two_processes_share_first_generation(tmp_path, servers):
     asyncio.run(run())
 
 
+def test_late_lease_acquisition_reuses_fresh_result(tmp_path):
+    async def run():
+        cache_path = tmp_path / "shared.sqlite3"
+        first = ISRCache(cache_backend="sqlite", cache_path=cache_path)
+        second = ISRCache(cache_backend="sqlite", cache_path=cache_path)
+        observed_miss = asyncio.Event()
+        continue_after_generation = asyncio.Event()
+        lookup = second._shared_entry
+        calls = []
+
+        async def delayed_first_lookup(key):
+            entry = await lookup(key)
+            if not observed_miss.is_set():
+                assert entry is None
+                observed_miss.set()
+                await continue_after_generation.wait()
+            return entry
+
+        async def render_first():
+            calls.append("first")
+            return Response(b"first")
+
+        async def render_second():
+            calls.append("second")
+            return Response(b"second")
+
+        second._shared_entry = delayed_first_lookup
+        delayed = asyncio.create_task(second.get_or_render("/page", POLICY, render_second))
+        try:
+            await asyncio.wait_for(observed_miss.wait(), 5)
+            assert await first.get_or_render("/page", POLICY, render_first) == b"first"
+            continue_after_generation.set()
+            assert await asyncio.wait_for(delayed, 5) == b"first"
+            assert calls == ["first"]
+        finally:
+            continue_after_generation.set()
+            await asyncio.gather(delayed, return_exceptions=True)
+            await first.close()
+            await second.close()
+    asyncio.run(run())
+
+
 def test_two_processes_stale_serving_and_single_regeneration(tmp_path, servers):
     counter = _make_project(tmp_path, revalidate=0.2, stale=60, delay=0.6)
     cache_path = tmp_path / "shared.sqlite3"

@@ -13,7 +13,7 @@ with sync_playwright() as playwright:
     page.on("pageerror", lambda error: errors.append(str(error)))
 
     page.goto(base + "/", wait_until="networkidle")
-    assert page.get_by_text("Hello PyNext!").count() == 1
+    expect(page.get_by_text("Hello PyNext!")).to_have_count(1)
     assert page.evaluate("typeof window.__pynextNav === 'object'")
     # A marker that only survives if the page is NOT fully reloaded.
     page.evaluate("window.__navMarker = 'still-here'")
@@ -21,22 +21,22 @@ with sync_playwright() as playwright:
 
     # Hovering prefetches the target; the click then swaps content in place.
     link.hover()
-    page.wait_for_function("window.__pynextNav.isPrefetched('/blog/hello') === true")
+    page.wait_for_function("() => window.__pynextNav.isPrefetched('/blog/hello') === true")
     link.click()
     expect(page).to_have_url(base + "/blog/hello")
-    assert page.get_by_text("Blog post").count() == 1
-    assert page.get_by_text("hello", exact=True).count() == 1
+    expect(page.get_by_text("Blog post")).to_have_count(1)
+    expect(page.get_by_text("hello", exact=True)).to_have_count(1)
     assert page.evaluate("window.__navMarker") == "still-here"
     assert not errors, errors
 
     # Back/forward uses the same partial navigation, not a reload.
     page.go_back()
     expect(page).to_have_url(base + "/")
-    assert page.get_by_text("Hello PyNext!").count() == 1
+    expect(page.get_by_text("Hello PyNext!")).to_have_count(1)
     assert page.evaluate("window.__navMarker") == "still-here"
     page.go_forward()
     expect(page).to_have_url(base + "/blog/hello")
-    assert page.get_by_text("Blog post").count() == 1
+    expect(page.get_by_text("Blog post")).to_have_count(1)
     assert page.evaluate("window.__navMarker") == "still-here"
     context.close()
 
@@ -48,7 +48,7 @@ with sync_playwright() as playwright:
     page.goto(base + "/", wait_until="networkidle")
     assert page.evaluate("window.__pynextNav.isPrefetched('/blog/hello')") is False
     page.get_by_role("link", name="Read a post").hover()
-    page.wait_for_function("window.__pynextNav.isPrefetched('/blog/hello') === true")
+    page.wait_for_function("() => window.__pynextNav.isPrefetched('/blog/hello') === true")
     no_io.close()
 
     # A failed partial navigation (404) falls back to a full document load:
@@ -59,7 +59,7 @@ with sync_playwright() as playwright:
     page.evaluate("window.__navMarker = 'still-here'")
     page.evaluate("window.__pynextNav.navigate('/missing')")
     expect(page).to_have_url(base + "/missing")
-    assert page.get_by_text("Not Found").count() == 1
+    expect(page.get_by_text("Not Found")).to_have_count(1)
     assert page.evaluate("window.__navMarker === undefined")
     context.close()
     browser.close()

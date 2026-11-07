@@ -114,4 +114,4 @@ jobs:
         run: uv run --with playwright==1.62.0 python -m playwright install chromium
 
       - name: Browser end-to-end checks
-        run: uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
+        run: uv run --with playwright==1.62.0 python tests/browser/run_smoke.py --mode ${{ matrix.deploy }}
