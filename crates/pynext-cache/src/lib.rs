@@ -52,17 +52,23 @@ impl PageCache {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.clock = state.clock.wrapping_add(1);
         let access = state.clock;
-        let Some(entry) = state.entries.get_mut(key) else {
+        let Some(entry) = state.entries.get(key) else {
             return CacheResult::Miss;
         };
-        entry.access = access;
         let age = now.saturating_duration_since(entry.generated_at);
+        if age >= entry.fresh_for.saturating_add(entry.stale_for) {
+            // Expired entries must not be kept alive by lookups: drop the
+            // entry (and its bytes) instead of refreshing its LRU access.
+            let removed = state.entries.remove(key).expect("entry present");
+            state.total_bytes -= removed.body.len();
+            return CacheResult::Expired;
+        }
+        let entry = state.entries.get_mut(key).expect("entry present");
+        entry.access = access;
         if age < entry.fresh_for {
             CacheResult::Fresh(entry.body.clone())
-        } else if age < entry.fresh_for.saturating_add(entry.stale_for) {
-            CacheResult::Stale(entry.body.clone())
         } else {
-            CacheResult::Expired
+            CacheResult::Stale(entry.body.clone())
         }
     }
 
@@ -155,6 +161,32 @@ mod tests {
             CacheResult::Expired
         );
         assert_eq!(cache.lookup_at("/other", now), CacheResult::Miss);
+    }
+
+    #[test]
+    fn expired_lookup_removes_entry_instead_of_refreshing_it() {
+        let cache = PageCache::new(2, 100, 100);
+        let now = Instant::now();
+        let ttl = Duration::from_secs(10);
+        assert!(cache.insert_at(
+            "/a".into(),
+            Bytes::from_static(b"one"),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+            now
+        ));
+        assert!(cache.insert_at("/b".into(), Bytes::from_static(b"two"), ttl, ttl, now));
+        assert_eq!(
+            cache.lookup_at("/a", now + Duration::from_secs(5)),
+            CacheResult::Expired
+        );
+        // The expired entry is gone: a later lookup is a miss, its bytes no
+        // longer count, and it cannot be evicted in place of a live entry.
+        assert_eq!(cache.lookup_at("/a", now + Duration::from_secs(5)), CacheResult::Miss);
+        let state = cache.state.lock().unwrap();
+        assert!(!state.entries.contains_key("/a"));
+        assert_eq!(state.total_bytes, 3);
+        assert_eq!(state.entries.len(), 1);
     }
 
     #[test]

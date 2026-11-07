@@ -12,6 +12,9 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
 
+# How many times to try starting the server on a fresh port before giving up.
+MAX_SERVER_START_ATTEMPTS = 5
+
 
 def verify_http(base):
     pages = {
@@ -42,29 +45,84 @@ def verify_http(base):
         assert json.loads(response.read()) == {"name": "Smoke"}
 
 
-def main():
+def _free_port():
+    """Return a currently unbound loopback port.
+
+    The port is only free at this instant: another process may take it before
+    the server binds, so callers must retry on start failure instead of
+    assuming the port is still free.
+    """
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
+        return listener.getsockname()[1]
 
-    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as log:
-        server = subprocess.Popen(
-            [os.environ.get("PYNEXT_SERVER_PYTHON", sys.executable), "-m", "pynext.cli", "start", "--dir", str(ROOT / "examples/basic"),
-             "--host", "127.0.0.1", "--port", str(port)],
-            cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
-        )
+
+def _terminate(server):
+    if server.poll() is None:
+        server.terminate()
+    try:
+        server.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        server.kill()
+        server.wait(timeout=10)
+
+
+def _wait_ready(server, port, timeout=30):
+    deadline = time.monotonic() + timeout
+    while True:
+        if server.poll() is not None:
+            raise RuntimeError(f"PyNext server exited with status {server.returncode}")
         try:
-            deadline = time.monotonic() + 30
-            while True:
-                if server.poll() is not None:
-                    raise RuntimeError(f"PyNext server exited with status {server.returncode}")
-                try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                        break
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("PyNext server did not become ready")
-                    time.sleep(0.1)
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("PyNext server did not become ready")
+            time.sleep(0.1)
+
+
+def _start_server(argv_for_port, log, *, attempts=MAX_SERVER_START_ATTEMPTS, timeout=30,
+                  popen=subprocess.Popen):
+    """Start the server on a free port, retrying if it exits before ready.
+
+    Picking a port by binding a throwaway socket and closing it leaves a
+    window where another process can take the port; the server then fails to
+    bind and exits before becoming ready. Handing the bound socket to the
+    server is not possible here because `pynext start` only takes a port
+    number, so retry on a fresh port instead. Only an early exit (the
+    bind-failure symptom) is retried; a server that stays up but never
+    answers still fails via TimeoutError, and other startup failures surface
+    after the last attempt.
+    """
+    for attempt in range(1, attempts + 1):
+        port = _free_port()
+        server = popen(argv_for_port(port), cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            _wait_ready(server, port, timeout=timeout)
+            return server, port
+        except RuntimeError as exc:
+            _terminate(server)
+            if attempt == attempts:
+                raise RuntimeError(
+                    f"PyNext server exited before becoming ready after {attempts} attempts; "
+                    f"last error: {exc}"
+                ) from exc
+        except TimeoutError:
+            _terminate(server)
+            raise
+    raise AssertionError("server start retry loop ended without a server")
+
+
+def main():
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as log:
+        server = None
+        try:
+            server, port = _start_server(
+                lambda port: [os.environ.get("PYNEXT_SERVER_PYTHON", sys.executable), "-m", "pynext.cli", "start",
+                              "--dir", str(ROOT / "examples/basic"),
+                              "--host", "127.0.0.1", "--port", str(port)],
+                log,
+            )
             base = f"http://127.0.0.1:{port}"
             verify_http(base)
             subprocess.run(
@@ -72,13 +130,8 @@ def main():
                 cwd=ROOT, check=True, timeout=120,
             )
         finally:
-            if server.poll() is None:
-                server.terminate()
-            try:
-                server.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                server.kill()
-                server.wait(timeout=10)
+            if server is not None:
+                _terminate(server)
             log.seek(0)
             output = log.read()
             if output:

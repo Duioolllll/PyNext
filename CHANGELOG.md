@@ -2,6 +2,18 @@
 
 All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
 
+## Unreleased
+
+- Follow the main version line (currently v0.6.0a1); the 0.1.0a0 release line and the v0.1.0-alpha.prealpha tag plan are dropped (see docs/RELEASE_PLAN.md).
+- Route with a trie (static > dynamic > catch-all, backtracking) instead of a linear scan, and wait up to a bounded timeout for a concurrency slot before returning 503 with Retry-After: 1.
+- Make concurrency limits configurable (--max-concurrent, --acquire-timeout-ms, --body-capacity, --body-timeout-ms) with CLI range validation; limit body intake to 16 slots and apply a 10-second header-read deadline.
+- Restore HTTP/2 prior-knowledge (h2c) support via the hyper auto builder while keeping the header-read timeout.
+- Detect oversized bodies by counting bytes instead of relying on error wrapping, add cache-control to SSG responses, evict expired cache entries instead of refreshing them, and normalize router parameter names.
+- Return a clean 400 for conflicting Content-Length headers (hyper handles the common case; the dispatch check covers the Transfer-Encoding-first edge case).
+- Propagate native server startup failures to the caller instead of returning a dead server.
+- Validate h() arguments and Response bodies at construction, reload directly loaded modules from fresh source, share one module per file regardless of letter case, warn when an ISR cache insert fails, and add native-path coverage for the 1000-field query limit.
+- Fix the smoke-test port race with retries, measure the CI benchmark in production mode, and run browser smoke checks on macOS and Windows as well as Linux.
+
 ## v0.6.0a1
 
 - Bound Axum request-body intake separately from Python execution, apply a 10-second body-read deadline, and allow static and fresh ISR responses while Python slots are busy.

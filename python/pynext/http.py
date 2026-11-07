@@ -41,7 +41,12 @@ class Response:
     def __init__(self, body=b"", *, status=200, headers=(), media_type="text/plain; charset=utf-8"):
         if not 100 <= status <= 599:
             raise ValueError("Invalid HTTP status")
-        self.body = body.encode("utf-8") if isinstance(body, str) else bytes(body)
+        if isinstance(body, str):
+            self.body = body.encode("utf-8")
+        elif isinstance(body, (bytes, bytearray, memoryview)):
+            self.body = bytes(body)
+        else:
+            raise TypeError(f"Response body must be str or bytes, got {type(body).__name__}")
         self.status = status
         self.headers = [(bytes(k).lower(), bytes(v)) for k, v in headers]
         for key, value in self.headers:

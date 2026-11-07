@@ -142,7 +142,9 @@ def test_isr_capacity_and_lifespan_shutdown(tmp_path, monkeypatch):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             first = asyncio.create_task(client.get("/blog/one"))
             await asyncio.wait_for(module.started.wait(), 3)
-            assert (await client.get("/blog/two")).status_code == 503
+            busy = await client.get("/blog/two")
+            assert busy.status_code == 503
+            assert busy.headers["retry-after"] == "1"
             assert app.isr.store.insert("/blog/two", b"<p>stale</p>", 0.01, 2)
             await until(lambda: app.isr.store.lookup("/blog/two")[0] == "stale")
             assert (await client.get("/blog/two")).text == "<p>stale</p>"

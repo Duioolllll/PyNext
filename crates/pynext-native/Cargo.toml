@@ -15,4 +15,11 @@ pyo3 = { version = "0.25", features = ["extension-module"] }
 serde_json = "1"
 axum = "0.8"
 http-body-util = "0.1"
+hyper = { version = "1", features = ["http2"] }
+# hyper-util's auto builder sniffs the HTTP/2 prior-knowledge preface and
+# otherwise serves HTTP/1.1; it needs hyper's http2 feature above (which
+# pulls in the h2 crate, so Cargo.lock is refreshed by the next cargo run —
+# CI runs cargo without --locked, so it regenerates the lock itself).
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+tower-service = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }

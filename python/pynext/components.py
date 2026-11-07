@@ -15,6 +15,10 @@ def _node(child):
 
 
 def h(tag, attrs=None, *children):
+    if not isinstance(tag, str):
+        raise TypeError(f"Element tag must be a string, got {type(tag).__name__}")
+    if attrs is not None and not isinstance(attrs, dict):
+        raise TypeError(f"Element attributes must be a dict, got {type(attrs).__name__}")
     return {"kind": "element", "tag": tag, "attrs": attrs or {},
             "children": [_node(child) for child in children if child is not None]}
 

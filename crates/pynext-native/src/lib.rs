@@ -1,11 +1,14 @@
 use axum::{
-    body::{to_bytes, Body, Bytes, HttpBody},
+    body::{Body, Bytes, HttpBody},
     extract::{Request, State},
-    http::{header, HeaderName, HeaderValue, StatusCode, Version},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Version},
     response::Response as AxumResponse,
     routing::any,
     Router as AxumRouter,
 };
+use http_body_util::BodyExt as _;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use pynext_cache::{CacheResult, PageCache};
 use pynext_router::Router;
 use pyo3::exceptions::PyValueError;
@@ -13,11 +16,12 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::error::Error as _;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::{oneshot, Semaphore};
+use tower_service::Service as TowerService;
 
 #[pyclass(name = "Router")]
 struct PyRouter {
@@ -337,7 +341,9 @@ fn render(py: Python<'_>, tree_json: &str) -> PyResult<String> {
 struct ServerState {
     callback: Py<PyAny>,
     capacity: Arc<Semaphore>,
+    acquire_timeout: Duration,
     body_capacity: Arc<Semaphore>,
+    body_timeout: Duration,
     static_pages: HashMap<String, Bytes>,
     public_assets: HashMap<String, PublicAsset>,
     client_assets: HashMap<String, Bytes>,
@@ -345,7 +351,6 @@ struct ServerState {
 }
 
 const MAX_REQUEST_BODY: usize = 1_048_576;
-const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct PublicAsset {
     body: Bytes,
@@ -397,6 +402,73 @@ fn plain_response(status: StatusCode, body: &'static str) -> AxumResponse<Body> 
         .expect("static response is valid")
 }
 
+fn busy_response() -> AxumResponse<Body> {
+    AxumResponse::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header(
+            "content-security-policy",
+            "script-src 'self'; object-src 'none'",
+        )
+        .header("retry-after", "1")
+        .body(Body::from("Server Busy"))
+        .expect("busy response is valid")
+}
+
+/// Conflicting `Content-Length` headers must fail as a clean 400 in dispatch
+/// instead of reaching hyper as a protocol error that just drops the
+/// connection. Identical duplicates are one value and pass; anything
+/// unparsable or disagreeing is a conflict.
+///
+/// This check is NOT dead code even though hyper rejects the plain case
+/// itself: for an ordinary request hyper's parser turns conflicting
+/// `Content-Length` values into an automatic 400 before dispatch ever runs.
+/// The check only becomes the deciding layer when `Transfer-Encoding:
+/// chunked` comes first — then hyper skips its `Content-Length` framing
+/// check and leaves the headers in the map, so a TE+CL mismatch (a classic
+/// request-smuggling shape) would otherwise reach the handler. Keep this
+/// check even if the plain-case test below looks like it only exercises
+/// hyper: see `test_transfer_encoding_first_conflicting_content_length_is_bad_request`.
+fn conflicting_content_length(headers: &HeaderMap) -> bool {
+    let mut values = std::collections::HashSet::new();
+    for value in headers.get_all(header::CONTENT_LENGTH).iter() {
+        let Ok(text) = value.to_str() else {
+            return true;
+        };
+        for part in text.split(',') {
+            let Ok(length) = part.trim().parse::<u64>() else {
+                return true;
+            };
+            values.insert(length);
+        }
+    }
+    values.len() > 1
+}
+
+enum BodyReadError {
+    TooLarge,
+    BadRequest,
+}
+
+/// Read a request body with our own byte count instead of classifying the
+/// error `to_bytes` returns: that classification downcasts through
+/// `error.source()`, so it breaks if axum/http-body-util ever changes how
+/// the limit error is wrapped. A body that grows past the limit is 413 no
+/// matter how the underlying error is shaped.
+async fn read_limited_body(mut body: Body, limit: usize) -> Result<Bytes, BodyReadError> {
+    let mut buf = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| BodyReadError::BadRequest)?;
+        if let Ok(data) = frame.into_data() {
+            if buf.len() + data.len() > limit {
+                return Err(BodyReadError::TooLarge);
+            }
+            buf.extend_from_slice(&data);
+        }
+    }
+    Ok(Bytes::from(buf))
+}
+
 // HTTP/1 connections with an unread body must not be reused for another request.
 fn close_with_unread_body(
     mut response: AxumResponse<Body>,
@@ -412,6 +484,12 @@ fn close_with_unread_body(
 
 async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> AxumResponse<Body> {
     let (parts, body) = request.into_parts();
+    if conflicting_content_length(&parts.headers) {
+        return close_with_unread_body(
+            plain_response(StatusCode::BAD_REQUEST, "Bad Request"),
+            parts.version,
+        );
+    }
     // Empty requests do not compete with clients currently uploading bodies.
     let body = if body.is_end_stream() {
         Bytes::new()
@@ -419,35 +497,28 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         let _body_permit = match state.body_capacity.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                return close_with_unread_body(
-                    plain_response(StatusCode::SERVICE_UNAVAILABLE, "Server Busy"),
-                    parts.version,
-                );
+                return close_with_unread_body(busy_response(), parts.version);
             }
         };
-        match tokio::time::timeout(BODY_READ_TIMEOUT, to_bytes(body, MAX_REQUEST_BODY)).await {
+        match tokio::time::timeout(state.body_timeout, read_limited_body(body, MAX_REQUEST_BODY))
+            .await
+        {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
-                let status = if error
-                    .source()
-                    .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
-                {
-                    StatusCode::PAYLOAD_TOO_LARGE
-                } else {
-                    StatusCode::BAD_REQUEST
-                };
-                let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
-                    "Payload Too Large"
-                } else {
-                    "Bad Request"
+                let (status, message) = match error {
+                    BodyReadError::TooLarge => {
+                        (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large")
+                    }
+                    BodyReadError::BadRequest => (StatusCode::BAD_REQUEST, "Bad Request"),
                 };
                 return close_with_unread_body(plain_response(status, message), parts.version);
             }
             Err(_) => {
-                return close_with_unread_body(
-                    plain_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout"),
-                    parts.version,
-                );
+                let mut response = plain_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout");
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return close_with_unread_body(response, parts.version);
             }
         }
     };
@@ -502,6 +573,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     .status(StatusCode::OK)
                     .header("content-type", "text/html; charset=utf-8")
                     .header("content-length", length.to_string())
+                    .header("cache-control", "public, max-age=0, must-revalidate")
                     .header(
                         "content-security-policy",
                         "script-src 'self'; object-src 'none'",
@@ -536,9 +608,19 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         }
     }
     // Static/cache hits never compete with Python handler execution.
-    let permit = match state.capacity.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Server Busy"),
+    // Wait briefly for a slot instead of rejecting the moment the server is
+    // busy: a burst that clears within the timeout degrades gracefully, and
+    // only sustained overload gets a 503 with Retry-After. Waiting requests
+    // hold a Tokio task, not a Python worker thread, and the body permit was
+    // already released above, so waiting cannot starve body intake.
+    let permit = match tokio::time::timeout(
+        state.acquire_timeout,
+        state.capacity.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => return busy_response(),
     };
     let method = parts.method.to_string();
     let path = parts.uri.path().to_string();
@@ -588,6 +670,36 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     }
 }
 
+/// Bridge from hyper's connection service to the axum router: the router is a
+/// tower service, so each connection polls it ready and then calls it with the
+/// request body converted to axum's `Body`.
+struct HyperService {
+    router: AxumRouter,
+}
+
+impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for HyperService {
+    type Response = AxumResponse<Body>;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
+        let mut router = self.router.clone();
+        Box::pin(async move {
+            std::future::poll_fn(|cx| router.poll_ready(cx)).await?;
+            let req = req.map(Body::new);
+            router.call(req).await
+        })
+    }
+}
+
+// Slow header transmission (slow-loris on the request line/headers) is bounded
+// by hyper's per-connection header read timeout, so one idle connection cannot
+// hold a slot in the accept loop forever. This is separate from the body read
+// timeout, which only starts once headers are complete.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[pyclass]
 struct NativeServer {
     shutdown: Option<oneshot::Sender<()>>,
@@ -599,6 +711,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000))]
     fn new(
         callback: Py<PyAny>,
         host: &str,
@@ -607,7 +720,17 @@ impl NativeServer {
         public_assets: HashMap<String, (Vec<u8>, String)>,
         client_assets: HashMap<String, Vec<u8>>,
         isr_cache: PyRef<'_, PyPageCache>,
+        max_concurrent: usize,
+        acquire_timeout_ms: u64,
+        body_capacity: usize,
+        body_timeout_ms: u64,
     ) -> PyResult<Self> {
+        if max_concurrent == 0 {
+            return Err(PyValueError::new_err("max_concurrent must be at least 1"));
+        }
+        if body_capacity == 0 {
+            return Err(PyValueError::new_err("body_capacity must be at least 1"));
+        }
         let isr_cache = isr_cache.inner.clone();
         let public_assets = public_assets
             .into_iter()
@@ -633,18 +756,43 @@ impl NativeServer {
             .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?
             .to_string();
         let (shutdown, rx) = oneshot::channel();
+        // The spawned thread reports its startup result back: previously a
+        // panic in `.expect` here only killed the thread while `new()` had
+        // already returned Ok with an address, leaving a dead server behind.
+        let (startup_tx, startup_rx) = mpsc::channel::<Result<(), String>>();
         let thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .expect("Tokio runtime");
+            {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    let _ = startup_tx.send(Err(format!("Tokio runtime failed: {e}")));
+                    return;
+                }
+            };
             runtime.block_on(async move {
-                let listener =
-                    tokio::net::TcpListener::from_std(listener).expect("configured listener");
+                let listener = match tokio::net::TcpListener::from_std(listener) {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        let _ = startup_tx.send(Err(format!("Configured listener failed: {e}")));
+                        return;
+                    }
+                };
+                let _ = startup_tx.send(Ok(()));
                 let state = Arc::new(ServerState {
                     callback,
-                    capacity: Arc::new(Semaphore::new(64)),
-                    body_capacity: Arc::new(Semaphore::new(64)),
+                    capacity: Arc::new(Semaphore::new(max_concurrent)),
+                    acquire_timeout: Duration::from_millis(acquire_timeout_ms),
+                    // Body intake gets fewer slots than Python execution on
+                    // purpose: a flood of slow uploads can then only take the
+                    // body slots, leaving execution slots free for requests
+                    // whose bodies are already in. The cost is that a burst of
+                    // legitimate concurrent uploads 503s sooner; raise
+                    // body_capacity if uploads, not execution, are the
+                    // bottleneck.
+                    body_capacity: Arc::new(Semaphore::new(body_capacity)),
+                    body_timeout: Duration::from_millis(body_timeout_ms),
                     static_pages: static_pages
                         .into_iter()
                         .map(|(path, body)| (path, Bytes::from(body)))
@@ -657,16 +805,62 @@ impl NativeServer {
                     isr_cache,
                 });
                 let app = AxumRouter::new().fallback(any(dispatch)).with_state(state);
-                if let Err(e) = axum::serve(listener, app)
-                    .with_graceful_shutdown(async {
-                        let _ = rx.await;
-                    })
-                    .await
-                {
-                    eprintln!("PyNext server failed: {e}");
+                let mut shutdown = std::pin::pin!(async {
+                    let _ = rx.await;
+                });
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown => break,
+                        accepted = listener.accept() => {
+                            let (stream, _) = match accepted {
+                                Ok(pair) => pair,
+                                Err(_) => {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                    continue;
+                                }
+                            };
+                            let service = HyperService {
+                                router: app.clone(),
+                            };
+                            // Auto-detect the protocol per connection: a
+                            // client that opens with the HTTP/2
+                            // prior-knowledge preface (`PRI * HTTP/2.0`) is
+                            // served h2c, everything else is HTTP/1.1. The
+                            // old Http1Builder-only loop turned the h2
+                            // preface into a VersionH2 error and dropped the
+                            // connection. The 10s header read timeout still
+                            // applies to the HTTP/1.1 side via `.http1()`.
+                            connections.spawn(async move {
+                                let mut builder = AutoBuilder::new(TokioExecutor::new());
+                                builder.http1().header_read_timeout(HEADER_READ_TIMEOUT);
+                                let _ = builder
+                                    .serve_connection(TokioIo::new(stream), service)
+                                    .await;
+                            });
+                        }
+                        _ = connections.join_next(), if !connections.is_empty() => {}
+                    }
                 }
+                // Drain in-flight connections, bounded so `stop()` cannot
+                // hang on a stuck connection.
+                let _ = tokio::time::timeout(Duration::from_secs(30), async {
+                    while connections.join_next().await.is_some() {}
+                })
+                .await;
             });
         });
+        match startup_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                return Err(pyo3::exceptions::PyOSError::new_err(message));
+            }
+            Err(_) => {
+                return Err(pyo3::exceptions::PyOSError::new_err(
+                    "server thread failed to start",
+                ));
+            }
+        }
         Ok(Self {
             shutdown: Some(shutdown),
             thread: Some(thread),
