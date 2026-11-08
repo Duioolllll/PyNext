@@ -6,6 +6,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 - Add a Redis session store (`RedisSessionStore`, `pynext-framework[redis]` or `PYNEXT_REDIS_URL`) sharing login, rotation and logout across nodes with TTL expiry and version-fenced writes; the session store interface (load/save/delete) is unchanged so external stores keep working.
 - Run expired-session cleanup automatically: `SessionMiddleware` now purges expired sessions in a background task every hour by default (`purge_interval`, `None` disables it, `close()` stops it).
+- Add `fail_open` / `fail_closed` failure policies for shared-backend outages (roadmap item B4): the ISR cache defaults to `fail_open` (local fallback, as before) and the Redis rate limiter defaults to `fail_closed` (503, as before); each can be flipped via `ISRCache(..., failure_policy=...)`, `RedisRateLimiter(..., failure_policy=...)`, `create_app(..., cache_failure_policy=...)`, or `--cache-failure-policy` / `--rate-limit-failure-policy`. Under `fail_closed`, an ISR page whose shared store cannot be consulted answers 503, and an invalidation that never reached the shared store raises instead of reporting success. Best-effort cache writes stay best-effort in both policies.
 
 ## 0.1.0
 

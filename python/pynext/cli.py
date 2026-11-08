@@ -82,7 +82,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                  observability=None, rate_limit=None, security=None, websocket_max_message=MAX_WS_MESSAGE,
                  max_connections=None, max_connections_per_ip=None,
                  header_read_timeout_ms=None, body_min_rate_bytes_per_sec=None,
-                 trusted_proxies=()):
+                 trusted_proxies=(), cache_failure_policy=None):
     """Serve the app in development mode, replacing changed island bundles.
 
     Other file changes restart the server on the same port and reload open
@@ -116,7 +116,9 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                     app = create_app(root, production=False, cache_backend=cache_backend, cache_path=cache_path,
                                observability=observability, rate_limit=rate_limit, debug=True, security=security,
                                websocket_max_message=websocket_max_message, hot_reload=True,
-                               trusted_proxies=trusted_proxies)
+                               trusted_proxies=trusted_proxies,
+                               **({"cache_failure_policy": cache_failure_policy}
+                                  if cache_failure_policy is not None else {}))
                 except Exception:
                     traceback.print_exc()
                     print("PyNext dev: fix the error above; watching for changes...", flush=True)
@@ -147,7 +149,9 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                     new_app = create_app(root, production=False, cache_backend=cache_backend, cache_path=cache_path,
                                observability=observability, rate_limit=rate_limit, debug=True, security=security,
                                websocket_max_message=websocket_max_message, hot_reload=True,
-                               trusted_proxies=trusted_proxies)
+                               trusted_proxies=trusted_proxies,
+                               **({"cache_failure_policy": cache_failure_policy}
+                                  if cache_failure_policy is not None else {}))
                 except Exception:
                     traceback.print_exc()
                     print("PyNext dev: keeping the previous version running; "
@@ -217,6 +221,11 @@ def main():
             command.add_argument("--cache-path", default=None,
                                  help="SQLite cache file for --cache-backend sqlite;"
                                       " defaults to <project>/.pynext/isr-cache.sqlite3")
+            command.add_argument("--cache-failure-policy", choices=("fail_open", "fail_closed"),
+                                 default="fail_open",
+                                 help="shared ISR cache behaviour when its backend is unavailable:"
+                                      " fail_open serves from the local cache (default);"
+                                      " fail_closed answers 503 instead")
             command.add_argument("--structured-logs", dest="structured_logs",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="emit one JSON object per log line (default: on)")
@@ -235,6 +244,11 @@ def main():
                                  help="rate limit window in seconds")
             command.add_argument("--rate-limit-backend", choices=("memory", "redis"), default="memory",
                                  help="per-process memory (default) or Redis via PYNEXT_REDIS_URL")
+            command.add_argument("--rate-limit-failure-policy", choices=("fail_open", "fail_closed"),
+                                 default="fail_closed",
+                                 help="Redis rate limiter behaviour when Redis is unavailable:"
+                                      " fail_closed answers 503 (default);"
+                                      " fail_open admits the request")
             command.add_argument("--trusted-proxy", action="append", default=[], metavar="IP_OR_CIDR",
                                  help="peer IP or network whose forwarded headers "
                                       "(X-Forwarded-For, Forwarded, X-Forwarded-Proto, "
@@ -295,7 +309,8 @@ def main():
             obs_config.tracing = args.tracing
     try:
         limiter_type = RedisRateLimiter if args.rate_limit_backend == "redis" else RateLimiter
-        options = ({"namespace": os.environ.get("PYNEXT_RATE_LIMIT_NAMESPACE", "default")}
+        options = ({"namespace": os.environ.get("PYNEXT_RATE_LIMIT_NAMESPACE", "default"),
+                    "failure_policy": args.rate_limit_failure_policy}
                    if args.rate_limit_backend == "redis" else {})
         limiter = (limiter_type(args.rate_limit, args.rate_limit_window,
                                 trusted_proxies=args.trusted_proxy,
@@ -338,8 +353,10 @@ def main():
                               rate_limit_window=args.rate_limit_window,
                               rate_limit_backend=args.rate_limit_backend,
                               rate_limit_exempt_paths=tuple(args.rate_limit_exempt_path),
+                              rate_limit_failure_policy=args.rate_limit_failure_policy,
                               trusted_proxies=tuple(args.trusted_proxy),
                               cache_backend=args.cache_backend, cache_path=args.cache_path,
+                              cache_failure_policy=args.cache_failure_policy,
                               observability=obs_config, security=security,
                               websocket_max_message=args.ws_max_message_bytes)
         return run_supervisor(config, workers=args.workers)
@@ -348,6 +365,7 @@ def main():
             asyncio.run(run_dev(root, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
                                 args.body_capacity, args.body_timeout_ms,
                                 cache_backend=args.cache_backend, cache_path=args.cache_path,
+                                cache_failure_policy=args.cache_failure_policy,
                                 rate_limit=limiter, security=security,
                                 websocket_max_message=args.ws_max_message_bytes,
                                 trusted_proxies=args.trusted_proxy, **extra, **conn_kwargs))
@@ -359,6 +377,8 @@ def main():
                      rate_limit=limiter,
                      **({"trusted_proxies": args.trusted_proxy} if args.trusted_proxy else {}),
                      **({"security": security} if security else {}),
+                     **({"cache_failure_policy": args.cache_failure_policy}
+                        if args.cache_failure_policy != "fail_open" else {}),
                      **({"websocket_max_message": args.ws_max_message_bytes}
                         if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}), **extra)
     try:

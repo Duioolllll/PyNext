@@ -32,6 +32,7 @@ import uuid
 from collections import OrderedDict
 
 from . import _native
+from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
 
 log = logging.getLogger("pynext")
 MAX_INFLIGHT = 128
@@ -414,12 +415,26 @@ def _is_storable(response):
 
 
 class ISRCache:
-    def __init__(self, cache_backend="memory", cache_path=None, namespace="", cache_url=None):
+    def __init__(self, cache_backend="memory", cache_path=None, namespace="", cache_url=None,
+                 failure_policy=None):
+        """Create an ISR cache.
+
+        ``failure_policy`` (roadmap item B4) decides what happens when
+        the shared backend (``sqlite``/``redis``) is unavailable: the
+        default ``"fail_open"`` falls back to the process-local cache
+        and renders locally, while ``"fail_closed"`` raises
+        :class:`SharedCacheUnavailable` so the caller can answer 503
+        instead of serving from degraded state. The policy is inert
+        for the ``memory`` backend, which has no shared store. It
+        governs the read/decision path (lookup, lease, generation);
+        best-effort writes stay best-effort — see ``failure_policy``.
+        """
         if cache_backend not in ("memory", "sqlite", "redis"):
             raise ValueError(
                 f"Unknown cache backend {cache_backend!r}: expected 'memory', 'sqlite' or 'redis'"
             )
         self.backend_name = cache_backend
+        self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_OPEN)
         # The process-local store stays the native fast path in both modes:
         # the Axum server reads it directly for fresh hits.
         self.store = _native.PageCache()
@@ -467,14 +482,24 @@ class ISRCache:
         return loop
 
     async def _shared_entry(self, key):
-        """Return an entry, a miss, or a distinct backend-failure sentinel."""
+        """Return an entry, a miss, or a distinct backend-failure sentinel.
+
+        Under ``fail_closed`` a backend failure raises
+        :class:`SharedCacheUnavailable` instead of returning the
+        sentinel, so the request fails rather than falling back.
+        """
         try:
             return await asyncio.to_thread(self.shared.lookup_entry, self.namespace + key)
-        except Exception:
+        except Exception as exc:
+            if self.failure_policy == FAIL_CLOSED:
+                raise SharedCacheUnavailable("Shared cache lookup failed") from exc
             log.warning("Shared cache lookup failed for %s", key, exc_info=True)
             return _SHARED_UNAVAILABLE
 
     async def _shared_store(self, key, body, policy, expected_version, owner):
+        # Best-effort in both policies: the page was already rendered
+        # correctly, so a failed write only loses caching, never the
+        # response. See failure_policy.
         try:
             return await asyncio.to_thread(
                 self.shared.insert_fenced, self.namespace + key, body,
@@ -487,11 +512,15 @@ class ISRCache:
     async def _shared_acquire(self, key, owner):
         try:
             return await asyncio.to_thread(self.shared.acquire_lease, self.namespace + key, owner)
-        except Exception:
+        except Exception as exc:
+            if self.failure_policy == FAIL_CLOSED:
+                raise SharedCacheUnavailable("Shared cache lease failed") from exc
             log.warning("Shared cache lease failed for %s", key, exc_info=True)
             return _SHARED_UNAVAILABLE
 
     async def _shared_release(self, key, owner):
+        # Best-effort in both policies: leases expire on their own, and
+        # a release failure must not fail a request that already rendered.
         try:
             await asyncio.to_thread(self.shared.release_lease, self.namespace + key, owner)
         except Exception:
@@ -500,7 +529,11 @@ class ISRCache:
     async def _shared_remove(self, key):
         try:
             return await asyncio.to_thread(self.shared.remove, self.namespace + key)
-        except Exception:
+        except Exception as exc:
+            if self.failure_policy == FAIL_CLOSED:
+                # An explicit invalidation must not report success when
+                # the shared store never saw it.
+                raise SharedCacheUnavailable("Shared cache invalidation failed") from exc
             log.warning("Shared cache remove failed for %s", key, exc_info=True)
             return False
 
@@ -536,7 +569,9 @@ class ISRCache:
                     self.shared.variant_generation, self.namespace + path, invalidate=invalidate)
                 self._remember_variant_generation(path, token)
                 return token, existed or had_local
-            except Exception:
+            except Exception as exc:
+                if self.failure_policy == FAIL_CLOSED:
+                    raise SharedCacheUnavailable("Shared cache generation failed") from exc
                 log.warning("Shared cache generation failed for %s", path, exc_info=True)
         if invalidate or not had_local:
             token = uuid.uuid4().hex
@@ -675,7 +710,9 @@ class ISRCache:
             try:
                 valid = owner is not None and await asyncio.to_thread(
                     self.shared.owns_lease, self.namespace + key, owner)
-            except Exception:
+            except Exception as exc:
+                if self.failure_policy == FAIL_CLOSED:
+                    raise SharedCacheUnavailable("Shared cache lease lookup failed") from exc
                 if status == "fresh":
                     return body
                 return await self._get_or_render_local(key, policy, render, status, body)

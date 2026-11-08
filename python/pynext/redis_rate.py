@@ -1,9 +1,13 @@
 """A bounded shared Redis token bucket using server time."""
 import hashlib
+import logging
 import math
 import os
 
-from .ratelimit import RateLimiter, RateLimitUnavailable
+from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
+from .ratelimit import RateLimiter, RateLimitUnavailable, _MAX_BUCKETS
+
+log = logging.getLogger("pynext")
 
 _ALLOW = """
 local t = redis.call('TIME')
@@ -62,15 +66,26 @@ class RedisRateLimiter(RateLimiter):
     pressure follows the same policy as the in-process limiter: a new key
     evicts the stalest active bucket instead of being denied, and only
     the global new-key sliding window can deny a brand-new key.
+
+    ``failure_policy`` (roadmap item B4) decides what happens when
+    Redis is unreachable: the default ``"fail_closed"`` raises
+    :class:`RateLimitUnavailable` (the caller answers 503), while
+    ``"fail_open"`` admits the request. Failing open removes abuse
+    protection for the duration of the outage, so only use it where
+    availability matters more than limiting. The process-local
+    :class:`RateLimiter` never raises, so the policy only applies to
+    this Redis-backed limiter.
     """
 
     blocking = True
 
     def __init__(self, limit, window_seconds, *, url=None, namespace="default", trusted_proxies=(),
-                 exempt_paths=(), max_buckets=None, max_new_keys_per_window=None):
+                 exempt_paths=(), max_buckets=None, max_new_keys_per_window=None,
+                 failure_policy=None):
         super().__init__(limit, window_seconds, trusted_proxies=trusted_proxies,
                          exempt_paths=exempt_paths, max_buckets=max_buckets,
                          max_new_keys_per_window=max_new_keys_per_window)
+        self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_CLOSED)
         if limit > 1_000_000 or not 0.001 <= self.window_seconds <= 31_536_000:
             raise ValueError("Redis rate limits require at most 1000000 tokens and a window from 0.001 to 31536000 seconds")
         url = url or os.environ.get("PYNEXT_REDIS_URL")
@@ -97,6 +112,10 @@ class RedisRateLimiter(RateLimiter):
                                               max(1, math.ceil(self.window_seconds * 1000)),
                                               self.max_buckets, self.max_new_keys_per_window)
         except Exception as exc:
+            if self.failure_policy == FAIL_OPEN:
+                log.warning("Redis rate limiter unavailable; admitting request (fail_open)",
+                            exc_info=True)
+                return True, None
             raise RateLimitUnavailable("Redis rate limiter unavailable") from exc
         return bool(allowed), None if allowed else int(retry)
 

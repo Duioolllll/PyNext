@@ -184,7 +184,7 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG 和 ISR 页面不能接收 `request`，仅用于公开内容。ISR 默认忽略查询字符串。通过 `@page(render="isr", revalidate=30, query_keys=("lang",))` 和页面的 `query` 参数，只传入允许的键及其字符串列表，并按值分别缓存。使路径失效会使其所有查询变体失效。包含 Cookie 或 Authorization 的请求绕过共享缓存并返回 `private, no-store`。默认缓存仅在本进程内，也可使用 SQLite 或可选 Redis（`pynext-framework[redis]` 和 `PYNEXT_REDIS_URL`）在 worker 间共享；共享存储故障时可能回退到过期的本地缓存。带 `Set-Cookie` 或 private/no-store 的响应不缓存。SSG 异步生成器在构建期间消费，并作为静态文件提供。
+SSG 和 ISR 页面不能接收 `request`，仅用于公开内容。ISR 默认忽略查询字符串。通过 `@page(render="isr", revalidate=30, query_keys=("lang",))` 和页面的 `query` 参数，只传入允许的键及其字符串列表，并按值分别缓存。使路径失效会使其所有查询变体失效。包含 Cookie 或 Authorization 的请求绕过共享缓存并返回 `private, no-store`。默认缓存仅在本进程内，也可使用 SQLite 或可选 Redis（`pynext-framework[redis]` 和 `PYNEXT_REDIS_URL`）在 worker 间共享；共享存储故障时遵循故障策略：默认（`fail_open`，`--cache-failure-policy fail_open`）回退到过期的本地缓存，`fail_closed` 则返回 503。带 `Set-Cookie` 或 private/no-store 的响应不缓存。SSG 异步生成器在构建期间消费，并作为静态文件提供。
 
 SSG 构建最多生成 10,000 个页面；开发模式下每次请求都会渲染 SSG 页面。ISR 页面不能导出 `generate_static_params()`，每个进程最多并发执行 128 个生成任务。
 
@@ -255,7 +255,7 @@ OpenTelemetry 追踪默认关闭且为可选项：安装 `opentelemetry-api`（�
 
 ## 限流
 
-限流是可选项，采用按进程的令牌桶：`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的动态请求返回 429，并带有以秒为单位的 `Retry-After` 头。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失；分布式限流尚未实现。静态文件和新鲜的 ISR 页面在到达 Python 桥接之前已由 Rust 层返回，因此不受限流。
+限流是可选项，采用按进程的令牌桶：`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的动态请求返回 429，并带有以秒为单位的 `Retry-After` 头。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失。使用 `--rate-limit-backend redis` 时桶在进程间共享；Redis 不可达时遵循故障策略：默认（`fail_closed`，`--rate-limit-failure-policy fail_closed`）返回 503，`fail_open` 则放行请求。静态文件和新鲜的 ISR 页面在到达 Python 桥接之前已由 Rust 层返回，因此不受限流。
 
 转发链从右向左遍历受信任的代理，使用最近的不受信任地址。必须准确配置所有中间代理。每个进程最多保留 10,000 个桶；全部处于活跃状态时，新键会逐出最旧的桶而不是收到 429，新键的创建受全局滑动窗口限制（每个窗口最多 10,000 个新键）。IPv6 地址按 /64 前缀共享桶。用 `--rate-limit-exempt-path`（例如 `/healthz`）指定的路径跳过速率限制。
 
