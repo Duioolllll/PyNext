@@ -211,9 +211,12 @@ def main():
             command.add_argument("--trusted-proxy", action="append", default=[], metavar="IP_OR_CIDR",
                                  help="peer IP or network whose X-Forwarded-For is honoured "
                                       "for rate limiting (repeatable; default: none trusted)")
-            command.add_argument("--csrf", action="store_true", help="protect state-changing API requests")
-            command.add_argument("--csrf-cookie-secure", action="store_true",
-                                 help="send the double-submit CSRF cookie only over HTTPS")
+            command.add_argument("--csrf", action=argparse.BooleanOptionalAction, default=None,
+                                 help="protect state-changing API requests (default: auto — on when a "
+                                      "session middleware is installed; --no-csrf opts out)")
+            command.add_argument("--csrf-cookie-secure", action=argparse.BooleanOptionalAction, default=None,
+                                 help="send the double-submit CSRF cookie only over HTTPS "
+                                      "(default: on for start, off for dev over plain http)")
             command.add_argument("--cors-origin", action="append", default=[], metavar="ORIGIN",
                                  help="allow this CORS origin (repeatable)")
             command.add_argument("--cors-credentials", action="store_true",
@@ -265,11 +268,14 @@ def main():
         limiter = (limiter_type(args.rate_limit, args.rate_limit_window,
                                 trusted_proxies=args.trusted_proxy, **options)
                    if args.rate_limit >= 1 else None)
-        security = (SecurityConfig(csrf_enabled=args.csrf, csrf_cookie_secure=args.csrf_cookie_secure,
+        security = (SecurityConfig(csrf_enabled=args.csrf,
+                                   csrf_cookie_secure=(args.csrf_cookie_secure
+                                                      if args.csrf_cookie_secure is not None
+                                                      else args.command == "start"),
                                    cors_allowed_origins=tuple(args.cors_origin),
                                    cors_allow_credentials=args.cors_credentials,
                                    csp_nonce_enabled=args.csp_nonce)
-                    if (args.csrf or args.csrf_cookie_secure or args.cors_origin or
+                    if (args.csrf is not None or args.csrf_cookie_secure is not None or args.cors_origin or
                         args.cors_credentials or args.csp_nonce) else None)
     except ValueError as exc:
         parser.error(str(exc))

@@ -76,15 +76,15 @@ async def echo(request):
 
 Responses default to the Content Security Policy `script-src 'self'; object-src 'none'`. This limits which scripts a browser may load; account for it when adding client code. Response headers and media types reject control characters.
 
-State-changing API requests can opt into CSRF protection (spec v0.2 §11). PyNext has no auth system yet, so protection uses the double-submit pattern: the app issues an unpredictable token, stores it in a `pynext_csrf` cookie, and the client sends the same value back in the `X-CSRF-Token` header (or a `csrf_token` form field). GET, HEAD and OPTIONS are exempt; other methods without a matching token get HTTP 403.
+State-changing API requests are CSRF-protected (spec v0.2 §11). Installing a session middleware protects every state-changing API route automatically, with the token bound to the server-side session. Without a session middleware CSRF is off by default and uses the double-submit pattern: the app issues an unpredictable token, stores it in a `pynext_csrf` cookie, and the client sends the same value back in the `X-CSRF-Token` header (or a `csrf_token` form field). The cookie value is HMAC-signed, so an unsigned cookie is rejected even when the submitted token matches (this stops subdomain cookie injection). `Origin` and `Sec-Fetch-Site` are checked too: requests from cross-site or subdomain pages get HTTP 403 even with a valid token. GET, HEAD and OPTIONS are exempt; other methods without a matching token get HTTP 403.
 
 ~~~python
 from pynext import JSONResponse, csrf_protect, new_csrf_token, route, set_csrf_cookie
 
 @route("GET")
-async def get_token():
+async def get_token(request):
     token = new_csrf_token()
-    return set_csrf_cookie(JSONResponse({"token": token}), token)
+    return set_csrf_cookie(JSONResponse({"token": token}), token, config=request.security)
 
 @route("POST")
 @csrf_protect
@@ -92,7 +92,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-Pass `security=SecurityConfig(csrf_enabled=True)` to `create_app` to protect every state-changing API route instead of marking handlers one by one. With SessionMiddleware, the token is bound to the server-side session; without it, the double-submit token proves the request came from a page that could read the cookie. A page that can read the cookie through XSS can bypass it, as with any double-submit scheme. The cookie defaults to `SameSite=Lax` without `HttpOnly` (JavaScript must read it); set `csrf_cookie_secure=True` in production so it is only sent over HTTPS.
+With SessionMiddleware, CSRF turns on automatically — no security config needed. Without sessions, pass `security=SecurityConfig(csrf_enabled=True)` to `create_app` to protect every state-changing API route instead of marking handlers one by one. The double-submit token only proves the request came from a page that could read the cookie. A page that can read the cookie through XSS can bypass it, as with any double-submit scheme. The cookie defaults to `SameSite=Lax` without `HttpOnly` (JavaScript must read it) and is `Secure` by default; for plain-`http://` local development pass `csrf_cookie_secure=False` to both the app config and `set_csrf_cookie()` (`pynext dev` does this automatically). Multi-worker deployments must share one `csrf_signing_key` (or the `PYNEXT_CSRF_SIGNING_KEY` environment variable) on every worker so a cookie issued by one worker verifies on the others.
 
 Cross-origin requests are denied by default (spec v0.2 §11): no `Access-Control-Allow-Origin` header is sent unless the origin is configured. Pass the policy to `create_app` with `SecurityConfig`:
 

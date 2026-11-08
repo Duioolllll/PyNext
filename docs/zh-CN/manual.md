@@ -76,15 +76,15 @@ async def echo(request):
 
 响应默认使用 Content Security Policy `script-src 'self'; object-src 'none'`。该策略限制浏览器可加载的脚本，添加客户端代码时应予以考虑。响应头和媒体类型中的控制字符会被拒绝。
 
-状态变更类 API 请求可以选择启用 CSRF 保护（规范 v0.2 §11）。启用会话中间件时令牌绑定到服务端会话；否则采用 double-submit 模式：应用签发一个不可预测的令牌，存入 `pynext_csrf` Cookie，客户端再以 `X-CSRF-Token` 请求头（或 `csrf_token` 表单字段）回传相同的值。GET、HEAD 和 OPTIONS 不受检查；其他方法若缺少令牌或令牌不匹配，将返回 HTTP 403。
+状态变更类 API 请求适用 CSRF 保护（规范 v0.2 §11）。启用会话中间件后，全部状态变更类 API 路由会自动受到保护，令牌绑定到服务端会话。没有会话中间件时默认关闭，采用 double-submit 模式：应用签发一个不可预测的令牌，存入 `pynext_csrf` Cookie，客户端再以 `X-CSRF-Token` 请求头（或 `csrf_token` 表单字段）回传相同的值。Cookie 值经过 HMAC 签名，未签名的 Cookie 即使令牌相符也会被拒绝（防止子域 Cookie 注入）。同时还会检查 `Origin` 和 `Sec-Fetch-Site`：来自跨站或子域页面的请求即使令牌有效也会被拒绝。GET、HEAD 和 OPTIONS 不受检查；其他方法若缺少令牌或令牌不匹配，将返回 HTTP 403。
 
 ~~~python
 from pynext import JSONResponse, csrf_protect, new_csrf_token, route, set_csrf_cookie
 
 @route("GET")
-async def get_token():
+async def get_token(request):
     token = new_csrf_token()
-    return set_csrf_cookie(JSONResponse({"token": token}), token)
+    return set_csrf_cookie(JSONResponse({"token": token}), token, config=request.security)
 
 @route("POST")
 @csrf_protect
@@ -92,7 +92,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-除逐个标记处理器外，也可向 `create_app` 传入 `security=SecurityConfig(csrf_enabled=True)`，保护全部状态变更类 API 路由。由于目前没有会话，令牌不与用户会话绑定：它仅证明请求来自能够读取该 Cookie 的页面。与其他 double-submit 方案一样，能够通过 XSS 读取 Cookie 的页面可以绕过它。Cookie 默认使用 `SameSite=Lax`，且不设 `HttpOnly`（JavaScript 需要读取它）；生产环境请设置 `csrf_cookie_secure=True`，使 Cookie 仅通过 HTTPS 发送。
+启用会话中间件后，无需另传安全配置即可自动开启 CSRF。若没有会话，又想保护全部状态变更类 API 路由，可向 `create_app` 传入 `security=SecurityConfig(csrf_enabled=True)`。令牌仅证明请求来自能够读取该 Cookie 的页面。与其他 double-submit 方案一样，能够通过 XSS 读取 Cookie 的页面可以绕过它。Cookie 默认使用 `SameSite=Lax`，且不设 `HttpOnly`（JavaScript 需要读取它）；CSRF Cookie 默认带 `Secure`，在明文 `http://` 本地开发时，请同时向应用配置和 `set_csrf_cookie()` 调用传入 `csrf_cookie_secure=False`（`pynext dev` 会自动这样做）。多 worker 部署时，所有 worker 必须使用相同的 `csrf_signing_key`（或 `PYNEXT_CSRF_SIGNING_KEY` 环境变量），这样一个 worker 签发的 Cookie 才能在其他 worker 上通过验证。
 
 跨源请求默认一律拒绝（规范 v0.2 §11）：未配置来源时，不会发送 `Access-Control-Allow-Origin` 请求头。请通过 `SecurityConfig` 将策略传给 `create_app`：
 

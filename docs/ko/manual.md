@@ -76,15 +76,15 @@ async def echo(request):
 
 응답의 기본 Content Security Policy는 `script-src 'self'; object-src 'none'`입니다. 브라우저에서 불러올 수 있는 스크립트가 제한되므로 클라이언트 코드를 추가할 때 이를 고려하세요. 응답 헤더와 미디어 타입의 제어 문자는 거부합니다.
 
-상태 변경 API 요청에는 CSRF 보호를 선택적으로 적용할 수 있습니다(명세 v0.2 §11). 세션 미들웨어가 있으면 토큰을 서버 세션에 결합하고, 없으면 double-submit 방식을 사용합니다. 앱이 예측할 수 없는 토큰을 발급해 `pynext_csrf` 쿠키에 담고, 클라이언트는 같은 값을 `X-CSRF-Token` 헤더(또는 `csrf_token` 폼 필드)로 돌려보냅니다. GET, HEAD, OPTIONS는 제외되며, 토큰이 없거나 일치하지 않는 그 외의 메서드는 HTTP 403을 받습니다.
+상태 변경 API 요청에는 CSRF 보호가 적용됩니다(명세 v0.2 §11). 세션 미들웨어를 설치하면 모든 상태 변경 API가 자동으로 보호되며, 토큰은 서버 세션에 결합됩니다. 세션 미들웨어가 없으면 기본적으로 꺼져 있으며, double-submit 방식을 사용합니다. 앱이 예측할 수 없는 토큰을 발급해 `pynext_csrf` 쿠키에 담고, 클라이언트는 같은 값을 `X-CSRF-Token` 헤더(또는 `csrf_token` 폼 필드)로 돌려보냅니다. 쿠키 값은 HMAC으로 서명되므로 서명이 없는 쿠키는 토큰이 일치해도 거부됩니다(서브도메인 쿠키 주입 방지). `Origin`/`Sec-Fetch-Site`도 검사해 교차 사이트·서브도메인 페이지에서 온 요청은 토큰이 있어도 거부됩니다. GET, HEAD, OPTIONS는 제외되며, 토큰이 없거나 일치하지 않는 그 외의 메서드는 HTTP 403을 받습니다.
 
 ~~~python
 from pynext import JSONResponse, csrf_protect, new_csrf_token, route, set_csrf_cookie
 
 @route("GET")
-async def get_token():
+async def get_token(request):
     token = new_csrf_token()
-    return set_csrf_cookie(JSONResponse({"token": token}), token)
+    return set_csrf_cookie(JSONResponse({"token": token}), token, config=request.security)
 
 @route("POST")
 @csrf_protect
@@ -92,7 +92,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-핸들러를 하나씩 표시하는 대신 `create_app`에 `security=SecurityConfig(csrf_enabled=True)`를 전달하면 모든 상태 변경 API 라우트를 보호할 수 있습니다. 아직 세션이 없으므로 토큰은 사용자 세션에 묶이지 않습니다. 토큰은 쿠키를 읽을 수 있는 페이지에서 요청이 왔다는 것만 증명합니다. XSS로 쿠키를 읽을 수 있는 페이지는 다른 double-submit 방식과 마찬가지로 이를 우회할 수 있습니다. 쿠키는 기본적으로 `SameSite=Lax`이며 `HttpOnly`가 아닙니다(JavaScript가 읽어야 합니다). 운영 환경에서는 `csrf_cookie_secure=True`로 설정해 HTTPS에서만 전송되게 하세요.
+세션 미들웨어가 있으면 `create_app`에 보안 설정을 따로 전달하지 않아도 CSRF가 자동으로 켜집니다. 세션이 없는데 모든 상태 변경 API 라우트를 보호하려면 `create_app`에 `security=SecurityConfig(csrf_enabled=True)`를 전달하세요. 토큰은 쿠키를 읽을 수 있는 페이지에서 요청이 왔다는 것만 증명합니다. XSS로 쿠키를 읽을 수 있는 페이지는 다른 double-submit 방식과 마찬가지로 이를 우회할 수 있습니다. 쿠키는 기본적으로 `SameSite=Lax`이며 `HttpOnly`가 아닙니다(JavaScript가 읽어야 합니다). CSRF 쿠키는 기본적으로 `Secure`이므로 평문 `http://` 로컬 개발에서는 `csrf_cookie_secure=False`를 앱 설정과 `set_csrf_cookie()` 호출에 함께 전달하세요(`pynext dev`는 자동으로 이렇게 동작합니다). 다중 워커로 배포할 때는 모든 워커가 같은 `csrf_signing_key`(또는 `PYNEXT_CSRF_SIGNING_KEY` 환경 변수)를 써야 한 워커가 발급한 쿠키를 다른 워커도 검증할 수 있습니다.
 
 교차 출처 요청은 기본적으로 허용하지 않습니다(명세 v0.2 §11). 출처를 설정하지 않으면 `Access-Control-Allow-Origin` 헤더를 보내지 않습니다. `SecurityConfig`로 정책을 `create_app`에 전달하세요.
 

@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import hashlib
 import html
 import importlib.machinery
@@ -41,6 +42,7 @@ from .observability import (
     span,
 )
 from .ratelimit import RateLimitUnavailable, rate_limited_response
+from .sessions import SessionMiddleware
 from .static import asset_response
 
 log = logging.getLogger("pynext")
@@ -351,6 +353,18 @@ class App:
                 if not (inspect.iscoroutinefunction(item) or
                         inspect.iscoroutinefunction(getattr(item, "__call__", None))):
                     raise TypeError("middleware entries must be async callables")
+            if security.csrf_enabled is None:
+                # Auto CSRF: a session middleware means the app keeps
+                # server-side state, so every state-changing API route is
+                # protected unless the app explicitly opts out with
+                # SecurityConfig(csrf_enabled=False). Without sessions the
+                # default stays off (opt in with csrf_enabled=True or
+                # @csrf_protect) so token-less API clients keep working.
+                security = dataclasses.replace(
+                    security,
+                    csrf_enabled=any(isinstance(item, SessionMiddleware)
+                                     for item in self.middleware))
+                self.security = security
             configured_resources = {}
             if "resources.py" in manifest["sources"]:
                 configured_resources = getattr(self._module("resources.py"), "RESOURCES", None)

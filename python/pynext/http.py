@@ -1,5 +1,7 @@
+import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 from dataclasses import dataclass, field
@@ -15,6 +17,15 @@ class BadRequest(Exception):
 #: Methods that never change server state and are exempt from CSRF checks.
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
+#: One process-wide fallback signing key for double-submit CSRF cookies.
+#: Configs that do not set a key (and have no PYNEXT_CSRF_SIGNING_KEY)
+#: share it, so a cookie issued with the framework default config
+#: verifies against an app's own default config. Explicit keys and the
+#: environment variable still override it per config. Workers are
+#: separate processes, so each has its own fallback key — multi-worker
+#: deployments must share one key explicitly.
+_FALLBACK_CSRF_SIGNING_KEY = secrets.token_bytes(32)
+
 _KNOWN_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
 _TOKEN_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _ORIGIN = re.compile(r"https?://[^/]+")
@@ -25,18 +36,37 @@ _CSP_NONCE = re.compile(r"[A-Za-z0-9+/=_-]+")
 class SecurityConfig:
     """Security defaults for an app (spec v0.2 §11).
 
-    CSRF protection is opt-in: either set ``csrf_enabled`` to require a
-    valid token on every state-changing API request, or mark individual
-    handlers with :func:`csrf_protect`. CORS denies every cross-origin
-    request by default; list origins explicitly to allow them. CSP nonce
-    support is off by default and only changes dynamically rendered pages.
+    CSRF protection is automatic when a session middleware is installed:
+    ``csrf_enabled=None`` (the default) enables it for every state-changing
+    API request once a ``SessionMiddleware`` is present, and leaves it
+    off otherwise. Pass ``csrf_enabled=True`` to protect state-changing
+    API routes even without sessions, or ``csrf_enabled=False`` to opt
+    out explicitly (for example when a legacy client cannot send a token
+    yet). Individual handlers can also be marked with :func:`csrf_protect`.
+
+    Without sessions the double-submit cookie is HMAC-signed with
+    ``csrf_signing_key`` so a subdomain that can set a cookie cannot
+    inject its own token: an unsigned or foreign-signed cookie is
+    rejected even when the submitted token matches it. The key defaults
+    to ``PYNEXT_CSRF_SIGNING_KEY`` when set, and otherwise to a fresh
+    per-process key — so multi-worker deployments must set the same
+    key (or signing secret) on every worker, or a cookie issued by one
+    worker is rejected by the others. With sessions the token is bound
+    to the server-side session instead and the signing key is unused.
+
+    CORS denies every cross-origin request by default; list origins
+    explicitly to allow them. CSP nonce support is off by default and
+    only changes dynamically rendered pages. The CSRF cookie is
+    ``Secure`` by default: over plain ``http://`` (local development)
+    pass ``csrf_cookie_secure=False`` to the app config and to
+    :func:`set_csrf_cookie` (or use ``pynext dev``, which does that).
     """
 
-    csrf_enabled: bool = False
+    csrf_enabled: bool | None = None
     csrf_cookie_name: str = "pynext_csrf"
     csrf_header_name: str = "X-CSRF-Token"
     csrf_form_field: str = "csrf_token"
-    csrf_cookie_secure: bool = False
+    csrf_cookie_secure: bool = True
     csrf_cookie_samesite: str = "Lax"
     cors_allowed_origins: tuple = ()
     cors_allowed_methods: tuple = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
@@ -44,10 +74,12 @@ class SecurityConfig:
     cors_allow_credentials: bool = False
     cors_max_age: int = 600
     csp_nonce_enabled: bool = False
+    csrf_signing_key: str | bytes | None = field(default=None, repr=False)
+    csrf_origin_check: bool = True
 
     def __post_init__(self):
-        if not isinstance(self.csrf_enabled, bool):
-            raise TypeError("csrf_enabled must be a bool")
+        if self.csrf_enabled is not None and not isinstance(self.csrf_enabled, bool):
+            raise TypeError("csrf_enabled must be a bool or None")
         for name in ("csrf_cookie_name", "csrf_header_name", "csrf_form_field"):
             value = getattr(self, name)
             if not isinstance(value, str) or not _TOKEN_NAME.fullmatch(value):
@@ -56,6 +88,28 @@ class SecurityConfig:
             raise ValueError("csrf_cookie_samesite must be Lax, Strict or None")
         if not isinstance(self.csrf_cookie_secure, bool):
             raise TypeError("csrf_cookie_secure must be a bool")
+        if not isinstance(self.csrf_origin_check, bool):
+            raise TypeError("csrf_origin_check must be a bool")
+        key = self.csrf_signing_key
+        if key is None:
+            env_key = os.environ.get("PYNEXT_CSRF_SIGNING_KEY")
+            if env_key:
+                key = env_key
+        if key is None:
+            # Shared process-wide fallback key (see _FALLBACK_CSRF_SIGNING_KEY):
+            # a cookie issued with the framework default config must verify
+            # against an app's own default config. Multi-worker deployments
+            # must share one key explicitly (see the class docstring).
+            key = _FALLBACK_CSRF_SIGNING_KEY
+        elif isinstance(key, str):
+            key = key.encode("utf-8")
+        elif isinstance(key, (bytes, bytearray)):
+            key = bytes(key)
+        else:
+            raise TypeError("csrf_signing_key must be str, bytes or None")
+        if len(key) < 16:
+            raise ValueError("csrf_signing_key must be at least 16 bytes")
+        self.csrf_signing_key = key
         self.cors_allowed_origins = tuple(self.cors_allowed_origins)
         self.cors_allowed_methods = tuple(self.cors_allowed_methods)
         self.cors_allowed_headers = tuple(self.cors_allowed_headers)
@@ -76,7 +130,8 @@ class SecurityConfig:
             raise TypeError("csp_nonce_enabled must be a bool")
 
 
-#: The framework defaults: CSRF off (opt-in), CORS deny-all, CSP nonce off.
+#: The framework defaults: CSRF auto (on with a session middleware, off
+#: otherwise), CORS deny-all, CSP nonce off, CSRF cookie Secure.
 DEFAULT_SECURITY = SecurityConfig()
 
 
@@ -85,16 +140,51 @@ def new_csrf_token():
     return secrets.token_urlsafe(32)
 
 
+def sign_csrf_token(token, *, config=DEFAULT_SECURITY):
+    """Return the signed double-submit cookie value for ``token``.
+
+    The value is ``"<token>.<HMAC-SHA256 hex>"`` signed with the config's
+    ``csrf_signing_key``. Clients send the raw ``token`` back in the
+    header (or form field) and the signed value back as the cookie, so a
+    subdomain that can plant an unsigned cookie cannot pass validation
+    even if it knows the token.
+    """
+    signature = hmac.new(config.csrf_signing_key, token.encode("ascii"),
+                         hashlib.sha256).hexdigest()
+    return f"{token}.{signature}"
+
+
+def _signed_csrf_token(cookie_value, *, config=DEFAULT_SECURITY):
+    """Return the token inside a signed CSRF cookie value, or ``None``.
+
+    Unsigned values (a bare token, a missing signature, a signature made
+    with another key) are rejected: this is what stops subdomain cookie
+    injection, where the attacker controls the cookie but not the key.
+    """
+    token, separator, signature = cookie_value.rpartition(".")
+    if not separator or not token:
+        return None
+    expected = hmac.new(config.csrf_signing_key, token.encode("ascii"),
+                        hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return None
+    return token
+
+
 def set_csrf_cookie(response, token, *, config=DEFAULT_SECURITY):
     """Set the double-submit CSRF cookie on a response.
 
     The cookie is readable by same-origin JavaScript on purpose: the client
     reads it and sends the same value back in the ``X-CSRF-Token`` header (or
     the ``csrf_token`` form field), so it must not be ``HttpOnly``. It is
-    ``SameSite=Lax`` by default; pass a config with ``csrf_cookie_secure=True``
-    in production so it is only sent over HTTPS.
+    ``SameSite=Lax`` by default and ``Secure`` by default; pass a config
+    with ``csrf_cookie_secure=False`` for plain-``http://`` local
+    development. The cookie value is the HMAC-signed token (see
+    :func:`sign_csrf_token`): send the cookie back exactly as issued and
+    the raw token in the header — reconstructing the cookie from the
+    token alone will not validate.
     """
-    parts = [f"{config.csrf_cookie_name}={token}", "Path=/",
+    parts = [f"{config.csrf_cookie_name}={sign_csrf_token(token, config=config)}", "Path=/",
              f"SameSite={config.csrf_cookie_samesite}"]
     if config.csrf_cookie_secure:
         parts.append("Secure")
@@ -137,21 +227,58 @@ def csrf_token_from_request(request, *, config=DEFAULT_SECURITY):
     return None
 
 
-def validate_csrf(request, *, config=DEFAULT_SECURITY):
-    """Check a session-bound token, or the double-submit token without sessions.
+def _csrf_origin_allowed(request):
+    """True when the request's origin signals do not show a cross-site call.
 
-    GET, HEAD and OPTIONS are exempt. Tokens are compared in constant time.
+    A present ``Origin`` must match the ``Host`` header exactly (a
+    malformed Origin, ``Origin: null`` or a missing Host all fail closed).
+    Without an Origin, ``Sec-Fetch-Site`` must be ``same-origin`` or
+    ``none`` (a non-browser client sends neither header and is allowed
+    through to the token check). ``same-site`` is rejected too: a
+    subdomain page is a different origin and must not drive state-changing
+    API calls. Disable with ``SecurityConfig(csrf_origin_check=False)``
+    when an app legitimately serves its API from another subdomain.
+    """
+    origin = _request_origin(request)
+    if origin is not None:
+        return _is_same_origin(request, origin)
+    fetch_site = _header_values(request, "sec-fetch-site")
+    if fetch_site:
+        return fetch_site[0].decode("ascii", "ignore").strip().lower() in {"same-origin", "none"}
+    return True
+
+
+def validate_csrf(request, *, config=DEFAULT_SECURITY):
+    """Check the CSRF token, and the request's origin signals.
+
+    GET, HEAD and OPTIONS are exempt. Otherwise the Origin /
+    Sec-Fetch-Site check runs first (when ``csrf_origin_check`` is on),
+    then the token: with a session the token must match the session-bound
+    token, and without one the cookie must be a valid HMAC-signed
+    double-submit value whose token matches the submitted header or form
+    field. Tokens are compared in constant time.
     """
     if request.method.upper() in SAFE_METHODS:
         return True
+    if config.csrf_origin_check and not _csrf_origin_allowed(request):
+        return False
     submitted = csrf_token_from_request(request, config=config)
     from .sessions import Session
     session = request.state.get("session")
-    expected = session._csrf if isinstance(session, Session) else _cookie_value(request, config.csrf_cookie_name)
-    if not expected or not submitted:
+    if isinstance(session, Session):
+        expected = session._csrf
+        if not expected or not submitted:
+            return False
+        try:
+            return hmac.compare_digest(expected, submitted)
+        except TypeError:
+            return False
+    cookie = _cookie_value(request, config.csrf_cookie_name)
+    token = _signed_csrf_token(cookie, config=config) if cookie else None
+    if not token or not submitted:
         return False
     try:
-        return hmac.compare_digest(expected, submitted)
+        return hmac.compare_digest(token, submitted)
     except TypeError:
         return False
 
@@ -429,6 +556,13 @@ class Request:
         if self._app is None:
             raise RuntimeError("This request is not attached to an app")
         return self._app.resources
+
+    @property
+    def security(self):
+        """The app's :class:`SecurityConfig` (for issuing CSRF cookies, etc.)."""
+        if self._app is None:
+            raise RuntimeError("This request is not attached to an app")
+        return self._app.security
 
     async def revalidate(self, path):
         """Invalidate an ISR path in the current app's process-local cache."""
