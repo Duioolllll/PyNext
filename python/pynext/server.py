@@ -15,6 +15,16 @@ from .ratelimit import RateLimitUnavailable, rate_limited_response
 log = logging.getLogger("pynext")
 REQUEST_TIMEOUT = 30
 STREAM_CHUNK_TIMEOUT = 30
+# Connection limits (A4). These are the native server defaults; the Rust
+# accept loop enforces them, so a client that never completes a request
+# cannot hold a Python worker thread or an execution slot.
+DEFAULT_MAX_CONNECTIONS = 1024
+DEFAULT_MAX_CONNECTIONS_PER_IP = 128
+DEFAULT_HEADER_READ_TIMEOUT_MS = 10_000
+# Minimum average body receive rate in bytes/second, enforced after a
+# 2-second grace window (see read_limited_body in the native crate). 0
+# disables the rate check; the whole-body timeout still applies.
+DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC = 1024
 _CANCEL_POLL_SECONDS = 0.05
 _WS_QUEUE_SIZE = 32
 _WS_INBOX_TIMEOUT = 1
@@ -263,7 +273,11 @@ class _NativeStream:
 
 
 def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,
-                 body_capacity=16, body_timeout_ms=10000, observability=None, *, reuse_port=False, listener=None):
+                 body_capacity=16, body_timeout_ms=10000, observability=None, *, reuse_port=False, listener=None,
+                 max_connections=DEFAULT_MAX_CONNECTIONS,
+                 max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
+                 header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
+                 body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC):
     if observability is not None:
         app.configure_observability(observability)
     app.metrics.observe_worker_start()
@@ -366,6 +380,10 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store, app.asset_etags,
                                 max_concurrent=max_concurrent, acquire_timeout_ms=acquire_timeout_ms,
                                 body_capacity=body_capacity, body_timeout_ms=body_timeout_ms,
+                                max_connections=max_connections,
+                                max_connections_per_ip=max_connections_per_ip,
+                                header_read_timeout_ms=header_read_timeout_ms,
+                                body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
                                 websocket_paths=sorted(app.websocket_routes),
                                 websocket_callback=ws_callback,
                                 reuse_port=reuse_port,
@@ -378,18 +396,35 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
 
 async def serve(app, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,
                 body_capacity=16, body_timeout_ms=10000, stop_event=None, observability=None, *,
-                reuse_port=False, on_ready=None, listener=None):
+                reuse_port=False, on_ready=None, listener=None,
+                max_connections=DEFAULT_MAX_CONNECTIONS,
+                max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
+                header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
+                body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
     it on the same port after a file change.
+
+    Connection limits (A4): ``max_connections`` caps concurrent TCP
+    connections (excess connections are dropped at accept time, before any
+    request is read); ``max_connections_per_ip`` caps them per client IP;
+    ``header_read_timeout_ms`` bounds both slow request headers and idle
+    keep-alive connections (hyper applies it to every header read on the
+    connection); ``body_min_rate_bytes_per_sec`` rejects bodies arriving
+    slower than that average after a 2-second grace window with a 408.
+    These limits apply to the native (Axum) server only; the ASGI adapter
+    relies on the ASGI server's own limits.
     """
     await app.startup()
     server = None
     try:
         server = start_native(app, asyncio.get_running_loop(), host, port, max_concurrent, acquire_timeout_ms,
                               body_capacity, body_timeout_ms, observability=observability, reuse_port=reuse_port,
-                              listener=listener)
+                              listener=listener, max_connections=max_connections,
+                              max_connections_per_ip=max_connections_per_ip,
+                              header_read_timeout_ms=header_read_timeout_ms,
+                              body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec)
         print(f"PyNext listening on http://{server.address}", flush=True)
         if on_ready is not None:
             on_ready(server.address)

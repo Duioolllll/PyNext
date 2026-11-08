@@ -20,10 +20,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
@@ -405,6 +405,18 @@ struct ServerState {
     acquire_timeout: Duration,
     body_capacity: Arc<Semaphore>,
     body_timeout: Duration,
+    // Connection budget (A4): a semaphore for the total number of live TCP
+    // connections, plus a per-IP count. Both are checked in the accept loop
+    // before any request is read.
+    connection_capacity: Arc<Semaphore>,
+    per_ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    max_connections_per_ip: usize,
+    // Bounds slow request headers and, because hyper applies it to every
+    // header read on the connection, idle keep-alive time between requests.
+    // Zero disables the timeout.
+    header_read_timeout: Duration,
+    // Minimum average body receive rate in bytes/second (0 disables).
+    body_min_rate: usize,
     static_pages: HashMap<String, Bytes>,
     public_assets: HashMap<String, PublicAsset>,
     client_assets: HashMap<String, Bytes>,
@@ -810,16 +822,48 @@ fn conflicting_content_length(headers: &HeaderMap) -> bool {
 enum BodyReadError {
     TooLarge,
     BadRequest,
+    // The body arrived slower than `body_min_rate` on average after the
+    // grace window: a slow client holding a body slot, not a malformed
+    // request.
+    TooSlow,
 }
+
+/// A body that is still arriving after this grace window must average at
+/// least `body_min_rate` bytes/second, re-checked every 250 ms while the
+/// read is stalled. The check only runs while the body is incomplete, so a
+/// body that finished arriving is never rejected for being slow after the
+/// fact.
+const BODY_MIN_RATE_GRACE: Duration = Duration::from_secs(2);
+const BODY_MIN_RATE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Read a request body with our own byte count instead of classifying the
 /// error `to_bytes` returns: that classification downcasts through
 /// `error.source()`, so it breaks if axum/http-body-util ever changes how
 /// the limit error is wrapped. A body that grows past the limit is 413 no
 /// matter how the underlying error is shaped.
-async fn read_limited_body(mut body: Body, limit: usize) -> Result<Bytes, BodyReadError> {
+async fn read_limited_body(
+    mut body: Body,
+    limit: usize,
+    min_rate: usize,
+) -> Result<Bytes, BodyReadError> {
     let mut buf = Vec::new();
-    while let Some(frame) = body.frame().await {
+    let started = tokio::time::Instant::now();
+    loop {
+        let frame = tokio::select! {
+            frame = body.frame() => frame,
+            _ = tokio::time::sleep(BODY_MIN_RATE_CHECK_INTERVAL) => {
+                // Stalled mid-body: enforce the minimum rate now instead of
+                // waiting for the whole-body timeout to free the slot.
+                if min_rate > 0
+                    && started.elapsed() >= BODY_MIN_RATE_GRACE
+                    && (buf.len() as f64) < min_rate as f64 * started.elapsed().as_secs_f64()
+                {
+                    return Err(BodyReadError::TooSlow);
+                }
+                continue;
+            }
+        };
+        let Some(frame) = frame else { break };
         let frame = frame.map_err(|_| BodyReadError::BadRequest)?;
         if let Ok(data) = frame.into_data() {
             if buf.len() + data.len() > limit {
@@ -1162,17 +1206,32 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         };
         match tokio::time::timeout(
             state.body_timeout,
-            read_limited_body(body, MAX_REQUEST_BODY),
+            read_limited_body(body, MAX_REQUEST_BODY, state.body_min_rate),
         )
         .await
         {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
-                let (status, message) = match error {
-                    BodyReadError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
-                    BodyReadError::BadRequest => (StatusCode::BAD_REQUEST, "Bad Request"),
+                let (status, message, retry_after) = match error {
+                    BodyReadError::TooLarge => {
+                        (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large", false)
+                    }
+                    BodyReadError::BadRequest => (StatusCode::BAD_REQUEST, "Bad Request", false),
+                    // A body below the minimum receive rate is a slow
+                    // client, not a malformed request: 408 like the
+                    // whole-body timeout, with Retry-After so a client
+                    // that can go faster retries instead of hammering.
+                    BodyReadError::TooSlow => {
+                        (StatusCode::REQUEST_TIMEOUT, "Request Timeout", true)
+                    }
                 };
-                return close_with_unread_body(plain_response(status, message), parts.version);
+                let mut response = plain_response(status, message);
+                if retry_after {
+                    response
+                        .headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                }
+                return close_with_unread_body(response, parts.version);
             }
             Err(_) => {
                 let mut response = plain_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout");
@@ -1355,6 +1414,29 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     }
 }
 
+/// RAII guard for one entry in the per-IP connection count: created when a
+/// connection is admitted, it decrements the count when the connection task
+/// ends (normal close, error, or server shutdown) so a slot is never leaked.
+struct PerIpConnectionGuard {
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl Drop for PerIpConnectionGuard {
+    fn drop(&mut self) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
 /// The peer address of the TCP connection a request arrived on, carried in
 /// request extensions so dispatch can hand the client IP to the Python
 /// bridge. The Python rate limiter keys buckets on it (spec §11); without
@@ -1394,11 +1476,11 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for HyperSer
     }
 }
 
-// Slow header transmission (slow-loris on the request line/headers) is bounded
-// by hyper's per-connection header read timeout, so one idle connection cannot
-// hold a slot in the accept loop forever. This is separate from the body read
-// timeout, which only starts once headers are complete.
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+// Slow header transmission (slow-loris on the request line/headers) is
+// bounded by hyper's per-connection header read timeout, so one idle
+// connection cannot hold a slot in the accept loop forever. The timeout is
+// configurable per server (see `header_read_timeout` in ServerState); 0
+// disables it.
 
 /// Optional SO_REUSEPORT binding for callers on Unix. The supervisor uses
 /// a shared listening socket instead, including on Windows.
@@ -1474,7 +1556,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1499,6 +1581,10 @@ impl NativeServer {
         websocket_protocols: Option<HashMap<String, Vec<String>>>,
         websocket_max_message: usize,
         listener: Option<Py<PyAny>>,
+        max_connections: usize,
+        max_connections_per_ip: usize,
+        header_read_timeout_ms: u64,
+        body_min_rate_bytes_per_sec: usize,
     ) -> PyResult<Self> {
         let websocket_paths = websocket_paths.unwrap_or_default();
         if websocket_max_message == 0 || websocket_max_message > 16 * 1024 * 1024 {
@@ -1519,6 +1605,16 @@ impl NativeServer {
         if body_capacity == 0 || body_capacity > Semaphore::MAX_PERMITS {
             return Err(PyValueError::new_err(
                 "body_capacity is outside the supported range",
+            ));
+        }
+        if max_connections == 0 || max_connections > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "max_connections is outside the supported range",
+            ));
+        }
+        if max_connections_per_ip == 0 || max_connections_per_ip > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "max_connections_per_ip is outside the supported range",
             ));
         }
         if static_pages
@@ -1617,6 +1713,11 @@ impl NativeServer {
                     // bottleneck.
                     body_capacity: Arc::new(Semaphore::new(body_capacity)),
                     body_timeout: Duration::from_millis(body_timeout_ms),
+                    connection_capacity: Arc::new(Semaphore::new(max_connections)),
+                    per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
+                    max_connections_per_ip,
+                    header_read_timeout: Duration::from_millis(header_read_timeout_ms),
+                    body_min_rate: body_min_rate_bytes_per_sec,
                     static_pages: static_pages
                         .into_iter()
                         .map(|(path, body)| (path, Bytes::from(body)))
@@ -1636,6 +1737,9 @@ impl NativeServer {
                     websocket_max_message,
                     ws_callback: websocket_callback,
                 });
+                // The accept loop below enforces the connection budget from
+                // this handle; the router takes its own clone via with_state.
+                let limits = Arc::clone(&state);
                 let app = AxumRouter::new().fallback(any(dispatch)).with_state(state);
                 let mut shutdown = std::pin::pin!(async {
                     let _ = rx.await;
@@ -1653,6 +1757,54 @@ impl NativeServer {
                                     continue;
                                 }
                             };
+                            // Connection budget (A4): the total cap and the
+                            // per-IP cap are enforced here, before any
+                            // request is read, so a flood of idle or slow
+                            // connections cannot starve the accept loop or
+                            // the Python bridge. An over-limit connection is
+                            // dropped by closing the socket: the client sees
+                            // EOF, not a response, because no HTTP request
+                            // exists to answer yet. Both permits are held
+                            // for the lifetime of the connection task.
+                            // IPv4-mapped IPv6 addresses count under their
+                            // IPv4 form, matching the Python rate limiter.
+                            let peer_ip = match peer_addr.ip() {
+                                IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                                    Some(v4) => IpAddr::V4(v4),
+                                    None => peer_addr.ip(),
+                                },
+                                ip => ip,
+                            };
+                            let total_permit = match limits
+                                .connection_capacity
+                                .clone()
+                                .try_acquire_owned()
+                            {
+                                Ok(permit) => permit,
+                                Err(_) => continue,
+                            };
+                            let per_ip_admitted = {
+                                let mut counts = limits
+                                    .per_ip_connections
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let count = counts.entry(peer_ip).or_insert(0);
+                                if *count >= limits.max_connections_per_ip {
+                                    false
+                                } else {
+                                    *count += 1;
+                                    true
+                                }
+                            };
+                            if !per_ip_admitted {
+                                drop(total_permit);
+                                continue;
+                            }
+                            let per_ip_guard = PerIpConnectionGuard {
+                                counts: Arc::clone(&limits.per_ip_connections),
+                                ip: peer_ip,
+                            };
+                            let header_read_timeout = limits.header_read_timeout;
                             let service = HyperService {
                                 router: app.clone(),
                                 peer_addr: Some(peer_addr),
@@ -1664,14 +1816,21 @@ impl NativeServer {
                             // served h2c, everything else is HTTP/1.1. The
                             // old Http1Builder-only loop turned the h2
                             // preface into a VersionH2 error and dropped the
-                            // connection. The 10s header read timeout still
-                            // applies to the HTTP/1.1 side via `.http1()`.
+                            // connection. The header read timeout applies to
+                            // the HTTP/1.1 side via `.http1()`; h2c
+                            // connections have no idle timeout, only the
+                            // connection caps above.
                             connections.spawn(async move {
+                                let _total_permit = total_permit;
+                                let _per_ip_guard = per_ip_guard;
                                 let mut builder = AutoBuilder::new(TokioExecutor::new());
-                                builder
-                                    .http1()
-                                    .timer(TokioTimer::new())
-                                    .header_read_timeout(HEADER_READ_TIMEOUT);
+                                {
+                                    let mut http1 = builder.http1();
+                                    http1.timer(TokioTimer::new());
+                                    if !header_read_timeout.is_zero() {
+                                        http1.header_read_timeout(header_read_timeout);
+                                    }
+                                }
                                 // Upgrades (WebSocket) need the upgradable
                                 // connection: plain serve_connection leaves
                                 // the upgrade future failing with "upgrade

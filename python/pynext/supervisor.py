@@ -63,6 +63,11 @@ class WorkerConfig:
     acquire_timeout_ms: int
     body_capacity: int
     body_timeout_ms: int
+    # Connection limits (A4); defaults mirror server.DEFAULT_*.
+    max_connections: int = 1024
+    max_connections_per_ip: int = 128
+    header_read_timeout_ms: int = 10000
+    body_min_rate_bytes_per_sec: int = 1024
     rate_limit: int = 0  # 0 disables rate limiting
     rate_limit_window: float = 60.0
     rate_limit_backend: str = "memory"
@@ -125,6 +130,10 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                         config.acquire_timeout_ms, config.body_capacity, config.body_timeout_ms,
                         listener=listener, stop_event=stop_event,
                         observability=config.observability,
+                        max_connections=config.max_connections,
+                        max_connections_per_ip=config.max_connections_per_ip,
+                        header_read_timeout_ms=config.header_read_timeout_ms,
+                        body_min_rate_bytes_per_sec=config.body_min_rate_bytes_per_sec,
                         on_ready=lambda _address: ready.set())
         finally:
             shutdown_task.cancel()

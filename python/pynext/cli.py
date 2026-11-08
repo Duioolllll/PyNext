@@ -79,12 +79,23 @@ async def _reload_dev_client(app, root):
 
 async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                   body_capacity, body_timeout_ms, cache_backend="memory", cache_path=None,
-                 observability=None, rate_limit=None, security=None, websocket_max_message=MAX_WS_MESSAGE):
+                 observability=None, rate_limit=None, security=None, websocket_max_message=MAX_WS_MESSAGE,
+                 max_connections=None, max_connections_per_ip=None,
+                 header_read_timeout_ms=None, body_min_rate_bytes_per_sec=None):
     """Serve the app in development mode, replacing changed island bundles.
 
     Other file changes restart the server on the same port and reload open
     pages. Broken edits retain the previous app or bundles until fixed.
     """
+    conn_kwargs = {}
+    if max_connections is not None:
+        conn_kwargs["max_connections"] = max_connections
+    if max_connections_per_ip is not None:
+        conn_kwargs["max_connections_per_ip"] = max_connections_per_ip
+    if header_read_timeout_ms is not None:
+        conn_kwargs["header_read_timeout_ms"] = header_read_timeout_ms
+    if body_min_rate_bytes_per_sec is not None:
+        conn_kwargs["body_min_rate_bytes_per_sec"] = body_min_rate_bytes_per_sec
     watcher = Watcher(root)
     watched = ", ".join(str(path.relative_to(root)) for path in watcher.watch_roots())
     print(f"PyNext dev watching {watched or 'nothing'} for changes", flush=True)
@@ -113,7 +124,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
             server_task = asyncio.create_task(serve(app, host, current_port, max_concurrent,
                                                     acquire_timeout_ms, body_capacity, body_timeout_ms,
                                                     stop_event=stop_server, observability=observability,
-                                                    on_ready=record_address))
+                                                    on_ready=record_address, **conn_kwargs))
             new_app = None
             while new_app is None:
                 changed = await _wait_for_change(watcher, server_task)
@@ -184,6 +195,19 @@ def main():
                                  help="concurrent request bodies being read before new ones get a 503")
             command.add_argument("--body-timeout-ms", type=_at_least(0, "--body-timeout-ms"), default=10000,
                                  help="how long a request body may take to arrive before a 408")
+            command.add_argument("--max-connections", type=_at_least(1, "--max-connections"), default=None,
+                                 help="concurrent TCP connections before new ones are dropped at accept")
+            command.add_argument("--max-connections-per-ip", type=_at_least(1, "--max-connections-per-ip"),
+                                 default=None,
+                                 help="concurrent TCP connections allowed from one client IP")
+            command.add_argument("--header-read-timeout-ms", type=_at_least(0, "--header-read-timeout-ms"),
+                                 default=None,
+                                 help="how long request headers (and idle keep-alive) may take before the "
+                                      "connection is closed")
+            command.add_argument("--body-min-rate-bytes-per-sec",
+                                 type=_at_least(0, "--body-min-rate-bytes-per-sec"), default=None,
+                                 help="minimum average body receive rate in bytes/second after a 2s grace "
+                                      "window; slower bodies get a 408 (0 disables)")
             command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis"), default="memory",
                                  help="ISR page cache backend: process-local memory (default) or a"
                                       " shared SQLite file or Redis via PYNEXT_REDIS_URL")
@@ -274,6 +298,19 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
     extra = {"observability": obs_config} if obs_config is not None else {}
+    # Connection limits keep the historical serve() call shape when no flag
+    # is given (see test_cli_without_observability_flags_keeps_old_call_shape):
+    # only explicitly set limits are forwarded, the rest stay at serve()'s
+    # defaults.
+    conn_kwargs = {}
+    if args.max_connections is not None:
+        conn_kwargs["max_connections"] = args.max_connections
+    if args.max_connections_per_ip is not None:
+        conn_kwargs["max_connections_per_ip"] = args.max_connections_per_ip
+    if args.header_read_timeout_ms is not None:
+        conn_kwargs["header_read_timeout_ms"] = args.header_read_timeout_ms
+    if args.body_min_rate_bytes_per_sec is not None:
+        conn_kwargs["body_min_rate_bytes_per_sec"] = args.body_min_rate_bytes_per_sec
     if args.workers > 1:
         config = WorkerConfig(root=str(root), host=args.host, port=args.port,
                               production=args.command == "start",
@@ -281,6 +318,7 @@ def main():
                               acquire_timeout_ms=args.acquire_timeout_ms,
                               body_capacity=args.body_capacity,
                               body_timeout_ms=args.body_timeout_ms,
+                              **conn_kwargs,
                               rate_limit=args.rate_limit,
                               rate_limit_window=args.rate_limit_window,
                               rate_limit_backend=args.rate_limit_backend,
@@ -295,7 +333,7 @@ def main():
                                 args.body_capacity, args.body_timeout_ms,
                                 cache_backend=args.cache_backend, cache_path=args.cache_path,
                                 rate_limit=limiter, security=security,
-                                websocket_max_message=args.ws_max_message_bytes, **extra))
+                                websocket_max_message=args.ws_max_message_bytes, **extra, **conn_kwargs))
         except KeyboardInterrupt:
             pass
         return
@@ -306,7 +344,7 @@ def main():
                         if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}), **extra)
     try:
         asyncio.run(serve(app, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
-                          args.body_capacity, args.body_timeout_ms, **extra))
+                          args.body_capacity, args.body_timeout_ms, **extra, **conn_kwargs))
     except KeyboardInterrupt:
         pass
 

@@ -4,6 +4,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## 0.1.0
 
+- Bound native-server connections (A4): a total TCP connection cap (default 1024) and a per-IP cap (default 128) enforced at accept time — excess connections are closed before any request is read, and a freed slot admits a new client. Slow request headers and idle keep-alive connections close after the header-read timeout (default 10s, configurable), and request bodies arriving slower than 1024 bytes/second on average after a 2-second grace window are rejected with 408 + `Retry-After: 1`. The limits are settable via `serve()`/`start_native()` and `--max-connections`, `--max-connections-per-ip`, `--header-read-timeout-ms`, `--body-min-rate-bytes-per-sec`; they apply to the native (Axum) server only and are enforced per worker process. h2c connections count toward the caps but have no idle timeout.
 - Add Redis ISR storage with expiring leases, fenced writes and cross-worker invalidation; add Redis-backed shared rate limiting, including static and cached responses. Redis cache failures fall back locally; rate-limiter failures return 503.
 - Add an ISR query-key allowlist and generation-based invalidation across all query variants and shared-cache workers.
 - Stream the first ISR generation while caching only complete responses; allow asynchronous SSG chunks to be consumed during the build.
