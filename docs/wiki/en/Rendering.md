@@ -32,7 +32,7 @@ def Page(params):
 
 Place this in `app/guides/[slug]/page.py`. Run `pynext build --dir PROJECT`. Only generated dynamic paths are served in production; other paths return **404**. A static route needs no generator. Builds are capped at **10,000** generated SSG pages. **SSG page functions must not accept `request`**; they render public content at build time.
 
-## ISR (process-local, public content)
+## ISR (public content)
 
 ~~~python
 from pynext import h, page
@@ -42,7 +42,7 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-A route such as `app/news/[slug]/page.py` generates on demand, serves fresh cached HTML, and can serve stale HTML while one background regeneration runs. The cache is bounded and **not shared across worker processes**. ISR page functions must not accept `request` or export `generate_static_params()`.
+A route such as `app/news/[slug]/page.py` generates on demand, serves fresh cached HTML, and can serve stale HTML while one background regeneration runs. The cache is bounded; the default `memory` backend is process-local, while the `sqlite` and `redis` backends share entries across workers. ISR page functions must not accept `request` or export `generate_static_params()`.
 
 - Anonymous **query strings are not part of the ISR cache key**.
 - Requests with `Cookie` or `Authorization` bypass shared ISR and receive private, no-store responses.

@@ -20,6 +20,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
   `docs/WHEEL_RELEASE.md`. CI still does not upload anything to PyPI;
   publishing stays a manual maintainer step.
 
+The current release is **0.1.0** (top section). The `v0.7.0a1` section below is a release plan superseded by the 0.1.0 decision; its items were merged to `main` and are included in 0.1.0. The `v0.1.0` section at the bottom is the early reconstructed snapshot, not the current release.
+
 ## 0.1.0
 
 - Add the A1 default security headers to every response (SSR, SSG, ISR, API, static, client assets, preflight, and error pages) on both the ASGI adapter and the native server, including the Rust fast path for static and fresh ISR responses: HSTS in production only (`max-age=31536000; includeSubDomains`, configurable, omitted in development so `pynext dev` on `http://127.0.0.1` is unaffected), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`, and an extended CSP (`script-src 'self'` plus the per-request nonce when enabled, `style-src 'self'`, `object-src 'none'`, `base-uri 'self'`, `form-action 'self'`, `frame-ancestors 'none'`). All of them are configurable on `SecurityConfig` (set a field to `None`/`False` to disable that header); an explicitly set response header still wins, and the per-request CSP nonce is preserved. See `security_headers()` and `apply_security_headers()`.
@@ -52,7 +54,9 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Unify forwarded-header handling in `pynext.proxy`: `X-Forwarded-For`, `Forwarded` (RFC 7239), `X-Forwarded-Proto` and `X-Forwarded-Host` are interpreted only from trusted proxies (none trusted means all are ignored), the resolved client IP/scheme/host is exposed to handlers as `request.state["client_ip"/"client_scheme"/"client_host"]`, and the rate limiter delegates to the same module.
 - Document the architecture, observed limitations, and verification criteria.
 
-## v0.7.0a1 (unreleased candidate)
+## v0.7.0a1 (superseded plan — shipped in 0.1.0)
+
+The 0.7.0a1 release plan was replaced by the 0.1.0 decision; the items below were merged to `main` and are included in 0.1.0.
 
 - Add a shared SQLite ISR cache backend (`--cache-backend sqlite`, `create_app(..., cache_backend="sqlite", cache_path=...)`, default file `<project>/.pynext/isr-cache.sqlite3`) so multiple workers share ISR entries with no external service. Stale regeneration is single-flight per key through an expiring owner-token lease, shared writes are fenced by entry version so a slow generation cannot overwrite a newer result, failures preserve the old entry, and first-generation requests wait for the worker holding the lease. Responses with `Set-Cookie` or `Cache-Control: private`/`no-store` are never stored in the shared cache. The memory backend stays the default, and a Redis adapter is documented as a future option.
 - Add streaming SSR: a page function may return an async iterable of UI nodes; the layout shell is sent first, each chunk is serialized and sent as produced, and the layout suffix closes the document. Buffered rendering stays the default, streaming is SSR-only, a disconnect closes the generator, and a mid-stream error ends the stream without changing its status. See `examples/basic/app/stream/page.py`.
@@ -123,7 +127,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 - Add JavaScript/TypeScript island bundling and browser mounting.
 
-## v0.1.0
+## v0.1.0 (reconstructed early snapshot)
 
 - Introduce the Python/Rust runtime, file routing, buffered SSR, API handlers, ASGI and Axum.
 - Add SSG, public file snapshots and process-local ISR caching.

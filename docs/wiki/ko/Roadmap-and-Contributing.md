@@ -4,23 +4,26 @@
 
 ## 현재 릴리스
 
-이 위키가 설명하는 공개 실험 릴리스는 **[v0.6.0a2](https://github.com/Duioolllll/PyNext/releases/tag/v0.6.0a2)**입니다. 위키는 릴리스 준비 이후 벤치마크·CI 개선이 병합된 `main`의 [aa256bf](https://github.com/Duioolllll/PyNext/commit/aa256bf2b03a175d96f9f084a3b8cfaeca883ceb)를 기준으로 작성했습니다. 업데이트할 때는 [CHANGELOG](../../../CHANGELOG.md)와 [릴리스 계획](../../RELEASE_PLAN.md)을 함께 확인하세요.
+이 위키가 설명하는 공개 실험 릴리스는 **[0.1.0](https://github.com/Duioolllll/PyNext/releases/tag/0.1.0v)**입니다. 위키는 릴리스 준비 이후 벤치마크·CI 개선이 병합된 `main`의 [d8560f8](https://github.com/Duioolllll/PyNext/commit/d8560f828a13e6ae5bb82bf4496fed6b4d45ecb8)를 기준으로 작성했습니다. 업데이트할 때는 [CHANGELOG](../../../CHANGELOG.md)와 [릴리스 계획](../../RELEASE_PLAN.md)을 함께 확인하세요.
 
 ## 현재 구현됨
 
 - Rust trie 라우팅, Axum HTTP 엔진, Python/ASGI 통합
-- 버퍼형 SSR, 빌드 시 SSG, 프로세스별 ISR
+- 버퍼형/스트리밍 SSR, 빌드 시 SSG, 프로세스별 메모리 또는 SQLite/Redis 공유 ISR
 - ETag 및 단일 byte-range 공개 파일 응답
-- 비동기 API 스트리밍
-- load/visible/idle/제한된 interaction 활성화가 가능한 JS/TS Islands
+- 비동기 API 스트리밍과 WebSocket
+- load/visible/idle/interaction 활성화가 가능한 JS/TS Islands, 클라이언트 탐색, island HMR
+- 전역 HTTP 미들웨어, 세션 기반 CSRF가 있는 SQLite 세션, multipart 업로드, `pynext init`, 개발 오류 페이지, Linux standalone 디렉터리
+- 구조화 로그·지표·OpenTelemetry 트레이싱(실제 SDK)
 - 플랫폼별 CI 및 전송 방식이 표시되는 벤치마크
+
+전체 기능 목록은 코드에서 자동 생성됩니다: [FEATURES](../../FEATURES.md).
 
 ## 계획 및 미구현
 
-- 스트리밍 페이지 SSR. React/RSC 호환은 별도의 대규모 설계 과제입니다.
-- 분산 ISR 및 워커 간 조정
-- 앱별 프로세스 격리와 안정적인 워커 수명주기
-- 프로덕션 관측성, 속도 제한, 보안 기본값, standalone 패키징
+- React/RSC 호환은 별도의 대규모 설계 과제이며 1.0의 명시적 비목표입니다.
+- 전체 연결 제한과 보안 기본값 강화([로드맵](../../ROADMAP.md) 참고)
+- DB·인증 레퍼런스 앱(자격 증명 검증은 앱의 책임)
 - Rust/Python 데이터 전달 최적화 및 프로파일링
 - **Django 통합**(ORM·인증·Admin 상호운용)은 추후 검토할 수 있는 아이디어이지만, **현재 구현되지 않았고 호환성을 약속하는 기능도 아닙니다.**
 

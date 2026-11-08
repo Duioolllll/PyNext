@@ -34,7 +34,7 @@ def Page(params):
 
 `pynext build --dir PROJECT`를 실행하면 정적 HTML을 생성합니다. 동적 SSG 경로 중 생성하지 않은 URL은 프로덕션에서 **404**입니다. 정적 경로에는 생성기가 필요 없습니다. 빌드당 **최대 10,000 페이지**까지 생성하며 **SSG 페이지 함수는 `request`를 받을 수 없습니다.**
 
-## ISR (프로세스별 공개 캐시)
+## ISR (공개 캐시)
 
 ~~~python
 from pynext import h, page
@@ -44,7 +44,7 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-`app/news/[slug]/page.py`처럼 쓰면 최초 요청에 생성하고, 신선한 HTML은 재사용하며, 만료 후에는 한 개의 백그라운드 재생성 중 오래된 HTML을 제공할 수 있습니다. 캐시는 크기가 제한되고 **워커/프로세스 간 공유되지 않습니다.** ISR은 `request` 인자를 받거나 `generate_static_params()`를 내보낼 수 없습니다.
+`app/news/[slug]/page.py`처럼 쓰면 최초 요청에 생성하고, 신선한 HTML은 재사용하며, 만료 후에는 한 개의 백그라운드 재생성 중 오래된 HTML을 제공할 수 있습니다. 캐시는 크기가 제한됩니다. 기본 `memory` 백엔드는 프로세스별이지만 `sqlite`·`redis` 백엔드는 워커 간 항목을 공유합니다. ISR은 `request` 인자를 받거나 `generate_static_params()`를 내보낼 수 없습니다.
 
 - 익명 요청의 **쿼리 문자열은 ISR 캐시 키에 포함되지 않습니다.**
 - `Cookie` 또는 `Authorization` 헤더가 있으면 공유 캐시를 우회하며 `private, no-store`로 응답합니다.
