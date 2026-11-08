@@ -114,6 +114,25 @@ jobs:
       - name: Browser end-to-end checks
         run: uv run --with playwright==1.62.0 python tests/browser/run_smoke.py --mode ${{ matrix.deploy }}
 
+  docs:
+    name: Documentation consistency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Stdlib-only check: no Rust toolchain or package build needed.
+      # Verifies the generated capability table is fresh, the
+      # current-version documents agree on 0.1.0, and no stale
+      # "not implemented" claims remain (roadmap item E1).
+      - name: Check generated feature table and documentation consistency
+        run: python scripts/check_docs.py
+
   redis:
     name: Redis cache integration
     runs-on: ubuntu-latest
@@ -138,4 +157,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --locked --extra dev --extra redis
-      - run: uv run --locked --extra dev --extra redis pytest -q tests/test_redis_cache.py tests/test_redis_faults.py tests/test_redis_restart.py tests/test_isr_query.py tests/test_streaming_isr.py
+      - run: uv run --locked --extra dev --extra redis pytest -q tests/test_redis_cache.py tests/test_redis_faults.py tests/test_redis_restart.py tests/test_redis_sessions.py tests/test_isr_query.py tests/test_streaming_isr.py

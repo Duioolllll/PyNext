@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 보안 취약점 신고
+    url: https://github.com/Duioolllll/PyNext/blob/main/SECURITY.md
+    about: 취약점은 공개 이슈로 올리지 마세요. SECURITY.md의 비공개 신고 경로를 사용해 주세요.
+  - name: 기여 가이드
+    url: https://github.com/Duioolllll/PyNext/blob/main/CONTRIBUTING.md
+    about: 개발 환경, 확인 사항, PR 절차를 먼저 읽어 주세요.
+  - name: 지원 버전과 릴리스 주기
+    url: https://github.com/Duioolllll/PyNext/blob/main/docs/SUPPORT.md
+    about: 지원 중인 버전과 업그레이드 정책을 확인해 주세요.

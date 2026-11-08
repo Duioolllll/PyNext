@@ -1,0 +1,1 @@
+{"concurrency":10,"modes":["axum","uvicorn"],"production":true,"repetitions":3,"requests":2000,"scenarios":["static","ssg","isr-hit","ssr","json-api","db-query","streaming"],"warmup":100}

@@ -20,10 +20,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
@@ -405,6 +405,18 @@ struct ServerState {
     acquire_timeout: Duration,
     body_capacity: Arc<Semaphore>,
     body_timeout: Duration,
+    // Connection budget (A4): a semaphore for the total number of live TCP
+    // connections, plus a per-IP count. Both are checked in the accept loop
+    // before any request is read.
+    connection_capacity: Arc<Semaphore>,
+    per_ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    max_connections_per_ip: usize,
+    // Bounds slow request headers and, because hyper applies it to every
+    // header read on the connection, idle keep-alive time between requests.
+    // Zero disables the timeout.
+    header_read_timeout: Duration,
+    // Minimum average body receive rate in bytes/second (0 disables).
+    body_min_rate: usize,
     static_pages: HashMap<String, Bytes>,
     public_assets: HashMap<String, PublicAsset>,
     client_assets: HashMap<String, Bytes>,
@@ -412,6 +424,11 @@ struct ServerState {
     isr_cache: Arc<PageCache>,
     middleware_enabled: bool,
     shared_cache_enabled: bool,
+    /// A1 security headers configured in Python (`SecurityConfig`), applied
+    /// to every response the Rust layer builds itself (static assets,
+    /// cached ISR pages, plain errors). Bridge responses already carry them
+    /// from Python dispatch and pass through untouched.
+    security_headers: Vec<(Vec<u8>, Vec<u8>)>,
     websocket_router: Router,
     websocket_paths: std::collections::HashSet<String>,
     websocket_protocols: HashMap<String, Vec<String>>,
@@ -626,14 +643,33 @@ struct AssetPolicy<'a> {
     content_type: &'a HeaderValue,
     etag: &'a HeaderValue,
     cache_control: &'static str,
-    nosniff: bool,
     vary: bool,
+}
+
+/// Add the Python-configured A1 security headers to a response the Rust
+/// layer builds itself (static assets, cached ISR pages, plain errors).
+/// Bridge responses already carry them from Python dispatch and pass
+/// through untouched. Invalid entries are skipped; Python validates the
+/// values before handing them over.
+fn apply_security_headers(
+    mut builder: axum::http::response::Builder,
+    security_headers: &[(Vec<u8>, Vec<u8>)],
+) -> axum::http::response::Builder {
+    for (name, value) in security_headers {
+        if let (Ok(name), Ok(value)) =
+            (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+        {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
 }
 
 fn static_response(
     parts: &axum::http::request::Parts,
     content: &Bytes,
     policy: AssetPolicy<'_>,
+    security_headers: &[(Vec<u8>, Vec<u8>)],
 ) -> AxumResponse<Body> {
     let length = content.len();
     let mut status = StatusCode::OK;
@@ -698,19 +734,13 @@ fn static_response(
         .header(header::CONTENT_TYPE, policy.content_type.clone())
         .header(header::ETAG, policy.etag.clone())
         .header(header::CACHE_CONTROL, policy.cache_control)
-        .header(header::ACCEPT_RANGES, "bytes")
-        .header(
-            "content-security-policy",
-            "script-src 'self'; object-src 'none'",
-        );
+        .header(header::ACCEPT_RANGES, "bytes");
+    builder = apply_security_headers(builder, security_headers);
     if status != StatusCode::NOT_MODIFIED {
         builder = builder.header(header::CONTENT_LENGTH, response_length.to_string());
     }
     if let Some(content_range) = content_range {
         builder = builder.header(header::CONTENT_RANGE, content_range);
-    }
-    if policy.nosniff {
-        builder = builder.header("x-content-type-options", "nosniff");
     }
     if policy.vary {
         builder = builder.header(header::VARY, "Cookie, Authorization");
@@ -751,29 +781,42 @@ fn static_path(raw: &str) -> Option<String> {
     Some(path)
 }
 
-fn plain_response(status: StatusCode, body: &'static str) -> AxumResponse<Body> {
-    AxumResponse::builder()
-        .status(status)
-        .header("content-type", "text/plain; charset=utf-8")
-        .header(
-            "content-security-policy",
-            "script-src 'self'; object-src 'none'",
-        )
-        .body(Body::from(body))
-        .expect("static response is valid")
+fn plain_response(
+    status: StatusCode,
+    body: &'static str,
+    security_headers: &[(Vec<u8>, Vec<u8>)],
+) -> AxumResponse<Body> {
+    apply_security_headers(
+        AxumResponse::builder()
+            .status(status)
+            .header("content-type", "text/plain; charset=utf-8"),
+        security_headers,
+    )
+    .body(Body::from(body))
+    .expect("static response is valid")
 }
 
-fn busy_response() -> AxumResponse<Body> {
-    AxumResponse::builder()
-        .status(StatusCode::SERVICE_UNAVAILABLE)
-        .header("content-type", "text/plain; charset=utf-8")
-        .header(
-            "content-security-policy",
-            "script-src 'self'; object-src 'none'",
-        )
-        .header("retry-after", "1")
-        .body(Body::from("Server Busy"))
-        .expect("busy response is valid")
+/// `Retry-After` for a request that waited the full slot-acquire timeout
+/// without getting a slot: whole seconds, at least 1. The queue was full
+/// for the whole configured wait, so telling the client to retry sooner
+/// would most likely hit the same wall.
+fn retry_after_for_timeout(timeout: Duration) -> u64 {
+    (timeout.as_millis() as u64).div_ceil(1000).max(1)
+}
+
+fn busy_response(
+    retry_after_secs: u64,
+    security_headers: &[(Vec<u8>, Vec<u8>)],
+) -> AxumResponse<Body> {
+    apply_security_headers(
+        AxumResponse::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("content-type", "text/plain; charset=utf-8")
+            .header("retry-after", retry_after_secs.to_string()),
+        security_headers,
+    )
+    .body(Body::from("Server Busy"))
+    .expect("busy response is valid")
 }
 
 /// Conflicting `Content-Length` headers must fail as a clean 400 in dispatch
@@ -810,16 +853,48 @@ fn conflicting_content_length(headers: &HeaderMap) -> bool {
 enum BodyReadError {
     TooLarge,
     BadRequest,
+    // The body arrived slower than `body_min_rate` on average after the
+    // grace window: a slow client holding a body slot, not a malformed
+    // request.
+    TooSlow,
 }
+
+/// A body that is still arriving after this grace window must average at
+/// least `body_min_rate` bytes/second, re-checked every 250 ms while the
+/// read is stalled. The check only runs while the body is incomplete, so a
+/// body that finished arriving is never rejected for being slow after the
+/// fact.
+const BODY_MIN_RATE_GRACE: Duration = Duration::from_secs(2);
+const BODY_MIN_RATE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Read a request body with our own byte count instead of classifying the
 /// error `to_bytes` returns: that classification downcasts through
 /// `error.source()`, so it breaks if axum/http-body-util ever changes how
 /// the limit error is wrapped. A body that grows past the limit is 413 no
 /// matter how the underlying error is shaped.
-async fn read_limited_body(mut body: Body, limit: usize) -> Result<Bytes, BodyReadError> {
+async fn read_limited_body(
+    mut body: Body,
+    limit: usize,
+    min_rate: usize,
+) -> Result<Bytes, BodyReadError> {
     let mut buf = Vec::new();
-    while let Some(frame) = body.frame().await {
+    let started = tokio::time::Instant::now();
+    loop {
+        let frame = tokio::select! {
+            frame = body.frame() => frame,
+            _ = tokio::time::sleep(BODY_MIN_RATE_CHECK_INTERVAL) => {
+                // Stalled mid-body: enforce the minimum rate now instead of
+                // waiting for the whole-body timeout to free the slot.
+                if min_rate > 0
+                    && started.elapsed() >= BODY_MIN_RATE_GRACE
+                    && (buf.len() as f64) < min_rate as f64 * started.elapsed().as_secs_f64()
+                {
+                    return Err(BodyReadError::TooSlow);
+                }
+                continue;
+            }
+        };
+        let Some(frame) = frame else { break };
         let frame = frame.map_err(|_| BodyReadError::BadRequest)?;
         if let Ok(data) = frame.into_data() {
             if buf.len() + data.len() > limit {
@@ -1099,13 +1174,13 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
     if upgrade_headers {
         let Some(path) = static_path(parts.uri.path()) else {
-            return plain_response(StatusCode::NOT_FOUND, "Not Found");
+            return plain_response(StatusCode::NOT_FOUND, "Not Found", &state.security_headers);
         };
         let Some((pattern, _)) = state.websocket_router.matches(&path) else {
-            return plain_response(StatusCode::NOT_FOUND, "Not Found");
+            return plain_response(StatusCode::NOT_FOUND, "Not Found", &state.security_headers);
         };
         if !state.websocket_paths.contains(&pattern) {
-            return plain_response(StatusCode::NOT_FOUND, "Not Found");
+            return plain_response(StatusCode::NOT_FOUND, "Not Found", &state.security_headers);
         }
         let mut parts = parts;
         let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
@@ -1130,7 +1205,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         if has_protocols && requested && protocol.is_none() {
-            return plain_response(StatusCode::BAD_REQUEST, "Unsupported WebSocket subprotocol");
+            return plain_response(
+                StatusCode::BAD_REQUEST,
+                "Unsupported WebSocket subprotocol",
+                &state.security_headers,
+            );
         }
         let upgrade = upgrade.max_message_size(state.websocket_max_message);
         let query = parts.uri.query().unwrap_or("").as_bytes().to_vec();
@@ -1146,7 +1225,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     }
     if conflicting_content_length(&parts.headers) {
         return close_with_unread_body(
-            plain_response(StatusCode::BAD_REQUEST, "Bad Request"),
+            plain_response(
+                StatusCode::BAD_REQUEST,
+                "Bad Request",
+                &state.security_headers,
+            ),
             parts.version,
         );
     }
@@ -1157,25 +1240,47 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         let _body_permit = match state.body_capacity.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                return close_with_unread_body(busy_response(), parts.version);
+                return close_with_unread_body(
+                    busy_response(1, &state.security_headers),
+                    parts.version,
+                );
             }
         };
         match tokio::time::timeout(
             state.body_timeout,
-            read_limited_body(body, MAX_REQUEST_BODY),
+            read_limited_body(body, MAX_REQUEST_BODY, state.body_min_rate),
         )
         .await
         {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
-                let (status, message) = match error {
-                    BodyReadError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
-                    BodyReadError::BadRequest => (StatusCode::BAD_REQUEST, "Bad Request"),
+                let (status, message, retry_after) = match error {
+                    BodyReadError::TooLarge => {
+                        (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large", false)
+                    }
+                    BodyReadError::BadRequest => (StatusCode::BAD_REQUEST, "Bad Request", false),
+                    // A body below the minimum receive rate is a slow
+                    // client, not a malformed request: 408 like the
+                    // whole-body timeout, with Retry-After so a client
+                    // that can go faster retries instead of hammering.
+                    BodyReadError::TooSlow => {
+                        (StatusCode::REQUEST_TIMEOUT, "Request Timeout", true)
+                    }
                 };
-                return close_with_unread_body(plain_response(status, message), parts.version);
+                let mut response = plain_response(status, message, &state.security_headers);
+                if retry_after {
+                    response
+                        .headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                }
+                return close_with_unread_body(response, parts.version);
             }
             Err(_) => {
-                let mut response = plain_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout");
+                let mut response = plain_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "Request Timeout",
+                    &state.security_headers,
+                );
                 response
                     .headers_mut()
                     .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -1185,6 +1290,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     };
     if !state.middleware_enabled
         && (parts.method == axum::http::Method::GET || parts.method == axum::http::Method::HEAD)
+        // Health probes are reserved framework paths (B6): a public
+        // asset or static page with the same name must not shadow them,
+        // so they always fall through to the Python bridge.
+        && parts.uri.path() != "/healthz"
+        && parts.uri.path() != "/readyz"
     {
         if let Some(path) = static_path(parts.uri.path()) {
             if let Some(content) = state.client_assets.get(&path) {
@@ -1195,9 +1305,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         content_type: &HeaderValue::from_static("text/javascript; charset=utf-8"),
                         etag: &state.asset_etags[&path],
                         cache_control: "public, max-age=31536000, immutable",
-                        nosniff: true,
                         vary: false,
                     },
+                    &state.security_headers,
                 );
             }
             if let Some(asset) = state.public_assets.get(&path) {
@@ -1208,9 +1318,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         content_type: &asset.content_type,
                         etag: &state.asset_etags[&path],
                         cache_control: "public, max-age=0, must-revalidate",
-                        nosniff: true,
                         vary: false,
                     },
+                    &state.security_headers,
                 );
             }
             if let Some(content) = state.static_pages.get(&path) {
@@ -1221,9 +1331,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         content_type: &HeaderValue::from_static("text/html; charset=utf-8"),
                         etag: &state.asset_etags[&path],
                         cache_control: "public, max-age=0, must-revalidate",
-                        nosniff: false,
                         vary: true,
                     },
+                    &state.security_headers,
                 );
             }
             if !state.shared_cache_enabled
@@ -1237,42 +1347,62 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     } else {
                         Body::from(content)
                     };
-                    return AxumResponse::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "text/html; charset=utf-8")
-                        .header("content-length", length.to_string())
-                        .header("cache-control", "public, max-age=0, must-revalidate")
-                        .header(
-                            "content-security-policy",
-                            "script-src 'self'; object-src 'none'",
-                        )
-                        .header("vary", "Cookie, Authorization")
-                        .body(body)
-                        .expect("cached response is valid");
+                    return apply_security_headers(
+                        AxumResponse::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/html; charset=utf-8")
+                            .header("content-length", length.to_string())
+                            .header("cache-control", "public, max-age=0, must-revalidate")
+                            .header("vary", "Cookie, Authorization"),
+                        &state.security_headers,
+                    )
+                    .body(body)
+                    .expect("cached response is valid");
                 }
             }
         }
     }
-    // Static/cache hits never compete with Python handler execution.
-    // Wait briefly for a slot instead of rejecting the moment the server is
-    // busy: a burst that clears within the timeout degrades gracefully, and
-    // only sustained overload gets a 503 with Retry-After. Waiting requests
-    // hold a Tokio task, not a Python worker thread. Bound this queue too:
-    // each waiter can already hold a fully buffered request body.
-    let waiting = match state.waiting_capacity.clone().try_acquire_owned() {
+    // Overload policy (roadmap C7): bounded wait, then reject. A burst
+    // that clears within the acquire timeout degrades gracefully, and only
+    // sustained overload gets a 503 with Retry-After. A request that finds
+    // a free slot takes it immediately without consuming queue capacity;
+    // only requests that must wait take a waiting permit, so `max_waiting`
+    // bounds exactly the number of waiters (0: a slot must be free at
+    // once). Waiting requests hold a Tokio task, not a Python worker
+    // thread. Bound this queue too: each waiter can already hold a fully
+    // buffered request body, so an unbounded wait would trade 503s for
+    // memory exhaustion and head-of-line latency, and probabilistic early
+    // shedding would drop requests that would have succeeded within the
+    // timeout. The queue size is configurable via `max_waiting`; the
+    // default stays `min(max_concurrent, 64)`.
+    let permit = match state.capacity.clone().try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return busy_response(),
+        Err(_) => {
+            let waiting = match state.waiting_capacity.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                // No waiting slot: the earliest a slot could free is
+                // unknown, so the advisory retry delay stays 1 second.
+                Err(_) => return busy_response(1, &state.security_headers),
+            };
+            match tokio::time::timeout(
+                state.acquire_timeout,
+                state.capacity.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => {
+                    drop(waiting);
+                    permit
+                }
+                _ => {
+                    return busy_response(
+                        retry_after_for_timeout(state.acquire_timeout),
+                        &state.security_headers,
+                    )
+                }
+            }
+        }
     };
-    let permit = match tokio::time::timeout(
-        state.acquire_timeout,
-        state.capacity.clone().acquire_owned(),
-    )
-    .await
-    {
-        Ok(Ok(permit)) => permit,
-        _ => return busy_response(),
-    };
-    drop(waiting);
     let method = parts.method.to_string();
     let path = parts.uri.path().to_string();
     let query = parts.uri.query().unwrap_or("").as_bytes().to_vec();
@@ -1287,6 +1417,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         .extensions
         .get::<PeerAddr>()
         .map(|peer| peer.0.ip().to_string());
+    let security_headers = state.security_headers.clone();
     let result = tokio::task::spawn_blocking(move || {
         let result = Python::with_gil(|py| {
             let cb = state.callback.bind(py);
@@ -1323,7 +1454,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 if let BridgeBody::Streaming(stream) = body {
                     close_stream(Arc::new(stream));
                 }
-                return plain_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+                return plain_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
+                    &security_headers,
+                );
             };
             let mut response = AxumResponse::new(Body::empty());
             *response.status_mut() = status;
@@ -1338,6 +1473,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     return plain_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Internal Server Error",
+                        &security_headers,
                     );
                 };
                 response.headers_mut().append(key, value);
@@ -1351,7 +1487,34 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             };
             response
         }
-        _ => plain_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
+        _ => plain_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal Server Error",
+            &security_headers,
+        ),
+    }
+}
+
+/// RAII guard for one entry in the per-IP connection count: created when a
+/// connection is admitted, it decrements the count when the connection task
+/// ends (normal close, error, or server shutdown) so a slot is never leaked.
+struct PerIpConnectionGuard {
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl Drop for PerIpConnectionGuard {
+    fn drop(&mut self) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -1394,11 +1557,11 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for HyperSer
     }
 }
 
-// Slow header transmission (slow-loris on the request line/headers) is bounded
-// by hyper's per-connection header read timeout, so one idle connection cannot
-// hold a slot in the accept loop forever. This is separate from the body read
-// timeout, which only starts once headers are complete.
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+// Slow header transmission (slow-loris on the request line/headers) is
+// bounded by hyper's per-connection header read timeout, so one idle
+// connection cannot hold a slot in the accept loop forever. The timeout is
+// configurable per server (see `header_read_timeout` in ServerState); 0
+// disables it.
 
 /// Optional SO_REUSEPORT binding for callers on Unix. The supervisor uses
 /// a shared listening socket instead, including on Windows.
@@ -1474,7 +1637,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1488,6 +1651,7 @@ impl NativeServer {
         asset_etags: HashMap<String, String>,
         max_concurrent: usize,
         acquire_timeout_ms: u64,
+        max_waiting: Option<usize>,
         body_capacity: usize,
         body_timeout_ms: u64,
         websocket_paths: Option<Vec<String>>,
@@ -1499,7 +1663,21 @@ impl NativeServer {
         websocket_protocols: Option<HashMap<String, Vec<String>>>,
         websocket_max_message: usize,
         listener: Option<Py<PyAny>>,
+        max_connections: usize,
+        max_connections_per_ip: usize,
+        header_read_timeout_ms: u64,
+        body_min_rate_bytes_per_sec: usize,
+        security_headers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+        drain_timeout_secs: f64,
     ) -> PyResult<Self> {
+        // The drain bound is a shutdown budget, not a request timeout:
+        // negative or NaN values would silently become "no drain at
+        // all", so clamp them to zero instead.
+        let drain_timeout = Duration::from_secs_f64(if drain_timeout_secs.is_finite() {
+            drain_timeout_secs.max(0.0)
+        } else {
+            0.0
+        });
         let websocket_paths = websocket_paths.unwrap_or_default();
         if websocket_max_message == 0 || websocket_max_message > 16 * 1024 * 1024 {
             return Err(PyValueError::new_err(
@@ -1516,9 +1694,26 @@ impl NativeServer {
                 "max_concurrent is outside the supported range",
             ));
         }
+        if let Some(waiting) = max_waiting {
+            if waiting > Semaphore::MAX_PERMITS {
+                return Err(PyValueError::new_err(
+                    "max_waiting is outside the supported range",
+                ));
+            }
+        }
         if body_capacity == 0 || body_capacity > Semaphore::MAX_PERMITS {
             return Err(PyValueError::new_err(
                 "body_capacity is outside the supported range",
+            ));
+        }
+        if max_connections == 0 || max_connections > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "max_connections is outside the supported range",
+            ));
+        }
+        if max_connections_per_ip == 0 || max_connections_per_ip > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "max_connections_per_ip is outside the supported range",
             ));
         }
         if static_pages
@@ -1606,7 +1801,12 @@ impl NativeServer {
                 let state = Arc::new(ServerState {
                     callback,
                     capacity: Arc::new(Semaphore::new(max_concurrent)),
-                    waiting_capacity: Arc::new(Semaphore::new(max_concurrent.min(64))),
+                    // Configurable (roadmap C7); None keeps the old
+                    // default of min(max_concurrent, 64). 0 means an
+                    // execution slot must be free immediately, else 503.
+                    waiting_capacity: Arc::new(Semaphore::new(
+                        max_waiting.unwrap_or_else(|| max_concurrent.min(64)),
+                    )),
                     acquire_timeout: Duration::from_millis(acquire_timeout_ms),
                     // Body intake gets fewer slots than Python execution on
                     // purpose: a flood of slow uploads can then only take the
@@ -1617,6 +1817,11 @@ impl NativeServer {
                     // bottleneck.
                     body_capacity: Arc::new(Semaphore::new(body_capacity)),
                     body_timeout: Duration::from_millis(body_timeout_ms),
+                    connection_capacity: Arc::new(Semaphore::new(max_connections)),
+                    per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
+                    max_connections_per_ip,
+                    header_read_timeout: Duration::from_millis(header_read_timeout_ms),
+                    body_min_rate: body_min_rate_bytes_per_sec,
                     static_pages: static_pages
                         .into_iter()
                         .map(|(path, body)| (path, Bytes::from(body)))
@@ -1630,12 +1835,16 @@ impl NativeServer {
                     isr_cache,
                     middleware_enabled,
                     shared_cache_enabled,
+                    security_headers: security_headers.unwrap_or_default(),
                     websocket_router,
                     websocket_paths: websocket_paths.into_iter().collect(),
                     websocket_protocols: websocket_protocols.unwrap_or_default(),
                     websocket_max_message,
                     ws_callback: websocket_callback,
                 });
+                // The accept loop below enforces the connection budget from
+                // this handle; the router takes its own clone via with_state.
+                let limits = Arc::clone(&state);
                 let app = AxumRouter::new().fallback(any(dispatch)).with_state(state);
                 let mut shutdown = std::pin::pin!(async {
                     let _ = rx.await;
@@ -1653,6 +1862,54 @@ impl NativeServer {
                                     continue;
                                 }
                             };
+                            // Connection budget (A4): the total cap and the
+                            // per-IP cap are enforced here, before any
+                            // request is read, so a flood of idle or slow
+                            // connections cannot starve the accept loop or
+                            // the Python bridge. An over-limit connection is
+                            // dropped by closing the socket: the client sees
+                            // EOF, not a response, because no HTTP request
+                            // exists to answer yet. Both permits are held
+                            // for the lifetime of the connection task.
+                            // IPv4-mapped IPv6 addresses count under their
+                            // IPv4 form, matching the Python rate limiter.
+                            let peer_ip = match peer_addr.ip() {
+                                IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                                    Some(v4) => IpAddr::V4(v4),
+                                    None => peer_addr.ip(),
+                                },
+                                ip => ip,
+                            };
+                            let total_permit = match limits
+                                .connection_capacity
+                                .clone()
+                                .try_acquire_owned()
+                            {
+                                Ok(permit) => permit,
+                                Err(_) => continue,
+                            };
+                            let per_ip_admitted = {
+                                let mut counts = limits
+                                    .per_ip_connections
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let count = counts.entry(peer_ip).or_insert(0);
+                                if *count >= limits.max_connections_per_ip {
+                                    false
+                                } else {
+                                    *count += 1;
+                                    true
+                                }
+                            };
+                            if !per_ip_admitted {
+                                drop(total_permit);
+                                continue;
+                            }
+                            let per_ip_guard = PerIpConnectionGuard {
+                                counts: Arc::clone(&limits.per_ip_connections),
+                                ip: peer_ip,
+                            };
+                            let header_read_timeout = limits.header_read_timeout;
                             let service = HyperService {
                                 router: app.clone(),
                                 peer_addr: Some(peer_addr),
@@ -1664,14 +1921,21 @@ impl NativeServer {
                             // served h2c, everything else is HTTP/1.1. The
                             // old Http1Builder-only loop turned the h2
                             // preface into a VersionH2 error and dropped the
-                            // connection. The 10s header read timeout still
-                            // applies to the HTTP/1.1 side via `.http1()`.
+                            // connection. The header read timeout applies to
+                            // the HTTP/1.1 side via `.http1()`; h2c
+                            // connections have no idle timeout, only the
+                            // connection caps above.
                             connections.spawn(async move {
+                                let _total_permit = total_permit;
+                                let _per_ip_guard = per_ip_guard;
                                 let mut builder = AutoBuilder::new(TokioExecutor::new());
-                                builder
-                                    .http1()
-                                    .timer(TokioTimer::new())
-                                    .header_read_timeout(HEADER_READ_TIMEOUT);
+                                {
+                                    let mut http1 = builder.http1();
+                                    http1.timer(TokioTimer::new());
+                                    if !header_read_timeout.is_zero() {
+                                        http1.header_read_timeout(header_read_timeout);
+                                    }
+                                }
                                 // Upgrades (WebSocket) need the upgradable
                                 // connection: plain serve_connection leaves
                                 // the upgrade future failing with "upgrade
@@ -1693,8 +1957,11 @@ impl NativeServer {
                 }
                 let _ = connection_shutdown.send(true);
                 // Drain in-flight connections, bounded so `stop()` cannot
-                // hang on a stuck connection.
-                let _ = tokio::time::timeout(Duration::from_secs(30), async {
+                // hang on a stuck connection. The bound is the Python
+                // shutdown timeout (B6): serve() already waited that long
+                // for Python handlers, so this only covers connections
+                // whose close handshake is still in flight.
+                let _ = tokio::time::timeout(drain_timeout, async {
                     while connections.join_next().await.is_some() {}
                 })
                 .await;

@@ -3,7 +3,7 @@ import asyncio
 import httpx
 import pytest
 
-from pynext import SecurityConfig, create_app
+from pynext import SecurityConfig, create_app, sign_csrf_token
 from pynext.server import start_native
 
 
@@ -32,7 +32,8 @@ def test_form_uploads_and_csrf(tmp_path, mode):
             client = httpx.AsyncClient(base_url=f"http://{server.address}", trust_env=False)
         try:
             async with client:
-                client.cookies.set("pynext_csrf", "secret")
+                client.cookies.set("pynext_csrf",
+                                   sign_csrf_token("secret", config=app.security))
                 response = await client.post("/api", files=[
                     ("csrf_token", (None, "secret")), ("tag", (None, "한글")),
                     ("tag", (None, "two")), ("upload", ("note.txt", b"hello", "text/plain")),

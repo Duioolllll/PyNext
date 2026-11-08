@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import hashlib
 import html
 import importlib.machinery
@@ -21,13 +22,13 @@ from urllib.parse import quote, unquote_to_bytes
 from . import _native
 from .assets import read_public_artifacts, read_public_sources
 from .auth import check_authorization
-from .cache import CacheBusy, ISRCache
+from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
 from .client import compile_client, read_client_artifacts
 from .components import _isr_policy, _isr_query_keys, _node, bind_islands
 from .build import discover, load_manifest
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
-                   cors_preflight_response, new_csp_nonce, validate_csrf)
+                   apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
 from .images import ImageBusy, ImageUnavailable, optimize_image
 from .observability import (
     MetricsCollector,
@@ -40,7 +41,9 @@ from .observability import (
     route_var,
     span,
 )
+from .proxy import ProxyTrust
 from .ratelimit import RateLimitUnavailable, rate_limited_response
+from .sessions import SessionMiddleware
 from .static import asset_response
 
 log = logging.getLogger("pynext")
@@ -241,7 +244,17 @@ class _ISRStreamingResponse(StreamingResponse):
         await super().aclose()
 
 
-async def _send_response(response, send):
+async def _send_response(response, send, *, config=None, production=True):
+    """Send ``response`` over ASGI, adding the A1 security headers first.
+
+    ``config`` is the app's :class:`SecurityConfig`; when it is ``None`` the
+    response is sent unchanged (callers that already went through
+    :meth:`App.dispatch` applied the headers there). Applying here as well
+    covers the responses that bypass dispatch: rate-limit 429/503, bad
+    request 400, oversized 413 and the 500 error page.
+    """
+    if config is not None:
+        apply_security_headers(response, config=config, production=production)
     if not isinstance(response, StreamingResponse):
         await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
         await send({"type": "http.response.body", "body": response.body})
@@ -304,7 +317,9 @@ def _module_key(root, relative):
 class App:
     def __init__(self, root, manifest, *, production=False, security=None, cache_backend="memory",
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
-                 resources=None, cache_url=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False):
+                 resources=None, cache_url=None, cache_failure_policy=None,
+                 websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
+                 trusted_proxies=None):
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
         if production and debug:
@@ -332,11 +347,20 @@ class App:
         # disables it. The Axum adapter reads the same attribute in
         # server.start_native; see ratelimit.py for the trust rules.
         self.rate_limit = rate_limit
+        # Trusted proxies for forwarded-header resolution (A6, pynext.proxy).
+        # An explicit list wins; otherwise the rate limiter's list is reused
+        # so the bucket key and the handler-visible client IP agree; with
+        # neither configured, no forwarded header is interpreted at all.
+        if trusted_proxies is None:
+            trusted_proxies = (rate_limit.trusted_proxies
+                               if rate_limit is not None else ())
+        self.proxy_trust = ProxyTrust(trusted_proxies)
         try:
             _register_project(self._namespace)
             _package(self._namespace, Path(root).resolve(), load_initializer=False)
             self._initialize(root, manifest, production=production,
-                             cache_backend=cache_backend, cache_path=cache_path, cache_url=cache_url)
+                             cache_backend=cache_backend, cache_path=cache_path, cache_url=cache_url,
+                             cache_failure_policy=cache_failure_policy)
             configured = ()
             if "middleware.py" in manifest["sources"]:
                 configured = getattr(self._module("middleware.py"), "MIDDLEWARE", None)
@@ -351,6 +375,18 @@ class App:
                 if not (inspect.iscoroutinefunction(item) or
                         inspect.iscoroutinefunction(getattr(item, "__call__", None))):
                     raise TypeError("middleware entries must be async callables")
+            if security.csrf_enabled is None:
+                # Auto CSRF: a session middleware means the app keeps
+                # server-side state, so every state-changing API route is
+                # protected unless the app explicitly opts out with
+                # SecurityConfig(csrf_enabled=False). Without sessions the
+                # default stays off (opt in with csrf_enabled=True or
+                # @csrf_protect) so token-less API clients keep working.
+                security = dataclasses.replace(
+                    security,
+                    csrf_enabled=any(isinstance(item, SessionMiddleware)
+                                     for item in self.middleware))
+                self.security = security
             configured_resources = {}
             if "resources.py" in manifest["sources"]:
                 configured_resources = getattr(self._module("resources.py"), "RESOURCES", None)
@@ -372,6 +408,17 @@ class App:
             self.resources = MappingProxyType(combined)
             self._resources_started = []
             self._started = False
+            # Graceful-shutdown state (B6): set by begin_drain() when the
+            # server stops accepting new traffic. In-flight requests and
+            # WebSocket sessions are tracked here so serve() can wait for
+            # them; the counters are touched from Rust worker threads, so
+            # they are guarded by a plain lock, never the event loop.
+            self._draining = False
+            self._ws_sessions = set()
+            self._ws_lock = threading.Lock()
+            self._inflight = 0
+            self._inflight_streams = 0
+            self._inflight_lock = threading.Lock()
         except BaseException:
             self._release_modules()
             raise
@@ -384,7 +431,7 @@ class App:
         return self
 
     def _initialize(self, root, manifest, *, production=False, cache_backend="memory", cache_path=None,
-                    cache_url=None):
+                    cache_url=None, cache_failure_policy=None):
         self.root = Path(root).resolve()
         self.manifest = manifest
         self.production = production
@@ -401,7 +448,7 @@ class App:
                                              ensure_ascii=True).encode("ascii")).hexdigest()
         self.isr = ISRCache(cache_backend=cache_backend, cache_path=cache_path,
                             namespace=(build_id + ":") if cache_backend in {"sqlite", "redis"} else "",
-                            cache_url=cache_url)
+                            cache_url=cache_url, failure_policy=cache_failure_policy)
         self.static_generators = {}
         self.static_pages = {}
         self.public_assets = {}
@@ -556,6 +603,7 @@ class App:
     async def shutdown(self):
         """Close resources in reverse order even when one shutdown fails."""
         error = None
+        self._draining = True
         for resource in reversed(self._resources_started):
             try:
                 await resource.shutdown()
@@ -575,6 +623,83 @@ class App:
                 log.exception("Cache shutdown failed")
         if error is not None:
             raise error
+
+    @property
+    def is_ready(self):
+        """True once startup finished and the app is not draining.
+
+        ``/readyz`` answers from this: a load balancer must stop sending
+        new traffic as soon as draining starts, while in-flight requests
+        still finish.
+        """
+        return self._started and not self._draining
+
+    def begin_drain(self):
+        """Stop advertising readiness without stopping in-flight work.
+
+        Idempotent. Called by ``server.serve()`` the moment a shutdown is
+        requested, before the native server stops accepting connections.
+        """
+        self._draining = True
+
+    def _register_ws_session(self, session):
+        with self._ws_lock:
+            self._ws_sessions.add(session)
+
+    def _unregister_ws_session(self, session):
+        with self._ws_lock:
+            self._ws_sessions.discard(session)
+
+    async def close_websockets(self, code=1001, reason="server shutting down", timeout=5.0):
+        """End every live native WebSocket session with a clean close.
+
+        Each accepted session first gets a close frame (``code`` 1001 by
+        default, "going away"), so peers see an orderly shutdown instead
+        of a dropped connection. Handlers that do not exit on their own
+        are cancelled once ``timeout`` seconds have passed. Sessions that
+        never accepted a connection have nothing to close and are only
+        waited on. Returns True when every handler finished in time.
+        """
+        with self._ws_lock:
+            sessions = list(self._ws_sessions)
+        for session in sessions:
+            ws = getattr(session, "_ws", None)
+            if ws is not None and ws.accepted and not ws.closed:
+                try:
+                    await ws.close(code, reason)
+                except Exception:
+                    log.debug("WebSocket close during drain failed", exc_info=True)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            pending = [s for s in sessions
+                       if (future := getattr(s, "_future", None)) is not None and not future.done()]
+            if not pending:
+                return True
+            if time.monotonic() >= deadline:
+                for session in pending:
+                    future = getattr(session, "_future", None)
+                    if future is not None and not future.done():
+                        future.cancel()
+                return False
+            await asyncio.sleep(0.05)
+
+    async def wait_for_inflight(self, timeout):
+        """Wait until in-flight HTTP requests and streams drain.
+
+        Returns True when nothing is in flight, False on timeout. The
+        counters are updated by the native bridge (HTTP) and by
+        ``_NativeStream`` (streaming bodies), both from Rust threads.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._inflight_lock:
+                remaining = self._inflight + self._inflight_streams
+            if remaining <= 0:
+                return True
+            if time.monotonic() >= deadline:
+                log.warning("Shutdown timed out with %d requests still in flight", remaining)
+                return False
+            await asyncio.sleep(0.05)
 
     async def revalidate(self, path):
         """Invalidate one decoded ISR path for this app instance."""
@@ -743,6 +868,28 @@ class App:
 
     async def dispatch(self, request):
         """Return a response. Exceptions are converted at the transport boundary."""
+        # Health probes are reserved framework paths (B6): they bypass
+        # middleware, CORS preflight and CSRF so a load balancer can probe
+        # a half-broken app, and an app route or public asset with the
+        # same path never shadows them. The native transport also skips
+        # rate limiting and static serving for these paths; see
+        # server.start_native and crates/pynext-native/src/lib.rs.
+        # /healthz is liveness (the process answers at all); /readyz is
+        # readiness (startup finished and not draining).
+        if request.path in ("/healthz", "/readyz"):
+            route_var.set("__health__")
+            if request.method not in {"GET", "HEAD"}:
+                return Response("Method Not Allowed", status=405,
+                                headers=[(b"allow", b"GET, HEAD")])
+            if request.path == "/healthz":
+                body = b"" if request.method == "HEAD" else b"ok"
+                return Response(body, media_type="text/plain; charset=utf-8")
+            if self.is_ready:
+                body = b"" if request.method == "HEAD" else b"ready"
+                return Response(body, media_type="text/plain; charset=utf-8")
+            return Response(b"" if request.method == "HEAD" else b"not ready", status=503,
+                            media_type="text/plain; charset=utf-8",
+                            headers=[(b"retry-after", b"1")])
         preflight = cors_preflight_response(request, config=self.security)
         if self.middleware:
             async def terminal(current):
@@ -773,6 +920,7 @@ class App:
             response = await self._dispatch_timed(request, lambda: invoke(0, request))
             if preflight is None:
                 apply_cors_headers(request, response, config=self.security)
+            apply_security_headers(response, config=self.security, production=self.production)
             if request.method == "HEAD":
                 if isinstance(response, StreamingResponse):
                     await response.aclose()
@@ -780,9 +928,11 @@ class App:
                 response.body = b""
             return response
         if preflight is not None:
+            apply_security_headers(preflight, config=self.security, production=self.production)
             return preflight
         response = await self._dispatch_timed(request)
         apply_cors_headers(request, response, config=self.security)
+        apply_security_headers(response, config=self.security, production=self.production)
         return response
 
     async def _dispatch_timed(self, request, handler=None):
@@ -956,7 +1106,12 @@ class App:
                     # runs in the background, a miss renders synchronously.
                     cache_key = path
                     if self.isr_queries[pattern]:
-                        generation, _ = await self.isr.variant_generation(path)
+                        try:
+                            generation, _ = await self.isr.variant_generation(path)
+                        except SharedCacheUnavailable:
+                            self.metrics.observe_regeneration("failure")
+                            return Response("Service Unavailable", status=503,
+                                            headers=[(b"retry-after", b"1")])
                         encoded = json.dumps(query, ensure_ascii=True, separators=(",", ":")).encode("ascii")
                         cache_key = ("\0isr:" + hashlib.sha256(path.encode("utf-8")).hexdigest() + ":" +
                                      generation + ":" + hashlib.sha256(encoded).hexdigest())
@@ -968,6 +1123,13 @@ class App:
                         self.metrics.observe_cache("busy")
                         self.metrics.observe_regeneration("failure")
                         return Response("Server Busy", status=503,
+                                        headers=[(b"retry-after", b"1")])
+                    except SharedCacheUnavailable:
+                        # fail_closed cache policy: the shared store could
+                        # not be consulted, so refuse rather than serve
+                        # from degraded state.
+                        self.metrics.observe_regeneration("failure")
+                        return Response("Service Unavailable", status=503,
                                         headers=[(b"retry-after", b"1")])
                     except TimeoutError:
                         self.metrics.observe_regeneration("failure")
@@ -1152,7 +1314,11 @@ class App:
             _reset_request_context()
 
     async def _handle_http(self, scope, receive, send):
-        if self.rate_limit is not None:
+        # Health probes bypass rate limiting (B6): a saturated limiter
+        # must never make the process look dead to a load balancer.
+        is_health = scope.get("path") in ("/healthz", "/readyz")
+        exempt = getattr(self.rate_limit, "is_exempt", None)
+        if self.rate_limit is not None and not (is_health or (exempt and exempt(scope.get("path", "")))):
             # Check before reading the body: an over-limit request is
             # rejected without handler execution or body intake.
             client = scope.get("client")
@@ -1167,13 +1333,13 @@ class App:
                 response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
                 if scope["method"].upper() == "HEAD":
                     response.body = b""
-                await _send_response(response, send)
+                await _send_response(response, send, config=self.security, production=self.production)
                 return
             if not allowed:
                 response = rate_limited_response(retry_after)
                 if scope["method"].upper() == "HEAD":
                     response.body = b""
-                await _send_response(response, send)
+                await _send_response(response, send, config=self.security, production=self.production)
                 return
         request = None
         try:
@@ -1206,6 +1372,24 @@ class App:
                 log.exception("Request failed")
                 response = self.error_response(exc)
         if request is not None:
+            # Trust-resolved client identity (A6, pynext.proxy): the peer
+            # address, scheme and Host header, unless a trusted proxy
+            # supplied forwarded values. Handlers read these from
+            # ``request.state``; without trusted proxies they are just the
+            # direct connection values, never a spoofed header.
+            client = scope.get("client")
+            peer_ip = client[0] if client else None
+            headers = tuple(scope.get("headers", []))
+            host = next((value.decode("latin-1") for key, value in headers
+                         if key.lower() == b"host"), None)
+            info = self.proxy_trust.resolve(
+                peer_ip, headers,
+                default_scheme=scope.get("scheme") or "http",
+                default_host=host)
+            request.state["client_ip"] = info.client_ip
+            request.state["client_scheme"] = info.scheme
+            request.state["client_host"] = info.host
+
             async def dispatch_and_send():
                 try:
                     result = await self.dispatch(request)
@@ -1217,7 +1401,7 @@ class App:
                     result = self.error_response(exc)
                 if scope["method"].upper() == "HEAD":
                     result.body = b""
-                await _send_response(result, send)
+                await _send_response(result, send, config=self.security, production=self.production)
 
             await _run_while_connected(dispatch_and_send(), receive)
             return
@@ -1226,15 +1410,17 @@ class App:
         request_id = get_request_id()
         if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
             response.headers.append((b"x-request-id", request_id.encode("ascii")))
-        await _send_response(response, send)
+        await _send_response(response, send, config=self.security, production=self.production)
 
 
 def create_app(root=".", *, production=False, security=None, cache_backend="memory", cache_path=None,
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
-               websocket_max_message=MAX_WS_MESSAGE, hot_reload=False):
+               cache_failure_policy=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
+               trusted_proxies=None):
     root = Path(root).resolve()
     return App(root, load_manifest(root) if production else discover(root), production=production,
                security=security, cache_backend=cache_backend, cache_path=cache_path,
                observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
-               resources=resources, cache_url=cache_url, websocket_max_message=websocket_max_message,
-               hot_reload=hot_reload)
+               resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
+               websocket_max_message=websocket_max_message, hot_reload=hot_reload,
+               trusted_proxies=trusted_proxies)

@@ -20,11 +20,7 @@ PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust�
 
 ## 구현 현황
 
-- 파일 기반 라우팅과 중첩 레이아웃, Python 페이지·API, SSR·SSG·ISR 및 Axum·ASGI 실행을 지원합니다. API와 SSR은 스트리밍할 수 있으며 ISR은 최초 생성 시 스트리밍하고 완성된 응답을 캐시합니다.
-- JS/TS island와 클라이언트 탐색, 제한된 공유 모델을 통한 서버 DOM 재사용을 제공합니다. 개발 모드에서 JS/TS island 모듈을 전체 페이지 새로고침 없이 교체할 수 있습니다.
-- SQLite·Redis 공유 ISR, 워커 간 무효화, Redis 공유 요청 제한, 전역 HTTP 미들웨어와 multipart 업로드를 제공합니다.
-- SQLite 세션과 세션 기반 CSRF, 인증·권한 검사 연결점, WebSocket과 프로세스 내 pub/sub, 공유 리스너를 사용하는 다중 워커를 지원합니다.
-- `pynext init`, 개발 오류 페이지와 파일 감시, 구조화 로그·지표·선택적 OpenTelemetry, 로컬 이미지 WebP 변환 및 Linux standalone 디렉터리를 제공합니다.
+기능 목록은 코드에서 자동 생성됩니다: [FEATURES](docs/FEATURES.md). 요약하면 파일 기반 라우팅과 중첩 레이아웃, Python 페이지·API, SSR·SSG·ISR, Axum·ASGI 실행, JS/TS island와 클라이언트 탐색, SQLite·Redis 공유 ISR, 전역 HTTP 미들웨어, SQLite 세션과 CSRF, WebSocket, 다중 워커, `pynext init`과 Linux standalone 디렉터리를 제공합니다.
 
 공유 island 모델은 문자열 props 등을 사용하는 제한된 부분집합이며 HMR 중 island 상태가 초기화될 수 있습니다. 인증 정보 검증은 앱의 책임이고 WebSocket pub/sub은 프로세스 내부로 한정됩니다. 현재 버전은 실험 단계이므로 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하는 데 사용하지 마세요.
 
@@ -129,12 +125,16 @@ store = SQLiteSessionStore(Path(__file__).parent / ".pynext" / "sessions.sqlite3
 MIDDLEWARE = [SessionMiddleware(store)]
 ```
 
-세션 미들웨어가 설치된 경우 CSRF 보호는 `session.csrf_token()`으로 발급한
+세션 미들웨어가 설치된 경우 CSRF 보호가 자동으로 켜지며 `session.csrf_token()`으로 발급한
 토큰을 해당 세션과 비교합니다. 로그인 시 `rotate()`는 CSRF 토큰도 바꾸므로
 클라이언트에 새 토큰을 전달해야 합니다. 동시 수정이나 만료·폐기와 충돌한 저장은
 409를 반환합니다. 핸들러에서 이미 수행한 외부 작업은 자동으로 되돌리지 않으므로
-앱에서 멱등성을 보장해야 합니다. SQLite 저장소의 만료 행은 유지보수 작업에서
-`await store.purge_expired()`로 정리할 수 있습니다.
+앱에서 멱등성을 보장해야 합니다. 미들웨어는 기본적으로 한 시간마다 만료된
+세션을 백그라운드에서 정리합니다(`purge_interval`, `None`이면 비활성화).
+여러 노드에서 세션을 공유하려면 `RedisSessionStore("redis://...")`를 쓰세요
+(`pynext-framework[redis]` 또는 `PYNEXT_REDIS_URL` 환경 변수). Redis 저장소는
+TTL로 만료하고 버전 fencing으로 동시 쓰기를 막으며, 저장소 인터페이스는
+SQLite와 동일합니다.
 
 ## 앱 작성
 
@@ -201,11 +201,11 @@ URL 인코딩과 multipart를 지원하고 중복 필드는 순서대로 보존�
 
 `request.query`를 읽을 때 잘못된 UTF-8 쿼리 문자열과 `await request.json()`을 읽을 때 잘못된 JSON 본문은 `BadRequest` 예외가 발생하며 HTTP 400으로 응답합니다. 쿼리의 퍼센트 인코딩을 푼 결과도 UTF-8로 검사합니다. JSON의 `NaN`과 `Infinity`도 허용하지 않습니다. 파싱은 해당 속성이나 메서드를 읽을 때 이루어지므로, 읽지 않는 요청에는 적용되지 않습니다. 앱에서 직접 `from pynext import BadRequest`로 불러와 입력 검증 오류에 사용할 수도 있습니다. 클라이언트에는 예외의 상세 내용 대신 `Bad Request`만 전송합니다. 요청 본문은 최대 1 MiB이며 초과하면 413입니다.
 
-상태 변경 API에는 CSRF 보호를 선택적으로 적용할 수 있습니다(명세 v0.2 §11). 세션 미들웨어를 사용하면 `session.csrf_token()`을 발급하고 헤더 또는 폼 필드에서 받은 토큰을 해당 세션과 비교합니다. 세션 미들웨어가 없으면 `new_csrf_token()`과 `set_csrf_cookie()`를 사용하는 double-submit 방식입니다. 핸들러에 `@csrf_protect`를 붙이거나 `create_app(..., security=SecurityConfig(csrf_enabled=True))`로 모든 상태 변경 API를 보호할 수 있으며, 토큰이 없거나 일치하지 않으면 403을 반환합니다.
+상태 변경 API에는 CSRF 보호가 적용됩니다(명세 v0.2 §11). 세션 미들웨어를 설치하면 모든 상태 변경 API가 자동으로 보호됩니다(`session.csrf_token()`을 발급하고 헤더 또는 폼 필드에서 받은 토큰을 해당 세션과 비교합니다). 세션 미들웨어가 없으면 기본적으로 꺼져 있으며, 핸들러에 `@csrf_protect`를 붙이거나 `create_app(..., security=SecurityConfig(csrf_enabled=True))`로 켤 수 있습니다. 세션이 없는 경우 `new_csrf_token()`과 `set_csrf_cookie()`를 사용하는 double-submit 방식이며, 쿠키 값은 HMAC으로 서명돼 서명이 없는 쿠키는 토큰이 일치해도 거부됩니다(서브도메인 쿠키 주입 방지). `Origin`/`Sec-Fetch-Site`도 검사해 교차 사이트·서브도메인 페이지에서 온 상태 변경 요청은 토큰이 있어도 403을 반환합니다. 토큰이 없거나 일치하지 않으면 403을 반환합니다. 명시적으로 끄려면 `SecurityConfig(csrf_enabled=False)`를 전달하세요. CSRF 쿠키는 기본적으로 `Secure`이므로 평문 `http://` 로컬 개발에서는 `csrf_cookie_secure=False`를 앱 설정과 `set_csrf_cookie()` 호출에 함께 전달하세요(`pynext dev`는 자동으로 이렇게 동작합니다).
 
-CLI의 `dev`와 `start`에서는 `--csrf`, `--csrf-cookie-secure`, 반복 가능한
+CLI의 `dev`와 `start`에서는 `--csrf`/`--no-csrf`, `--csrf-cookie-secure`/`--no-csrf-cookie-secure`, 반복 가능한
 `--cors-origin`, `--cors-credentials`, `--csp-nonce`로 같은 보안 설정을 켤 수 있습니다.
-기본값은 기존과 같이 CSRF와 nonce가 꺼져 있고 교차 출처를 허용하지 않습니다.
+`--csrf`를 지정하지 않으면 세션 미들웨어 설치 여부에 따라 자동으로 결정되며, `start`에서는 CSRF 쿠키가 기본적으로 `Secure`이고 `dev`에서는 평문 HTTP 개발을 위해 `Secure`가 꺼집니다. 기본적으로 nonce는 꺼져 있고 교차 출처를 허용하지 않습니다.
 
 교차 출처 요청은 기본적으로 허용하지 않습니다(명세 v0.2 §11). `SecurityConfig(cors_allowed_origins=("https://example.com",), ...)`로 origin·method·header를 명시하면 해당 출처의 preflight에 204와 `Access-Control-Allow-*` 헤더를 반환하고, 실제 요청에도 허용 헤더를 붙입니다. 허용되지 않은 출처의 preflight는 403이며, 실제 요청에는 CORS 헤더를 붙이지 않아 브라우저가 응답을 차단합니다. 같은 출처 요청은 CORS로 차단하지 않습니다. 자세한 내용은 [사용 설명서](docs/ko/manual.md)를 참조하세요.
 
@@ -392,10 +392,10 @@ OpenTelemetry 트레이싱은 기본으로 꺼져 있으며 선택 사항입니�
 
 - SSR은 기본적으로 Python에서 UI 트리를 만들고 Rust가 이스케이프해 직렬화하는 buffered 렌더링입니다. 페이지 함수가 UI 노드의 비동기 iterable을 반환하면 레이아웃 셸을 먼저 보내고 청크 단위로 스트리밍합니다. 문자열을 raw HTML로 삽입하는 API는 없습니다.
 - Axum의 기본 본문 수신 슬롯은 16개, Python 실행 슬롯은 64개이며 CLI에서 조정합니다. 본문 수신 제한은 기본 10초이고 HTTP/1.1 헤더 수신에도 10초 제한이 있습니다. 실행 대기열은 최대 실행 슬롯 수와 64 중 작은 값으로 제한합니다. 정적 파일과 신선한 ISR 캐시는 Python 슬롯을 건너뜁니다. 연결 총수는 제한하지 않으며 동기 함수는 504 또는 연결 해제 후에도 스레드에서 계속 실행될 수 있습니다. DB·외부 서비스 시간 제한과 쓰기 멱등성을 별도로 확보해야 합니다. 외부 ASGI 서버의 시간 제한은 해당 서버가 관리합니다.
-- 요청 속도 제한은 선택 사항입니다. `pynext start --rate-limit 100 --rate-limit-window 60`은 IP당 토큰 버킷을 적용하고 초과 요청에 429와 `Retry-After`를 반환합니다. 기본 메모리 버킷은 프로세스별이며, `--rate-limit-backend redis`는 Redis에서 모든 워커의 버킷을 공유합니다. Redis 연결은 `PYNEXT_REDIS_URL`, 앱별 구분은 `PYNEXT_RATE_LIMIT_NAMESPACE`로 설정합니다. Redis 장애 시 제한 판단을 우회하지 않고 503을 반환합니다. 정적 파일과 SSG·ISR에도 적용되며 Axum은 제한이 활성화된 경우 이 요청들을 Python으로 전달합니다. `X-Forwarded-For`는 `--trusted-proxy`로 지정한 피어에서만 신뢰합니다.
-  전달된 주소는 오른쪽부터 신뢰하는 프록시를 거슬러 가장 가까운 비신뢰 주소를 사용합니다. 모든 중간 프록시를 정확히 등록해야 합니다. 프로세스당 버킷은 최대 10,000개이며 모두 사용 중이면 기존 버킷을 제거하지 않고 새 주소에 429를 반환합니다.
+- 요청 속도 제한은 선택 사항입니다. `pynext start --rate-limit 100 --rate-limit-window 60`은 IP당 토큰 버킷을 적용하고 초과 요청에 429와 `Retry-After`를 반환합니다. 기본 메모리 버킷은 프로세스별이며, `--rate-limit-backend redis`는 Redis에서 모든 워커의 버킷을 공유합니다. Redis 연결은 `PYNEXT_REDIS_URL`, 앱별 구분은 `PYNEXT_RATE_LIMIT_NAMESPACE`로 설정합니다. Redis 장애 시 제한 판단을 우회하지 않고 503을 반환합니다. 정적 파일과 SSG·ISR에도 적용되며 Axum은 제한이 활성화된 경우 이 요청들을 Python으로 전달합니다. `X-Forwarded-For`·`Forwarded`·`X-Forwarded-Proto`·`X-Forwarded-Host`는 `--trusted-proxy`로 지정한 피어에서만 신뢰합니다(신뢰 목록이 없으면 전부 무시). 핸들러는 해석된 클라이언트 IP·스킴·호스트를 `request.state["client_ip"/"client_scheme"/"client_host"]`로 읽습니다.
+  전달된 주소는 오른쪽부터 신뢰하는 프록시를 거슬러 가장 가까운 비신뢰 주소를 사용합니다. 모든 중간 프록시를 정확히 등록해야 합니다. 프로세스당 버킷은 최대 10,000개이며, 모두 사용 중이면 새 주소가 가장 오래된 버킷을 내보내고 들어갑니다(기존 주소가 429를 받지는 않습니다). 신규 주소 생성은 윈도우당 최대 10,000개까지의 전역 슬라이딩 윈도우로 제한합니다. IPv6 주소는 /64 접두사별로 버킷을 공유합니다. `--rate-limit-exempt-path`(예: `/healthz`)로 지정한 경로는 속도 제한을 건너뜁니다.
 - ASGI HTTP와 기본 lifespan, 비동기 API 응답 스트리밍과 연결 해제 시 비동기 작업 취소를 지원합니다. WebSocket도 ASGI와 Axum에서 지원합니다(텍스트·바이너리, close 코드, 설정 가능한 메시지 크기). ASGI 적합성은 `tests/test_asgi_conformance.py`로 검증합니다(HTTP 이벤트 순서, 다중 청크 본문, 본문 크기 경계, 연결 해제, lifespan 시작·종료와 실패 시 `lifespan.*.failed` 응답). 강제 프로세스 격리는 `--workers`로 제공합니다.
-- `--workers N`으로 리스너를 공유하는 여러 워커 프로세스를 띄울 수 있습니다. `--port 0`이면 수퍼바이저가 포트를 할당하고 워커가 재시작해도 유지합니다. 상위 프로세스가 워커를 감시하고 비정상 종료 시 재시작하며 종료 신호를 받으면 모든 워커를 정리합니다. 기본 캐시와 속도 제한은 워커별이며 SQLite·Redis 공유 ISR과 Redis 공유 제한을 선택할 수 있습니다. 워커가 죽는 도중 처리하던 요청은 실패하고 클라이언트가 재시도해야 합니다. 기본값은 1(기존 단일 프로세스)입니다. 공유 리스너를 사용하는 워커의 실행과 재시작은 Linux·macOS·Windows CI에서 검사하며, 신호 기반 수퍼바이저 검사는 Linux·macOS에서 수행합니다.
+- `--workers N`으로 리스너를 공유하는 여러 워커 프로세스를 띄울 수 있습니다. `--port 0`이면 수퍼바이저가 포트를 할당하고 워커가 재시작해도 유지합니다. 상위 프로세스가 워커를 감시하고 비정상 종료 시 재시작하며 종료 신호를 받으면 모든 워커를 정리합니다. 기본 캐시와 속도 제한은 워커별이며 SQLite·Redis 공유 ISR과 Redis 공유 제한을 선택할 수 있습니다. 워커가 죽는 도중 처리하던 요청은 실패하고 클라이언트가 재시도해야 합니다. 기본값은 1(기존 단일 프로세스)입니다. 공유 리스너를 사용하는 워커의 실행과 재시작은 Linux·macOS·Windows CI에서 검사하며, 신호 기반 수퍼바이저 검사는 Linux·macOS에서 수행합니다. `/healthz`는 프로세스 생존, `/readyz`는 시작 완료 후·드레인 전만 200을 반환하며 속도 제한을 우회합니다. SIGTERM을 받으면 워커는 신규 연결을 중단하고 진행 중인 요청 완료와 WebSocket 1001 종료를 `--shutdown-timeout`(기본 30초) 안에 처리합니다. 수퍼바이저에 SIGHUP을 보내면 워커를 한 대씩 교체하는 롤링 재시작을 수행합니다.
 - ISR 기본값은 단일 프로세스 메모리 구현이며 SQLite와 Redis 공유 백엔드를 선택할 수 있습니다. `pynext dev`는 변경된 JS/TS island 모듈을 문서 전체 새로고침 없이 교체하고 기존 정리 함수를 호출합니다. 해당 island의 상태는 초기화될 수 있습니다. Python 페이지 등 다른 파일은 서버를 재시작하고 문서를 새로고침합니다. 버튼 이외의 상호작용 재생과 프로덕션 보안 기능은 **미구현**입니다. PyNext의 hydration은 React나 React Server Components와 호환되지 않습니다. 현재 버전을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하는 데 사용하지 마세요.
 - 빌드할 때 앱 모듈을 import하므로 개발자가 작성한 Python 코드가 실행됩니다. 프로젝트를 신뢰할 수 있는 환경에서 빌드해야 합니다.
 - 페이지·레이아웃·API 파일에서 `from .helpers import name` 같은 상대 import를 사용할 수 있습니다. **0.6 변경:** 프로젝트 루트를 전역 `sys.path`에 자동 추가하지 않습니다. 기존 루트 기준 절대 import가 실패하면 상대 import로 바꾸거나 프로젝트를 Python 패키지로 설치하세요.

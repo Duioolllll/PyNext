@@ -16,11 +16,11 @@
 | API returns 413 | Request body exceeds 1 MiB |
 | 503 overload | Adjust execution/body capacity after identifying the load; do not disable safeguards |
 | 504 timeout | Python handler exceeded deadline; synchronous thread may still run |
-| ISR differs between processes | Current cache/invalidation is **process-local** |
+| ISR differs between processes | The default `memory` cache is process-local; use `--cache-backend sqlite` or `redis` to share entries across workers |
 
 ## Debug checklist
 
-1. Confirm CPython **3.13**, current Cargo/Rust, uv and (if using islands) Node/npm.
+1. Confirm CPython **3.13 or 3.14**, current Cargo/Rust, uv and (if using islands) Node/npm.
 2. Verify that `app/page.py` exports a decorated `Page`, that API handlers return a `Response` subclass, and that route paths do not conflict.
 3. Run `uv run pytest -q` and `cargo test --locked --workspace --all-features`.
 4. Rebuild from trusted sources, restart the server and check one route at a time.

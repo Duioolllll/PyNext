@@ -281,9 +281,9 @@ def test_cli_without_observability_flags_keeps_old_call_shape(tmp_path, monkeypa
     cli.main()
     # No observability kwarg leaks through when no flags are given; the
     # other kwargs are the merged defaults from the cache (#42) and
-    # rate-limit (#49) options.
+    # rate-limit (#49) options, plus the graceful-shutdown default (B6).
     assert seen["create_app"] == {"cache_backend": "memory", "cache_path": None, "rate_limit": None}
-    assert seen["serve"] == {}
+    assert seen["serve"] == {"shutdown_timeout": 30}
 
 
 def test_observability_config_from_env(monkeypatch):
