@@ -8,7 +8,8 @@ import time
 
 from . import _native
 from .app import _decode_path, _invoke
-from .http import MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket, WebSocketDisconnect
+from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
+                   WebSocketDisconnect, apply_security_headers, security_headers)
 from .observability import begin_request_context, queue_wait_var
 from .ratelimit import RateLimitUnavailable, rate_limited_response
 
@@ -278,6 +279,10 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
             response = await _call_inner(method, raw_path, query, headers, body)
         finally:
             reset_context()
+        # dispatch() already applied the headers to routed responses; this
+        # covers the 400/error-page responses _call_inner builds itself.
+        # Idempotent, so routed responses are unchanged.
+        apply_security_headers(response, config=app.security, production=app.production)
         if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
             response.headers.append((b"x-request-id", request_id.encode("ascii")))
         return response
@@ -316,11 +321,13 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                 response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
                 if method.upper() == "HEAD":
                     response.body = b""
+                apply_security_headers(response, config=app.security, production=app.production)
                 return response.status, response.headers, response.body
             if not allowed:
                 response = rate_limited_response(retry_after)
                 if method.upper() == "HEAD":
                     response.body = b""
+                apply_security_headers(response, config=app.security, production=app.production)
                 return response.status, response.headers, response.body
         app.metrics.observe_queue_enter()
         try:
@@ -356,6 +363,9 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                     app.metrics.observe_worker_timeout("unavailable")
                     response = Response("Service Unavailable", status=503)
                     break
+        # Timeout/unavailable responses built here bypass dispatch, so apply
+        # the headers here; routed responses already have them (idempotent).
+        apply_security_headers(response, config=app.security, production=app.production)
         body = (_NativeStream(response, loop) if isinstance(response, StreamingResponse) and not response._head_only
                 else response.body)
         return response.status, response.headers, body
@@ -373,7 +383,9 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 middleware_enabled=bool(app.middleware) or limiter is not None or app.hot_reload,
                                 shared_cache_enabled=app.isr.shared is not None,
                                 websocket_protocols=app.websocket_protocols,
-                                websocket_max_message=app.websocket_max_message, listener=listener)
+                                websocket_max_message=app.websocket_max_message, listener=listener,
+                                security_headers=security_headers(config=app.security,
+                                                                  production=app.production))
 
 
 async def serve(app, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,

@@ -19,6 +19,18 @@ _KNOWN_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OP
 _TOKEN_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _ORIGIN = re.compile(r"https?://[^/]+")
 _CSP_NONCE = re.compile(r"[A-Za-z0-9+/=_-]+")
+#: A CSP directive value is a space-separated source list: keywords
+#: ('self', 'none', ...), hosts, or schemes. No semicolons (directive
+#: separator), quotes outside keywords, or control characters.
+_CSP_SOURCE_LIST = re.compile(r"[A-Za-z0-9\-_.*:/' ]+")
+#: Referrer-Policy values from the spec; anything else is a typo, not a policy.
+_REFERRER_POLICIES = frozenset({
+    "no-referrer", "no-referrer-when-downgrade", "origin", "origin-when-cross-origin",
+    "same-origin", "strict-origin", "strict-origin-when-cross-origin", "unsafe-url",
+})
+#: Permissions-Policy is `feature=(allowlist)` groups; reject separators and
+#: control characters so a bad value cannot smuggle in another directive.
+_PERMISSIONS_POLICY = re.compile(r"[A-Za-z0-9\-_()*,= ']+")
 
 
 @dataclass
@@ -30,6 +42,16 @@ class SecurityConfig:
     handlers with :func:`csrf_protect`. CORS denies every cross-origin
     request by default; list origins explicitly to allow them. CSP nonce
     support is off by default and only changes dynamically rendered pages.
+
+    The A1 default security headers (HSTS, ``X-Content-Type-Options``,
+    ``X-Frame-Options``, ``Referrer-Policy``, ``Permissions-Policy`` and the
+    CSP below) are on by default and applied to every response by
+    :func:`apply_security_headers`. HSTS is only *sent* in production
+    (see :func:`security_headers`): it is ignored over plain HTTP anyway,
+    and omitting it in development keeps ``pynext dev`` on
+    ``http://127.0.0.1`` free of HSTS side effects. Set a field to ``None``
+    to disable that header (``frame_options``, ``referrer_policy``,
+    ``permissions_policy``); set ``hsts_enabled=False`` to disable HSTS.
     """
 
     csrf_enabled: bool = False
@@ -44,6 +66,17 @@ class SecurityConfig:
     cors_allow_credentials: bool = False
     cors_max_age: int = 600
     csp_nonce_enabled: bool = False
+    hsts_enabled: bool = True
+    hsts_max_age: int = 31_536_000
+    hsts_include_subdomains: bool = True
+    hsts_preload: bool = False
+    frame_options: str | None = "DENY"
+    referrer_policy: str | None = "strict-origin-when-cross-origin"
+    permissions_policy: str | None = "camera=(), microphone=(), geolocation=()"
+    csp_style_src: str = "'self'"
+    csp_frame_ancestors: str = "'none'"
+    csp_base_uri: str = "'self'"
+    csp_form_action: str = "'self'"
 
     def __post_init__(self):
         if not isinstance(self.csrf_enabled, bool):
@@ -74,6 +107,30 @@ class SecurityConfig:
             raise ValueError("cors_max_age must be a non-negative integer")
         if not isinstance(self.csp_nonce_enabled, bool):
             raise TypeError("csp_nonce_enabled must be a bool")
+        if not isinstance(self.hsts_enabled, bool):
+            raise TypeError("hsts_enabled must be a bool")
+        if isinstance(self.hsts_max_age, bool) or not isinstance(self.hsts_max_age, int) or self.hsts_max_age < 0:
+            raise ValueError("hsts_max_age must be a non-negative integer")
+        if not isinstance(self.hsts_include_subdomains, bool):
+            raise TypeError("hsts_include_subdomains must be a bool")
+        if not isinstance(self.hsts_preload, bool):
+            raise TypeError("hsts_preload must be a bool")
+        if self.frame_options is not None:
+            if not isinstance(self.frame_options, str) or self.frame_options.upper() not in {"DENY", "SAMEORIGIN"}:
+                raise ValueError("frame_options must be 'DENY' or 'SAMEORIGIN'")
+            self.frame_options = self.frame_options.upper()
+        if self.referrer_policy is not None and (
+                not isinstance(self.referrer_policy, str) or self.referrer_policy not in _REFERRER_POLICIES):
+            raise ValueError(f"Invalid referrer_policy: {self.referrer_policy!r}")
+        if self.permissions_policy is not None and (
+                not isinstance(self.permissions_policy, str)
+                or not _PERMISSIONS_POLICY.fullmatch(self.permissions_policy)):
+            raise ValueError(f"Invalid permissions_policy: {self.permissions_policy!r}")
+        for name in ("csp_style_src", "csp_frame_ancestors", "csp_base_uri", "csp_form_action"):
+            value = getattr(self, name)
+            if (not isinstance(value, str) or not value.strip()
+                    or not _CSP_SOURCE_LIST.fullmatch(value) or ";" in value):
+                raise ValueError(f"{name} must be a space-separated CSP source list")
 
 
 #: The framework defaults: CSRF off (opt-in), CORS deny-all, CSP nonce off.
@@ -173,13 +230,85 @@ def new_csp_nonce():
     return secrets.token_urlsafe(16)
 
 
-def content_security_policy(nonce=None):
-    """Return the default CSP policy, with a nonce when one is given."""
-    if nonce is None:
-        return "script-src 'self'; object-src 'none'"
-    if not _CSP_NONCE.fullmatch(nonce):
+def content_security_policy(nonce=None, *, config=DEFAULT_SECURITY):
+    """Return the default CSP policy, with a nonce when one is given.
+
+    Directives come from ``config`` so an app can tune them. The defaults
+    are ``script-src 'self'`` (plus the nonce), ``style-src 'self'``,
+    ``object-src 'none'``, ``base-uri 'self'``, ``form-action 'self'`` and
+    ``frame-ancestors 'none'``. ``style-src 'self'`` is safe here because
+    the renderer already rejects inline ``style`` attributes and ``<style>``
+    tags (see ``components.py``), so no page depends on inline styles.
+    """
+    if nonce is not None and not _CSP_NONCE.fullmatch(nonce):
         raise ValueError("Invalid CSP nonce")
-    return f"script-src 'self' 'nonce-{nonce}'; object-src 'none'"
+    script_src = "'self'" + (f" 'nonce-{nonce}'" if nonce is not None else "")
+    return (f"script-src {script_src}; style-src {config.csp_style_src}"
+            f"; object-src 'none'; base-uri {config.csp_base_uri}"
+            f"; form-action {config.csp_form_action}"
+            f"; frame-ancestors {config.csp_frame_ancestors}")
+
+
+def security_headers(*, config=DEFAULT_SECURITY, nonce=None, production=True):
+    """Return the A1 default security headers as ``(name, value)`` byte pairs.
+
+    HSTS is only included for production: it is ignored over plain HTTP
+    anyway, and omitting it in development keeps ``pynext dev`` on
+    ``http://127.0.0.1`` free of HSTS side effects. Every other header is
+    the same in both modes, so a header scan passes identically in dev and
+    production except for HSTS.
+    """
+    headers = []
+    if production and config.hsts_enabled:
+        value = f"max-age={config.hsts_max_age}"
+        if config.hsts_include_subdomains:
+            value += "; includeSubDomains"
+        if config.hsts_preload:
+            value += "; preload"
+        headers.append((b"strict-transport-security", value.encode("ascii")))
+    headers.append((b"x-content-type-options", b"nosniff"))
+    if config.frame_options is not None:
+        headers.append((b"x-frame-options", config.frame_options.encode("ascii")))
+    if config.referrer_policy is not None:
+        headers.append((b"referrer-policy", config.referrer_policy.encode("ascii")))
+    if config.permissions_policy is not None:
+        headers.append((b"permissions-policy", config.permissions_policy.encode("ascii")))
+    headers.append((b"content-security-policy",
+                    content_security_policy(nonce, config=config).encode("ascii")))
+    return headers
+
+
+def apply_security_headers(response, *, config=DEFAULT_SECURITY, nonce=None, production=True):
+    """Add the A1 default security headers to ``response`` (in place).
+
+    A header an app or handler already set wins and is never overwritten,
+    so explicit choices survive — except ``content-security-policy``:
+    :class:`Response` always adds the default policy on construction, so an
+    existing CSP is replaced when it differs from the configured one. A
+    nonce already present in that CSP is preserved (dynamic pages render
+    with a per-request nonce that :meth:`App.dispatch` cannot know), and a
+    CSP a handler set explicitly is left alone. Idempotent: calling it
+    twice, or on a response that already went through dispatch, changes
+    nothing. Returns the response for call-site chaining.
+    """
+    wanted = dict(security_headers(config=config, nonce=nonce, production=production))
+    present = {}
+    for index, (key, _value) in enumerate(response.headers):
+        present.setdefault(key, index)
+    if b"content-security-policy" in present and not getattr(response, "_csp_explicit", False):
+        index = present[b"content-security-policy"]
+        existing = response.headers[index][1]
+        if nonce is None:
+            match = re.search(rb"'nonce-([A-Za-z0-9+/=_-]+)'", existing)
+            if match:
+                nonce = match.group(1).decode("ascii")
+                wanted = dict(security_headers(config=config, nonce=nonce, production=production))
+        if existing != wanted[b"content-security-policy"]:
+            response.headers[index] = (b"content-security-policy", wanted[b"content-security-policy"])
+    for key, value in wanted.items():
+        if key not in present:
+            response.headers.append((key, value))
+    return response
 
 
 def _request_origin(request):
@@ -488,7 +617,10 @@ class Response:
                 raise ValueError("Invalid media type")
         if media_type and not any(k == b"content-type" for k, _ in self.headers):
             self.headers.append((b"content-type", media_type_bytes))
-        if not any(k == b"content-security-policy" for k, _ in self.headers):
+        # Remember whether the caller set CSP explicitly: apply_security_headers
+        # replaces only the policy this constructor added itself.
+        self._csp_explicit = any(k == b"content-security-policy" for k, _ in self.headers)
+        if not self._csp_explicit:
             self.headers.append((b"content-security-policy",
                                  content_security_policy(csp_nonce).encode("ascii")))
         if status not in (204, 304) and not any(k == b"content-length" for k, _ in self.headers):

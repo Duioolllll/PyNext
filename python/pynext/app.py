@@ -27,7 +27,7 @@ from .components import _isr_policy, _isr_query_keys, _node, bind_islands
 from .build import discover, load_manifest
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
-                   cors_preflight_response, new_csp_nonce, validate_csrf)
+                   apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
 from .images import ImageBusy, ImageUnavailable, optimize_image
 from .observability import (
     MetricsCollector,
@@ -241,7 +241,17 @@ class _ISRStreamingResponse(StreamingResponse):
         await super().aclose()
 
 
-async def _send_response(response, send):
+async def _send_response(response, send, *, config=None, production=True):
+    """Send ``response`` over ASGI, adding the A1 security headers first.
+
+    ``config`` is the app's :class:`SecurityConfig`; when it is ``None`` the
+    response is sent unchanged (callers that already went through
+    :meth:`App.dispatch` applied the headers there). Applying here as well
+    covers the responses that bypass dispatch: rate-limit 429/503, bad
+    request 400, oversized 413 and the 500 error page.
+    """
+    if config is not None:
+        apply_security_headers(response, config=config, production=production)
     if not isinstance(response, StreamingResponse):
         await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
         await send({"type": "http.response.body", "body": response.body})
@@ -773,6 +783,7 @@ class App:
             response = await self._dispatch_timed(request, lambda: invoke(0, request))
             if preflight is None:
                 apply_cors_headers(request, response, config=self.security)
+            apply_security_headers(response, config=self.security, production=self.production)
             if request.method == "HEAD":
                 if isinstance(response, StreamingResponse):
                     await response.aclose()
@@ -780,9 +791,11 @@ class App:
                 response.body = b""
             return response
         if preflight is not None:
+            apply_security_headers(preflight, config=self.security, production=self.production)
             return preflight
         response = await self._dispatch_timed(request)
         apply_cors_headers(request, response, config=self.security)
+        apply_security_headers(response, config=self.security, production=self.production)
         return response
 
     async def _dispatch_timed(self, request, handler=None):
@@ -1167,13 +1180,13 @@ class App:
                 response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
                 if scope["method"].upper() == "HEAD":
                     response.body = b""
-                await _send_response(response, send)
+                await _send_response(response, send, config=self.security, production=self.production)
                 return
             if not allowed:
                 response = rate_limited_response(retry_after)
                 if scope["method"].upper() == "HEAD":
                     response.body = b""
-                await _send_response(response, send)
+                await _send_response(response, send, config=self.security, production=self.production)
                 return
         request = None
         try:
@@ -1217,7 +1230,7 @@ class App:
                     result = self.error_response(exc)
                 if scope["method"].upper() == "HEAD":
                     result.body = b""
-                await _send_response(result, send)
+                await _send_response(result, send, config=self.security, production=self.production)
 
             await _run_while_connected(dispatch_and_send(), receive)
             return
@@ -1226,7 +1239,7 @@ class App:
         request_id = get_request_id()
         if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
             response.headers.append((b"x-request-id", request_id.encode("ascii")))
-        await _send_response(response, send)
+        await _send_response(response, send, config=self.security, production=self.production)
 
 
 def create_app(root=".", *, production=False, security=None, cache_backend="memory", cache_path=None,

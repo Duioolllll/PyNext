@@ -163,7 +163,7 @@ def test_invalid_request_data_is_bad_request_and_headers_are_safe(tmp_path):
             assert (await client.post("/", content=b"{")).status_code == 400
             assert (await client.get("/bad")).status_code == 500
             response = await client.get("/")
-            assert response.headers["content-security-policy"] == "script-src 'self'; object-src 'none'"
+            assert response.headers["content-security-policy"] == "script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
         await application.isr.close()
 
     asyncio.run(run())

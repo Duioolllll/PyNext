@@ -33,7 +33,7 @@ def verify_http(base):
     for path, expected in pages.items():
         with urlopen(base + path, timeout=10) as response:
             assert response.status == 200, path
-            assert response.headers.get("content-security-policy") == "script-src 'self'; object-src 'none'", path
+            assert response.headers.get("content-security-policy") == "script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'", path
             assert expected in response.read().decode("utf-8"), path
     try:
         urlopen(base + "/guides/missing", timeout=10)

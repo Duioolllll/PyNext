@@ -412,6 +412,11 @@ struct ServerState {
     isr_cache: Arc<PageCache>,
     middleware_enabled: bool,
     shared_cache_enabled: bool,
+    /// A1 security headers configured in Python (`SecurityConfig`), applied
+    /// to every response the Rust layer builds itself (static assets,
+    /// cached ISR pages, plain errors). Bridge responses already carry them
+    /// from Python dispatch and pass through untouched.
+    security_headers: Vec<(Vec<u8>, Vec<u8>)>,
     websocket_router: Router,
     websocket_paths: std::collections::HashSet<String>,
     websocket_protocols: HashMap<String, Vec<String>>,
@@ -626,14 +631,33 @@ struct AssetPolicy<'a> {
     content_type: &'a HeaderValue,
     etag: &'a HeaderValue,
     cache_control: &'static str,
-    nosniff: bool,
     vary: bool,
+}
+
+/// Add the Python-configured A1 security headers to a response the Rust
+/// layer builds itself (static assets, cached ISR pages, plain errors).
+/// Bridge responses already carry them from Python dispatch and pass
+/// through untouched. Invalid entries are skipped; Python validates the
+/// values before handing them over.
+fn apply_security_headers(
+    mut builder: axum::http::response::Builder,
+    security_headers: &[(Vec<u8>, Vec<u8>)],
+) -> axum::http::response::Builder {
+    for (name, value) in security_headers {
+        if let (Ok(name), Ok(value)) =
+            (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+        {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
 }
 
 fn static_response(
     parts: &axum::http::request::Parts,
     content: &Bytes,
     policy: AssetPolicy<'_>,
+    security_headers: &[(Vec<u8>, Vec<u8>)],
 ) -> AxumResponse<Body> {
     let length = content.len();
     let mut status = StatusCode::OK;
@@ -698,19 +722,13 @@ fn static_response(
         .header(header::CONTENT_TYPE, policy.content_type.clone())
         .header(header::ETAG, policy.etag.clone())
         .header(header::CACHE_CONTROL, policy.cache_control)
-        .header(header::ACCEPT_RANGES, "bytes")
-        .header(
-            "content-security-policy",
-            "script-src 'self'; object-src 'none'",
-        );
+        .header(header::ACCEPT_RANGES, "bytes");
+    builder = apply_security_headers(builder, security_headers);
     if status != StatusCode::NOT_MODIFIED {
         builder = builder.header(header::CONTENT_LENGTH, response_length.to_string());
     }
     if let Some(content_range) = content_range {
         builder = builder.header(header::CONTENT_RANGE, content_range);
-    }
-    if policy.nosniff {
-        builder = builder.header("x-content-type-options", "nosniff");
     }
     if policy.vary {
         builder = builder.header(header::VARY, "Cookie, Authorization");
@@ -751,29 +769,31 @@ fn static_path(raw: &str) -> Option<String> {
     Some(path)
 }
 
-fn plain_response(status: StatusCode, body: &'static str) -> AxumResponse<Body> {
-    AxumResponse::builder()
-        .status(status)
-        .header("content-type", "text/plain; charset=utf-8")
-        .header(
-            "content-security-policy",
-            "script-src 'self'; object-src 'none'",
-        )
-        .body(Body::from(body))
-        .expect("static response is valid")
+fn plain_response(
+    status: StatusCode,
+    body: &'static str,
+    security_headers: &[(Vec<u8>, Vec<u8>)],
+) -> AxumResponse<Body> {
+    apply_security_headers(
+        AxumResponse::builder()
+            .status(status)
+            .header("content-type", "text/plain; charset=utf-8"),
+        security_headers,
+    )
+    .body(Body::from(body))
+    .expect("static response is valid")
 }
 
-fn busy_response() -> AxumResponse<Body> {
-    AxumResponse::builder()
-        .status(StatusCode::SERVICE_UNAVAILABLE)
-        .header("content-type", "text/plain; charset=utf-8")
-        .header(
-            "content-security-policy",
-            "script-src 'self'; object-src 'none'",
-        )
-        .header("retry-after", "1")
-        .body(Body::from("Server Busy"))
-        .expect("busy response is valid")
+fn busy_response(security_headers: &[(Vec<u8>, Vec<u8>)]) -> AxumResponse<Body> {
+    apply_security_headers(
+        AxumResponse::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("content-type", "text/plain; charset=utf-8")
+            .header("retry-after", "1"),
+        security_headers,
+    )
+    .body(Body::from("Server Busy"))
+    .expect("busy response is valid")
 }
 
 /// Conflicting `Content-Length` headers must fail as a clean 400 in dispatch
@@ -1099,13 +1119,13 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
     if upgrade_headers {
         let Some(path) = static_path(parts.uri.path()) else {
-            return plain_response(StatusCode::NOT_FOUND, "Not Found");
+            return plain_response(StatusCode::NOT_FOUND, "Not Found", &state.security_headers);
         };
         let Some((pattern, _)) = state.websocket_router.matches(&path) else {
-            return plain_response(StatusCode::NOT_FOUND, "Not Found");
+            return plain_response(StatusCode::NOT_FOUND, "Not Found", &state.security_headers);
         };
         if !state.websocket_paths.contains(&pattern) {
-            return plain_response(StatusCode::NOT_FOUND, "Not Found");
+            return plain_response(StatusCode::NOT_FOUND, "Not Found", &state.security_headers);
         }
         let mut parts = parts;
         let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
@@ -1130,7 +1150,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         if has_protocols && requested && protocol.is_none() {
-            return plain_response(StatusCode::BAD_REQUEST, "Unsupported WebSocket subprotocol");
+            return plain_response(
+                StatusCode::BAD_REQUEST,
+                "Unsupported WebSocket subprotocol",
+                &state.security_headers,
+            );
         }
         let upgrade = upgrade.max_message_size(state.websocket_max_message);
         let query = parts.uri.query().unwrap_or("").as_bytes().to_vec();
@@ -1146,7 +1170,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     }
     if conflicting_content_length(&parts.headers) {
         return close_with_unread_body(
-            plain_response(StatusCode::BAD_REQUEST, "Bad Request"),
+            plain_response(
+                StatusCode::BAD_REQUEST,
+                "Bad Request",
+                &state.security_headers,
+            ),
             parts.version,
         );
     }
@@ -1157,7 +1185,10 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         let _body_permit = match state.body_capacity.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                return close_with_unread_body(busy_response(), parts.version);
+                return close_with_unread_body(
+                    busy_response(&state.security_headers),
+                    parts.version,
+                );
             }
         };
         match tokio::time::timeout(
@@ -1172,10 +1203,17 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     BodyReadError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
                     BodyReadError::BadRequest => (StatusCode::BAD_REQUEST, "Bad Request"),
                 };
-                return close_with_unread_body(plain_response(status, message), parts.version);
+                return close_with_unread_body(
+                    plain_response(status, message, &state.security_headers),
+                    parts.version,
+                );
             }
             Err(_) => {
-                let mut response = plain_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout");
+                let mut response = plain_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "Request Timeout",
+                    &state.security_headers,
+                );
                 response
                     .headers_mut()
                     .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -1195,9 +1233,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         content_type: &HeaderValue::from_static("text/javascript; charset=utf-8"),
                         etag: &state.asset_etags[&path],
                         cache_control: "public, max-age=31536000, immutable",
-                        nosniff: true,
                         vary: false,
                     },
+                    &state.security_headers,
                 );
             }
             if let Some(asset) = state.public_assets.get(&path) {
@@ -1208,9 +1246,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         content_type: &asset.content_type,
                         etag: &state.asset_etags[&path],
                         cache_control: "public, max-age=0, must-revalidate",
-                        nosniff: true,
                         vary: false,
                     },
+                    &state.security_headers,
                 );
             }
             if let Some(content) = state.static_pages.get(&path) {
@@ -1221,9 +1259,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         content_type: &HeaderValue::from_static("text/html; charset=utf-8"),
                         etag: &state.asset_etags[&path],
                         cache_control: "public, max-age=0, must-revalidate",
-                        nosniff: false,
                         vary: true,
                     },
+                    &state.security_headers,
                 );
             }
             if !state.shared_cache_enabled
@@ -1237,18 +1275,17 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     } else {
                         Body::from(content)
                     };
-                    return AxumResponse::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "text/html; charset=utf-8")
-                        .header("content-length", length.to_string())
-                        .header("cache-control", "public, max-age=0, must-revalidate")
-                        .header(
-                            "content-security-policy",
-                            "script-src 'self'; object-src 'none'",
-                        )
-                        .header("vary", "Cookie, Authorization")
-                        .body(body)
-                        .expect("cached response is valid");
+                    return apply_security_headers(
+                        AxumResponse::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/html; charset=utf-8")
+                            .header("content-length", length.to_string())
+                            .header("cache-control", "public, max-age=0, must-revalidate")
+                            .header("vary", "Cookie, Authorization"),
+                        &state.security_headers,
+                    )
+                    .body(body)
+                    .expect("cached response is valid");
                 }
             }
         }
@@ -1261,7 +1298,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     // each waiter can already hold a fully buffered request body.
     let waiting = match state.waiting_capacity.clone().try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return busy_response(),
+        Err(_) => return busy_response(&state.security_headers),
     };
     let permit = match tokio::time::timeout(
         state.acquire_timeout,
@@ -1270,7 +1307,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     .await
     {
         Ok(Ok(permit)) => permit,
-        _ => return busy_response(),
+        _ => return busy_response(&state.security_headers),
     };
     drop(waiting);
     let method = parts.method.to_string();
@@ -1287,6 +1324,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         .extensions
         .get::<PeerAddr>()
         .map(|peer| peer.0.ip().to_string());
+    let security_headers = state.security_headers.clone();
     let result = tokio::task::spawn_blocking(move || {
         let result = Python::with_gil(|py| {
             let cb = state.callback.bind(py);
@@ -1323,7 +1361,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 if let BridgeBody::Streaming(stream) = body {
                     close_stream(Arc::new(stream));
                 }
-                return plain_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+                return plain_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
+                    &security_headers,
+                );
             };
             let mut response = AxumResponse::new(Body::empty());
             *response.status_mut() = status;
@@ -1338,6 +1380,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     return plain_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Internal Server Error",
+                        &security_headers,
                     );
                 };
                 response.headers_mut().append(key, value);
@@ -1351,7 +1394,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             };
             response
         }
-        _ => plain_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
+        _ => plain_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal Server Error",
+            &security_headers,
+        ),
     }
 }
 
@@ -1474,7 +1521,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, security_headers=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1499,6 +1546,7 @@ impl NativeServer {
         websocket_protocols: Option<HashMap<String, Vec<String>>>,
         websocket_max_message: usize,
         listener: Option<Py<PyAny>>,
+        security_headers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     ) -> PyResult<Self> {
         let websocket_paths = websocket_paths.unwrap_or_default();
         if websocket_max_message == 0 || websocket_max_message > 16 * 1024 * 1024 {
@@ -1630,6 +1678,7 @@ impl NativeServer {
                     isr_cache,
                     middleware_enabled,
                     shared_cache_enabled,
+                    security_headers: security_headers.unwrap_or_default(),
                     websocket_router,
                     websocket_paths: websocket_paths.into_iter().collect(),
                     websocket_protocols: websocket_protocols.unwrap_or_default(),
