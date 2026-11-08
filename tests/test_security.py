@@ -355,7 +355,8 @@ def test_csp_nonce_in_header_and_matching_script_tag(tmp_path, esbuild):
             assert first.status_code == 200
             csp = first.headers["content-security-policy"]
             assert csp.startswith("script-src 'self' 'nonce-")
-            assert csp.endswith("'; object-src 'none'")
+            assert "style-src 'self'" in csp
+            assert csp.endswith("'; frame-ancestors 'none'")
             nonce = csp.split("'nonce-")[1].split("'")[0]
             assert f'nonce="{nonce}"' in first.text
             second = await client.get("/")
@@ -370,6 +371,251 @@ def test_csp_nonce_disabled_keeps_static_policy(tmp_path, esbuild):
                                      base_url="http://test") as client:
             response = await client.get("/")
             assert response.status_code == 200
-            assert response.headers["content-security-policy"] == "script-src 'self'; object-src 'none'"
+            assert response.headers["content-security-policy"] == "script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
             assert "nonce=" not in response.text
+    run(exercise())
+
+# --- A1: default security headers ---
+
+from pynext import apply_security_headers, content_security_policy, security_headers
+from pynext.build import write_manifest
+
+DEFAULT_CSP = ("script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'self'; "
+               "form-action 'self'; frame-ancestors 'none'")
+
+EXPECTED_HEADERS = {
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "referrer-policy": "strict-origin-when-cross-origin",
+    "permissions-policy": "camera=(), microphone=(), geolocation=()",
+    "content-security-policy": DEFAULT_CSP,
+}
+
+
+def _header_map(response):
+    # httpx responses expose a case-insensitive mapping; raw Response objects
+    # carry a list of (bytes, bytes) pairs. Normalize both to str keys/values.
+    pairs = response.headers.items() if hasattr(response.headers, "items") else response.headers
+    out = {}
+    for key, value in pairs:
+        if isinstance(key, bytes):
+            key = key.decode("ascii")
+        if isinstance(value, bytes):
+            value = value.decode("ascii")
+        out[key.lower()] = value
+    return out
+
+
+def assert_security_headers(response, *, production=False):
+    headers = _header_map(response)
+    for name, value in EXPECTED_HEADERS.items():
+        assert headers[name] == value, name
+    if production:
+        assert headers["strict-transport-security"] == "max-age=31536000; includeSubDomains"
+    else:
+        assert "strict-transport-security" not in headers
+
+
+def test_content_security_policy_defaults():
+    assert content_security_policy() == DEFAULT_CSP
+    assert content_security_policy("abc123") == (
+        "script-src 'self' 'nonce-abc123'; style-src 'self'; object-src 'none'; "
+        "base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
+    with pytest.raises(ValueError, match="Invalid CSP nonce"):
+        content_security_policy('bad" nonce')
+
+
+def test_security_config_header_defaults():
+    config = SecurityConfig()
+    assert config.hsts_enabled is True
+    assert config.hsts_max_age == 31_536_000
+    assert config.hsts_include_subdomains is True
+    assert config.hsts_preload is False
+    assert config.frame_options == "DENY"
+    assert config.referrer_policy == "strict-origin-when-cross-origin"
+    assert config.permissions_policy == "camera=(), microphone=(), geolocation=()"
+    assert config.csp_style_src == "'self'"
+    assert config.csp_frame_ancestors == "'none'"
+    assert config.csp_base_uri == "'self'"
+    assert config.csp_form_action == "'self'"
+
+
+def test_security_config_rejects_bad_header_values():
+    with pytest.raises(ValueError, match="frame_options"):
+        SecurityConfig(frame_options="ALLOW")
+    with pytest.raises(ValueError, match="referrer_policy"):
+        SecurityConfig(referrer_policy="unsafe")
+    with pytest.raises(ValueError, match="permissions_policy"):
+        SecurityConfig(permissions_policy="camera=(); injected: yes")
+    with pytest.raises(ValueError, match="hsts_max_age"):
+        SecurityConfig(hsts_max_age=-1)
+    with pytest.raises(ValueError, match="csp_style_src"):
+        SecurityConfig(csp_style_src="'self'; script-src 'unsafe-inline'")
+
+
+def test_security_headers_dev_omits_hsts_but_keeps_the_rest():
+    headers = dict(security_headers(production=False))
+    assert "strict-transport-security" not in headers
+    assert headers[b"x-content-type-options"] == b"nosniff"
+    assert headers[b"x-frame-options"] == b"DENY"
+    assert headers[b"referrer-policy"] == b"strict-origin-when-cross-origin"
+    assert headers[b"permissions-policy"] == b"camera=(), microphone=(), geolocation=()"
+    assert headers[b"content-security-policy"] == DEFAULT_CSP.encode("ascii")
+
+
+def test_security_headers_production_includes_hsts():
+    headers = dict(security_headers(production=True))
+    assert headers[b"strict-transport-security"] == b"max-age=31536000; includeSubDomains"
+    config = SecurityConfig(hsts_preload=True, hsts_include_subdomains=False)
+    headers = dict(security_headers(config=config, production=True))
+    assert headers[b"strict-transport-security"] == b"max-age=31536000; preload"
+
+
+def test_security_headers_custom_config_can_disable_headers():
+    config = SecurityConfig(hsts_enabled=False, frame_options=None,
+                            referrer_policy=None, permissions_policy=None)
+    headers = dict(security_headers(config=config, production=True))
+    assert "strict-transport-security" not in headers
+    assert b"x-frame-options" not in headers
+    assert b"referrer-policy" not in headers
+    assert b"permissions-policy" not in headers
+    assert headers[b"x-content-type-options"] == b"nosniff"
+    assert headers[b"content-security-policy"] == DEFAULT_CSP.encode("ascii")
+
+
+def test_apply_security_headers_is_idempotent_and_keeps_explicit_choices():
+    response = apply_security_headers(Response("ok"), production=False)
+    assert_security_headers(response)
+    apply_security_headers(response, production=False)
+    assert_security_headers(response)
+    assert len([k for k, _ in response.headers if k == b"x-frame-options"]) == 1
+
+    explicit = Response("ok", headers=[(b"x-frame-options", b"SAMEORIGIN"),
+                                        (b"content-security-policy", b"script-src 'none'")])
+    apply_security_headers(explicit, production=False)
+    assert [v for k, v in explicit.headers if k == b"x-frame-options"] == [b"SAMEORIGIN"]
+    assert [v for k, v in explicit.headers if k == b"content-security-policy"] == [b"script-src 'none'"]
+    assert "strict-transport-security" not in [k for k, _ in explicit.headers]
+
+    production = apply_security_headers(Response("ok"), production=True)
+    assert_security_headers(production, production=True)
+
+
+def test_apply_security_headers_preserves_nonce_and_updates_directives():
+    nonce = "test-nonce_1"
+    response = Response("ok", csp_nonce=nonce)
+    custom = SecurityConfig(csp_style_src="'self' https://cdn.example")
+    apply_security_headers(response, config=custom)
+    csp = [v for k, v in response.headers if k == b"content-security-policy"][0].decode()
+    assert f"'nonce-{nonce}'" in csp
+    assert "style-src 'self' https://cdn.example" in csp
+
+
+def make_header_project(root):
+    app = root / "app"
+    (app / "api" / "echo").mkdir(parents=True)
+    (app / "api" / "boom").mkdir(parents=True)
+    (app / "api" / "echo" / "route.py").write_text(
+        "from pynext import JSONResponse, route\n"
+        "@route(\"GET\")\n"
+        "async def get_echo():\n"
+        "    return JSONResponse({\"ok\": True})\n"
+    )
+    (app / "api" / "boom" / "route.py").write_text(
+        "from pynext import route\n"
+        "@route(\"GET\")\n"
+        "async def get_boom():\n"
+        "    raise RuntimeError(\"boom\")\n"
+    )
+    (app / "page.py").write_text(
+        'from pynext import h, page\n@page(render="ssg")\ndef Page(): return h("p", {}, "built")\n'
+    )
+    public = root / "public"
+    public.mkdir()
+    (public / "data.bin").write_bytes(b"0123456789")
+
+
+async def check_header_scan(client, *, production=False):
+    assert_security_headers(await client.get("/api/echo"), production=production)
+    assert_security_headers(await client.get("/"), production=production)
+    assert_security_headers(await client.get("/data.bin"), production=production)
+    assert_security_headers(await client.get("/missing"), production=production)
+    response = await client.post("/")
+    assert response.status_code == 405
+    assert_security_headers(response, production=production)
+    response = await client.get("/api/boom")
+    assert response.status_code == 500
+    assert_security_headers(response, production=production)
+    head = await client.head("/api/echo")
+    assert head.status_code == 200
+    assert_security_headers(head, production=production)
+    response = await client.options("/api/echo", headers={
+        "origin": "https://example.com", "access-control-request-method": "POST"})
+    assert response.status_code == 403
+    assert_security_headers(response, production=production)
+
+
+def test_a1_header_scan_asgi_dev(tmp_path):
+    async def exercise():
+        make_header_project(tmp_path)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)),
+                                     base_url="http://test") as client:
+            await check_header_scan(client, production=False)
+    run(exercise())
+
+
+def test_a1_header_scan_asgi_production(tmp_path):
+    make_header_project(tmp_path)
+    # write_manifest renders SSG pages via asyncio.run, so it must run
+    # outside the exercise coroutine (a loop is already running there).
+    write_manifest(tmp_path)
+
+    async def exercise():
+        async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=create_app(tmp_path, production=True)),
+                base_url="http://test") as client:
+            await check_header_scan(client, production=True)
+    run(exercise())
+
+
+def test_a1_header_scan_native_and_rust_fast_path(tmp_path):
+    make_header_project(tmp_path)
+    write_manifest(tmp_path)
+
+    async def exercise():
+        app = create_app(tmp_path, production=True)
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=10) as client:
+                await check_header_scan(client, production=True)
+                # Static pages and public assets are served by the Rust
+                # layer without Python dispatch: prove the headers still
+                # come from Rust by breaking dispatch and re-requesting.
+                async def fail_dispatch(request):
+                    raise AssertionError("native static hit crossed the Python boundary")
+                app.dispatch = fail_dispatch
+                assert_security_headers(await client.get("/"), production=True)
+                assert_security_headers(await client.get("/data.bin"), production=True)
+        finally:
+            await asyncio.to_thread(server.stop)
+    run(exercise())
+
+
+def test_a1_nonce_page_keeps_nonce_and_other_headers(tmp_path, esbuild):
+    async def exercise():
+        make_island_project(tmp_path)
+        app = create_app(tmp_path, security=SecurityConfig(csp_nonce_enabled=True))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://test") as client:
+            response = await client.get("/")
+            assert response.status_code == 200
+            csp = response.headers["content-security-policy"]
+            assert csp.startswith("script-src 'self' 'nonce-")
+            assert csp.endswith("'; frame-ancestors 'none'")
+            nonce = csp.split("'nonce-")[1].split("'")[0]
+            assert f'nonce="{nonce}"' in response.text
+            assert response.headers["x-content-type-options"] == "nosniff"
+            assert response.headers["x-frame-options"] == "DENY"
+            assert response.headers["referrer-policy"] == "strict-origin-when-cross-origin"
+            assert "strict-transport-security" not in response.headers
     run(exercise())
