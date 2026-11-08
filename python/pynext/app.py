@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import html
 import importlib.machinery
 import importlib.util
 import inspect
@@ -10,20 +11,24 @@ import re
 import sys
 import threading
 import time
+import traceback
 import uuid
 import weakref
 from pathlib import Path
+from types import MappingProxyType
 from urllib.parse import quote, unquote_to_bytes
 
 from . import _native
 from .assets import read_public_artifacts, read_public_sources
+from .auth import check_authorization
 from .cache import CacheBusy, ISRCache
 from .client import compile_client, read_client_artifacts
-from .components import _isr_policy, _node, bind_islands
+from .components import _isr_policy, _isr_query_keys, _node, bind_islands
 from .build import discover, load_manifest
-from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, Request, Response, SecurityConfig,
+from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    cors_preflight_response, new_csp_nonce, validate_csrf)
+from .images import ImageBusy, ImageUnavailable, optimize_image
 from .observability import (
     MetricsCollector,
     ObservabilityConfig,
@@ -35,7 +40,7 @@ from .observability import (
     route_var,
     span,
 )
-from .ratelimit import rate_limited_response
+from .ratelimit import RateLimitUnavailable, rate_limited_response
 from .static import asset_response
 
 log = logging.getLogger("pynext")
@@ -171,6 +176,71 @@ async def _invoke(fn, **values):
     return await result if inspect.isawaitable(result) else result
 
 
+_MAX_ISR_STREAM_BYTES = 8 * 1024 * 1024
+
+
+class _ISRStreamFeed:
+    """One bounded stream tap for the request that starts regeneration."""
+
+    def __init__(self):
+        self.ready = asyncio.get_running_loop().create_future()
+        self._queue = asyncio.Queue(maxsize=4)
+        self._attached = True
+
+    def begin(self):
+        if self._attached and not self.ready.done():
+            self.ready.set_result(None)
+
+    async def send(self, chunk):
+        if self._attached:
+            await self._queue.put(("chunk", chunk))
+
+    async def finish(self):
+        if self._attached:
+            await self._queue.put(("end", None))
+
+    def fail(self, error):
+        if not self._attached:
+            return
+        while not self._queue.empty():
+            self._queue.get_nowait()
+        self._queue.put_nowait(("error", error))
+
+    def detach(self):
+        self._attached = False
+        while not self._queue.empty():
+            self._queue.get_nowait()
+
+    async def chunks(self):
+        try:
+            while True:
+                kind, value = await self._queue.get()
+                if kind == "end":
+                    return
+                if kind == "error":
+                    if isinstance(value, Exception):
+                        raise value
+                    raise RuntimeError("ISR stream interrupted")
+                yield value
+        finally:
+            self.detach()
+
+
+class _ISRStreamingResponse(StreamingResponse):
+    def __init__(self, feed):
+        self._feed = feed
+        super().__init__(feed.chunks(), media_type="text/html; charset=utf-8", headers=[
+            (b"cache-control", b"public, max-age=0, must-revalidate"),
+            (b"vary", b"Cookie, Authorization"),
+        ])
+
+    async def aclose(self):
+        # aclose() on an async generator that has never been iterated does
+        # not execute its finally block (notably on HEAD and early disconnect).
+        self._feed.detach()
+        await super().aclose()
+
+
 async def _send_response(response, send):
     if not isinstance(response, StreamingResponse):
         await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
@@ -233,7 +303,21 @@ def _module_key(root, relative):
 
 class App:
     def __init__(self, root, manifest, *, production=False, security=None, cache_backend="memory",
-                 cache_path=None, observability=None, rate_limit=None):
+                 cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
+                 resources=None, cache_url=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False):
+        if not isinstance(debug, bool):
+            raise TypeError("debug must be a bool")
+        if production and debug:
+            raise ValueError("debug cannot be enabled in production")
+        if not isinstance(hot_reload, bool) or (hot_reload and (production or not debug)):
+            raise ValueError("hot_reload requires development debug mode")
+        self.debug = debug
+        self.hot_reload = hot_reload
+        self._dev_id = uuid.uuid4().hex if hot_reload else None
+        if (isinstance(websocket_max_message, bool) or not isinstance(websocket_max_message, int) or
+                not 1 <= websocket_max_message <= 16 * 1024 * 1024):
+            raise ValueError("websocket_max_message must be from 1 to 16777216 bytes")
+        self.websocket_max_message = websocket_max_message
         self._namespace = "_pynext_project_" + uuid.uuid4().hex
         self._release_modules = weakref.finalize(self, _clear_project_modules, self._namespace)
         if security is None:
@@ -252,7 +336,42 @@ class App:
             _register_project(self._namespace)
             _package(self._namespace, Path(root).resolve(), load_initializer=False)
             self._initialize(root, manifest, production=production,
-                             cache_backend=cache_backend, cache_path=cache_path)
+                             cache_backend=cache_backend, cache_path=cache_path, cache_url=cache_url)
+            configured = ()
+            if "middleware.py" in manifest["sources"]:
+                configured = getattr(self._module("middleware.py"), "MIDDLEWARE", None)
+                if not isinstance(configured, (list, tuple)):
+                    raise TypeError("middleware.py must export a MIDDLEWARE list or tuple")
+            if middleware is None:
+                middleware = ()
+            if not isinstance(middleware, (list, tuple)):
+                raise TypeError("middleware must be a list or tuple")
+            self.middleware = tuple(configured) + tuple(middleware)
+            for item in self.middleware:
+                if not (inspect.iscoroutinefunction(item) or
+                        inspect.iscoroutinefunction(getattr(item, "__call__", None))):
+                    raise TypeError("middleware entries must be async callables")
+            configured_resources = {}
+            if "resources.py" in manifest["sources"]:
+                configured_resources = getattr(self._module("resources.py"), "RESOURCES", None)
+                if not isinstance(configured_resources, dict):
+                    raise TypeError("resources.py must export a RESOURCES dict")
+            if resources is None:
+                resources = {}
+            if not isinstance(resources, dict):
+                raise TypeError("resources must be a dict")
+            if set(configured_resources) & set(resources):
+                raise ValueError("resource names must be unique")
+            combined = {**configured_resources, **resources}
+            for name, resource in combined.items():
+                if not isinstance(name, str) or not name.isidentifier():
+                    raise ValueError("resource names must be Python identifiers")
+                if not all(inspect.iscoroutinefunction(getattr(resource, method, None))
+                           for method in ("startup", "shutdown")):
+                    raise TypeError("resources must provide async startup and shutdown methods")
+            self.resources = MappingProxyType(combined)
+            self._resources_started = []
+            self._started = False
         except BaseException:
             self._release_modules()
             raise
@@ -264,7 +383,8 @@ class App:
         configure_logging(config)
         return self
 
-    def _initialize(self, root, manifest, *, production=False, cache_backend="memory", cache_path=None):
+    def _initialize(self, root, manifest, *, production=False, cache_backend="memory", cache_path=None,
+                    cache_url=None):
         self.root = Path(root).resolve()
         self.manifest = manifest
         self.production = production
@@ -274,9 +394,14 @@ class App:
         self.modules = {}
         self.render_modes = {}
         self.isr_policies = {}
+        self.isr_queries = {}
         if cache_backend == "sqlite" and cache_path is None:
             cache_path = self.root / ".pynext" / "isr-cache.sqlite3"
-        self.isr = ISRCache(cache_backend=cache_backend, cache_path=cache_path)
+        build_id = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"),
+                                             ensure_ascii=True).encode("ascii")).hexdigest()
+        self.isr = ISRCache(cache_backend=cache_backend, cache_path=cache_path,
+                            namespace=(build_id + ":") if cache_backend in {"sqlite", "redis"} else "",
+                            cache_url=cache_url)
         self.static_generators = {}
         self.static_pages = {}
         self.public_assets = {}
@@ -288,12 +413,14 @@ class App:
                 fn = getattr(module, "Page", None)
                 if not callable(fn) or not getattr(fn, "__pynext_page__", False):
                     raise ValueError(f"{spec['entry']} must export a @page() Page function")
-                _check_signature(fn, {"request", "params"}, spec["entry"])
+                _check_signature(fn, {"request", "params", "query"}, spec["entry"])
                 mode = getattr(fn, "__pynext_render__", "ssr")
                 if mode not in {"ssr", "ssg", "isr"}:
                     raise ValueError(f"Unsupported render mode in {spec['entry']}")
                 if mode in {"ssg", "isr"} and "request" in inspect.signature(fn).parameters:
                     raise ValueError(f"{mode.upper()} page {spec['entry']} cannot accept request")
+                if mode in {"ssg", "isr"} and getattr(fn, "__pynext_auth__", False):
+                    raise ValueError(f"{mode.upper()} page {spec['entry']} cannot require authentication")
                 self.render_modes[pattern] = mode
                 if mode == "isr":
                     policy = getattr(fn, "__pynext_cache_policy__", None)
@@ -306,6 +433,15 @@ class App:
                     if getattr(module, "generate_static_params", None) is not None:
                         raise ValueError(f"ISR page {spec['entry']} cannot export generate_static_params yet")
                     self.isr_policies[pattern] = policy
+                    try:
+                        query_keys = _isr_query_keys(getattr(fn, "__pynext_cache_query__", ()))
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid ISR query keys in {spec['entry']}: {exc}") from exc
+                    self.isr_queries[pattern] = query_keys
+                else:
+                    query_keys = []
+                if "query" in inspect.signature(fn).parameters and not query_keys:
+                    raise ValueError(f"Page {spec['entry']} needs ISR query_keys to accept query")
                 if mode == "ssg":
                     dynamic = any(segment.startswith("[") for segment in pattern.split("/"))
                     generator = getattr(module, "generate_static_params", None)
@@ -350,6 +486,8 @@ class App:
                 raise ValueError("Render modes changed since build; run `pynext build` again")
             if manifest.get("isr_policies") != self.isr_policies:
                 raise ValueError("ISR policies changed since build; run `pynext build` again")
+            if manifest.get("isr_queries") != self.isr_queries:
+                raise ValueError("ISR query keys changed since build; run `pynext build` again")
             self.client_manifest, self.client_assets = read_client_artifacts(self.root, manifest)
             self.static_pages = read_static_pages(self.root, manifest, self.router)
             self.public_assets = read_public_artifacts(self.root, manifest)
@@ -361,6 +499,22 @@ class App:
         assets = {**self.static_pages, **self.client_assets,
                   **{path: body for path, (body, _) in self.public_assets.items()}}
         self.asset_etags = {path: f'"{hashlib.sha256(body).hexdigest()}"' for path, body in assets.items()}
+        self._dev_client_history = [self.client_assets] if self.hot_reload else []
+
+    def update_dev_client(self, manifest, assets):
+        """Atomically replace development bundles, keeping two prior versions."""
+        if not self.hot_reload:
+            raise RuntimeError("Hot reload is unavailable for this app")
+        self._dev_client_history = (self._dev_client_history + [assets])[-3:]
+        retained = {}
+        for generation in self._dev_client_history:
+            retained.update(generation)
+        for path in self.client_assets.keys() - retained.keys():
+            self.asset_etags.pop(path, None)
+        self.client_manifest = manifest
+        self.client_assets = retained
+        for path, body in retained.items():
+            self.asset_etags[path] = f'"{hashlib.sha256(body).hexdigest()}"'
         for path, body in self.client_assets.items():
             self.metrics.observe_island_bundle(path, len(body))
 
@@ -369,6 +523,58 @@ class App:
         if key not in self.modules:
             self.modules[key] = _load(self.root, path, self._namespace)
         return self.modules[key]
+
+    def error_response(self, exc):
+        if not self.debug:
+            return Response("Internal Server Error", status=500)
+        details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-16384:]
+        body = ("<!DOCTYPE html><html><head><title>PyNext development error</title></head>"
+                "<body><h1>Development error</h1><pre>" + html.escape(details) + "</pre></body></html>")
+        return Response(body, status=500, media_type="text/html; charset=utf-8",
+                        headers=[(b"cache-control", b"no-store")])
+
+    async def startup(self):
+        """Start the cache and registered resources in registration order."""
+        if self._started:
+            return
+        self.isr.open()
+        try:
+            for resource in self.resources.values():
+                self._resources_started.append(resource)
+                await resource.startup()
+        except BaseException:
+            for resource in reversed(self._resources_started):
+                try:
+                    await resource.shutdown()
+                except Exception:
+                    log.exception("Resource cleanup after startup failure failed")
+            self._resources_started.clear()
+            await self.isr.close()
+            raise
+        self._started = True
+
+    async def shutdown(self):
+        """Close resources in reverse order even when one shutdown fails."""
+        error = None
+        for resource in reversed(self._resources_started):
+            try:
+                await resource.shutdown()
+            except Exception as exc:
+                if error is None:
+                    error = exc
+                else:
+                    log.exception("Resource shutdown failed")
+        self._resources_started.clear()
+        self._started = False
+        try:
+            await self.isr.close()
+        except Exception as exc:
+            if error is None:
+                error = exc
+            else:
+                log.exception("Cache shutdown failed")
+        if error is not None:
+            raise error
 
     async def revalidate(self, path):
         """Invalidate one decoded ISR path for this app instance."""
@@ -381,11 +587,14 @@ class App:
         if (match is None or self.render_modes.get(match[0]) != "isr" or
                 path in self.public_assets or path in self.static_pages or path in self.client_assets):
             raise ValueError("Path does not match an ISR page")
+        if self.isr_queries.get(match[0]):
+            _, existed = await self.isr.variant_generation(path, invalidate=True)
+            return existed
         return await self.isr.invalidate(path)
 
     async def _render_stream_chunk(self, node):
         """Serialize one streamed UI node to HTML on a worker thread."""
-        bound = bind_islands(_node(node), self.client_manifest)
+        bound = bind_islands(_node(node), self.client_manifest, include_runtime=False)
         payload = json.dumps(bound, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         return await asyncio.to_thread(_native.render, payload)
 
@@ -397,16 +606,9 @@ class App:
         The prefix is sent first, each page chunk is serialized and sent as
         it arrives, and the suffix closes the document. Layouts must render
         their children exactly once; anything else fails before headers are
-        sent. Streaming is SSR-only: SSG and ISR need a complete body.
+        sent. SSG consumes the stream during the build. ISR streams its first
+        generation while retaining a bounded copy for the cache.
         """
-        if self.render_modes.get(pattern) != "ssr":
-            close = getattr(chunks, "aclose", None)
-            if close is not None:
-                await close()
-            raise TypeError(
-                f"Streaming page {pattern} must use render='ssr'; "
-                f"it uses render='{self.render_modes.get(pattern)}'"
-            )
         marker = "__pynext_stream_" + uuid.uuid4().hex + "__"
         shell = {"kind": "text", "value": marker}
         for layout_fn in reversed(layouts):
@@ -416,7 +618,7 @@ class App:
                     f"Layout for {pattern} must return a render node dict, "
                     f"got {type(shell).__name__}"
                 )
-        shell = bind_islands(shell, self.client_manifest)
+        shell = bind_islands(shell, self.client_manifest, dev_id=self._dev_id)
         payload = json.dumps(shell, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         html = await asyncio.to_thread(_native.render, payload)
         parts = html.split(marker)
@@ -445,17 +647,74 @@ class App:
 
         return StreamingResponse(page_stream(), media_type="text/html; charset=utf-8")
 
-    async def render_page(self, pattern, request, params, *, csp_nonce=True):
+    def _page_query(self, pattern, request):
+        keys = self.isr_queries.get(pattern, ())
+        if not keys or request is None:
+            return {}
+        parsed = request.query
+        selected = {key: parsed[key] for key in keys if key in parsed}
+        if (any(len(values) > 8 for values in selected.values()) or
+                len(json.dumps(selected, ensure_ascii=True).encode("ascii")) > 2048):
+            raise BadRequest("ISR query values are too large")
+        return selected
+
+    async def _render_isr_cached(self, pattern, params, query, key):
+        feed = _ISRStreamFeed()
+
+        async def render():
+            response = await self.render_page(pattern, None, params, csp_nonce=False, query=query)
+            if not isinstance(response, StreamingResponse):
+                return response
+            feed.begin()
+            body = bytearray()
+            try:
+                while (chunk := await response._next_chunk()) is not None:
+                    if len(body) + len(chunk) > _MAX_ISR_STREAM_BYTES:
+                        raise ValueError("Streamed ISR page exceeds the size limit")
+                    body.extend(chunk)
+                    await feed.send(chunk)
+                await feed.finish()
+                return Response(bytes(body), status=response.status, headers=response.headers)
+            except BaseException as exc:
+                feed.fail(exc)
+                raise
+            finally:
+                await response.aclose()
+
+        task = asyncio.create_task(self.isr.get_or_render(key, self.isr_policies[pattern], render))
+
+        def observe(done):
+            # A streamed request stops awaiting this task before generation
+            # finishes. Retrieve failures while ISR's own task logs them.
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(observe)
+        try:
+            await asyncio.wait((task, feed.ready), return_when=asyncio.FIRST_COMPLETED)
+            if task.done():
+                feed.detach()
+                return task.result()
+            return _ISRStreamingResponse(feed)
+        except BaseException:
+            # Do not cancel a shared generation when the initiating client
+            # disconnects; other requests can still use its eventual result.
+            feed.detach()
+            raise
+
+    async def render_page(self, pattern, request, params, *, csp_nonce=True, query=None):
         fn, layouts = self.entries[pattern]
+        if query is None:
+            query = self._page_query(pattern, request)
         if inspect.isasyncgenfunction(fn):
             # Calling an async generator function only creates the iterator;
             # its body runs when the stream is first pulled. Call it directly
             # instead of _invoke, which would run it on a worker thread.
-            kwargs = {key: value for key, value in (("request", request), ("params", params))
+            kwargs = {key: value for key, value in (("request", request), ("params", params), ("query", query))
                       if key in inspect.signature(fn).parameters}
             result = fn(**kwargs)
         else:
-            result = await _invoke(fn, request=request, params=params)
+            result = await _invoke(fn, request=request, params=params, query=query)
         if hasattr(result, "__aiter__"):
             return await self._streaming_page_response(pattern, result, layouts)
         tree = result
@@ -465,7 +724,7 @@ class App:
             tree = await _invoke(layout_fn, children=tree)
             if not isinstance(tree, dict):
                 raise TypeError(f"Layout for {pattern} must return a render node dict, got {type(tree).__name__}")
-        tree = bind_islands(tree, self.client_manifest)
+        tree = bind_islands(tree, self.client_manifest, dev_id=self._dev_id)
         payload = json.dumps(tree, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         # One fresh nonce per rendered response. Cached renders must not get
         # one: a nonce baked into shared HTML would be reused across
@@ -485,13 +744,48 @@ class App:
     async def dispatch(self, request):
         """Return a response. Exceptions are converted at the transport boundary."""
         preflight = cors_preflight_response(request, config=self.security)
+        if self.middleware:
+            async def terminal(current):
+                if preflight is not None:
+                    route_var.set("__preflight__")
+                    return preflight
+                return await self._dispatch(current)
+
+            async def invoke(index, current):
+                if not isinstance(current, Request):
+                    raise TypeError("call_next requires a Request")
+                if index == len(self.middleware):
+                    return await terminal(current)
+                called = False
+
+                async def call_next(next_request):
+                    nonlocal called
+                    if called:
+                        raise RuntimeError("call_next may be called only once")
+                    called = True
+                    return await invoke(index + 1, next_request)
+
+                result = await self.middleware[index](current, call_next)
+                if not isinstance(result, Response):
+                    raise TypeError("middleware must return a Response")
+                return result
+
+            response = await self._dispatch_timed(request, lambda: invoke(0, request))
+            if preflight is None:
+                apply_cors_headers(request, response, config=self.security)
+            if request.method == "HEAD":
+                if isinstance(response, StreamingResponse):
+                    await response.aclose()
+                    response._head_only = True
+                response.body = b""
+            return response
         if preflight is not None:
             return preflight
         response = await self._dispatch_timed(request)
         apply_cors_headers(request, response, config=self.security)
         return response
 
-    async def _dispatch_timed(self, request):
+    async def _dispatch_timed(self, request, handler=None):
         """Timed wrapper around :meth:`_dispatch`: records metrics + access log.
 
         The request id is attached to the response as ``x-request-id``. Route
@@ -504,7 +798,7 @@ class App:
         with span("pynext.request", {"http.method": request.method},
                   enabled=tracing) as request_span:
             try:
-                response = await self._dispatch(request)
+                response = await (self._dispatch(request) if handler is None else handler())
                 status = response.status
                 request_id = get_request_id()
                 if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
@@ -542,6 +836,15 @@ class App:
     async def _dispatch(self, request):
         """Return a response. Streaming pages return a StreamingResponse."""
         path = request.path
+        if self.hot_reload and path == "/_pynext/dev/client":
+            route_var.set("__dev__")
+            if request.method not in {"GET", "HEAD"}:
+                return Response("Method Not Allowed", status=405, headers=[(b"allow", b"GET, HEAD")])
+            response = JSONResponse({"id": self._dev_id, "bundles": self.client_manifest["bundles"]},
+                                    headers=[(b"cache-control", b"no-store")])
+            if request.method == "HEAD":
+                response.body = b""
+            return response
         if path != "/" and path.endswith("/"):
             route_var.set("__redirect__")
             location = quote(path.rstrip("/"), safe="/!$&'()*+,;=:@-._~").encode("ascii")
@@ -550,6 +853,35 @@ class App:
                     return Response("Bad Request", status=400)
                 location += b"?" + request.query_string
             return Response("", status=308, headers=[(b"location", location)])
+        if path == "/_pynext/image":
+            route_var.set("__image__")
+            if request.method == "OPTIONS":
+                return Response(b"", status=204, headers=[(b"allow", b"GET, HEAD, OPTIONS")], media_type=None)
+            if request.method not in {"GET", "HEAD"}:
+                return Response("Method Not Allowed", status=405, headers=[(b"allow", b"GET, HEAD, OPTIONS")])
+            query = request.query
+            if (set(query) - {"src", "w", "q"} or any(len(values) != 1 for values in query.values()) or
+                    "src" not in query or "w" not in query):
+                raise BadRequest("Invalid image parameters")
+            source = query["src"][0]
+            width, quality = query["w"][0], query.get("q", ["75"])[0]
+            if (not width.isascii() or not width.isdecimal() or not quality.isascii() or not quality.isdecimal() or
+                    len(width) > 4 or len(quality) > 2 or not 1 <= int(width) <= 2048 or
+                    not 1 <= int(quality) <= 95):
+                raise BadRequest("Invalid image dimensions or quality")
+            asset = self.public_assets.get(source)
+            if asset is None:
+                return Response("Not Found", status=404)
+            try:
+                body = await asyncio.to_thread(optimize_image, asset[0], int(width), int(quality))
+            except (ImageBusy, ImageUnavailable):
+                return Response("Image optimizer unavailable", status=503, headers=[(b"retry-after", b"1")])
+            except ValueError as exc:
+                raise BadRequest("Invalid image") from exc
+            etag = f'"{hashlib.sha256(body).hexdigest()}"'
+            return asset_response(request, body, "image/webp", etag,
+                                  cache_control=b"public, max-age=0, must-revalidate",
+                                  extra_headers=[(b"x-content-type-options", b"nosniff")])
         if path == "/_pynext" or path.startswith("/_pynext/"):
             route_var.set("__client__")
             if path not in self.client_assets:
@@ -580,7 +912,8 @@ class App:
         pattern, raw_params = match
         route_var.set(pattern)
         params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
-        request = Request(request.method, request.path, request.query_string, request.headers, request.body, params, self)
+        request = Request(request.method, request.path, request.query_string, request.headers, request.body,
+                          params, self, request.state)
         spec = self.manifest["routes"][pattern]
         entry = self.entries[pattern]
         if self.production and self.render_modes.get(pattern) == "ssg" and path not in self.static_pages:
@@ -597,15 +930,22 @@ class App:
             return Response(b"", status=204, headers=[(b"allow", allow)], media_type=None)
         if request.method not in allowed:
             return Response("Method Not Allowed", status=405, headers=[(b"allow", allow)])
+        handler = entry[0] if spec["kind"] == "page" else entry.get(
+            "GET" if request.method == "HEAD" and "HEAD" not in entry else request.method)
+        if handler is not None:
+            denied = check_authorization(request, handler)
+            if denied is not None:
+                return denied
         if spec["kind"] == "page":
             if self.production and self.render_modes[pattern] == "ssg":
                 response = asset_response(request, self.static_pages[path], "text/html; charset=utf-8",
                                           self.asset_etags[path], cache_control=b"public, max-age=0, must-revalidate",
                                           extra_headers=[(b"vary", b"Cookie, Authorization")])
             elif self.production and self.render_modes[pattern] == "isr":
+                query = self._page_query(pattern, request)
                 private = any(name.lower() in {b"authorization", b"cookie"} for name, _ in request.headers)
                 if private:
-                    response = await self.render_page(pattern, None, params)
+                    response = await self.render_page(pattern, None, params, query=query)
                     response.headers.extend([
                         (b"cache-control", b"private, no-store"),
                         (b"vary", b"Cookie, Authorization"),
@@ -614,13 +954,16 @@ class App:
                     # Classify the outcome before rendering: a fresh entry is
                     # a hit, a stale entry is served while one regeneration
                     # runs in the background, a miss renders synchronously.
-                    cache_before = self.isr.store.lookup(path)[0]
+                    cache_key = path
+                    if self.isr_queries[pattern]:
+                        generation, _ = await self.isr.variant_generation(path)
+                        encoded = json.dumps(query, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+                        cache_key = ("\0isr:" + hashlib.sha256(path.encode("utf-8")).hexdigest() + ":" +
+                                     generation + ":" + hashlib.sha256(encoded).hexdigest())
+                    cache_before = self.isr.store.lookup(cache_key)[0]
                     self.metrics.observe_cache(cache_before)
                     try:
-                        body = await self.isr.get_or_render(
-                            path, self.isr_policies[pattern],
-                            lambda: self.render_page(pattern, None, params, csp_nonce=False),
-                        )
+                        body = await self._render_isr_cached(pattern, params, query, cache_key)
                     except CacheBusy:
                         self.metrics.observe_cache("busy")
                         self.metrics.observe_regeneration("failure")
@@ -630,14 +973,15 @@ class App:
                         self.metrics.observe_regeneration("failure")
                         return Response("Gateway Timeout", status=504)
                     if cache_before == "miss":
-                        self.metrics.observe_regeneration("success")
+                        self.metrics.observe_regeneration("started" if isinstance(body, StreamingResponse)
+                                                          else "success")
                     elif cache_before == "stale":
                         self.metrics.observe_regeneration("started")
-                    response = Response(body, media_type="text/html; charset=utf-8",
-                                        headers=[
-                                            (b"cache-control", b"public, max-age=0, must-revalidate"),
-                                            (b"vary", b"Cookie, Authorization"),
-                                        ])
+                    response = body if isinstance(body, StreamingResponse) else Response(
+                        body, media_type="text/html; charset=utf-8", headers=[
+                            (b"cache-control", b"public, max-age=0, must-revalidate"),
+                            (b"vary", b"Cookie, Authorization"),
+                        ])
             else:
                 response = await self.render_page(pattern, request, params)
         else:
@@ -662,6 +1006,11 @@ class App:
         """URL patterns that export a WebSocket handler (for the Axum adapter)."""
         return frozenset(self.websocket_entries)
 
+    @property
+    def websocket_protocols(self):
+        return {path: list(getattr(handler, "__pynext_websocket_protocols__", ()))
+                for path, handler in self.websocket_entries.items()}
+
     async def _handle_websocket(self, scope, receive, send):
         try:
             path = _decode_path(scope["path"], scope.get("raw_path"))
@@ -679,6 +1028,15 @@ class App:
         if handler is None:
             # No route, or a route with no WebSocket handler: refuse the
             # handshake with a policy-violation close instead of hanging.
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        offered = scope.get("subprotocols", [])
+        if not isinstance(offered, (list, tuple)) or any(not isinstance(value, str) for value in offered):
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        supported = getattr(handler, "__pynext_websocket_protocols__", ())
+        chosen = next((protocol for protocol in supported if protocol in offered), None)
+        if supported and offered and chosen is None:
             await send({"type": "websocket.close", "code": 1008})
             return
         try:
@@ -702,13 +1060,13 @@ class App:
                     continue
                 if message.get("text") is not None:
                     data = message["text"]
-                    if len(data.encode("utf-8")) > MAX_WS_MESSAGE:
+                    if len(data.encode("utf-8")) > self.websocket_max_message:
                         await asgi_send(("close", 1009, "message too large"))
                         raise WebSocketDisconnect(1009, "message too large")
                     return ("text", data)
                 if message.get("bytes") is not None:
                     data = message["bytes"]
-                    if len(data) > MAX_WS_MESSAGE:
+                    if len(data) > self.websocket_max_message:
                         await asgi_send(("close", 1009, "message too large"))
                         raise WebSocketDisconnect(1009, "message too large")
                     return ("bytes", bytes(data))
@@ -719,7 +1077,10 @@ class App:
                 if state["accepted"]:
                     raise RuntimeError("WebSocket is already accepted")
                 state["accepted"] = True
-                await send({"type": "websocket.accept"})
+                message = {"type": "websocket.accept"}
+                if chosen is not None:
+                    message["subprotocol"] = chosen
+                await send(message)
             elif kind == "text":
                 await send({"type": "websocket.send", "text": item[1]})
             elif kind == "bytes":
@@ -732,7 +1093,8 @@ class App:
 
         ws = WebSocket(receive=asgi_receive, send=asgi_send, path=path, params=params,
                        headers=tuple(scope.get("headers", [])),
-                       query_string=scope.get("query_string", b""))
+                       query_string=scope.get("query_string", b""), max_message_bytes=self.websocket_max_message,
+                       subprotocol=chosen, offered_subprotocols=offered)
         try:
             await _invoke(handler, websocket=ws, params=params)
         except WebSocketDisconnect:
@@ -757,7 +1119,7 @@ class App:
                 message = await receive()
                 if message["type"] == "lifespan.startup":
                     try:
-                        self.isr.open()
+                        await self.startup()
                     except Exception as exc:
                         # ASGI requires startup.failed instead of a bare
                         # exception so the server can shut the app down.
@@ -767,7 +1129,7 @@ class App:
                     await send({"type": "lifespan.startup.complete"})
                 elif message["type"] == "lifespan.shutdown":
                     try:
-                        await self.isr.close()
+                        await self.shutdown()
                     except Exception as exc:
                         await send({"type": "lifespan.shutdown.failed",
                                     "message": str(exc) or exc.__class__.__name__})
@@ -796,7 +1158,17 @@ class App:
             client = scope.get("client")
             client_ip = client[0] if client else None
             key = self.rate_limit.key_for(client_ip, scope.get("headers", []))
-            allowed, retry_after = self.rate_limit.allow(key)
+            try:
+                if getattr(self.rate_limit, "blocking", False):
+                    allowed, retry_after = await asyncio.to_thread(self.rate_limit.allow, key)
+                else:
+                    allowed, retry_after = self.rate_limit.allow(key)
+            except RateLimitUnavailable:
+                response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
+                if scope["method"].upper() == "HEAD":
+                    response.body = b""
+                await _send_response(response, send)
+                return
             if not allowed:
                 response = rate_limited_response(retry_after)
                 if scope["method"].upper() == "HEAD":
@@ -825,14 +1197,14 @@ class App:
                     chunks.append(chunk)
                     if not message.get("more_body", False):
                         request = Request(scope["method"].upper(), path, scope.get("query_string", b""),
-                                          tuple(scope.get("headers", [])), b"".join(chunks))
+                                          tuple(scope.get("headers", [])), b"".join(chunks), _app=self)
                         break
             except BadRequest as exc:
                 log.info("Bad request: %s", exc)
                 response = Response("Bad Request", status=400)
-            except Exception:
+            except Exception as exc:
                 log.exception("Request failed")
-                response = Response("Internal Server Error", status=500)
+                response = self.error_response(exc)
         if request is not None:
             async def dispatch_and_send():
                 try:
@@ -840,9 +1212,9 @@ class App:
                 except BadRequest as exc:
                     log.info("Bad request: %s", exc)
                     result = Response("Bad Request", status=400)
-                except Exception:
+                except Exception as exc:
                     log.exception("Request failed")
-                    result = Response("Internal Server Error", status=500)
+                    result = self.error_response(exc)
                 if scope["method"].upper() == "HEAD":
                     result.body = b""
                 await _send_response(result, send)
@@ -858,8 +1230,11 @@ class App:
 
 
 def create_app(root=".", *, production=False, security=None, cache_backend="memory", cache_path=None,
-               observability=None, rate_limit=None):
+               observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
+               websocket_max_message=MAX_WS_MESSAGE, hot_reload=False):
     root = Path(root).resolve()
     return App(root, load_manifest(root) if production else discover(root), production=production,
                security=security, cache_backend=cache_backend, cache_path=cache_path,
-               observability=observability, rate_limit=rate_limit)
+               observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
+               resources=resources, cache_url=cache_url, websocket_max_message=websocket_max_message,
+               hot_reload=hot_reload)

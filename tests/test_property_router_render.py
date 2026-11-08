@@ -42,8 +42,7 @@ _VOID_TAGS = [
     "area", "base", "br", "col", "hr", "img", "input",
     "link", "meta", "param", "source", "track", "wbr",
 ]
-# NOTE: the renderer's void list also names "embed", but the tag blocklist
-# rejects it as unsafe, so it can never render and is excluded here.
+# The tag blocklist rejects "embed", so it is excluded here.
 _ELEMENT_TAGS = [
     "div", "p", "span", "a", "ul", "li", "h1", "section", "br", "img",
 ]

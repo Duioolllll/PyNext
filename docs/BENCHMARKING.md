@@ -18,7 +18,7 @@ uv run python benchmarks/bench.py --mode starlette --path /api/users --requests 
 - **asgi**: `httpx.ASGITransport`를 통해 네트워크 없이 앱을 직접 호출합니다. 출력 `transport=in_process_asgi`. Axum/Uvicorn의 HTTP 수치와 직접 비교하지 마세요.
 - **starlette**: 동일 기능을 구현한 Starlette 참조 앱(`benchmarks/starlette_app.py`, `/`·`/about`·`/blog/{slug}`·`/api/users`)을 Uvicorn으로 서비스하고 실제 TCP loopback HTTP 요청을 보냅니다. 출력 `transport=loopback_http`. PyNext 앱을 빌드하지 않으므로 `--production`은 이 그룹에 적용되지 않습니다.
 
-네 모드는 모두 클라이언트가 서버와 **같은 프로세스**에 있습니다. HTTP 경로가 같아진다고 해서 CPU 사용량, 이벤트 루프 경쟁, 코어 배치 등 모든 조건이 같아지는 것은 아닙니다. 운영 성능 비교에는 별도 서버·부하 생성 프로세스(가능하면 별도 머신)가 필요합니다.
+개별 `--mode` 실행에서는 클라이언트가 서버와 같은 프로세스에 있습니다. `--compare`는 각 서버를 별도 프로세스로 실행합니다. 운영 성능 비교에는 별도 머신을 포함한 더 엄격한 측정이 필요합니다.
 
 ## `--compare`: 동일 조건 비교
 
@@ -30,11 +30,10 @@ uv run python benchmarks/bench.py --mode starlette --path /api/users --requests 
 uv run python benchmarks/bench.py --compare --production --path /api/users --requests 1000 --concurrency 10 --warmup 10
 ```
 
-각 그룹 결과에는 성공 요청의 p50/p95/p99, CPU 시간, 최대 RSS가 모두
-포함됩니다. 단, `--compare`는 한 프로세스에서 세 그룹을 차례로 실행하므로
-`process_peak_rss_bytes`는 그룹별 서버 메모리가 아니라 해당 시점까지의
-프로세스 생애 최대값이라 뒤 그룹일수록 커지는 경향이 있습니다.
-`process_cpu_seconds`는 각 그룹 측정 구간에 대해서만 잰 값입니다.
+각 그룹의 `process_peak_rss_bytes`는 별도 서버 프로세스의 RSS를 약 10ms 간격으로
+샘플링한 최댓값입니다. 짧은 피크는 놓칠 수 있으며 자식 프로세스는 포함하지
+않습니다. `process_cpu_seconds`는 부하 생성기 프로세스의 측정 구간 CPU 시간이고,
+Linux에서는 서버 PID의 CPU 시간도 별도로 기록합니다.
 
 ### 기록된 비교 (2026-11-08, 1회 측정)
 

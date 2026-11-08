@@ -8,10 +8,15 @@ from pathlib import Path
 
 from .app import create_app
 from .build import write_manifest
+from .client import compile_client, discover_client
+from .http import MAX_WS_MESSAGE, SecurityConfig
 from .observability import ObservabilityConfig
 from .ratelimit import RateLimiter
+from .redis_rate import RedisRateLimiter
+from .scaffold import init_project
 from .server import serve
 from .supervisor import WorkerConfig, run_supervisor
+from .standalone import build_standalone
 from .watch import Watcher
 
 
@@ -64,14 +69,21 @@ async def _wait_for_change(watcher, server_task):
     return watcher_task.result()
 
 
+async def _reload_dev_client(app, root):
+    sources = await asyncio.to_thread(discover_client, root)
+    manifest, assets = await asyncio.to_thread(compile_client, root, sources)
+    if await asyncio.to_thread(discover_client, root) != sources:
+        raise ValueError("Island sources changed during compilation; retry the edit")
+    app.update_dev_client(manifest, assets)
+
+
 async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                   body_capacity, body_timeout_ms, cache_backend="memory", cache_path=None,
-                 observability=None, rate_limit=None):
-    """Serve the app in development mode, restarting on file changes.
+                 observability=None, rate_limit=None, security=None, websocket_max_message=MAX_WS_MESSAGE):
+    """Serve the app in development mode, replacing changed island bundles.
 
-    The new app is built before the old server stops, so a broken edit
-    prints its error and keeps the previous version serving until the next
-    change fixes it. The server restarts on the same port.
+    Other file changes restart the server on the same port and reload open
+    pages. Broken edits retain the previous app or bundles until fixed.
     """
     watcher = Watcher(root)
     watched = ", ".join(str(path.relative_to(root)) for path in watcher.watch_roots())
@@ -79,21 +91,29 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
     app = None
     server_task = None
     stop_server = None
+    current_port = port
+
+    def record_address(address):
+        nonlocal current_port
+        if current_port == 0:
+            current_port = int(address.rsplit(":", 1)[1])
     try:
         while True:
             if app is None:
                 try:
                     app = create_app(root, production=False, cache_backend=cache_backend, cache_path=cache_path,
-                               observability=observability, rate_limit=rate_limit)
+                               observability=observability, rate_limit=rate_limit, debug=True, security=security,
+                               websocket_max_message=websocket_max_message, hot_reload=True)
                 except Exception:
                     traceback.print_exc()
                     print("PyNext dev: fix the error above; watching for changes...", flush=True)
                     await watcher.wait_for_change()
                     continue
             stop_server = asyncio.Event()
-            server_task = asyncio.create_task(serve(app, host, port, max_concurrent,
+            server_task = asyncio.create_task(serve(app, host, current_port, max_concurrent,
                                                     acquire_timeout_ms, body_capacity, body_timeout_ms,
-                                                    stop_event=stop_server, observability=observability))
+                                                    stop_event=stop_server, observability=observability,
+                                                    on_ready=record_address))
             new_app = None
             while new_app is None:
                 changed = await _wait_for_change(watcher, server_task)
@@ -101,11 +121,19 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                     if not server_task.cancelled() and server_task.exception() is not None:
                         traceback.print_exception(server_task.exception())
                     return
-                print(f"PyNext dev: change detected ({', '.join(changed)}); reloading...",
-                      flush=True)
+                if changed and all(path.startswith("islands/") for path in changed):
+                    try:
+                        await _reload_dev_client(app, root)
+                        print(f"PyNext dev: island modules updated ({', '.join(changed)})", flush=True)
+                    except Exception:
+                        traceback.print_exc()
+                        print("PyNext dev: keeping previous island modules; fix the error above.", flush=True)
+                    continue
+                print(f"PyNext dev: change detected ({', '.join(changed)}); reloading...", flush=True)
                 try:
                     new_app = create_app(root, production=False, cache_backend=cache_backend, cache_path=cache_path,
-                               observability=observability, rate_limit=rate_limit)
+                               observability=observability, rate_limit=rate_limit, debug=True, security=security,
+                               websocket_max_message=websocket_max_message, hot_reload=True)
                 except Exception:
                     traceback.print_exc()
                     print("PyNext dev: keeping the previous version running; "
@@ -137,9 +165,14 @@ def _positive_float(value):
 def main():
     parser = argparse.ArgumentParser(prog="pynext")
     sub = parser.add_subparsers(dest="command", required=True)
+    init = sub.add_parser("init", help="create a minimal application")
+    init.add_argument("--dir", default=".", help="application project directory")
     for name in ("build", "dev", "start"):
         command = sub.add_parser(name)
         command.add_argument("--dir", default=".", help="application project directory")
+        if name == "build":
+            command.add_argument("--standalone", action="store_true", help="create a Linux standalone directory")
+            command.add_argument("--standalone-dir", default=None, help="new output directory for --standalone")
         if name != "build":
             command.add_argument("--host", default="127.0.0.1")
             command.add_argument("--port", type=_port, default=3000)
@@ -151,9 +184,9 @@ def main():
                                  help="concurrent request bodies being read before new ones get a 503")
             command.add_argument("--body-timeout-ms", type=_at_least(0, "--body-timeout-ms"), default=10000,
                                  help="how long a request body may take to arrive before a 408")
-            command.add_argument("--cache-backend", choices=("memory", "sqlite"), default="memory",
+            command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis"), default="memory",
                                  help="ISR page cache backend: process-local memory (default) or a"
-                                      " SQLite file shared by all workers")
+                                      " shared SQLite file or Redis via PYNEXT_REDIS_URL")
             command.add_argument("--cache-path", default=None,
                                  help="SQLite cache file for --cache-backend sqlite;"
                                       " defaults to <project>/.pynext/isr-cache.sqlite3")
@@ -173,15 +206,45 @@ def main():
                                  help="requests allowed per client per --rate-limit-window (0 disables)")
             command.add_argument("--rate-limit-window", type=_positive_float, default=60.0,
                                  help="rate limit window in seconds")
+            command.add_argument("--rate-limit-backend", choices=("memory", "redis"), default="memory",
+                                 help="per-process memory (default) or Redis via PYNEXT_REDIS_URL")
             command.add_argument("--trusted-proxy", action="append", default=[], metavar="IP_OR_CIDR",
                                  help="peer IP or network whose X-Forwarded-For is honoured "
                                       "for rate limiting (repeatable; default: none trusted)")
+            command.add_argument("--csrf", action="store_true", help="protect state-changing API requests")
+            command.add_argument("--csrf-cookie-secure", action="store_true",
+                                 help="send the double-submit CSRF cookie only over HTTPS")
+            command.add_argument("--cors-origin", action="append", default=[], metavar="ORIGIN",
+                                 help="allow this CORS origin (repeatable)")
+            command.add_argument("--cors-credentials", action="store_true",
+                                 help="allow credentials for configured CORS origins")
+            command.add_argument("--csp-nonce", action="store_true", help="enable CSP nonces on dynamic pages")
+            command.add_argument("--ws-max-message-bytes", type=_at_least(1, "--ws-max-message-bytes"),
+                                 default=MAX_WS_MESSAGE, help="WebSocket message limit in bytes (max 16777216)")
     args = parser.parse_args()
     root = Path(args.dir).resolve()
+    if args.command == "init":
+        try:
+            init_project(root)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        print(f"Created a PyNext app in {root}")
+        return
     if args.command == "build":
+        if args.standalone_dir and not args.standalone:
+            parser.error("--standalone-dir requires --standalone")
         manifest = write_manifest(root)
         print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
+        if args.standalone:
+            output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
+            try:
+                build_standalone(root, output)
+            except (OSError, ValueError) as exc:
+                parser.error(str(exc))
+            print(f"Created standalone directory in {output}")
         return
+    if args.ws_max_message_bytes > 16 * 1024 * 1024:
+        parser.error("--ws-max-message-bytes must be at most 16777216")
     obs_config = None
     if (args.structured_logs is not None or args.metrics is not None
             or args.tracing is not None):
@@ -195,15 +258,19 @@ def main():
             obs_config.metrics = args.metrics
         if args.tracing is not None:
             obs_config.tracing = args.tracing
-    if args.workers > 1:
-        if os.name != "posix":
-            parser.error("--workers > 1 is only supported on Unix (SO_REUSEPORT)")
-        if args.port == 0:
-            parser.error("--workers > 1 requires a fixed --port (port 0 cannot be shared by workers)")
     try:
-        limiter = (RateLimiter(args.rate_limit, args.rate_limit_window,
-                               trusted_proxies=args.trusted_proxy)
+        limiter_type = RedisRateLimiter if args.rate_limit_backend == "redis" else RateLimiter
+        options = ({"namespace": os.environ.get("PYNEXT_RATE_LIMIT_NAMESPACE", "default")}
+                   if args.rate_limit_backend == "redis" else {})
+        limiter = (limiter_type(args.rate_limit, args.rate_limit_window,
+                                trusted_proxies=args.trusted_proxy, **options)
                    if args.rate_limit >= 1 else None)
+        security = (SecurityConfig(csrf_enabled=args.csrf, csrf_cookie_secure=args.csrf_cookie_secure,
+                                   cors_allowed_origins=tuple(args.cors_origin),
+                                   cors_allow_credentials=args.cors_credentials,
+                                   csp_nonce_enabled=args.csp_nonce)
+                    if (args.csrf or args.csrf_cookie_secure or args.cors_origin or
+                        args.cors_credentials or args.csp_nonce) else None)
     except ValueError as exc:
         parser.error(str(exc))
     extra = {"observability": obs_config} if obs_config is not None else {}
@@ -216,22 +283,27 @@ def main():
                               body_timeout_ms=args.body_timeout_ms,
                               rate_limit=args.rate_limit,
                               rate_limit_window=args.rate_limit_window,
+                              rate_limit_backend=args.rate_limit_backend,
                               trusted_proxies=tuple(args.trusted_proxy),
                               cache_backend=args.cache_backend, cache_path=args.cache_path,
-                              observability=obs_config)
+                              observability=obs_config, security=security,
+                              websocket_max_message=args.ws_max_message_bytes)
         return run_supervisor(config, workers=args.workers)
     if args.command == "dev":
         try:
             asyncio.run(run_dev(root, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
                                 args.body_capacity, args.body_timeout_ms,
                                 cache_backend=args.cache_backend, cache_path=args.cache_path,
-                                rate_limit=limiter, **extra))
+                                rate_limit=limiter, security=security,
+                                websocket_max_message=args.ws_max_message_bytes, **extra))
         except KeyboardInterrupt:
             pass
         return
     app = create_app(root, production=args.command == "start",
                      cache_backend=args.cache_backend, cache_path=args.cache_path,
-                     rate_limit=limiter, **extra)
+                     rate_limit=limiter, **({"security": security} if security else {}),
+                     **({"websocket_max_message": args.ws_max_message_bytes}
+                        if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}), **extra)
     try:
         asyncio.run(serve(app, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
                           args.body_capacity, args.body_timeout_ms, **extra))

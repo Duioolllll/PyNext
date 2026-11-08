@@ -2,11 +2,11 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [日本語](../ja/manual.md)
 
-本手册适用于当前检出的 **v0.7.0a1** 尚未发布的实验候选代码。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
+本手册适用于当前检出的 **0.1.0** 实验版本代码。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
 
 ## 环境要求与首次运行
 
-需要 CPython 3.13、Rust/Cargo 和 [uv](https://docs.astral.sh/uv/)。受支持的环境由 CI 矩阵验证：操作系统为 Ubuntu、macOS 与 Windows（最新版本），Python 仅支持 CPython 3.13（3.14 未经验证，不在矩阵中），部署模式为独立 Axum 与 Uvicorn 之上的 ASGI（进程内 ASGI 模式由每个 CI 任务中的 pytest 覆盖）。浏览器冒烟测试在三个操作系统上都会运行。示例使用 island，因此还需要 Node.js 18 或更高版本和 npm，以安装 esbuild 0.28.1。
+需要 CPython 3.13 或 3.14、Rust/Cargo 和 [uv](https://docs.astral.sh/uv/)。受支持的环境由 CI 矩阵验证：操作系统为 Ubuntu、macOS 与 Windows（最新版本），Python 为 CPython 3.13 和 3.14，部署模式为独立 Axum 与 Uvicorn 之上的 ASGI（进程内 ASGI 模式由每个 CI 任务中的 pytest 覆盖）。浏览器冒烟测试在三个操作系统上都会运行。示例使用 island，因此还需要 Node.js 18 或更高版本和 npm，以安装 esbuild 0.28.1。
 
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
@@ -22,7 +22,7 @@ uv run pynext start --dir examples/basic
 
 `pynext dev --dir examples/basic` 不经构建直接运行源码，并在 `app/`、`islands/`、`public/` 或 `pynext.config.py` 变化时在同一端口重启服务器。`pynext start` 使用构建 manifest；受跟踪的源码发生变化后必须重新构建。不使用 island 的应用不需要 Node 和 esbuild。以上说明通过仓库源码安装，并不表示项目已发布到 PyPI。
 
-开发监视器每次轮询都会对受监视文件计算哈希，以检测大小和修改时间未变的编辑。目录较大时会增加磁盘 I/O。
+开发监视器使用原生文件通知和文件哈希，必要时回退到轮询。修改 JS/TS island 会重新构建并替换受影响的模块，无需刷新整个页面；旧清理函数会执行，该 island 的状态可能重置。修改其他源码会重启服务器并刷新打开的页面。错误修改保留上一个正常版本。`--port 0` 分配的端口在重启后保持不变。
 
 ## 项目结构和路由
 
@@ -76,7 +76,7 @@ async def echo(request):
 
 响应默认使用 Content Security Policy `script-src 'self'; object-src 'none'`。该策略限制浏览器可加载的脚本，添加客户端代码时应予以考虑。响应头和媒体类型中的控制字符会被拒绝。
 
-状态变更类 API 请求可以选择启用 CSRF 保护（规范 v0.2 §11）。由于目前还没有认证系统，保护采用 double-submit 模式：应用签发一个不可预测的令牌，存入 `pynext_csrf` Cookie，客户端再以 `X-CSRF-Token` 请求头（或 `csrf_token` 表单字段）回传相同的值。GET、HEAD 和 OPTIONS 不受检查；其他方法若缺少令牌或令牌不匹配，将返回 HTTP 403。
+状态变更类 API 请求可以选择启用 CSRF 保护（规范 v0.2 §11）。启用会话中间件时令牌绑定到服务端会话；否则采用 double-submit 模式：应用签发一个不可预测的令牌，存入 `pynext_csrf` Cookie，客户端再以 `X-CSRF-Token` 请求头（或 `csrf_token` 表单字段）回传相同的值。GET、HEAD 和 OPTIONS 不受检查；其他方法若缺少令牌或令牌不匹配，将返回 HTTP 403。
 
 ~~~python
 from pynext import JSONResponse, csrf_protect, new_csrf_token, route, set_csrf_cookie
@@ -120,7 +120,7 @@ app = create_app(".", security=SecurityConfig(
 
 ## 流式 SSR
 
-页面函数可以返回 UI 节点的异步 iterable，而不是一棵完整的树。服务器先发送布局外壳，再由 Rust 逐块序列化并按生成顺序发送，最后发送布局的闭合部分。缓冲渲染仍为默认方式。流式传输仅适用于 SSR：SSG 与 ISR 页面需要完整正文，指定流式传输会失败。布局必须恰好渲染一次 children。断开连接时关闭生成器；响应头发出后出错会中断流，而不是更改状态码。[示例页面](../../examples/basic/app/stream/page.py)可在 `/stream` 查看。
+页面函数可以返回 UI 节点的异步 iterable。SSR 按生成顺序发送布局和各块；SSG 在构建时合并并提供静态文件。公开 ISR 的首次请求接收流，其他并发请求等待完整结果或立即收到 stale 内容，只有完整结果才会缓存。SSG 和 ISR 流限制为 8 MiB、30 秒；ISR 最多缓存 2 MiB 的正文。首次客户端断开后生成仍可能继续。布局必须恰好渲染一次 children。[示例](../../examples/basic/app/stream/page.py)。
 
 ~~~python
 from pynext import h, page
@@ -164,7 +164,7 @@ async def echo(websocket: WebSocket):
         pass
 ~~~
 
-参见 [echo 示例](../../examples/basic/app/ws/echo/route.py)。没有 WebSocket 处理函数的路由会以 close 代码 1008 拒绝握手；未调用 accept 就返回的处理函数会以代码 1000 关闭连接。单条消息上限为 64 KiB，更大的消息会以 close 代码 1009 拒绝。close 代码须在 1000~4999 之间，且不能是保留的 1005、1006、1015；reason 不超过 123 个 UTF-8 字节。不支持子协议协商、广播或 pub/sub，也没有连接间共享状态：每个连接只能收到自己的消息。仅含 WebSocket 的 `route.py` 对普通 HTTP 请求返回 405。ASGI 适配器与 Axum 独立服务器均支持 WebSocket；Axum 会在处理函数运行前完成握手，因此那里的 `accept()` 仅起标记作用。
+参见 [echo 示例](../../examples/basic/app/ws/echo/route.py)。ASGI 和 Axum 均支持文本和二进制消息。默认上限为 64 KiB，可通过 `create_app(..., websocket_max_message=...)` 或 `--ws-max-message-bytes` 调至最多 16 MiB；接收超限以 1009 关闭。`@websocket(protocols=("chat.v1", "chat.v2"))` 选择子协议，结果可从 `websocket.subprotocol` 读取。`WebSocketPubSub` 使用 `async with broker.subscribe(topic) as sub`、`await sub.receive()` 和 `await broker.publish(topic, message)` 在单个进程中分发消息。慢订阅者会收到 `PubSubOverflow`；消息不会跨 worker 分发或持久化。Axum 在处理函数执行前完成握手。
 
 ## SSR、SSG 与 ISR
 
@@ -184,11 +184,11 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG 和 ISR 页面函数不能接收 `request`。它们仅适合公共内容；请确认环境变量和外部数据可以共享。ISR 不把匿名请求的查询字符串计入缓存键。带 Cookie 或 Authorization 的请求会绕过共享 ISR 缓存并返回 `private, no-store`。默认缓存大小有限，且**只存在于各自进程的内存中**，不在工作进程之间共享或失效。使用 `--cache-backend sqlite` 启动，或用 `create_app(..., cache_backend="sqlite", cache_path=...)` 创建，即可让所有工作进程共享一个 SQLite 文件（WAL）：过期内容的重新生成通过带过期时间和属主令牌的租约实现每个键仅一个进程执行，写入时原子检查版本和有效租约的所有权。共享存储故障时，工作进程回退到本地缓存。每个工作进程在共享文件前仍保留一份进程内缓存，因此其他进程的失效会立即作用于共享条目，但本地副本可能保留至剩余 TTL 结束。带 `Set-Cookie` 或 `Cache-Control: private/no-store` 的响应不会存入共享缓存。Redis 适配器是未来的可选方案，尚未实现。更新 SSG 内容需要重新构建。
+SSG 和 ISR 页面不能接收 `request`，仅用于公开内容。ISR 默认忽略查询字符串。通过 `@page(render="isr", revalidate=30, query_keys=("lang",))` 和页面的 `query` 参数，只传入允许的键及其字符串列表，并按值分别缓存。使路径失效会使其所有查询变体失效。包含 Cookie 或 Authorization 的请求绕过共享缓存并返回 `private, no-store`。默认缓存仅在本进程内，也可使用 SQLite 或可选 Redis（`pynext-framework[redis]` 和 `PYNEXT_REDIS_URL`）在 worker 间共享；共享存储故障时可能回退到过期的本地缓存。带 `Set-Cookie` 或 private/no-store 的响应不缓存。SSG 异步生成器在构建期间消费，并作为静态文件提供。
 
 SSG 构建最多生成 10,000 个页面；开发模式下每次请求都会渲染 SSG 页面。ISR 页面不能导出 `generate_static_params()`，每个进程最多并发执行 128 个生成任务。
 
-已授权的 API 处理函数可调用 `await request.revalidate("/news/example")`；持有应用实例的代码可调用 `await app.revalidate(path)`。请传入不含查询字符串、已解码的 ISR 路径。如果移除了缓存或使进行中的生成失效，返回 `True`。已有请求仍可能收到旧生成结果，但该结果不会重新覆盖缓存。内存后端下失效只作用于当前进程，不会传播到其他工作进程；SQLite 后端下也会删除共享条目，但其他工作进程的进程内副本可能保留至剩余 TTL 结束。对外提供此操作的端点需要认证和授权。
+已授权的 API 处理函数可调用 `await request.revalidate("/news/example")`；持有应用实例的代码可调用 `await app.revalidate(path)`。请传入不含查询字符串、已解码的 ISR 路径。如果移除了缓存或使进行中的生成失效，返回 `True`。已有请求仍可能收到旧生成结果，但该结果不会重新覆盖缓存。内存后端下失效只作用于当前进程，不会传播到其他工作进程；SQLite 后端下也会删除共享条目，共享存储正常时其他工作进程的下次查询会看到失效。对外提供此操作的端点需要认证和授权。
 
 ## 公共文件与 islands
 
@@ -213,13 +213,15 @@ def Page():
 
 如需复用现有服务端 DOM，请提供服务端 fallback、设置 `hydrate=True`，并在模块中导出 `render`、`hydrate` 和 `mount`。参见 [hydrated-counter.ts](../../examples/basic/islands/hydrated-counter.ts)。如果两侧的树不一致，框架会重新 mount 该 island，输入状态或焦点可能丢失。
 
+从 `pynext` 导入 `model_prop`，并使用 `island("shared-model", props={"name": "Ada"}, hydrate=True, model=h("button", {"type": "button"}, "Hello ", model_prop("name")))`，服务端与浏览器即可用同一模型创建初始 DOM。模型支持 element、text、fragment、字符串 props 占位符及静态字符串/布尔/None 属性，上限为 16 KiB、512 节点和深度 32。JS 模块导出 `hydrate`、`mount` 和 `render`，用于事件绑定与不匹配时恢复。动态属性、循环和客户端状态计算尚不支持。参见[服务端示例](../../examples/basic/app/shared-model/page.py)和[客户端模块](../../examples/basic/islands/shared-model.js)。
+
 默认激活策略为 `load`。`visible` 在进入视口时激活；`idle` 请求空闲回调，并请求 2 秒 timeout，但实际执行可能更晚。相关 API 不可用时会退回 idle 或定时器。这三种策略不会重放激活前的事件。
 
 设置 `hydrate=True, strategy="interaction"` 后，用户点击 `<button type="button">` 会激活 island。参见[示例页面](../../examples/basic/app/interaction/page.py)和[模块](../../examples/basic/islands/interaction-counter.js)。加载器为该 island 注册监听器后，最多缓存 16 次受支持的点击，在 hydration 成功后按顺序重放；超出的点击会被丢弃并产生警告。链接、表单提交、输入、label 和可编辑区域的事件不会被拦截或重放；监听器注册前的事件也不会被捕获。DOM 不匹配、元素被移除或激活失败时会丢弃待处理事件。重放事件是 `isTrusted=false` 的合成事件，不能保证需要浏览器用户激活的操作；island 外的捕获监听器可能同时观察到原始事件和重放事件。
 
 ## 客户端导航
 
-在加载客户端运行时的页面（带有 island 的页面）上，点击同源链接时无需整页刷新即可跳转：运行时会获取目标文档、替换页面主体，并通过 `pushState` 更新历史记录；浏览器的后退/前进按钮也是同样的工作方式。链接会在悬停、键盘聚焦和进入视口时预取（最多 20 个页面，每个 1 MiB）。任何失败——非 200 响应、非 HTML 响应或获取错误——都会回退到整页导航，因此页面永远不会损坏。带有 `target="_blank"` 或 `download` 的链接、跨源链接和同页哈希链接保持正常的浏览器行为，禁用 JavaScript 时也是如此。`window.__pynextNav` 提供用于调试的 `navigate`、`prefetch` 和 `isPrefetched`。没有 island 的页面不加载运行时，因此部分导航在那里不起作用。
+所有页面都会加载客户端运行时。同源链接在文档元数据和 CSP 兼容时使用局部导航，否则回退到完整导航。预取最多并发 4 个请求，每个响应不超过 1 MiB；仅缓存明确公开且仍然新鲜的响应，最多 60 秒、20 项。带 `Vary: Cookie` 或 `Authorization` 的响应不会缓存。
 
 ## Python 客户端 DSL（实验性）
 
@@ -235,7 +237,7 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 已构建的应用需使用 `create_app(project_path, production=True)`。ASGI 请求超时由所使用的服务器管理。Axum 适配器等待 Python 最多 30 秒，之后请求取消并返回 504。已经在线程中运行的同步函数可能在 504 之后继续执行并产生写入等副作用。请确保写入操作幂等，并为数据库与外部服务设置单独超时。进程隔离可通过 `--workers`（见下文）获得；单进程没有该能力。ISR 取消也有相同限制。
 
-工作进程间即时失效传播、分布式限流和生产环境加固尚未实现。安装可选包并启用追踪后会生成 OpenTelemetry span（见可观测性一节）。ASGI 一致性由 `tests/test_asgi_conformance.py` 验证（HTTP 事件顺序、分块请求体、断开连接、包含失败路径的 lifespan）。请参阅[生产路线图](. 请参阅[生产路线图](../PRODUCTION_ROADMAP.md)中的计划与验收条件。
+分布式限流和生产环境加固尚未实现。共享存储正常时 SQLite 失效会在下次查询时生效。安装可选包并启用追踪后会生成 OpenTelemetry span（见可观测性一节）。ASGI 一致性由 `tests/test_asgi_conformance.py` 验证（HTTP 事件顺序、分块请求体、断开连接、包含失败路径的 lifespan）。请参阅[生产路线图](. 请参阅[生产路线图](../PRODUCTION_ROADMAP.md)中的计划与验收条件。
 
 两个适配器的请求体上限均为 1 MiB，超出返回 413。Axum 默认同时接收 16 个请求体、接收期限 10 秒（408），Python 执行槽为 64 个，等待队列上限是执行槽数与 64 中较小的值；队列满返回 503。执行和请求体设置可通过 CLI 调整。HTTP/1.1 请求头读取期限为 10 秒，但连接总数没有限制。外部 ASGI 服务器的超时由其自身管理。非根路径末尾的 `/` 会以 308 重定向。编译后的 island 单个上限为 2 MiB，总计 32 MiB。
 
@@ -257,7 +259,7 @@ OpenTelemetry 追踪默认关闭且为可选项：安装 `opentelemetry-api`（�
 
 转发链从右向左遍历受信任的代理，使用最近的不受信任地址。必须准确配置所有中间代理。每个进程最多保留 10,000 个桶；全部处于活跃状态时，新地址会收到 429，直到某个桶完全补充。
 
-多工作进程：`pynext start --workers 4` 会运行一个监管器，启动 4 个共享同一端口的工作进程（SO_REUSEPORT，仅限 Unix，需要固定 `--port`）。监管器会重启已退出或心跳停止的工作进程，并将 SIGINT/SIGTERM 转发给全部工作进程以实现优雅关闭（最多 5 秒，之后 SIGKILL）。每个工作进程都是独立进程，拥有各自的解释器、事件循环、ISR 缓存和限流桶，状态不在进程间共享。若工作进程在处理请求中途死亡，该请求会失败，客户端需要重试。默认为 1 个工作进程，与此前的单进程行为完全相同。阻塞事件循环的处理函数不会停止工作进程的心跳线程，因此卡住的处理函数由 30 秒请求超时处理，而不会触发重启。
+多工作进程：`pynext start --workers 4` 启动共享监听套接字的监管器。使用 `--port 0` 时，动态分配的端口在 worker 重启后保持不变。各 worker 的解释器、内存缓存和默认限流独立；SQLite/Redis ISR 与 Redis 限流可以共享。监管器会重启故障 worker；中断的请求需要重试。CI 在 Linux、macOS 和 Windows 上检查共享监听套接字的 worker 启动和重启，并在 Linux 和 macOS 上运行基于信号的监管器测试。
 
 ## 测试与故障排查
 
@@ -266,7 +268,7 @@ cargo test -p pynext-router -p pynext-cache
 uv run --extra dev pytest -q
 ~~~
 
-路由器与 HTML 序列化除人工挑选的用例外，还有基于属性的测试：Python 侧用 hypothesis（`tests/test_property_router_render.py`，固定种子、40 个用例以保持 CI 快速），Rust 侧用 proptest（`crates/pynext-router` 与 `crates/pynext-native` 的单元测试，各 64 个用例），覆盖路由匹配往返、转义无泄漏、void 标签处理与任意树渲染。`embed` 虽在 void 列表中，但也在屏蔽标签列表中，因此无法渲染，已排除在测试之外。
+路由器与 HTML 序列化除人工挑选的用例外，还有基于属性的测试：Python 侧用 hypothesis（`tests/test_property_router_render.py`，固定种子、40 个用例以保持 CI 快速），Rust 侧用 proptest（`crates/pynext-router` 与 `crates/pynext-native` 的单元测试，各 64 个用例），覆盖路由匹配往返、转义无泄漏、void 标签处理与任意树渲染。`embed` 在屏蔽标签列表中，因此无法渲染，已排除在测试之外。
 
 ASGI 一致性由 `tests/test_asgi_conformance.py` 验证：HTTP 事件顺序、多分块请求体与 1 MiB 大小边界、读取中与慢处理执行期间的断开连接、包含失败时 `lifespan.startup.failed` / `lifespan.shutdown.failed` 的 lifespan 启动/关闭，以及流式响应帧顺序。lifespan 失败时发送 `.failed` 消息是随该套件一并修复的行为。
 
@@ -284,4 +286,4 @@ uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 - Windows 上的 npm esbuild 通过 Node 运行。直接设置 `PYNEXT_ESBUILD` 时，请指定原生 `esbuild.exe`，不要使用 `.cmd` 或 `.bat` 文件。
 - 若动态 SSG 路径返回 404，请将其加入 `generate_static_params()` 并重新构建。
 - 若 hydration 不匹配，请确保服务端 fallback 与客户端 `render` 产生一致且确定的结果。
-- 若工作进程之间的 ISR 结果不同，请检查缓存后端：内存后端按进程隔离；SQLite 后端下各工作进程的进程内副本也可能在共享失效后保留至 TTL 结束。
+- 若工作进程之间的 ISR 结果不同，请检查缓存后端：内存后端按进程隔离；SQLite 后端在共享存储故障时会回退到进程内副本。

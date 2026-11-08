@@ -1,3 +1,4 @@
+from conftest import page_html
 """Shared (SQLite) ISR cache backend and two-process ISR coordination.
 
 Finding #42 / spec v0.2 section 10.3 and section 15 M4: one shared
@@ -320,9 +321,117 @@ def test_shared_invalidate_removes_both_layers(tmp_path):
     asyncio.run(run())
 
 
+def test_other_worker_invalidation_is_seen_before_local_fresh_hit(tmp_path):
+    async def run():
+        path = tmp_path / "cache.sqlite3"
+        first = ISRCache(cache_backend="sqlite", cache_path=path)
+        second = ISRCache(cache_backend="sqlite", cache_path=path)
+        count = 0
+
+        async def render():
+            nonlocal count
+            count += 1
+            return Response(str(count))
+
+        try:
+            assert await first.get_or_render("/page", POLICY, render) == b"1"
+            assert await second.get_or_render("/page", POLICY, render) == b"1"
+            assert await second.invalidate("/page")
+            assert await first.get_or_render("/page", POLICY, render) == b"2"
+        finally:
+            await first.close()
+            await second.close()
+    asyncio.run(run())
+
+
+def test_build_namespaces_isolate_shared_entries(tmp_path):
+    async def run():
+        path = tmp_path / "cache.sqlite3"
+        first = ISRCache(cache_backend="sqlite", cache_path=path, namespace="build-a:")
+        second = ISRCache(cache_backend="sqlite", cache_path=path, namespace="build-b:")
+        async def render_a():
+            return Response("version-a")
+        async def render_b():
+            return Response("version-b")
+        try:
+            assert await first.get_or_render("/page", POLICY, render_a) == b"version-a"
+            assert await second.get_or_render("/page", POLICY, render_b) == b"version-b"
+            assert await first.invalidate("/page")
+            assert await second.get_or_render("/page", POLICY, render_b) == b"version-b"
+        finally:
+            await first.close()
+            await second.close()
+    asyncio.run(run())
+
+
+def test_axum_shared_cache_checks_invalidation_before_fast_hit(tmp_path):
+    from pynext.server import start_native
+
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "page.py").write_text(
+        'from pynext import h, page\n'
+        'count = 0\n'
+        '@page(render="isr", revalidate=60)\n'
+        'def Page():\n'
+        '    global count\n'
+        '    count += 1\n'
+        '    return h("p", {}, str(count))\n'
+    )
+    write_manifest(tmp_path)
+    path = tmp_path / "cache.sqlite3"
+    first = create_app(tmp_path, production=True, cache_backend="sqlite", cache_path=path)
+    second = create_app(tmp_path, production=True, cache_backend="sqlite", cache_path=path)
+
+    async def run():
+        server = start_native(first, asyncio.get_running_loop(), port=0)
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", trust_env=False) as client:
+                assert (await client.get("/")).text == page_html("<p>1</p>")
+                assert (await client.get("/")).text == page_html("<p>1</p>")
+                assert await second.revalidate("/")
+                assert (await client.get("/")).text == page_html("<p>2</p>")
+        finally:
+            await asyncio.to_thread(server.stop)
+            await first.isr.close()
+            await second.isr.close()
+    asyncio.run(run())
+
+
+def test_invalidation_retires_other_workers_inflight_task(tmp_path):
+    async def run():
+        path = tmp_path / "cache.sqlite3"
+        first = ISRCache(cache_backend="sqlite", cache_path=path)
+        second = ISRCache(cache_backend="sqlite", cache_path=path)
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def old():
+            started.set()
+            await finish.wait()
+            return Response("old")
+
+        async def new():
+            return Response("new")
+
+        task = asyncio.create_task(first.get_or_render("/page", POLICY, old))
+        try:
+            await asyncio.wait_for(started.wait(), 5)
+            assert await second.invalidate("/page")
+            assert await asyncio.wait_for(first.get_or_render("/page", POLICY, new), 5) == b"new"
+            finish.set()
+            assert await task == b"old"
+            assert await second.get_or_render("/page", POLICY, new) == b"new"
+        finally:
+            finish.set()
+            await asyncio.gather(task, return_exceptions=True)
+            await first.close()
+            await second.close()
+    asyncio.run(run())
+
+
 def test_invalid_cache_config_is_rejected_at_startup(tmp_path):
     with pytest.raises(ValueError, match="Unknown cache backend"):
-        ISRCache(cache_backend="redis")
+        ISRCache(cache_backend="bogus")
     with pytest.raises(ValueError, match="cache_path is required"):
         ISRCache(cache_backend="sqlite")
     with pytest.raises(ValueError, match="is a directory"):
@@ -333,7 +442,7 @@ def test_invalid_cache_config_is_rejected_at_startup(tmp_path):
         ISRCache(cache_backend="sqlite", cache_path=blocker / "cache.sqlite3")
     _make_project(tmp_path)
     with pytest.raises(ValueError, match="Unknown cache backend"):
-        create_app(tmp_path, cache_backend="redis")
+        create_app(tmp_path, cache_backend="bogus")
 
 
 def test_two_processes_share_first_generation(tmp_path, servers):
@@ -354,7 +463,7 @@ def test_two_processes_share_first_generation(tmp_path, servers):
         # Only one worker generated the page; the other waited and served
         # the shared result.
         assert len(_counter_lines(counter)) == 1
-        assert bodies == {f"<p>{_counter_lines(counter)[0]}</p>"}
+        assert bodies == {page_html(f"<p>{_counter_lines(counter)[0]}</p>")}
     asyncio.run(run())
 
 
@@ -495,7 +604,7 @@ def test_two_processes_stale_serving_and_single_regeneration(tmp_path, servers):
             assert len(_counter_lines(counter)) == 2
             fresh = await client.get(second.url + "/")
             assert fresh.text != token
-            assert fresh.text == f"<p>{_counter_lines(counter)[1]}</p>"
+            assert fresh.text == page_html(f"<p>{_counter_lines(counter)[1]}</p>")
     asyncio.run(run())
 
 
@@ -519,8 +628,9 @@ def test_two_processes_private_response_never_enters_shared_cache(tmp_path, serv
             assert again.text == public.text
             assert len(_counter_lines(counter)) == 2
             with sqlite3.connect(cache_path) as conn:
-                row = conn.execute("SELECT body FROM entries WHERE key = '/'").fetchone()
-            assert row is not None and row[0] == public.text.encode()
+                rows = conn.execute("SELECT key, body FROM entries").fetchall()
+            assert len(rows) == 1 and rows[0][0].endswith(":/")
+            assert rows[0][1] == public.text.encode()
     asyncio.run(run())
 
 

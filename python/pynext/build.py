@@ -12,8 +12,10 @@ from .assets import discover_public
 from .client import discover_client
 
 MANIFEST = ".pynext/manifest.json"
-VERSION = 7
+VERSION = 9
 MAX_STATIC_PAGES = 10_000
+MAX_STREAMED_STATIC_BYTES = 8 * 1024 * 1024
+MAX_STREAMED_STATIC_SECONDS = 30
 
 
 def _hash(path):
@@ -40,8 +42,16 @@ def discover(root):
     for path in files:
         if not path.resolve().is_relative_to(app_dir.resolve()):
             raise ValueError(f"Python file escapes app directory: {path}")
+    for name in ("middleware.py", "resources.py"):
+        extra = root / name
+        if extra.is_file():
+            if not extra.resolve().is_relative_to(root):
+                raise ValueError(f"{name} escapes project root")
+            files.append(extra)
     routes = {}
     for path in files:
+        if path.parent == root:
+            continue
         if path.name not in ("page.py", "route.py"):
             continue
         relative_parent = path.parent.relative_to(app_dir)
@@ -91,6 +101,7 @@ def write_manifest(root):
         raise ValueError("Application sources changed during build; retry the build")
     manifest["render_modes"] = app.render_modes
     manifest["isr_policies"] = app.isr_policies
+    manifest["isr_queries"] = app.isr_queries
     manifest["client"] = app.client_manifest
     manifest["static_pages"] = {}
     for path, (pattern, body) in rendered.items():
@@ -201,6 +212,7 @@ def _materialize(pattern, params):
 
 async def _render_static_pages(app):
     from .app import _invoke
+    from .http import StreamingResponse
     rendered = {}
     for pattern, generator in app.static_generators.items():
         params_list = [{}] if generator is None else await _invoke(generator)
@@ -218,7 +230,19 @@ async def _render_static_pages(app):
             if match is None or match[0] != pattern:
                 raise ValueError(f"Generated path {path} is not reachable through {pattern}")
             response = await app.render_page(pattern, None, params)
-            rendered[path] = (pattern, response.body)
+            if isinstance(response, StreamingResponse):
+                body = bytearray()
+                try:
+                    async with asyncio.timeout(MAX_STREAMED_STATIC_SECONDS):
+                        while (chunk := await response._next_chunk()) is not None:
+                            if len(body) + len(chunk) > MAX_STREAMED_STATIC_BYTES:
+                                raise ValueError("Streamed static page exceeds build size limit")
+                            body.extend(chunk)
+                finally:
+                    await response.aclose()
+                rendered[path] = (pattern, bytes(body))
+            else:
+                rendered[path] = (pattern, response.body)
     return rendered
 
 

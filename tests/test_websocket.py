@@ -4,6 +4,7 @@ The Axum checks use a minimal raw-socket WebSocket client (handshake plus
 masked frames) so the suite needs no extra client dependency.
 """
 import asyncio
+import array
 import base64
 import hashlib
 import os
@@ -166,15 +167,16 @@ class _RawWSClient:
 
     GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-    def __init__(self, address, path):
+    def __init__(self, address, path, protocols=()):
         host, port = address.split(":")
         self.sock = socket.create_connection((host, int(port)), timeout=5)
         self.sock.settimeout(5)
         self.key = base64.b64encode(os.urandom(16)).decode("ascii")
+        protocol_header = f"Sec-WebSocket-Protocol: {', '.join(protocols)}\r\n" if protocols else ""
         request = (
             f"GET {path} HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\n"
             f"Connection: Upgrade\r\nSec-WebSocket-Key: {self.key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
+            f"Sec-WebSocket-Version: 13\r\n{protocol_header}\r\n"
         )
         self.sock.sendall(request.encode("ascii"))
         response = b""
@@ -185,6 +187,9 @@ class _RawWSClient:
             response += chunk
         head, _, self._pending = response.partition(b"\r\n\r\n")
         assert head.startswith(b"HTTP/1.1 101"), head
+        selected = [line.split(b":", 1)[1].strip().decode("ascii") for line in head.split(b"\r\n")
+                    if line.lower().startswith(b"sec-websocket-protocol:")]
+        self.protocol = selected[0] if selected else None
         expected = base64.b64encode(
             hashlib.sha1((self.key + self.GUID).encode("ascii")).digest()).decode("ascii")
         accept = [line.split(b":", 1)[1].strip() for line in head.split(b"\r\n")
@@ -305,6 +310,128 @@ def test_axum_websocket_echo_and_oversized_close():
             await asyncio.to_thread(server.stop)
             await app.isr.close()
 
+    _run(run())
+
+
+def test_websocket_subprotocol_and_configured_message_limit(tmp_path):
+    ws_dir = tmp_path / "app" / "ws"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "route.py").write_text(
+        'from pynext import websocket\n@websocket(protocols=("fast", "slow"))\n'
+        'async def handler(websocket):\n'
+        '    await websocket.accept()\n'
+        '    await websocket.send_text(websocket.subprotocol or "none")\n'
+        '    await websocket.receive()\n'
+    )
+
+    async def run():
+        app = create_app(tmp_path, websocket_max_message=4)
+        conn = _ScriptedConnection([{"type": "websocket.connect"},
+                                    {"type": "websocket.receive", "text": "12345"}])
+        await app({"type": "websocket", "path": "/ws", "headers": [], "query_string": b"",
+                   "subprotocols": ["slow", "fast"]}, conn.receive, conn.send)
+        assert conn.sent == [{"type": "websocket.accept", "subprotocol": "fast"},
+                             {"type": "websocket.send", "text": "fast"},
+                             {"type": "websocket.close", "code": 1009, "reason": "message too large"}]
+        denied = _ScriptedConnection([{"type": "websocket.connect"}])
+        await app({"type": "websocket", "path": "/ws", "headers": [], "query_string": b"",
+                   "subprotocols": ["unsupported"]}, denied.receive, denied.send)
+        assert denied.sent == [{"type": "websocket.close", "code": 1008}]
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            def check():
+                client = _RawWSClient(server.address, "/ws", ["slow", "fast"])
+                try:
+                    assert client.protocol == "fast"
+                    assert client.recv() == (1, b"fast")
+                    client.send_text("12345")
+                    opcode, payload = client.recv()
+                    assert opcode == 8 and struct.unpack("!H", payload[:2])[0] == 1009
+                finally:
+                    client.shutdown()
+                with pytest.raises(AssertionError, match="HTTP/1.1 400"):
+                    _RawWSClient(server.address, "/ws", ["unsupported"])
+            await asyncio.to_thread(check)
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    _run(run())
+
+
+def test_websocket_binary_limit_counts_bytes_in_memoryviews():
+    from pynext import WebSocket
+
+    async def run():
+        async def send(_item):
+            pass
+        ws = WebSocket(receive=None, send=send, path="/", max_message_bytes=4)
+        await ws.accept()
+        with pytest.raises(ValueError, match="configured limit"):
+            await ws.send_bytes(memoryview(array.array("I", [1, 2])))
+    _run(run())
+
+
+def test_native_websocket_bounds_slow_receiver_queue(tmp_path):
+    ws_dir = tmp_path / "app" / "ws"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "route.py").write_text(
+        "import asyncio\nfrom pynext import websocket\n@websocket\n"
+        "async def handler(websocket):\n    await websocket.accept()\n"
+        "    await asyncio.sleep(30)\n"
+    )
+
+    async def run():
+        app = create_app(tmp_path)
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            def check():
+                client = _RawWSClient(server.address, "/ws")
+                try:
+                    for _ in range(40):
+                        client.send_text("x")
+                    opcode, payload = client.recv()
+                    assert opcode == 8 and struct.unpack("!H", payload[:2])[0] == 1013
+                finally:
+                    client.shutdown()
+            await asyncio.to_thread(check)
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    _run(run())
+
+
+def test_websocket_pubsub_fanout_native(tmp_path):
+    ws_dir = tmp_path / "app" / "ws"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "route.py").write_text(
+        "from pynext import websocket, WebSocketPubSub\n"
+        "broker = WebSocketPubSub()\n@websocket\n"
+        "async def handler(websocket):\n"
+        "    async with broker.subscribe('news') as subscription:\n"
+        "        await websocket.accept()\n"
+        "        await websocket.send_text('ready')\n"
+        "        while True:\n"
+        "            await websocket.send_text(await subscription.receive())\n"
+    )
+
+    async def run():
+        app = create_app(tmp_path)
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        clients = []
+        try:
+            for _ in range(2):
+                client = await asyncio.to_thread(_RawWSClient, server.address, "/ws")
+                clients.append(client)
+                assert await asyncio.to_thread(client.recv) == (1, b"ready")
+            broker = app._module("app/ws/route.py").broker
+            assert await broker.publish("news", "hello") == 2
+            for client in clients:
+                assert await asyncio.to_thread(client.recv) == (1, b"hello")
+        finally:
+            for client in clients:
+                client.shutdown()
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
     _run(run())
 
 

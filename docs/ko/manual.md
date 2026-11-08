@@ -2,11 +2,11 @@
 
 [English](../en/manual.md) · [日本語](../ja/manual.md) · [简体中文](../zh-CN/manual.md)
 
-이 설명서는 현재 체크아웃한 코드인 **v0.7.0a1** 미출시 실험판 후보를 기준으로 합니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
+이 설명서는 현재 체크아웃한 코드인 **0.1.0** 실험판를 기준으로 합니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
 
 ## 준비와 첫 실행
 
-CPython 3.13, Rust/Cargo, [uv](https://docs.astral.sh/uv/)가 필요합니다. 지원 환경은 CI 매트릭스로 검증합니다. OS는 Ubuntu·macOS·Windows(최신), Python은 CPython 3.13만 지원합니다(3.14는 검증되지 않아 매트릭스에 없습니다). 배포 모드는 독립 실행 Axum과 Uvicorn 위의 ASGI이며, 인프로세스 ASGI 모드는 모든 CI 잡에서 pytest가 검사합니다. 브라우저 스모크는 세 OS에서 모두 실행합니다. 예제는 island를 사용하므로 Node.js 18 이상과 npm으로 esbuild 0.28.1도 설치해야 합니다.
+CPython 3.13·3.14, Rust/Cargo, [uv](https://docs.astral.sh/uv/)가 필요합니다. 지원 환경은 CI 매트릭스로 검증합니다. OS는 Ubuntu·macOS·Windows(최신), Python은 CPython 3.13·3.14를 대상으로 합니다. 배포 모드는 독립 실행 Axum과 Uvicorn 위의 ASGI이며, 인프로세스 ASGI 모드는 모든 CI 잡에서 pytest가 검사합니다. 브라우저 스모크는 세 OS에서 모두 실행합니다. 예제는 island를 사용하므로 Node.js 18 이상과 npm으로 esbuild 0.28.1도 설치해야 합니다.
 
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
@@ -22,7 +22,7 @@ http://127.0.0.1:3000/, /about, /guides/intro, /news/example, /hydrate, /strateg
 
 `pynext dev --dir examples/basic`는 빌드 없이 소스를 제공하며 `app/`·`islands/`·`public/`·`pynext.config.py` 변경 시 같은 포트로 서버를 다시 시작합니다. `pynext start`는 빌드 manifest를 사용하며 추적하는 소스가 바뀌면 재빌드를 요구합니다. island가 없는 앱에는 Node와 esbuild가 필요하지 않습니다. 설치 안내의 기준은 저장소 소스이며 PyPI 배포를 의미하지 않습니다.
 
-개발 감시기는 크기와 수정 시간이 같은 변경도 감지하도록 매번 파일 내용을 해시합니다. 감시 디렉터리가 크면 디스크 사용량이 늘어납니다.
+개발 감시기는 네이티브 파일 이벤트와 해시를 사용하고 필요하면 폴링으로 대체합니다. JS/TS island 수정은 영향받은 모듈만 다시 빌드해 문서 새로고침 없이 교체합니다. 이전 정리 함수가 호출되며 해당 island 상태는 초기화될 수 있습니다. 다른 소스 변경은 서버를 재시작하고 열린 문서를 새로고침합니다. 잘못된 수정은 이전 정상 버전을 유지합니다. `--port 0`으로 시작해도 재시작 시 처음 할당된 포트를 재사용합니다.
 
 ## 프로젝트 구조와 라우팅
 
@@ -76,7 +76,7 @@ async def echo(request):
 
 응답의 기본 Content Security Policy는 `script-src 'self'; object-src 'none'`입니다. 브라우저에서 불러올 수 있는 스크립트가 제한되므로 클라이언트 코드를 추가할 때 이를 고려하세요. 응답 헤더와 미디어 타입의 제어 문자는 거부합니다.
 
-상태 변경 API 요청에는 CSRF 보호를 선택적으로 적용할 수 있습니다(명세 v0.2 §11). 아직 인증 시스템이 없으므로 double-submit 방식을 사용합니다. 앱이 예측할 수 없는 토큰을 발급해 `pynext_csrf` 쿠키에 담고, 클라이언트는 같은 값을 `X-CSRF-Token` 헤더(또는 `csrf_token` 폼 필드)로 돌려보냅니다. GET, HEAD, OPTIONS는 제외되며, 토큰이 없거나 일치하지 않는 그 외의 메서드는 HTTP 403을 받습니다.
+상태 변경 API 요청에는 CSRF 보호를 선택적으로 적용할 수 있습니다(명세 v0.2 §11). 세션 미들웨어가 있으면 토큰을 서버 세션에 결합하고, 없으면 double-submit 방식을 사용합니다. 앱이 예측할 수 없는 토큰을 발급해 `pynext_csrf` 쿠키에 담고, 클라이언트는 같은 값을 `X-CSRF-Token` 헤더(또는 `csrf_token` 폼 필드)로 돌려보냅니다. GET, HEAD, OPTIONS는 제외되며, 토큰이 없거나 일치하지 않는 그 외의 메서드는 HTTP 403을 받습니다.
 
 ~~~python
 from pynext import JSONResponse, csrf_protect, new_csrf_token, route, set_csrf_cookie
@@ -120,7 +120,7 @@ app = create_app(".", security=SecurityConfig(
 
 ## 스트리밍 SSR
 
-페이지 함수는 단일 트리 대신 UI 노드의 비동기 iterable을 반환할 수 있습니다. 레이아웃 셸을 먼저 보내고 각 청크를 Rust가 직렬화해 생성되는 대로 전송한 뒤 레이아웃 닫는 부분을 보냅니다. 기본값은 여전히 전체 버퍼를 만든 뒤 보내는 방식입니다. 스트리밍은 SSR 전용이며 SSG·ISR 페이지는 전체 본문이 필요하므로 스트리밍 페이지를 지정하면 실패합니다. 레이아웃은 자식을 정확히 한 번 렌더링해야 합니다. 연결이 끊기면 생성기를 닫고, 헤더 전송 후 오류가 나면 스트림을 중단합니다. [예제 페이지](../../examples/basic/app/stream/page.py)는 `/stream`에서 확인할 수 있습니다.
+페이지 함수는 UI 노드의 비동기 iterable을 반환할 수 있습니다. SSR은 레이아웃 셸과 청크를 생성되는 대로 보내고, SSG는 빌드 중 청크를 합쳐 정적 파일로 제공합니다. 공개 ISR 최초 요청은 스트리밍하고 동시 요청은 완성된 결과를 기다리며 stale 결과가 있으면 즉시 받습니다. 완성된 결과만 캐시합니다. SSG·ISR 스트림은 8 MiB와 30초로 제한하며 ISR 캐시는 최대 2 MiB의 본문을 저장합니다. ISR 최초 요청이 끊겨도 다른 요청을 위해 생성이 계속될 수 있습니다. 레이아웃은 자식을 한 번 렌더링해야 하며 헤더 전송 후 오류는 스트림을 중단합니다. [예제 페이지](../../examples/basic/app/stream/page.py)를 참고하세요.
 
 ~~~python
 from pynext import h, page
@@ -164,7 +164,7 @@ async def echo(websocket: WebSocket):
         pass
 ~~~
 
-[echo 예제](../../examples/basic/app/ws/echo/route.py)를 참고하세요. WebSocket 핸들러가 없는 경로는 close 코드 1008로 핸드셰이크를 거부하고, accept 없이 반환한 핸들러는 코드 1000으로 닫힙니다. 메시지 1개는 64 KiB까지이며, 더 큰 메시지는 close 코드 1009로 거부합니다. close 코드는 1005·1006·1015를 제외한 1000~4999여야 하고 reason은 UTF-8 123바이트까지입니다. 서브프로토콜 협상, 브로드캐스트·pub/sub, 연결 간 공유 상태는 없습니다. 각 연결은 자신의 메시지만 받습니다. WebSocket 전용 `route.py`는 일반 HTTP 요청에 405로 답합니다. ASGI 어댑터와 Axum 독립 서버 모두 WebSocket을 지원하며, Axum에서는 핸들러 실행 전에 서버가 핸드셰이크를 완료하므로 `accept()`는 연결을 수락됨으로 표시만 합니다.
+[echo 예제](../../examples/basic/app/ws/echo/route.py)를 참고하세요. ASGI와 Axum에서 텍스트·바이너리 메시지를 지원합니다. 기본 상한은 64 KiB이며 `create_app(..., websocket_max_message=...)` 또는 `--ws-max-message-bytes`로 최대 16 MiB까지 설정합니다. 수신 한도 초과는 코드 1009로 닫습니다. `@websocket(protocols=("chat.v1", "chat.v2"))`는 클라이언트가 제안한 프로토콜 중 서버 우선순위에 따라 선택하며 `websocket.subprotocol`로 확인합니다. `WebSocketPubSub`의 `async with broker.subscribe(topic) as sub`, `await sub.receive()`, `await broker.publish(topic, message)`는 한 프로세스에서 제한된 큐로 메시지를 전달합니다. 느린 구독자는 `PubSubOverflow`를 받으며 워커 간 전달과 메시지 보존은 제공하지 않습니다. Axum은 핸들러 전에 핸드셰이크하므로 `accept()`는 수락 상태를 표시합니다.
 
 ## SSR, SSG, ISR
 
@@ -184,11 +184,11 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG와 ISR 페이지 함수는 `request`를 받을 수 없습니다. 공개 콘텐츠에만 사용하고 환경 변수와 외부 데이터가 공유 가능한지 확인하세요. ISR은 익명 요청의 쿼리를 캐시 키에 포함하지 않습니다. Cookie 또는 Authorization 헤더가 있으면 공유 ISR 캐시를 우회하고 `private, no-store`로 응답합니다. 기본 캐시는 크기가 제한된 **프로세스별 메모리 캐시**이므로 워커 간 공유·무효화되지 않습니다. `--cache-backend sqlite`로 시작하거나 `create_app(..., cache_backend="sqlite", cache_path=...)`로 만들면 모든 워커가 하나의 SQLite 파일(WAL)을 공유합니다. stale 재생성은 만료·소유 토큰이 있는 lease로 키마다 한 워커만 수행하고, 저장할 때 버전과 유효한 lease 소유권을 원자적으로 확인합니다. 공유 저장소 장애 시 워커별 로컬 캐시로 대체합니다. 각 워커는 공유 파일 앞에 프로세스별 캐시를 두므로, 다른 워커의 무효화는 공유 항목에 즉시 반영되지만 로컬 복사본은 남은 TTL 동안 유지될 수 있습니다. `Set-Cookie`나 `Cache-Control: private/no-store` 응답은 공유 캐시에 저장하지 않습니다. Redis 어댑터는 이후 과제이며 미구현입니다. SSG 내용을 바꾸려면 재빌드해야 합니다.
+SSG와 ISR 페이지는 `request`를 받을 수 없고 공개 콘텐츠에 사용해야 합니다. ISR은 기본적으로 쿼리를 무시합니다. `@page(render="isr", revalidate=30, query_keys=("lang",))`와 페이지 함수의 `query` 인자를 사용하면 허용한 키와 문자열 목록만 전달하고 값별로 캐시합니다. 경로 무효화는 모든 쿼리 변형에 적용됩니다. Cookie 또는 Authorization 요청은 공유 캐시를 우회하고 `private, no-store`로 응답합니다. 기본 캐시는 프로세스별이며 SQLite 또는 선택적 Redis(`pynext-framework[redis]`, `PYNEXT_REDIS_URL`)로 워커 간 공유할 수 있습니다. 공유 조회는 저장소를 확인하고 lease와 fencing으로 쓰기를 보호합니다. 저장소 장애 시 오래된 로컬 캐시로 대체할 수 있습니다. `Set-Cookie`와 private/no-store 응답은 캐시하지 않습니다. SSG 비동기 생성기는 빌드 중 소비되어 정적 파일로 제공됩니다. 내용을 바꾸려면 재빌드하세요.
 
 SSG 빌드는 최대 10,000페이지를 생성하며 개발 모드에서는 요청마다 SSG 페이지를 렌더링합니다. ISR 페이지는 `generate_static_params()`를 내보낼 수 없고 프로세스별 동시 생성 작업은 최대 128개입니다.
 
-권한을 확인한 API 핸들러에서는 `await request.revalidate("/news/example")`, 앱 인스턴스를 가진 코드에서는 `await app.revalidate(path)`를 사용할 수 있습니다. 쿼리 문자열이 없는 디코딩된 ISR 경로를 전달합니다. 캐시나 진행 중인 생성을 무효화했다면 `True`를 반환합니다. 기존 요청은 이전 생성 결과를 받을 수 있지만 그 결과가 캐시를 다시 덮어쓰지는 않습니다. 메모리 백엔드에서는 무효화가 프로세스별이며 다른 워커에 전파되지 않고, SQLite 백엔드에서는 공유 항목도 제거되지만 다른 워커의 프로세스별 복사본은 남은 TTL 동안 유지될 수 있습니다. 외부에 노출하는 엔드포인트는 인증·권한 검사가 필요합니다.
+권한을 확인한 API 핸들러에서는 `await request.revalidate("/news/example")`, 앱 인스턴스를 가진 코드에서는 `await app.revalidate(path)`를 사용할 수 있습니다. 쿼리 문자열이 없는 디코딩된 ISR 경로를 전달합니다. 캐시나 진행 중인 생성을 무효화했다면 `True`를 반환합니다. 기존 요청은 이전 생성 결과를 받을 수 있지만 그 결과가 캐시를 다시 덮어쓰지는 않습니다. 메모리 백엔드에서는 무효화가 프로세스별이며 다른 워커에 전파되지 않고, SQLite 백엔드에서는 공유 항목도 제거되며 정상 상태의 다른 워커는 다음 조회에서 이를 확인합니다. 외부에 노출하는 엔드포인트는 인증·권한 검사가 필요합니다.
 
 ## 공개 파일과 islands
 
@@ -213,13 +213,15 @@ def Page():
 
 기존 서버 DOM을 재사용하려면 서버 fallback과 `hydrate=True`를 지정하고 모듈에서 `render`, `hydrate`, `mount`를 모두 내보냅니다. [hydrated-counter.ts](../../examples/basic/islands/hydrated-counter.ts)를 참고하세요. 서버와 클라이언트 트리가 다르면 해당 island를 다시 mount하며 입력 상태나 포커스를 잃을 수 있습니다.
 
+`model_prop`를 `pynext`에서 가져와 `island("shared-model", props={"name": "Ada"}, hydrate=True, model=h("button", {"type": "button"}, "Hello ", model_prop("name")))`처럼 선언하면 서버와 브라우저가 같은 모델로 초기 DOM을 만듭니다. 모델은 element·text·fragment, 문자열 props 치환, 정적 문자열·불리언·None 속성을 지원하며 16 KiB·512노드·깊이 32로 제한됩니다. JS 모듈은 이벤트 연결 및 불일치 복구를 위해 `hydrate`, `mount`, `render`를 내보냅니다. 동적 속성·반복·클라이언트 상태 계산은 지원하지 않습니다. [서버 예제](../../examples/basic/app/shared-model/page.py)와 [클라이언트 모듈](../../examples/basic/islands/shared-model.js)을 참고하세요.
+
 활성화 기본 전략은 `load`입니다. `visible`은 화면에 들어올 때, `idle`은 유휴 콜백을 요청해 활성화합니다. idle 콜백에는 2초 timeout을 요청하지만 실제 실행은 더 늦을 수 있습니다. 관련 API가 없으면 idle 또는 타이머로 대체합니다. 이 세 전략은 활성화 전 이벤트를 재생하지 않습니다.
 
 `hydrate=True, strategy="interaction"`은 사용자가 `<button type="button">`을 클릭할 때 활성화합니다. [예제 페이지](../../examples/basic/app/interaction/page.py)와 [모듈](../../examples/basic/islands/interaction-counter.js)을 참고하세요. 로더가 해당 island에 리스너를 등록한 뒤 들어온 지원 클릭은 최대 16개를 보관해 hydration 성공 후 순서대로 재생하고 초과분은 경고 후 버립니다. 링크, 폼 제출, 입력, label 및 편집 영역의 이벤트는 가로채거나 재생하지 않습니다. 리스너 등록 전 이벤트도 보관하지 않습니다. DOM 불일치, 요소 제거 또는 활성화 실패 시 대기 이벤트는 버립니다. 재생 이벤트는 `isTrusted=false`인 합성 이벤트로 브라우저 사용자 제스처가 필요한 동작을 보장하지 않으며, island 밖 캡처 리스너는 원본과 재생 이벤트를 모두 볼 수 있습니다.
 
 ## 클라이언트 탐색
 
-클라이언트 런타임을 로드하는 페이지(island가 있는 페이지)에서는 같은 출처 링크 클릭 시 전체 새로고침 없이 이동합니다. 런타임이 대상 문서를 가져와 페이지 본문을 교체하고 `pushState`로 히스토리를 갱신하며, 뒤로/앞으로 버튼도 같은 방식으로 동작합니다. 링크는 호버, 키보드 포커스, 뷰포트 진입 시 미리 가져옵니다(최대 20개, 개당 1 MiB). 200이 아닌 응답, HTML이 아닌 응답, 가져오기 오류 등 어떤 실패가 있어도 전체 문서 이동으로 되돌아가므로 페이지가 깨지지 않습니다. `target="_blank"`나 `download`가 있는 링크, 다른 출처 링크, 같은 페이지 해시 링크는 기존 브라우저 동작을 유지하고, JavaScript가 꺼져 있을 때도 마찬가지입니다. `window.__pynextNav`에 디버깅용 `navigate`·`prefetch`·`isPrefetched`가 있습니다. island가 없는 페이지는 런타임을 로드하지 않으므로 부분 탐색이 동작하지 않습니다.
+모든 페이지가 클라이언트 런타임을 로드합니다. 같은 출처 링크는 문서 메타데이터와 CSP가 호환되면 부분 탐색하고 그렇지 않으면 전체 이동합니다. 호버·포커스·뷰포트 prefetch는 동시 4개, 응답당 1 MiB로 제한합니다. 명시적으로 공개되고 유효하며 `Vary: Cookie` 또는 `Authorization`이 없는 응답만 최대 60초, 20개까지 보관합니다. 외부 출처·다운로드·같은 페이지 해시 링크는 브라우저 기본 동작을 유지합니다. `window.__pynextNav`에서 디버깅 함수를 사용할 수 있습니다.
 
 ## Python 클라이언트 DSL (실험적)
 
@@ -235,7 +237,7 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 빌드된 앱은 `create_app(project_path, production=True)`로 만듭니다. ASGI 서버의 시간 제한은 해당 서버가 관리합니다. Axum 어댑터는 Python 응답을 최대 30초 기다린 뒤 취소를 요청하고 504를 반환합니다. 이미 스레드에서 실행 중인 동기 함수는 504 이후에도 계속 실행되어 쓰기 등의 부작용을 일으킬 수 있습니다. 쓰기 작업의 멱등성과 데이터베이스·외부 서비스의 별도 시간 제한을 확보하세요. 강제 프로세스 격리는 `--workers`(아래)로 제공하며, 단일 프로세스에는 없습니다. ISR 취소에도 같은 제한이 있습니다.
 
-워커 간 즉시 무효화 전파, 분산 요청 제한, 운영 환경 보안 강화는 미구현입니다. OpenTelemetry 스팬은 선택 패키지를 설치하고 트레이싱을 켰을 때 생성됩니다(관측성 참고). ASGI 적합성은 `tests/test_asgi_conformance.py`로 검증합니다(HTTP 이벤트 순서, 청크 분할 본문, 연결 해제, 실패 경로를 포함한 lifespan). 계획과 완료 기준은 [프로덕션 로드맵](../PRODUCTION_ROADMAP.md)을 참고하세요.
+분산 요청 제한과 운영 환경 보안 강화는 미구현입니다. SQLite 무효화는 공유 저장소가 정상일 때 다음 조회에 반영됩니다. OpenTelemetry 스팬은 선택 패키지를 설치하고 트레이싱을 켰을 때 생성됩니다(관측성 참고). ASGI 적합성은 `tests/test_asgi_conformance.py`로 검증합니다(HTTP 이벤트 순서, 청크 분할 본문, 연결 해제, 실패 경로를 포함한 lifespan). 계획과 완료 기준은 [프로덕션 로드맵](../PRODUCTION_ROADMAP.md)을 참고하세요.
 
 두 어댑터의 요청 본문은 최대 1 MiB이며 초과 시 413입니다. Axum의 기본 본문 수신 슬롯은 16개, 본문 수신 제한은 10초(408), Python 실행 슬롯은 64개입니다. 대기열은 실행 슬롯 수와 64 중 작은 값으로 제한하며 가득 차면 503입니다. 실행 및 본문 설정은 CLI에서 조정할 수 있습니다. HTTP/1.1 헤더 수신은 10초로 제한하지만 전체 연결 수는 제한하지 않습니다. 외부 ASGI 서버의 시간 제한은 해당 서버가 관리합니다. 루트가 아닌 경로의 마지막 `/`는 308로 리디렉션됩니다. 컴파일된 island는 개당 2 MiB, 전체 32 MiB 이하입니다.
 
@@ -257,7 +259,7 @@ CLI 플래그 `--structured-logs` / `--no-structured-logs`, `--metrics` / `--no-
 
 전달된 주소는 오른쪽부터 신뢰하는 프록시를 거슬러 가장 가까운 비신뢰 주소를 사용합니다. 모든 중간 프록시를 정확히 등록해야 합니다. 프로세스당 버킷은 최대 10,000개이며 모두 사용 중이면 버킷이 완전히 충전될 때까지 새 주소에 429를 반환합니다.
 
-여러 워커: `pynext start --workers 4`는 한 포트를 공유하는 워커 프로세스 4개를 띄우는 수퍼바이저를 실행합니다(SO_REUSEPORT, Unix 전용, 고정 `--port` 필요). 수퍼바이저는 종료된 워커나 하트비트가 멈춘 워커를 재시작하고, SIGINT/SIGTERM을 모든 워커에 전달해 정상 종료합니다(최대 5초, 이후 SIGKILL). 각 워커는 별도 프로세스로 인터프리터·이벤트 루프·ISR 캐시·속도 제한 버킷을 따로 가지며 상태를 공유하지 않습니다. 워커가 요청 처리 중 죽으면 그 요청은 실패하고 클라이언트가 재시도해야 합니다. 기본값은 워커 1개로 기존 단일 프로세스와 동일합니다. 이벤트 루프를 막는 핸들러는 하트비트 스레드를 멈추지 않으므로, 멈춘 핸들러는 재시작이 아니라 30초 요청 시간 제한으로 처리됩니다.
+여러 워커: `pynext start --workers 4`는 하나의 리스너를 공유하는 워커 수퍼바이저를 실행합니다. `--port 0`으로 시작하면 할당된 포트를 워커 재시작 시에도 유지합니다. 워커의 인터프리터와 이벤트 루프는 독립적이며 메모리 캐시와 기본 요청 제한은 워커별입니다. SQLite·Redis ISR과 Redis 요청 제한은 공유할 수 있습니다. 수퍼바이저가 실패한 워커를 재시작하고 종료를 조정합니다. 처리 중 중단된 요청은 실패하므로 재시도해야 합니다. 공유 리스너 워커의 실행과 재시작은 Linux·macOS·Windows CI에서 검사하며, 신호 기반 수퍼바이저 검사는 Linux·macOS에서 수행합니다.
 
 ## 테스트와 문제 해결
 
@@ -266,7 +268,7 @@ cargo test -p pynext-router -p pynext-cache
 uv run --extra dev pytest -q
 ~~~
 
-라우터와 HTML 직렬화에는 직접 고른 예제 외에 property-based 테스트도 있습니다. Python 쪽은 hypothesis(`tests/test_property_router_render.py`, 고정 시드·40개 예제로 CI를 빠르게 유지), Rust 쪽은 proptest(`crates/pynext-router`와 `crates/pynext-native` 단위 테스트, 각 64케이스)로 라우트 매칭 왕복, 이스케이프 누수 없음, void 태그 처리, 임의 트리 렌더링을 검사합니다. `embed`은 void 목록에 있지만 차단 태그 목록에도 있어 렌더링되지 않으므로 제외합니다.
+라우터와 HTML 직렬화에는 직접 고른 예제 외에 property-based 테스트도 있습니다. Python 쪽은 hypothesis(`tests/test_property_router_render.py`, 고정 시드·40개 예제로 CI를 빠르게 유지), Rust 쪽은 proptest(`crates/pynext-router`와 `crates/pynext-native` 단위 테스트, 각 64케이스)로 라우트 매칭 왕복, 이스케이프 누수 없음, void 태그 처리, 임의 트리 렌더링을 검사합니다. `embed`는 차단 태그 목록에 있어 렌더링되지 않으므로 제외합니다.
 
 ASGI 적합성은 `tests/test_asgi_conformance.py`로 검증합니다. HTTP 이벤트 순서, 다중 청크 본문과 1 MiB 크기 경계, 본문 읽기 중·느린 핸들러 실행 중 연결 해제, 실패 시 `lifespan.startup.failed`/`lifespan.shutdown.failed`를 포함한 lifespan 시작·종료, 스트리밍 응답 프레임 순서를 다룹니다. lifespan 실패 시 `.failed` 메시지를 보내는 것은 이 스위트와 함께 고친 동작입니다.
 
@@ -284,4 +286,4 @@ uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 - Windows에서는 npm esbuild를 Node로 실행합니다. `PYNEXT_ESBUILD`를 직접 설정할 때는 `.cmd`·`.bat` 대신 네이티브 `esbuild.exe`를 지정하세요.
 - 동적 SSG 경로가 404이면 `generate_static_params()`에 경로를 추가하고 재빌드합니다.
 - hydration이 일치하지 않으면 서버 fallback과 클라이언트 `render` 결과를 결정적으로 동일하게 만듭니다.
-- ISR 결과가 워커마다 다르면 캐시 백엔드를 확인합니다. 메모리 백엔드는 프로세스별이며, SQLite 백엔드에서도 각 워커의 프로세스별 복사본은 공유 무효화 후 TTL이 끝날 때까지 유지될 수 있습니다.
+- ISR 결과가 워커마다 다르면 캐시 백엔드를 확인합니다. 메모리 백엔드는 프로세스별이며, SQLite 백엔드는 공유 저장소 장애 시 프로세스별 복사본으로 대체합니다.

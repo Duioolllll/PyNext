@@ -5,6 +5,8 @@ import secrets
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote_to_bytes
 
+from .forms import parse_form
+
 
 class BadRequest(Exception):
     """A request could not be parsed or failed application validation."""
@@ -118,42 +120,40 @@ def csrf_token_from_request(request, *, config=DEFAULT_SECURITY):
     """Return the CSRF token a client submitted, or ``None``.
 
     The configured header wins; a ``csrf_token`` field in an
-    ``application/x-www-form-urlencoded`` body is the fallback.
+    URL-encoded or multipart form field is the fallback.
     """
     values = _header_values(request, config.csrf_header_name)
     if values:
         return values[0].decode("ascii", "ignore").strip() or None
     content_type = _header_values(request, "content-type")
-    if content_type and content_type[0].split(b";", 1)[0].strip().lower() == b"application/x-www-form-urlencoded":
+    if len(content_type) == 1:
         try:
-            fields = parse_qs(request.body.decode("utf-8"), keep_blank_values=True)
-        except (UnicodeDecodeError, ValueError):
+            fields = parse_form(content_type[0], request.body)
+        except (UnicodeError, ValueError):
             return None
         submitted = fields.get(config.csrf_form_field)
-        if submitted:
+        if submitted and isinstance(submitted[0], str):
             return submitted[0] or None
     return None
 
 
 def validate_csrf(request, *, config=DEFAULT_SECURITY):
-    """Check the double-submit CSRF token on a request.
+    """Check a session-bound token, or the double-submit token without sessions.
 
-    Safe methods (GET/HEAD/OPTIONS) are always allowed. Otherwise the token
-    in the ``pynext_csrf`` cookie (or the configured cookie name) must match
-    the token submitted in the header or form field, compared in constant
-    time. There is no server-side session yet, so the token is not bound to
-    a user: it proves the request came from a page that could read the
-    cookie (same origin), which is what stops cross-site forgery. An
-    attacker who can read the cookie (for example through XSS) can bypass
-    this, as with any double-submit scheme.
+    GET, HEAD and OPTIONS are exempt. Tokens are compared in constant time.
     """
     if request.method.upper() in SAFE_METHODS:
         return True
-    cookie = _cookie_value(request, config.csrf_cookie_name)
     submitted = csrf_token_from_request(request, config=config)
-    if not cookie or not submitted:
+    from .sessions import Session
+    session = request.state.get("session")
+    expected = session._csrf if isinstance(session, Session) else _cookie_value(request, config.csrf_cookie_name)
+    if not expected or not submitted:
         return False
-    return hmac.compare_digest(cookie, submitted)
+    try:
+        return hmac.compare_digest(expected, submitted)
+    except TypeError:
+        return False
 
 
 def csrf_protect(fn):
@@ -316,13 +316,17 @@ class WebSocket:
     frames/messages and enforces the per-message size limit.
     """
 
-    def __init__(self, *, receive, send, path, params=None, headers=(), query_string=b""):
+    def __init__(self, *, receive, send, path, params=None, headers=(), query_string=b"",
+                 max_message_bytes=MAX_WS_MESSAGE, subprotocol=None, offered_subprotocols=()):
         self._receive_raw = receive
         self._send_raw = send
         self.path = path
         self.params = dict(params or {})
         self.headers = tuple(headers)
         self.query_string = bytes(query_string)
+        self.max_message_bytes = max_message_bytes
+        self.subprotocol = subprotocol
+        self.offered_subprotocols = tuple(offered_subprotocols)
         self._accepted = False
         self._closed = False
 
@@ -361,12 +365,17 @@ class WebSocket:
         if not isinstance(data, str):
             raise TypeError("WebSocket text messages must be str")
         self._require_accepted()
+        if len(data.encode("utf-8")) > self.max_message_bytes:
+            raise ValueError("WebSocket message exceeds the configured limit")
         await self._send_raw(("text", data))
 
     async def send_bytes(self, data):
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError("WebSocket binary messages must be bytes")
         self._require_accepted()
+        size = data.nbytes if isinstance(data, memoryview) else len(data)
+        if size > self.max_message_bytes:
+            raise ValueError("WebSocket message exceeds the configured limit")
         await self._send_raw(("bytes", bytes(data)))
 
     async def receive(self):
@@ -412,6 +421,14 @@ class Request:
     body: bytes = b""
     params: dict = field(default_factory=dict)
     _app: object = field(default=None, repr=False, compare=False)
+    state: dict = field(default_factory=dict, compare=False)
+
+    @property
+    def resources(self):
+        """Named application resources managed by the server lifespan."""
+        if self._app is None:
+            raise RuntimeError("This request is not attached to an app")
+        return self._app.resources
 
     async def revalidate(self, path):
         """Invalidate an ISR path in the current app's process-local cache."""
@@ -433,6 +450,16 @@ class Request:
             return json.loads(self.body, parse_constant=_reject_json_constant)
         except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise BadRequest("Invalid JSON body") from exc
+
+    async def form(self):
+        """Parse a URL-encoded or multipart body as a mapping of value lists."""
+        content_types = _header_values(self, "content-type")
+        if len(content_types) != 1:
+            raise BadRequest("Expected one form Content-Type")
+        try:
+            return parse_form(content_types[0], self.body)
+        except (UnicodeError, ValueError) as exc:
+            raise BadRequest("Invalid form body") from exc
 
 
 class Response:

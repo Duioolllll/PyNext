@@ -28,7 +28,7 @@ uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 
 ## GitHub Actions
 
-CI는 **Ubuntu·macOS·Windows**에서 Python 3.13, Node.js 20, Rust, uv를 사용합니다. 포맷·Clippy·Rust/Python 테스트, 프로덕션 예제 빌드, sdist/wheel 패키징, 독립 wheel 검증, Axum/Uvicorn HTTP 스모크 벤치마크, 브라우저 테스트를 수행합니다. 의존성은 `uv sync --locked`, `npm ci`, Rust `--locked`로 검증합니다.
+CI는 **Ubuntu·macOS·Windows**에서 Python 3.13·3.14, Node.js 20, Rust, uv를 사용합니다. 포맷·Clippy·Rust/Python 테스트, 프로덕션 예제 빌드, sdist/wheel 패키징, 독립 wheel 검증, Axum/Uvicorn HTTP 스모크 벤치마크, 브라우저 테스트를 수행합니다. 의존성은 `uv sync --locked`, `npm ci`, Rust `--locked`로 검증합니다.
 
 플랫폼별 배포 파일과 서버별 벤치마크 JSON이 아티팩트로 남습니다. **CI 성공은 프로덕션 보안·대규모 처리량 보증이 아닙니다.**
 

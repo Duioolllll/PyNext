@@ -18,13 +18,15 @@ says so instead of guessing: see :data:`KNOWN_DIFFERENCES`.
 import ast
 import json
 
-__all__ = ["ClientDSLCompileError", "compile_client_dsl", "SUPPORTED", "KNOWN_DIFFERENCES"]
+__all__ = ["ClientDSLCompileError", "compile_client_dsl", "DSL_VERSION", "SUPPORTED", "KNOWN_DIFFERENCES"]
+
+DSL_VERSION = 1
 
 SUPPORTED = (
     "literals: int (within the JavaScript safe-integer range), float, str, "
-    "bool, None, list, tuple (as an array), dict (string keys)",
+    "bool, None, list, tuple (as an array), dict (literal str/int/float/bool keys, stringified)",
     "arithmetic: +, -, *, /, //, %, ** and unary -, +",
-    "comparisons: ==, !=, <, <=, >, >=, in, not in, is None, is not None",
+    "comparisons: ==, !=, <, <=, >, >=, in, not in, is None, is not None, including chains",
     "boolean ops: and, or, not (Python truthiness and operand values)",
     "if/else statements and if/else expressions",
     "for loops over range() or a list, while loops, break, continue",
@@ -46,6 +48,15 @@ KNOWN_DIFFERENCES = (
     "JavaScript safe-integer range",
     "print() writes with console.log, so its exact formatting differs",
     "dict keys are JavaScript object keys: non-string keys are stringified",
+    "tuples and lists are both represented as JavaScript arrays, so equality "
+    "and mutation cannot distinguish the two types",
+    "arithmetic results are JavaScript numbers and are not checked for "
+    "safe-integer overflow",
+    "division by zero and invalid or out-of-range indexing do not always "
+    "raise the same errors as Python",
+    "arithmetic and ordering involving strings, lists, booleans or mixed "
+    "types can follow JavaScript coercion rather than Python operator semantics",
+    "range() is materialized as an array and is limited to 100000 items",
 )
 
 
@@ -73,6 +84,13 @@ _BUILTINS = {
 }
 
 _MAX_SAFE_INTEGER = 2**53 - 1
+_JS_RESERVED = {
+    "arguments", "await", "break", "case", "catch", "class", "const", "continue", "debugger",
+    "default", "delete", "do", "else", "enum", "eval", "export", "extends", "false", "finally",
+    "for", "function", "if", "implements", "import", "in", "instanceof", "interface", "let",
+    "new", "null", "package", "private", "protected", "public", "return", "static", "super",
+    "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with", "yield",
+}
 
 _HELPERS = """\
 function __pyFloorDiv(a, b) { return Math.floor(a / b); }
@@ -94,13 +112,33 @@ function __pyStr(v) {
   return String(v);
 }
 function __pyLen(v) {
-  if (typeof v === "string" || Array.isArray(v)) return v.length;
+  if (typeof v === "string") return Array.from(v).length;
+  if (Array.isArray(v)) return v.length;
   if (typeof v === "object" && v !== null) return Object.keys(v).length;
   throw new Error("object has no len()");
 }
+function __pyEq(a, b) {
+  if (a === b) return true;
+  if ((typeof a === "number" || typeof a === "boolean") &&
+      (typeof b === "number" || typeof b === "boolean")) return Number(a) === Number(b);
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((value, index) => __pyEq(value, b[index]));
+  }
+  if (a !== null && b !== null && typeof a === "object" && typeof b === "object" &&
+      !Array.isArray(a) && !Array.isArray(b)) {
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length &&
+      keys.every(key => Object.prototype.hasOwnProperty.call(b, key) && __pyEq(a[key], b[key]));
+  }
+  return false;
+}
 function __pyContains(v, item) {
-  if (typeof v === "string" || Array.isArray(v)) return v.includes(item);
-  if (typeof v === "object" && v !== null) return item in v;
+  if (typeof v === "string") {
+    if (typeof item !== "string") throw new Error("string membership requires a string");
+    return v.includes(item);
+  }
+  if (Array.isArray(v)) return v.some(value => __pyEq(value, item));
+  if (typeof v === "object" && v !== null) return Object.prototype.hasOwnProperty.call(v, item);
   throw new Error("argument of type is not iterable");
 }
 function __pyInt(v) { return Math.trunc(Number(v)); }
@@ -108,17 +146,32 @@ function __pyRange(a, b, c) {
   let start = 0, stop = a, step = 1;
   if (b !== undefined) { start = a; stop = b; }
   if (c !== undefined) step = c;
+  if (![start, stop, step].every(Number.isSafeInteger)) throw new Error("range() requires safe integers");
+  if (step === 0) throw new Error("range() arg 3 must not be zero");
+  const count = Math.max(0, Math.ceil((stop - start) / step));
+  if (count > 100000) throw new Error("range() exceeds the DSL item limit");
   const out = [];
   if (step > 0) { for (let i = start; i < stop; i += step) out.push(i); }
   else if (step < 0) { for (let i = start; i > stop; i += step) out.push(i); }
-  else throw new Error("range() arg 3 must not be zero");
   return out;
 }
 function __pyGet(v, i) {
-  if ((Array.isArray(v) || typeof v === "string") && typeof i === "number" && i < 0) return v[v.length + i];
-  return v[i];
+  if (typeof v === "string") v = Array.from(v);
+  if (Array.isArray(v)) {
+    if (!Number.isInteger(i)) throw new Error("sequence index must be an integer");
+    if (i < 0) i += v.length;
+    if (i < 0 || i >= v.length) throw new Error("sequence index out of range");
+    return v[i];
+  }
+  if (typeof v === "object" && v !== null && Object.prototype.hasOwnProperty.call(v, i)) return v[i];
+  throw new Error("key not found");
 }
-function __pySlice(v, a, b) { return v.slice(a === null || a === undefined ? undefined : a, b === null || b === undefined ? undefined : b); }
+function __pySlice(v, a, b) {
+  const string = typeof v === "string";
+  if (string) v = Array.from(v);
+  const result = v.slice(a === null || a === undefined ? undefined : a, b === null || b === undefined ? undefined : b);
+  return string ? result.join("") : result;
+}
 """
 
 
@@ -225,8 +278,15 @@ class _Compiler:
     def check_name(self, name, node):
         if name.startswith("__py"):
             self.fail(node, "names starting with __py are reserved for the compiler")
+        if name in _SERVER_ONLY:
+            self.fail(node, f"{name!r} is server-only and cannot be compiled for the browser")
+        if name in _BUILTINS:
+            self.fail(node, f"{name!r} is a reserved DSL builtin")
+        if name in _JS_RESERVED:
+            self.fail(node, f"{name!r} is reserved in JavaScript")
 
     def function_def(self, node, indent):
+        self.check_name(node.name, node)
         if node.decorator_list:
             self.fail(node, "decorators are not supported")
         if node.args.vararg or node.args.kwarg or node.args.kwonlyargs:
@@ -360,12 +420,14 @@ class _Compiler:
     def expr_Name(self, node):
         if node.id in _SERVER_ONLY:
             self.fail(node, f"{node.id!r} is server-only and cannot be compiled for the browser")
-        self.check_name(node.id, node)
         if isinstance(node.ctx, ast.Store):
             self.fail(node, "unexpected assignment target")
         if node.id == "range":
             self.fail(node, "range() is only supported as a for-loop or comprehension iterable")
-        if not self.is_defined(node.id) and node.id not in _BUILTINS:
+        if node.id in _BUILTINS:
+            self.fail(node, "DSL builtins are only supported as direct calls")
+        self.check_name(node.id, node)
+        if not self.is_defined(node.id):
             self.fail(node, f"undefined name: {node.id!r}")
         return node.id
 
@@ -382,7 +444,7 @@ class _Compiler:
                 self.fail(node, "dict unpacking is not supported")
             if not isinstance(key, ast.Constant) or not isinstance(key.value, (str, int, float, bool)):
                 self.fail(key, "dict keys must be str, int, float or bool literals")
-            parts.append(f"{json.dumps(str(key.value), ensure_ascii=True)}: {self.expr(value)}")
+            parts.append(f"[{json.dumps(str(key.value), ensure_ascii=True)}]: {self.expr(value)}")
         return "{" + ", ".join(parts) + "}"
 
     def expr_BinOp(self, node):
@@ -423,15 +485,23 @@ class _Compiler:
         return result
 
     def expr_Compare(self, node):
-        if len(node.ops) != 1 or len(node.comparators) != 1:
-            self.fail(node, "chained comparisons are not supported")
-        left = self.expr(node.left)
-        right = self.expr(node.comparators[0])
-        op = node.ops[0]
+        # Bind each operand once and evaluate later operands only when all
+        # previous comparisons succeeded, matching Python's chained tests.
+        pieces = [f"const __pycmp0 = {self.expr(node.left)};"]
+        for index, (op, comparator) in enumerate(zip(node.ops, node.comparators), start=1):
+            right = f"__pycmp{index}"
+            left = f"__pycmp{index - 1}"
+            pieces.append(f"const {right} = {self.expr(comparator)};")
+            comparison = self._comparison(node, op, comparator, left, right)
+            pieces.append(f"if (!({comparison})) return false;")
+        pieces.append("return true;")
+        return "(() => { " + " ".join(pieces) + " })()"
+
+    def _comparison(self, node, op, comparator, left, right):
         if isinstance(op, ast.Eq):
-            return f"({left} === {right})"
+            return f"__pyEq({left}, {right})"
         if isinstance(op, ast.NotEq):
-            return f"({left} !== {right})"
+            return f"!__pyEq({left}, {right})"
         if isinstance(op, ast.Lt):
             return f"({left} < {right})"
         if isinstance(op, ast.LtE):
@@ -445,7 +515,7 @@ class _Compiler:
         if isinstance(op, ast.NotIn):
             return f"(!__pyContains({right}, {left}))"
         if isinstance(op, (ast.Is, ast.IsNot)):
-            if not (isinstance(node.comparators[0], ast.Constant) and node.comparators[0].value is None):
+            if not (isinstance(comparator, ast.Constant) and comparator.value is None):
                 self.fail(node, "only 'is None' / 'is not None' are supported")
             return f"({left} === null)" if isinstance(op, ast.Is) else f"({left} !== null)"
         self.fail(node, f"comparison {type(op).__name__} is not supported")
@@ -460,7 +530,8 @@ class _Compiler:
         if isinstance(node.func, ast.Attribute):
             if node.func.attr != "append" or len(node.args) != 1:
                 self.fail(node, "only .append(value) method calls are supported")
-            return f"{self.expr(node.func.value)}.push({self.expr(node.args[0])})"
+            return (f"((__pylist, __pyvalue) => {{ __pylist.push(__pyvalue); return null; }})"
+                    f"({self.expr(node.func.value)}, {self.expr(node.args[0])})")
         if not isinstance(node.func, ast.Name):
             self.fail(node, "only plain function calls are supported")
         name = node.func.id
@@ -506,7 +577,7 @@ class _Compiler:
                 self.fail(node, "only dict() with no arguments is supported")
             return "{}"
         if name == "print":
-            return f"console.log({args})"
+            return f"(console.log({args}), null)"
         if self.is_defined(name):
             return f"{name}({args})"
         self.fail(node, f"{name!r} is not in the supported subset")

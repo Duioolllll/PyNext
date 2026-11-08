@@ -1,3 +1,4 @@
+from conftest import page_html
 import asyncio
 import gc
 import importlib
@@ -52,8 +53,8 @@ def test_relative_imports_are_isolated_between_apps_and_do_not_change_sys_path(t
     async def run():
         for app, message in ((app_one, "one"), (app_two, "two")):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-                assert (await client.get("/")).text == f"<p>{message}:{message}</p>"
-                assert (await client.get("/docs/one/two")).text == "<p>docs</p>"
+                assert (await client.get("/")).text == page_html(f"<p>{message}:{message}</p>")
+                assert (await client.get("/docs/one/two")).text == page_html("<p>docs</p>")
             await app.isr.close()
     asyncio.run(run())
 

@@ -300,10 +300,39 @@ def test_observability_config_from_env(monkeypatch):
 
 # -- tracing ---------------------------------------------------------------
 
-def test_tracing_is_noop_without_opentelemetry():
-    assert is_tracing_available() is False
-    with span("pynext.request", {"http.method": "GET"}, enabled=True) as active:
-        active.set_attribute("http.status_code", 200)  # must not raise
+def test_tracing_is_noop_without_opentelemetry(monkeypatch):
+    import importlib
+    original = importlib.import_module
+
+    def unavailable(name, *args, **kwargs):
+        if name == "opentelemetry.trace":
+            raise ImportError("not installed")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", unavailable)
+    _reset_otel_cache()
+    try:
+        assert is_tracing_available() is False
+        with span("pynext.request", {"http.method": "GET"}, enabled=True) as active:
+            active.set_attribute("http.status_code", 200)
+    finally:
+        _reset_otel_cache()
+
+
+def test_request_without_traceparent_clears_inherited_otel_context():
+    from pynext.observability import _otel_context_var
+
+    outer = object()
+    token = _otel_context_var.set(outer)
+    try:
+        _, reset = begin_request_context([])
+        try:
+            assert _otel_context_var.get() is None
+        finally:
+            reset()
+        assert _otel_context_var.get() is outer
+    finally:
+        _otel_context_var.reset(token)
 
 
 def test_span_creation_with_fake_opentelemetry(monkeypatch):
@@ -355,6 +384,61 @@ def test_span_creation_with_fake_opentelemetry(monkeypatch):
         assert request_span.attributes["http.route"] == "/"
     finally:
         _reset_otel_cache()
-        for name in ("opentelemetry", "opentelemetry.trace", "opentelemetry.propagate"):
-            sys.modules.pop(name, None)
-        assert is_tracing_available() is False
+
+
+@pytest.mark.parametrize("mode", ["asgi", "axum"])
+def test_real_opentelemetry_preserves_parentage_and_handler_errors(tmp_path, monkeypatch, mode):
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(trace, "get_tracer", lambda name: provider.get_tracer(name))
+    _reset_otel_cache()
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "page.py").write_text(
+        'from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "ok")\n'
+    )
+    error_dir = app_dir / "error"
+    error_dir.mkdir()
+    (error_dir / "route.py").write_text(
+        'from pynext import route\n@route("GET")\ndef get(): raise ValueError("expected error")\n'
+    )
+
+    async def run():
+        app = create_app(tmp_path, observability=ObservabilityConfig(tracing=True))
+        server = None
+        if mode == "asgi":
+            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+        else:
+            server = start_native(app, asyncio.get_running_loop(), port=0)
+            client = httpx.AsyncClient(base_url=f"http://{server.address}", trust_env=False)
+        try:
+            async with client:
+                response = await client.get("/", headers={
+                    "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+                })
+                assert response.status_code == 200
+                assert (await client.get("/error")).status_code == 500
+        finally:
+            if server is not None:
+                await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    try:
+        _run(run())
+        spans = exporter.get_finished_spans()
+        request_span = next(item for item in spans if item.name == "pynext.request"
+                            and item.context.trace_id == int("0123456789abcdef0123456789abcdef", 16))
+        render_span = next(item for item in spans if item.name == "pynext.render"
+                           and item.context.trace_id == request_span.context.trace_id)
+        assert request_span.parent.span_id == int("0123456789abcdef", 16)
+        assert render_span.parent.span_id == request_span.context.span_id
+        assert any(item.name == "pynext.request" and item.attributes.get("http.status_code") == 500
+                   for item in spans)
+    finally:
+        provider.shutdown()
+        _reset_otel_cache()

@@ -45,6 +45,46 @@ async def get_first_http1_chunk(reader, writer):
     return chunk[:-2]
 
 
+def test_native_stream_waits_for_cleanup_before_ending_response(tmp_path):
+    async def run():
+        cleanup_started, release_cleanup = asyncio.Event(), asyncio.Event()
+
+        class Chunks:
+            sent = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.sent:
+                    raise StopAsyncIteration
+                self.sent = True
+                return b"chunk"
+
+            async def aclose(self):
+                cleanup_started.set()
+                await release_cleanup.wait()
+
+        async def handler():
+            return StreamingResponse(Chunks())
+
+        app = make_app(tmp_path, handler)
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", trust_env=False) as client:
+                request = asyncio.create_task(client.get("/stream"))
+                await asyncio.wait_for(cleanup_started.wait(), 5)
+                await asyncio.sleep(0.05)
+                assert not request.done()
+                release_cleanup.set()
+                assert (await asyncio.wait_for(request, 5)).content == b"chunk"
+        finally:
+            release_cleanup.set()
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())
+
+
 def test_native_stream_disconnect_releases_handler_capacity(tmp_path):
     async def run():
         started, closed = asyncio.Event(), asyncio.Event()

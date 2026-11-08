@@ -17,11 +17,11 @@ NODE = shutil.which("node")
 
 
 def run_node(js):
-    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as handle:
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False, encoding="utf-8") as handle:
         handle.write(js)
         path = handle.name
     try:
-        result = subprocess.run([NODE, path], capture_output=True, text=True, timeout=15)
+        result = subprocess.run([NODE, path], capture_output=True, text=True, encoding="utf-8", timeout=15)
     finally:
         Path(path).unlink(missing_ok=True)
     assert result.returncode == 0, result.stderr
@@ -153,6 +153,55 @@ def test_conversions_and_functions():
     ])
 
 
+def test_chained_comparisons_short_circuit_and_evaluate_once():
+    source = (
+        "def record(seen, value):\n"
+        "    seen.append(value)\n"
+        "    return value\n"
+        "def chain(last):\n"
+        "    seen = []\n"
+        "    result = record(seen, 1) < record(seen, 2) < record(seen, last)\n"
+        "    return [result, seen]\n"
+        "def stopped():\n"
+        "    seen = []\n"
+        "    result = record(seen, 2) < record(seen, 1) < record(seen, 3)\n"
+        "    return [result, seen]\n"
+    )
+    check(source, [("chain(3)", "chain(3)"), ("chain(0)", "chain(0)"), ("stopped()", "stopped()")])
+
+
+def test_collection_equality_membership_and_unicode_match_python():
+    source = (
+        "def values():\n"
+        "    d = {'__proto__': [1, 2], 'x': {'a': True}}\n"
+        "    return [d == {'x': {'a': 1}, '__proto__': [1, 2]}, [1, [2]] == [1, [2]],\n"
+        "            [1] in [[1], [2]], 'toString' in d, '__proto__' in d, d['__proto__'],\n"
+        "            len('a😀b'), 'a😀b'[1], 'a😀b'[-2:], True == 1]\n"
+    )
+    check(source, [("values()", "values()")])
+
+
+def test_append_expression_returns_none_and_indices_obey_bounds():
+    source = (
+        "def appended():\n"
+        "    values = [1]\n"
+        "    result = values.append(2)\n"
+        "    return [result is None, values[-1]]\n"
+    )
+    check(source, [("appended()", "appended()")])
+    if NODE is None:
+        pytest.skip("node is required for DSL boundary tests")
+    js = compile_client_dsl("def get(xs):\n    return xs[3]\n")
+    assert run_node(js + "\ntry { get([1]); } catch (error) { console.log('out-of-range'); }") == "out-of-range"
+
+
+def test_range_is_bounded_before_allocating():
+    if NODE is None:
+        pytest.skip("node is required for DSL boundary tests")
+    js = compile_client_dsl("def values():\n    return [x for x in range(100001)]\n")
+    assert run_node(js + "\ntry { values(); } catch (error) { console.log('bounded'); }") == "bounded"
+
+
 @pytest.mark.parametrize("source,match", [
     ("import os\n", "not in the supported subset"),
     ("x = open('f')\n", "server-only"),
@@ -173,6 +222,12 @@ def test_conversions_and_functions():
     ("x = 9007199254740993\n", "safe-integer range"),
     ("x = 1 is 2\n", "only 'is None'"),
     ("x = 1\nx += 1\ndef f():\n    global x\n", "not in the supported subset"),
+    ("def __pyBool(x):\n    return x\n", "reserved for the compiler"),
+    ("let = 1\n", "reserved in JavaScript"),
+    ("def widget(interface):\n    return interface\n", "reserved in JavaScript"),
+    ("open = 'local'\n", "server-only"),
+    ("def widget(len):\n    return len\n", "reserved DSL builtin"),
+    ("f = len\n", "only supported as direct calls"),
 ])
 def test_unsupported_constructs_fail_compile(source, match):
     with pytest.raises(ClientDSLCompileError, match=match):

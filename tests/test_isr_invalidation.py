@@ -1,3 +1,4 @@
+from conftest import page_html
 import asyncio
 
 import httpx
@@ -126,11 +127,11 @@ def test_request_revalidation_invalidates_the_shared_local_native_store(tmp_path
             client = httpx.AsyncClient(base_url=f"http://{server.address}", timeout=10)
         try:
             async with client:
-                assert (await client.get("/news/a")).text == "<p>1</p>"
-                assert (await client.get("/news/a")).text == "<p>1</p>"
+                assert (await client.get("/news/a")).text == page_html("<p>1</p>")
+                assert (await client.get("/news/a")).text == page_html("<p>1</p>")
                 assert (await client.post("/api/purge")).json() == {"removed": True}
                 assert (await client.post("/api/purge")).json() == {"removed": False}
-                assert (await client.get("/news/a")).text == "<p>2</p>"
+                assert (await client.get("/news/a")).text == page_html("<p>2</p>")
                 with pytest.raises(ValueError, match="does not match an ISR page"):
                     await app.revalidate("/missing")
                 with pytest.raises(ValueError, match="does not match an ISR page"):

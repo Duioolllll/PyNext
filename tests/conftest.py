@@ -4,6 +4,12 @@ from pathlib import Path
 import pytest
 
 
+def page_html(content):
+    """Expected fragment page including the shared navigation runtime."""
+    from pynext.client import PREFIX, _digest, _runtime_bytes
+    return f'{content}<script type="module" src="{PREFIX}{_digest(_runtime_bytes())}.js"></script>'
+
+
 @pytest.fixture
 def esbuild(monkeypatch):
     root = Path(__file__).resolve().parents[1]

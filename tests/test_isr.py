@@ -1,3 +1,4 @@
+from conftest import page_html
 import asyncio
 import math
 
@@ -53,7 +54,7 @@ def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
                 assert module.calls == 1
                 module.gate.set()
                 results = await asyncio.gather(*requests)
-                assert {r.text for r in results} == {"<p>alpha:1</p>"}
+                assert {r.text for r in results} == {page_html("<p>alpha:1</p>")}
                 assert all(r.status_code == 200 for r in results)
                 assert (await client.post("/blog/alpha")).status_code == 405
 
@@ -86,7 +87,7 @@ def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
                 assert module.calls == previous_calls + 1
                 module.gate.set()
                 await until(lambda: app.isr.store.lookup("/blog/alpha")[0] == "fresh")
-                assert (await client.get("/blog/alpha")).text == f"<p>alpha:{previous_calls + 1}</p>"
+                assert (await client.get("/blog/alpha")).text == page_html(f"<p>alpha:{previous_calls + 1}</p>")
                 await until(lambda: "/blog/alpha" not in app.isr._inflight)
 
                 # Failure keeps the old response only until the stale window expires.
@@ -163,15 +164,15 @@ def test_isr_policy_drives_real_expiration_and_regeneration(tmp_path):
         app = create_app(tmp_path, production=True)
         module = app._module("app/blog/[slug]/page.py")
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            assert (await client.get("/blog/policy")).text == "<p>policy:1</p>"
+            assert (await client.get("/blog/policy")).text == page_html("<p>policy:1</p>")
             await until(lambda: app.isr.store.lookup("/blog/policy")[0] == "stale")
             module.started, module.gate = asyncio.Event(), asyncio.Event()
-            assert (await client.get("/blog/policy")).text == "<p>policy:1</p>"
+            assert (await client.get("/blog/policy")).text == page_html("<p>policy:1</p>")
             await asyncio.wait_for(module.started.wait(), 3)
             assert module.calls == 2
             module.gate.set()
             await until(lambda: "/blog/policy" not in app.isr._inflight)
-            assert app.isr.store.lookup("/blog/policy") == ("fresh", b"<p>policy:2</p>")
+            assert app.isr.store.lookup("/blog/policy") == ("fresh", page_html("<p>policy:2</p>").encode())
         await app.isr.close()
     asyncio.run(run())
 
@@ -207,15 +208,15 @@ def test_isr_shared_render_does_not_inherit_request_context(tmp_path):
         module.identity.set("private-data")
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             private = await client.get("/", headers={"cookie": "session=x"})
-            assert private.text == "<p>private-data</p>"
+            assert private.text == page_html("<p>private-data</p>")
             assert private.headers["cache-control"] == "private, no-store"
             assert private.headers["vary"] == "Cookie, Authorization"
             assert app.isr.store.lookup("/")[0] == "miss"
             public = await client.get("/")
-            assert public.text == "<p>public</p>"
+            assert public.text == page_html("<p>public</p>")
             assert public.headers["cache-control"] == "public, max-age=0, must-revalidate"
             assert public.headers["vary"] == "Cookie, Authorization"
-            assert app.isr.store.lookup("/")[1] == b"<p>public</p>"
+            assert app.isr.store.lookup("/")[1] == page_html("<p>public</p>").encode()
         await app.isr.close()
     asyncio.run(run())
 

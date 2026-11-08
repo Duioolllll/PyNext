@@ -26,7 +26,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tokio::sync::{mpsc as tokio_mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tower_service::Service as TowerService;
 
 #[pyclass(name = "Router")]
@@ -223,6 +223,20 @@ fn render_node(
             output.push_str(strategy);
             output.push_str("\" data-pynext-props=\"");
             escape(&props, output);
+            if let Some(model) = obj.get("model") {
+                if !hydrate
+                    || model.get("version").and_then(Value::as_u64) != Some(1)
+                    || !model.get("tree").is_some_and(Value::is_object)
+                {
+                    return Err("Invalid shared island model".into());
+                }
+                let model = serde_json::to_string(model).map_err(|e| e.to_string())?;
+                if model.len() > 16_512 {
+                    return Err("Shared island model exceeds maximum size".into());
+                }
+                output.push_str("\" data-pynext-model=\"");
+                escape(&model, output);
+            }
             output.push_str("\">");
             for child in obj
                 .get("children")
@@ -244,6 +258,15 @@ fn render_node(
             output.push_str("<script type=\"module\" src=\"");
             escape(src, output);
             output.push('"');
+            if let Some(id) = obj.get("dev_id") {
+                let id = id.as_str().ok_or("Invalid development server ID")?;
+                if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err("Invalid development server ID".into());
+                }
+                output.push_str(" data-pynext-dev=\"");
+                escape(id, output);
+                output.push('"');
+            }
             // A per-request nonce lets the CSP header allow this script
             // without opening script-src to every inline script. The nonce
             // is validated in render(); only the token characters produced
@@ -327,7 +350,6 @@ fn render_node(
                     | "base"
                     | "br"
                     | "col"
-                    | "embed"
                     | "hr"
                     | "img"
                     | "input"
@@ -388,8 +410,12 @@ struct ServerState {
     client_assets: HashMap<String, Bytes>,
     asset_etags: HashMap<String, HeaderValue>,
     isr_cache: Arc<PageCache>,
+    middleware_enabled: bool,
+    shared_cache_enabled: bool,
     websocket_router: Router,
     websocket_paths: std::collections::HashSet<String>,
+    websocket_protocols: HashMap<String, Vec<String>>,
+    websocket_max_message: usize,
     ws_callback: Option<Py<PyAny>>,
 }
 
@@ -818,11 +844,6 @@ fn close_with_unread_body(
     response
 }
 
-/// Maximum size of one WebSocket message (text in UTF-8 bytes, or binary),
-/// matching the Python `MAX_WS_MESSAGE` limit. Larger messages are refused
-/// with close code 1009 on both adapters.
-const MAX_WS_MESSAGE: usize = 65_536;
-
 enum WsOutgoing {
     Accept,
     Text(String),
@@ -840,19 +861,22 @@ enum WsPush {
 /// Run one short Python call on a blocking thread and wait for it. Used for
 /// the session queue operations, which must not run on a Tokio worker thread
 /// (they take the GIL and, for `_take_outgoing`, wait on the Python loop).
-async fn ws_call(session: &Arc<Py<PyAny>>, method: &'static str, arg: WsPush) {
+async fn ws_call(session: &Arc<Py<PyAny>>, method: &'static str, arg: WsPush) -> bool {
     let session = Arc::clone(session);
-    let _ = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         Python::with_gil(|py| {
             let bound = session.bind(py);
-            let _ = match arg {
+            match arg {
                 WsPush::Text(text) => bound.call_method1(method, (text,)),
                 WsPush::Bytes(data) => bound.call_method1(method, (data,)),
                 WsPush::None => bound.call_method0(method),
-            };
+            }
+            .map(|value| value.extract::<bool>().unwrap_or(true))
+            .unwrap_or(false)
         })
     })
-    .await;
+    .await
+    .unwrap_or(false)
 }
 
 async fn ws_is_done(session: &Arc<Py<PyAny>>) -> bool {
@@ -924,6 +948,7 @@ async fn run_ws_session(
     path: String,
     query: Vec<u8>,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
+    protocol: Option<String>,
     mut socket: WebSocket,
 ) {
     let Some(ws_callback) =
@@ -936,7 +961,9 @@ async fn run_ws_session(
     };
     let session = tokio::task::spawn_blocking(move || {
         Python::with_gil(|py| {
-            let session = ws_callback.bind(py).call1((path, query, headers))?;
+            let session = ws_callback
+                .bind(py)
+                .call1((path, query, headers, protocol))?;
             Ok::<_, PyErr>(session.unbind())
         })
     })
@@ -963,22 +990,30 @@ async fn run_ws_session(
             message = socket.recv() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
-                        if text.len() > MAX_WS_MESSAGE {
+                        if text.len() > state.websocket_max_message {
                             let _ = socket.send(ws_close_frame(1009, "message too large")).await;
                             sent_close = true;
                             ws_call(&session, "_push_disconnect", WsPush::None).await;
                             break;
                         }
-                        ws_call(&session, "_push_text", WsPush::Text(text.to_string())).await;
+                        if !ws_call(&session, "_push_text", WsPush::Text(text.to_string())).await {
+                            let _ = socket.send(ws_close_frame(1013, "receiver overloaded")).await;
+                            sent_close = true;
+                            break;
+                        }
                     }
                     Some(Ok(Message::Binary(data))) => {
-                        if data.len() > MAX_WS_MESSAGE {
+                        if data.len() > state.websocket_max_message {
                             let _ = socket.send(ws_close_frame(1009, "message too large")).await;
                             sent_close = true;
                             ws_call(&session, "_push_disconnect", WsPush::None).await;
                             break;
                         }
-                        ws_call(&session, "_push_bytes", WsPush::Bytes(data.to_vec())).await;
+                        if !ws_call(&session, "_push_bytes", WsPush::Bytes(data.to_vec())).await {
+                            let _ = socket.send(ws_close_frame(1013, "receiver overloaded")).await;
+                            sent_close = true;
+                            break;
+                        }
                     }
                     Some(Ok(Message::Close(_frame))) => {
                         // Tungstenite queues an automatic close reply when
@@ -1066,11 +1101,10 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         let Some(path) = static_path(parts.uri.path()) else {
             return plain_response(StatusCode::NOT_FOUND, "Not Found");
         };
-        let is_websocket_route = state
-            .websocket_router
-            .matches(&path)
-            .is_some_and(|(pattern, _)| state.websocket_paths.contains(&pattern));
-        if !is_websocket_route {
+        let Some((pattern, _)) = state.websocket_router.matches(&path) else {
+            return plain_response(StatusCode::NOT_FOUND, "Not Found");
+        };
+        if !state.websocket_paths.contains(&pattern) {
             return plain_response(StatusCode::NOT_FOUND, "Not Found");
         }
         let mut parts = parts;
@@ -1083,7 +1117,22 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         // Bound the protocol-level message size as well as the application
         // limit enforced in run_ws_session; tungstenite otherwise allows
         // up to 64 MiB per message.
-        let upgrade = upgrade.max_message_size(MAX_WS_MESSAGE);
+        let requested = upgrade.requested_protocols().next().is_some();
+        let protocols = state
+            .websocket_protocols
+            .get(&pattern)
+            .cloned()
+            .unwrap_or_default();
+        let has_protocols = !protocols.is_empty();
+        let upgrade = upgrade.protocols(protocols);
+        let protocol = upgrade
+            .selected_protocol()
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if has_protocols && requested && protocol.is_none() {
+            return plain_response(StatusCode::BAD_REQUEST, "Unsupported WebSocket subprotocol");
+        }
+        let upgrade = upgrade.max_message_size(state.websocket_max_message);
         let query = parts.uri.query().unwrap_or("").as_bytes().to_vec();
         let headers: Vec<(Vec<u8>, Vec<u8>)> = parts
             .headers
@@ -1092,7 +1141,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             .collect();
         let state = Arc::clone(&state);
         return upgrade.on_upgrade(move |socket| async move {
-            run_ws_session(state, path, query, headers, socket).await;
+            run_ws_session(state, path, query, headers, protocol, socket).await;
         });
     }
     if conflicting_content_length(&parts.headers) {
@@ -1134,7 +1183,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             }
         }
     };
-    if parts.method == axum::http::Method::GET || parts.method == axum::http::Method::HEAD {
+    if !state.middleware_enabled
+        && (parts.method == axum::http::Method::GET || parts.method == axum::http::Method::HEAD)
+    {
         if let Some(path) = static_path(parts.uri.path()) {
             if let Some(content) = state.client_assets.get(&path) {
                 return static_response(
@@ -1175,7 +1226,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     },
                 );
             }
-            if !parts.headers.contains_key("authorization") && !parts.headers.contains_key("cookie")
+            if !state.shared_cache_enabled
+                && !parts.headers.contains_key("authorization")
+                && !parts.headers.contains_key("cookie")
             {
                 if let CacheResult::Fresh(content) = state.isr_cache.lookup(&path) {
                     let length = content.len();
@@ -1347,12 +1400,8 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for HyperSer
 // timeout, which only starts once headers are complete.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Bind a listener with SO_REUSEPORT so several supervisor workers can
-/// share one port and the kernel load-balances connections between them
-/// (finding #52). SO_REUSEPORT is Unix-only: on other platforms the
-/// supervisor cannot share a port this way and `reuse_port` is rejected
-/// instead of silently falling back to a bind that would fail on the
-/// second worker with "address already in use".
+/// Optional SO_REUSEPORT binding for callers on Unix. The supervisor uses
+/// a shared listening socket instead, including on Windows.
 #[cfg(unix)]
 fn bind_reuse_port(host: &str, port: u16) -> std::io::Result<std::net::TcpListener> {
     use std::net::ToSocketAddrs;
@@ -1378,6 +1427,42 @@ fn bind_reuse_port(_host: &str, _port: u16) -> std::io::Result<std::net::TcpList
     ))
 }
 
+#[cfg(unix)]
+fn take_python_listener(py: Python<'_>, listener: Py<PyAny>) -> PyResult<std::net::TcpListener> {
+    use std::os::fd::FromRawFd;
+    let socket_type = py.import("socket")?.getattr("socket")?;
+    let listener = listener.bind(py);
+    if !listener.is_instance(&socket_type)? {
+        return Err(PyValueError::new_err("listener must be a socket.socket"));
+    }
+    let fd = listener.call_method0("detach")?.extract::<i32>()?;
+    if fd < 0 {
+        return Err(PyValueError::new_err("listener socket is closed"));
+    }
+    // Python's detach transfers sole ownership of this duplicated descriptor.
+    Ok(unsafe { std::net::TcpListener::from_raw_fd(fd) })
+}
+
+#[cfg(windows)]
+fn take_python_listener(py: Python<'_>, listener: Py<PyAny>) -> PyResult<std::net::TcpListener> {
+    use std::os::windows::io::{FromRawSocket, RawSocket};
+    let socket_type = py.import("socket")?.getattr("socket")?;
+    let listener = listener.bind(py);
+    if !listener.is_instance(&socket_type)? {
+        return Err(PyValueError::new_err("listener must be a socket.socket"));
+    }
+    let socket = listener.call_method0("detach")?.extract::<RawSocket>()?;
+    // Python's detach transfers sole ownership of this duplicated socket.
+    Ok(unsafe { std::net::TcpListener::from_raw_socket(socket) })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn take_python_listener(_py: Python<'_>, _listener: Py<PyAny>) -> PyResult<std::net::TcpListener> {
+    Err(PyValueError::new_err(
+        "shared listeners are unavailable on this platform",
+    ))
+}
+
 #[pyclass]
 struct NativeServer {
     shutdown: Option<oneshot::Sender<()>>,
@@ -1389,9 +1474,10 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         callback: Py<PyAny>,
         host: &str,
         port: u16,
@@ -1408,8 +1494,18 @@ impl NativeServer {
         websocket_callback: Option<Py<PyAny>>,
         reuse_port: bool,
         route_patterns: Option<Vec<String>>,
+        middleware_enabled: bool,
+        shared_cache_enabled: bool,
+        websocket_protocols: Option<HashMap<String, Vec<String>>>,
+        websocket_max_message: usize,
+        listener: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let websocket_paths = websocket_paths.unwrap_or_default();
+        if websocket_max_message == 0 || websocket_max_message > 16 * 1024 * 1024 {
+            return Err(PyValueError::new_err(
+                "websocket_max_message is outside the supported range",
+            ));
+        }
         // Route against the complete application trie first. A static HTTP
         // route must still shadow a dynamic WebSocket route.
         let websocket_router =
@@ -1466,7 +1562,9 @@ impl NativeServer {
                 ))
             })
             .collect::<PyResult<HashMap<_, _>>>()?;
-        let listener = if reuse_port {
+        let listener = if let Some(listener) = listener {
+            take_python_listener(py, listener)?
+        } else if reuse_port {
             bind_reuse_port(host, port)
                 .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?
         } else {
@@ -1530,8 +1628,12 @@ impl NativeServer {
                         .collect(),
                     asset_etags,
                     isr_cache,
+                    middleware_enabled,
+                    shared_cache_enabled,
                     websocket_router,
                     websocket_paths: websocket_paths.into_iter().collect(),
+                    websocket_protocols: websocket_protocols.unwrap_or_default(),
+                    websocket_max_message,
                     ws_callback: websocket_callback,
                 });
                 let app = AxumRouter::new().fallback(any(dispatch)).with_state(state);
@@ -1539,6 +1641,7 @@ impl NativeServer {
                     let _ = rx.await;
                 });
                 let mut connections = tokio::task::JoinSet::new();
+                let (connection_shutdown, _) = watch::channel(false);
                 loop {
                     tokio::select! {
                         _ = &mut shutdown => break,
@@ -1554,6 +1657,7 @@ impl NativeServer {
                                 router: app.clone(),
                                 peer_addr: Some(peer_addr),
                             };
+                            let mut stop_connection = connection_shutdown.subscribe();
                             // Auto-detect the protocol per connection: a
                             // client that opens with the HTTP/2
                             // prior-knowledge preface (`PRI * HTTP/2.0`) is
@@ -1572,14 +1676,22 @@ impl NativeServer {
                                 // connection: plain serve_connection leaves
                                 // the upgrade future failing with "upgrade
                                 // expected but low level API in use".
-                                let _ = builder
-                                    .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                                    .await;
+                                let connection = builder
+                                    .serve_connection_with_upgrades(TokioIo::new(stream), service);
+                                tokio::pin!(connection);
+                                tokio::select! {
+                                    _ = &mut connection => {}
+                                    _ = stop_connection.changed() => {
+                                        connection.as_mut().graceful_shutdown();
+                                        let _ = connection.await;
+                                    }
+                                }
                             });
                         }
                         _ = connections.join_next(), if !connections.is_empty() => {}
                     }
                 }
+                let _ = connection_shutdown.send(true);
                 // Drain in-flight connections, bounded so `stop()` cannot
                 // hang on a stuck connection.
                 let _ = tokio::time::timeout(Duration::from_secs(30), async {

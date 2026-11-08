@@ -1,9 +1,8 @@
 """Multi-worker supervisor (spec v0.2 §8.4 and §15 M4, finding #52).
 
-The supervisor is a plain parent process: it spawns ``workers`` child
-processes, each running one ``serve()`` on the same host and port (the
-Rust listener uses SO_REUSEPORT, so the kernel balances connections
-between workers), and watches them. A worker that exits — crash, kill,
+The supervisor is a plain parent process: it binds one listening socket,
+spawns ``workers`` child processes that accept from duplicated copies of
+that socket, and watches them. A worker that exits — crash, kill,
 or a failed in-flight request that takes the process down — is restarted
 automatically, so one worker's failure never takes the server down. A
 worker whose heartbeat goes stale is killed and restarted the same way;
@@ -13,8 +12,8 @@ outside Python). A handler that merely blocks the event loop does not
 stop the heartbeat: that case is still bounded by the 30-second request
 timeout, not by a restart.
 
-Graceful shutdown: SIGINT/SIGTERM to the supervisor is forwarded as
-SIGTERM to every worker; workers finish their current ``serve()``
+Graceful shutdown: SIGINT/SIGTERM to the supervisor signals every worker;
+workers finish their current ``serve()``
 shutdown (stop accepting, stop the native server, close the ISR cache)
 and the supervisor waits up to ``SHUTDOWN_TIMEOUT`` seconds before
 SIGKILLing stragglers.
@@ -29,20 +28,19 @@ Scope and limits, stated plainly:
 - The supervisor does not proxy or route requests: if a worker dies
   mid-request, that request fails (the connection drops) and the client
   must retry. Only the *server* survives, not the in-flight request.
-- SO_REUSEPORT is Unix-only. ``--workers`` greater than 1 on
-  non-Unix platforms fails at startup instead of silently running one
-  worker. ``--port 0`` cannot be shared by workers, so a fixed port is
-  required with ``--workers`` greater than 1.
+- The parent retains the listener, including a dynamically assigned port,
+  so replacements accept on the same address after a restart.
 - The default is one worker, which is exactly the historical
-  single-process path: no supervisor process, no SO_REUSEPORT.
+  single-process path: no supervisor process or shared listener.
 """
 import logging
 import multiprocessing
 import os
 import signal
+import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 log = logging.getLogger("pynext.supervisor")
 
@@ -67,12 +65,15 @@ class WorkerConfig:
     body_timeout_ms: int
     rate_limit: int = 0  # 0 disables rate limiting
     rate_limit_window: float = 60.0
+    rate_limit_backend: str = "memory"
     trusted_proxies: tuple = ()
     # Shared-cache / observability settings, forwarded to each worker's
     # create_app so multi-worker mode honours them (finding #42/#45).
     cache_backend: str = "memory"
     cache_path: str | None = None
     observability: object = None  # ObservabilityConfig or None
+    security: object = None  # SecurityConfig or None
+    websocket_max_message: int = 65_536
 
 
 def _heartbeat_loop(stop, heartbeat):
@@ -80,21 +81,26 @@ def _heartbeat_loop(stop, heartbeat):
         heartbeat.value = time.monotonic()
 
 
-def _worker_main(config, ready, heartbeat):
+def _worker_main(config, ready, heartbeat, shutdown, listener):
     """Run one worker process. Top-level so the spawn start method can import it."""
     import asyncio
 
     from .app import create_app
     from .ratelimit import RateLimiter
+    from .redis_rate import RedisRateLimiter
     from .server import serve
 
     limiter = None
     if config.rate_limit:
-        limiter = RateLimiter(config.rate_limit, config.rate_limit_window,
-                              trusted_proxies=config.trusted_proxies)
+        limiter_type = RedisRateLimiter if config.rate_limit_backend == "redis" else RateLimiter
+        options = ({"namespace": os.environ.get("PYNEXT_RATE_LIMIT_NAMESPACE", "default")}
+                   if config.rate_limit_backend == "redis" else {})
+        limiter = limiter_type(config.rate_limit, config.rate_limit_window,
+                               trusted_proxies=config.trusted_proxies, **options)
     app = create_app(config.root, production=config.production, rate_limit=limiter,
                      cache_backend=config.cache_backend, cache_path=config.cache_path,
-                     observability=config.observability)
+                     observability=config.observability, debug=not config.production,
+                     security=config.security, websocket_max_message=config.websocket_max_message)
 
     async def run():
         loop = asyncio.get_running_loop()
@@ -103,20 +109,26 @@ def _worker_main(config, ready, heartbeat):
             try:
                 loop.add_signal_handler(sig, stop_event.set)
             except (NotImplementedError, RuntimeError):
-                # Non-Unix loops cannot add signal handlers; the process
-                # then dies on the signal, and the supervisor restarts it.
+                # The shared shutdown event also works on Windows loops.
                 pass
         heartbeat_stop = threading.Event()
         heartbeat_thread = threading.Thread(target=_heartbeat_loop, args=(heartbeat_stop, heartbeat),
                                             daemon=True)
         heartbeat_thread.start()
+        async def watch_shutdown():
+            while not shutdown.is_set():
+                await asyncio.sleep(0.1)
+            stop_event.set()
+        shutdown_task = asyncio.create_task(watch_shutdown())
         try:
             await serve(app, config.host, config.port, config.max_concurrent,
                         config.acquire_timeout_ms, config.body_capacity, config.body_timeout_ms,
-                        reuse_port=True, stop_event=stop_event,
+                        listener=listener, stop_event=stop_event,
                         observability=config.observability,
                         on_ready=lambda _address: ready.set())
         finally:
+            shutdown_task.cancel()
+            await asyncio.gather(shutdown_task, return_exceptions=True)
             heartbeat_stop.set()
 
     try:
@@ -126,13 +138,15 @@ def _worker_main(config, ready, heartbeat):
 
 
 class _Worker:
-    def __init__(self, index, config, context):
+    def __init__(self, index, config, context, listener):
         self.index = index
         self.config = config
         self._context = context
+        self._listener = listener
         self.process = None
         self.ready = context.Event()
         self.heartbeat = context.Value("d", 0.0)
+        self.shutdown = context.Event()
         self.started_at = 0.0
         self.consecutive_failures = 0
         self.restart_at = None  # monotonic time of the next (re)start, if one is pending
@@ -144,10 +158,17 @@ class _Worker:
         self.restart_at = now + backoff
 
     def start(self):
+        if self.process is not None:
+            if self.process.is_alive():
+                raise RuntimeError("Cannot replace a running worker")
+            self.process.join(timeout=0)
+            self.process.close()
         self.ready = self._context.Event()
         self.heartbeat = self._context.Value("d", time.monotonic())
+        self.shutdown = self._context.Event()
         self.process = self._context.Process(target=_worker_main,
-                                             args=(self.config, self.ready, self.heartbeat),
+                                             args=(self.config, self.ready, self.heartbeat,
+                                                   self.shutdown, self._listener),
                                              name=f"pynext-worker-{self.index}")
         self.process.start()
         self.started_at = time.monotonic()
@@ -168,7 +189,7 @@ class _Worker:
 
     def terminate(self):
         if self.process is not None and self.process.is_alive():
-            self.process.terminate()
+            self.shutdown.set()
 
     def kill(self):
         if self.process is not None and self.process.is_alive():
@@ -186,13 +207,27 @@ def run_supervisor(config, *, workers):
     """
     if workers < 1:
         raise ValueError("workers must be >= 1")
-    if os.name != "posix":
-        raise RuntimeError("Multi-worker mode (--workers > 1) is only supported on Unix (SO_REUSEPORT)")
-    if config.port == 0:
-        raise ValueError("--workers > 1 requires a fixed --port (port 0 cannot be shared by workers)")
+    addresses = socket.getaddrinfo(config.host, config.port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+    family, kind, proto, _, address = addresses[0]
+    listener = socket.socket(family, kind, proto)
+    try:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        elif os.name == "posix":
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(address)
+        listener.listen(1024)
+        bound = listener.getsockname()
+        resolved_host = bound[0]
+        if family == socket.AF_INET6 and bound[3]:
+            resolved_host += f"%{bound[3]}"
+        config = replace(config, host=resolved_host, port=bound[1])
+    except BaseException:
+        listener.close()
+        raise
 
     context = multiprocessing.get_context("spawn")
-    pool = [_Worker(index, config, context) for index in range(workers)]
+    pool = [_Worker(index, config, context, listener) for index in range(workers)]
     stopping = threading.Event()
 
     def _request_stop(_signum, _frame):
@@ -203,7 +238,8 @@ def run_supervisor(config, *, workers):
     try:
         for worker in pool:
             worker.start()
-        print(f"PyNext supervisor listening on http://{config.host}:{config.port} "
+        display_host = f"[{config.host}]" if ":" in config.host else config.host
+        print(f"PyNext supervisor listening on http://{display_host}:{config.port} "
               f"with {workers} workers", flush=True)
         while not stopping.is_set():
             now = time.monotonic()
@@ -251,4 +287,5 @@ def run_supervisor(config, *, workers):
         for worker in pool:
             if worker.process is not None:
                 worker.process.close()
+        listener.close()
     return 0
