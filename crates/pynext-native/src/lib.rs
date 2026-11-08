@@ -1256,8 +1256,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         (StatusCode::REQUEST_TIMEOUT, "Request Timeout", true)
                     }
                 };
-                let mut response =
-                    plain_response(status, message, &state.security_headers);
+                let mut response = plain_response(status, message, &state.security_headers);
                 if retry_after {
                     response
                         .headers_mut()
