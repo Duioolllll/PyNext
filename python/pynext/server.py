@@ -195,6 +195,10 @@ class _NativeStream:
     async def _pull(self):
         async with self._iterator_lock:
             chunk = await self._response._next_chunk()
+            if chunk is None:
+                # Complete asynchronous iterator cleanup before signaling
+                # end-of-stream to the client.
+                await self._response.aclose()
             return chunk, contextvars.copy_context()
 
     async def _finish(self):

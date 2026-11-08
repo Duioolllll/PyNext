@@ -17,11 +17,11 @@ NODE = shutil.which("node")
 
 
 def run_node(js):
-    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as handle:
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False, encoding="utf-8") as handle:
         handle.write(js)
         path = handle.name
     try:
-        result = subprocess.run([NODE, path], capture_output=True, text=True, timeout=15)
+        result = subprocess.run([NODE, path], capture_output=True, text=True, encoding="utf-8", timeout=15)
     finally:
         Path(path).unlink(missing_ok=True)
     assert result.returncode == 0, result.stderr
