@@ -8,7 +8,9 @@ network in front of the server: a client behind an untrusted proxy can
 spoof ``X-Forwarded-For``, so forwarded headers are honoured only when
 the direct peer is listed in ``trusted_proxies`` (spec §11: only trusted
 proxies may have their forwarded headers interpreted). With no trusted
-proxies configured, ``X-Forwarded-For`` is ignored entirely.
+proxies configured, forwarded headers are ignored entirely. All of that
+resolution lives in :mod:`pynext.proxy`; this module only owns the
+buckets.
 
 When a limiter is configured, static files and fresh ISR pages also pass
 through the Python bridge. On the Axum adapter the body has already been read by the time
@@ -16,13 +18,13 @@ the bridge runs, so rate limiting happens at dispatch time there, after
 the body-intake limits; on the ASGI adapter the check runs before the
 body is read.
 """
-import ipaddress
 import math
 import threading
 import time
 from collections import OrderedDict
 
 from .http import Response
+from .proxy import ProxyTrust, parse_trusted_proxies
 
 _MAX_BUCKETS = 10_000
 
@@ -32,22 +34,11 @@ class RateLimitUnavailable(Exception):
 
 
 def _parse_trusted_proxies(trusted_proxies):
-    """Normalize trusted-proxy entries to ``ipaddress`` networks.
+    """Normalize trusted-proxy entries (kept for backward compatibility).
 
-    Each entry is an IP address (a single host) or a CIDR network.
-    Raises ``ValueError`` for anything unparseable so a typo fails at
-    startup instead of silently trusting nobody — or everybody.
+    See :func:`pynext.proxy.parse_trusted_proxies`.
     """
-    networks = []
-    for entry in trusted_proxies or ():
-        if isinstance(entry, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
-            networks.append(entry)
-            continue
-        try:
-            networks.append(ipaddress.ip_network(str(entry), strict=False))
-        except ValueError as exc:
-            raise ValueError(f"Invalid trusted proxy {entry!r}: must be an IP address or CIDR network") from exc
-    return tuple(networks)
+    return parse_trusted_proxies(trusted_proxies)
 
 
 class RateLimiter:
@@ -67,55 +58,27 @@ class RateLimiter:
         self.limit = limit
         self.window_seconds = float(window_seconds)
         self._refill_per_second = limit / self.window_seconds
-        self.trusted_proxies = _parse_trusted_proxies(trusted_proxies)
+        # One shared trust decision for the limiter and the app: the
+        # forwarded-header rules live in pynext.proxy (A6).
+        self._trust = ProxyTrust(trusted_proxies)
+        self.trusted_proxies = self._trust.networks
         self._lock = threading.Lock()
         # key -> [tokens, last_seen_monotonic]
         self._buckets = OrderedDict()
 
     def _is_trusted(self, client_ip):
-        if not self.trusted_proxies or client_ip is None:
-            return False
-        try:
-            address = ipaddress.ip_address(client_ip)
-        except ValueError:
-            return False
-        return any(address in network for network in self.trusted_proxies)
+        return self._trust.is_trusted(client_ip)
 
     def key_for(self, client_ip, headers=()):
         """Derive the bucket key for a request.
 
-        ``headers`` is an iterable of ``(name, value)`` byte pairs. Starting
-        at the direct peer, walk ``X-Forwarded-For`` right-to-left only while
-        each hop is trusted. The nearest untrusted address is the key.
-        A request with no known peer address shares the ``"unknown"``
-        bucket.
+        Delegates to :meth:`pynext.proxy.ProxyTrust.resolve_client_ip`:
+        the nearest untrusted address walking the forwarded chain from the
+        direct peer, or the peer itself when nothing is trusted. A request
+        with no known peer address shares the ``"unknown"`` bucket.
         """
-        if client_ip is None:
-            return "unknown"
-        try:
-            address = ipaddress.ip_address(client_ip)
-            current = str(address.ipv4_mapped or address) if isinstance(address, ipaddress.IPv6Address) else str(address)
-        except ValueError:
-            return client_ip
-        if not self._is_trusted(current):
-            return current
-        forwarded = []
-        for name, value in headers:
-            if name.lower() == b"x-forwarded-for":
-                forwarded.extend(value.decode("latin-1").split(","))
-        for candidate in reversed(forwarded):
-            if not self._is_trusted(current):
-                break
-            candidate = candidate.strip()
-            if candidate.startswith("[") and candidate.endswith("]"):
-                candidate = candidate[1:-1]
-            try:
-                address = ipaddress.ip_address(candidate)
-            except ValueError:
-                # Do not trust any hop to the left of malformed input.
-                break
-            current = str(address.ipv4_mapped or address) if isinstance(address, ipaddress.IPv6Address) else str(address)
-        return current
+        resolved = self._trust.resolve_client_ip(client_ip, headers)
+        return resolved if resolved is not None else "unknown"
 
     def allow(self, key, *, now=None):
         """Consume one token for ``key``.

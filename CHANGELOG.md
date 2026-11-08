@@ -27,6 +27,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Fix cross-platform watcher paths and same-timestamp edits, SQLite ISR generation races and failure fallback, and exercise the correct Axum/Uvicorn browser server in CI.
 - Match dynamic WebSocket routes on the native server using the same route priority as ASGI.
 - Bound rate-limit bucket storage and select forwarded client addresses from the nearest untrusted proxy hop.
+- Unify forwarded-header handling in `pynext.proxy`: `X-Forwarded-For`, `Forwarded` (RFC 7239), `X-Forwarded-Proto` and `X-Forwarded-Host` are interpreted only from trusted proxies (none trusted means all are ignored), the resolved client IP/scheme/host is exposed to handlers as `request.state["client_ip"/"client_scheme"/"client_host"]`, and the rate limiter delegates to the same module.
 - Document the architecture, observed limitations, and verification criteria.
 
 ## v0.7.0a1 (unreleased candidate)

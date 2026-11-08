@@ -9,6 +9,7 @@ from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, Request, Response, 
                    StreamingResponse, WebSocket, WebSocketDisconnect, csrf_protect, new_csrf_token,
                    new_csp_nonce, set_csrf_cookie, validate_csrf)
 from .observability import MetricsCollector, ObservabilityConfig
+from .proxy import ProxyTrust, ResolvedProxy, parse_trusted_proxies
 from .pubsub import PubSubOverflow, WebSocketPubSub
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
@@ -21,4 +22,5 @@ __all__ = ["App", "create_app", "h", "fragment", "island", "layout", "model_prop
            "ObservabilityConfig", "MetricsCollector", "WebSocket", "WebSocketDisconnect", "MAX_WS_MESSAGE",
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
            "Session", "SessionMiddleware", "SQLiteSessionStore", "require_auth", "require_permission",
-           "RedisRateLimiter", "WebSocketPubSub", "PubSubOverflow"]
+           "RedisRateLimiter", "WebSocketPubSub", "PubSubOverflow",
+           "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies"]

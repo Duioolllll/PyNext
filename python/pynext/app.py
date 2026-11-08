@@ -40,6 +40,7 @@ from .observability import (
     route_var,
     span,
 )
+from .proxy import ProxyTrust
 from .ratelimit import RateLimitUnavailable, rate_limited_response
 from .static import asset_response
 
@@ -304,7 +305,8 @@ def _module_key(root, relative):
 class App:
     def __init__(self, root, manifest, *, production=False, security=None, cache_backend="memory",
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
-                 resources=None, cache_url=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False):
+                 resources=None, cache_url=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
+                 trusted_proxies=None):
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
         if production and debug:
@@ -332,6 +334,14 @@ class App:
         # disables it. The Axum adapter reads the same attribute in
         # server.start_native; see ratelimit.py for the trust rules.
         self.rate_limit = rate_limit
+        # Trusted proxies for forwarded-header resolution (A6, pynext.proxy).
+        # An explicit list wins; otherwise the rate limiter's list is reused
+        # so the bucket key and the handler-visible client IP agree; with
+        # neither configured, no forwarded header is interpreted at all.
+        if trusted_proxies is None:
+            trusted_proxies = (rate_limit.trusted_proxies
+                               if rate_limit is not None else ())
+        self.proxy_trust = ProxyTrust(trusted_proxies)
         try:
             _register_project(self._namespace)
             _package(self._namespace, Path(root).resolve(), load_initializer=False)
@@ -1206,6 +1216,24 @@ class App:
                 log.exception("Request failed")
                 response = self.error_response(exc)
         if request is not None:
+            # Trust-resolved client identity (A6, pynext.proxy): the peer
+            # address, scheme and Host header, unless a trusted proxy
+            # supplied forwarded values. Handlers read these from
+            # ``request.state``; without trusted proxies they are just the
+            # direct connection values, never a spoofed header.
+            client = scope.get("client")
+            peer_ip = client[0] if client else None
+            headers = tuple(scope.get("headers", []))
+            host = next((value.decode("latin-1") for key, value in headers
+                         if key.lower() == b"host"), None)
+            info = self.proxy_trust.resolve(
+                peer_ip, headers,
+                default_scheme=scope.get("scheme") or "http",
+                default_host=host)
+            request.state["client_ip"] = info.client_ip
+            request.state["client_scheme"] = info.scheme
+            request.state["client_host"] = info.host
+
             async def dispatch_and_send():
                 try:
                     result = await self.dispatch(request)
@@ -1231,10 +1259,10 @@ class App:
 
 def create_app(root=".", *, production=False, security=None, cache_backend="memory", cache_path=None,
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
-               websocket_max_message=MAX_WS_MESSAGE, hot_reload=False):
+               websocket_max_message=MAX_WS_MESSAGE, hot_reload=False, trusted_proxies=None):
     root = Path(root).resolve()
     return App(root, load_manifest(root) if production else discover(root), production=production,
                security=security, cache_backend=cache_backend, cache_path=cache_path,
                observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
                resources=resources, cache_url=cache_url, websocket_max_message=websocket_max_message,
-               hot_reload=hot_reload)
+               hot_reload=hot_reload, trusted_proxies=trusted_proxies)

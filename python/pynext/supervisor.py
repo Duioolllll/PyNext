@@ -100,7 +100,8 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
     app = create_app(config.root, production=config.production, rate_limit=limiter,
                      cache_backend=config.cache_backend, cache_path=config.cache_path,
                      observability=config.observability, debug=not config.production,
-                     security=config.security, websocket_max_message=config.websocket_max_message)
+                     security=config.security, websocket_max_message=config.websocket_max_message,
+                     trusted_proxies=config.trusted_proxies)
 
     async def run():
         loop = asyncio.get_running_loop()
