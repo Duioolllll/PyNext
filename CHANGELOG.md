@@ -2,7 +2,7 @@
 
 All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
 
-## Unreleased
+## 0.1.0
 
 - Add Redis ISR storage with expiring leases, fenced writes and cross-worker invalidation; add Redis-backed shared rate limiting, including static and cached responses. Redis cache failures fall back locally; rate-limiter failures return 503.
 - Add an ISR query-key allowlist and generation-based invalidation across all query variants and shared-cache workers.
@@ -27,7 +27,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Fix cross-platform watcher paths and same-timestamp edits, SQLite ISR generation races and failure fallback, and exercise the correct Axum/Uvicorn browser server in CI.
 - Match dynamic WebSocket routes on the native server using the same route priority as ASGI.
 - Bound rate-limit bucket storage and select forwarded client addresses from the nearest untrusted proxy hop.
-- Document the unreleased architecture, observed limitations, and verification criteria.
+- Document the architecture, observed limitations, and verification criteria.
 
 ## v0.7.0a1 (unreleased candidate)
 

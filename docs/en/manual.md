@@ -2,7 +2,7 @@
 
 [한국어](../ko/manual.md) · [日本語](../ja/manual.md) · [简体中文](../zh-CN/manual.md)
 
-This manual describes the code in this checkout, corresponding to the **0.1.0** unreleased experimental candidate. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
+This manual describes the code in this checkout, corresponding to the experimental **0.1.0** version. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
 
 ## Requirements and first run
 
@@ -259,7 +259,7 @@ Rate limiting is opt-in and per process: `pynext start --rate-limit 100 --rate-l
 
 The forwarded chain is walked from right to left through trusted proxies; the nearest untrusted address is used. Configure every intermediate proxy accurately. Each process keeps at most 10,000 buckets; when all are active, requests from new keys get 429 until a bucket fully refills.
 
-Multiple workers: `pynext start --workers 4` runs a supervisor whose worker processes share one listener. With `--port 0`, the assigned port remains stable across worker restarts. Workers have independent interpreters and event loops; memory caches and rate limits are per worker, while SQLite/Redis ISR and Redis rate limiting can be shared. The supervisor restarts failed workers and coordinates shutdown. An interrupted in-flight request fails and must be retried. Linux execution is tested; macOS and Windows runtime results require CI confirmation.
+Multiple workers: `pynext start --workers 4` runs a supervisor whose worker processes share one listener. With `--port 0`, the assigned port remains stable across worker restarts. Workers have independent interpreters and event loops; memory caches and rate limits are per worker, while SQLite/Redis ISR and Redis rate limiting can be shared. The supervisor restarts failed workers and coordinates shutdown. An interrupted in-flight request fails and must be retried. CI tests shared-listener worker startup and restart on Linux, macOS, and Windows; signal-based supervisor tests run on Linux and macOS.
 
 ## Tests and troubleshooting
 

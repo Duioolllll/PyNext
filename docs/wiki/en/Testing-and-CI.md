@@ -28,7 +28,7 @@ The browser suite covers islands, hydration, interactions, mismatch fallback, na
 
 ## CI matrix
 
-GitHub Actions checks **Ubuntu, macOS and Windows** with Python 3.13, Node.js 20, Rust and uv. It runs format/lint, Rust/Python tests, production build, sdist/wheel packaging, isolated-wheel verification, Axum/Uvicorn HTTP smoke measurements, and browser checks. Dependencies are installed with `uv sync --locked` and `npm ci`; Rust checks use `--locked`.
+GitHub Actions checks **Ubuntu, macOS and Windows** with Python 3.13 and 3.14, Node.js 20, Rust and uv. It runs format/lint, Rust/Python tests, production build, sdist/wheel packaging, isolated-wheel verification, Axum/Uvicorn HTTP smoke measurements, and browser checks. Dependencies are installed with `uv sync --locked` and `npm ci`; Rust checks use `--locked`.
 
 Artifacts include platform distribution files and per-server benchmark JSON. A passing CI run **does not** prove production readiness, large-scale performance, or security auditing.
 

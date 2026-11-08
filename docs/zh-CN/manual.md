@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [日本語](../ja/manual.md)
 
-本手册适用于当前检出的 **0.1.0** 尚未发布的实验候选代码。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
+本手册适用于当前检出的 **0.1.0** 实验版本代码。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
 
 ## 环境要求与首次运行
 
@@ -259,7 +259,7 @@ OpenTelemetry 追踪默认关闭且为可选项：安装 `opentelemetry-api`（�
 
 转发链从右向左遍历受信任的代理，使用最近的不受信任地址。必须准确配置所有中间代理。每个进程最多保留 10,000 个桶；全部处于活跃状态时，新地址会收到 429，直到某个桶完全补充。
 
-多工作进程：`pynext start --workers 4` 启动共享监听套接字的监管器。使用 `--port 0` 时，动态分配的端口在 worker 重启后保持不变。各 worker 的解释器、内存缓存和默认限流独立；SQLite/Redis ISR 与 Redis 限流可以共享。监管器会重启故障 worker；中断的请求需要重试。Linux 运行已验证，macOS 和 Windows 仍需 CI 运行确认。
+多工作进程：`pynext start --workers 4` 启动共享监听套接字的监管器。使用 `--port 0` 时，动态分配的端口在 worker 重启后保持不变。各 worker 的解释器、内存缓存和默认限流独立；SQLite/Redis ISR 与 Redis 限流可以共享。监管器会重启故障 worker；中断的请求需要重试。CI 在 Linux、macOS 和 Windows 上检查共享监听套接字的 worker 启动和重启，并在 Linux 和 macOS 上运行基于信号的监管器测试。
 
 ## 测试与故障排查
 
