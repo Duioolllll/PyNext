@@ -2,6 +2,11 @@
 
 All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
 
+## Unreleased
+
+- Add a Redis session store (`RedisSessionStore`, `pynext-framework[redis]` or `PYNEXT_REDIS_URL`) sharing login, rotation and logout across nodes with TTL expiry and version-fenced writes; the session store interface (load/save/delete) is unchanged so external stores keep working.
+- Run expired-session cleanup automatically: `SessionMiddleware` now purges expired sessions in a background task every hour by default (`purge_interval`, `None` disables it, `close()` stops it).
+
 ## 0.1.0
 
 - Add the A1 default security headers to every response (SSR, SSG, ISR, API, static, client assets, preflight, and error pages) on both the ASGI adapter and the native server, including the Rust fast path for static and fresh ISR responses: HSTS in production only (`max-age=31536000; includeSubDomains`, configurable, omitted in development so `pynext dev` on `http://127.0.0.1` is unaffected), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`, and an extended CSP (`script-src 'self'` plus the per-request nonce when enabled, `style-src 'self'`, `object-src 'none'`, `base-uri 'self'`, `form-action 'self'`, `frame-ancestors 'none'`). All of them are configurable on `SecurityConfig` (set a field to `None`/`False` to disable that header); an explicitly set response header still wins, and the per-request CSP nonce is preserved. See `security_headers()` and `apply_security_headers()`.
