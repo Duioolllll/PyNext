@@ -133,8 +133,12 @@ MIDDLEWARE = [SessionMiddleware(store)]
 토큰을 해당 세션과 비교합니다. 로그인 시 `rotate()`는 CSRF 토큰도 바꾸므로
 클라이언트에 새 토큰을 전달해야 합니다. 동시 수정이나 만료·폐기와 충돌한 저장은
 409를 반환합니다. 핸들러에서 이미 수행한 외부 작업은 자동으로 되돌리지 않으므로
-앱에서 멱등성을 보장해야 합니다. SQLite 저장소의 만료 행은 유지보수 작업에서
-`await store.purge_expired()`로 정리할 수 있습니다.
+앱에서 멱등성을 보장해야 합니다. 미들웨어는 기본적으로 한 시간마다 만료된
+세션을 백그라운드에서 정리합니다(`purge_interval`, `None`이면 비활성화).
+여러 노드에서 세션을 공유하려면 `RedisSessionStore("redis://...")`를 쓰세요
+(`pynext-framework[redis]` 또는 `PYNEXT_REDIS_URL` 환경 변수). Redis 저장소는
+TTL로 만료하고 버전 fencing으로 동시 쓰기를 막으며, 저장소 인터페이스는
+SQLite와 동일합니다.
 
 ## 앱 작성
 

@@ -2,6 +2,11 @@
 
 All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
 
+## Unreleased
+
+- Add a Redis session store (`RedisSessionStore`, `pynext-framework[redis]` or `PYNEXT_REDIS_URL`) sharing login, rotation and logout across nodes with TTL expiry and version-fenced writes; the session store interface (load/save/delete) is unchanged so external stores keep working.
+- Run expired-session cleanup automatically: `SessionMiddleware` now purges expired sessions in a background task every hour by default (`purge_interval`, `None` disables it, `close()` stops it).
+
 ## 0.1.0
 
 - Add Redis ISR storage with expiring leases, fenced writes and cross-worker invalidation; add Redis-backed shared rate limiting, including static and cached responses. Redis cache failures fall back locally; rate-limiter failures return 503.
