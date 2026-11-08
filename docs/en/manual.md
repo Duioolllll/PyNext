@@ -20,6 +20,10 @@ uv run pynext start --dir examples/basic
 
 Open http://127.0.0.1:3000/, /about, /guides/intro, /news/example, /hydrate, /strategies, and /api/users. Stop the server with Ctrl+C.
 
+PyNext serves plain HTTP only and does not terminate TLS; see [ADR-0001](../adr/0001-tls-termination.md). For anything beyond localhost, put a TLS-terminating reverse proxy in front of it and keep PyNext bound to loopback or a trusted private network.
+
+Warning: `pynext build` imports and executes the application's Python code (page, layout, middleware and resource modules, plus SSG generators) and runs the island bundler. Only build apps you trust. To build an app you do not fully trust, use the sandboxed build recipe in [docs/SANDBOXED_BUILD.md](../SANDBOXED_BUILD.md).
+
 `pynext dev --dir examples/basic` serves source without a build and reloads when `app/`, `islands/`, `public/` or `pynext.config.py` change, restarting the server on the same port. `pynext start` uses the build manifest and fails if tracked source files changed; rebuild first. For an app without islands, Node and esbuild are not required. The repository is the installation source; no PyPI publication is implied.
 
 The dev watcher uses native filesystem events and hashes watched files, falling back to polling if needed. JS/TS island edits rebuild and replace affected modules without reloading the document; cleanup runs first and that island’s state may reset. Other source changes restart the server and reload open pages. Broken edits retain the last working version. With `--port 0`, the assigned port is reused on restart.

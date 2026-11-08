@@ -32,6 +32,6 @@ That included entry point creates a **development-mode** app. For built SSG beha
 - Protect any custom revalidation endpoint with real authorization.
 - Python synchronous work cannot be forcibly stopped at a request timeout. Use DB timeouts and idempotent operations.
 - No built-in WebSockets, production observability, global connection limits, shared worker cache or process isolation.
-- Avoid relying on unvalidated reverse-proxy headers or calling the HTTP/2 h2c implementation a full TLS termination solution.
+- Avoid relying on unvalidated reverse-proxy headers or calling the HTTP/2 h2c implementation a full TLS termination solution. TLS termination belongs to the reverse proxy; see [ADR-0001](../../adr/0001-tls-termination.md).
 
 For production hardening ideas and acceptance criteria, see [production roadmap](../../PRODUCTION_ROADMAP.md). The roadmap is **not a list of implemented functionality**.
