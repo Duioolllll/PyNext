@@ -27,7 +27,7 @@
 
 ## ISR 범위
 
-ISR은 크기가 제한된 **프로세스별 캐시**와 single-flight 재생성을 사용합니다. 신선한 익명 결과는 Rust가 직접 전달할 수 있고, 오래된 응답은 백그라운드 재생성 중 제공될 수 있습니다. `Cookie` 또는 `Authorization`은 공유 캐시를 우회합니다. 인증을 거친 API에서 `await request.revalidate("/news/example")` 또는 `await app.revalidate(path)`를 사용할 수 있습니다. 워커 간 캐시 동기화는 없습니다.
+ISR은 크기가 제한된 캐시와 single-flight 재생성을 사용합니다. 기본 `memory` 백엔드는 프로세스별이지만, `sqlite`·`redis` 백엔드는 만료되는 lease와 fencing된 쓰기로 워커 간 항목을 공유하므로, 저장소가 정상일 때는 다른 워커의 무효화가 다음 조회에 반영됩니다(장애 중 로컬 폴백은 오래된 값을 줄 수 있습니다). 신선한 익명 결과는 Rust가 직접 전달할 수 있고, 오래된 응답은 백그라운드 재생성 중 제공될 수 있습니다. `Cookie` 또는 `Authorization`은 공유 캐시를 우회합니다. 인증을 거친 API에서 `await request.revalidate("/news/example")` 또는 `await app.revalidate(path)`를 사용할 수 있습니다.
 
 ## 안전 주의
 

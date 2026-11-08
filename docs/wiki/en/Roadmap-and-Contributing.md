@@ -4,23 +4,26 @@
 
 ## Current release
 
-The published experimental release used for this wiki is **[v0.6.0a2](https://github.com/Duioolllll/PyNext/releases/tag/v0.6.0a2)**. This documentation follows `main` at [aa256bf](https://github.com/Duioolllll/PyNext/commit/aa256bf2b03a175d96f9f084a3b8cfaeca883ceb), including benchmark/CI improvements merged after release preparation. Review [CHANGELOG](../../../CHANGELOG.md) and [release plan](../../RELEASE_PLAN.md) when updating docs.
+The published experimental release used for this wiki is **[0.1.0](https://github.com/Duioolllll/PyNext/releases/tag/0.1.0v)**. This documentation follows `main` at [d8560f8](https://github.com/Duioolllll/PyNext/commit/d8560f828a13e6ae5bb82bf4496fed6b4d45ecb8), including benchmark/CI improvements merged after release preparation. Review [CHANGELOG](../../../CHANGELOG.md) and [release plan](../../RELEASE_PLAN.md) when updating docs.
 
 ## Implemented
 
 - Rust trie routing, Axum HTTP engine and Python/ASGI integration
-- Buffered SSR, build-time SSG and process-local ISR
+- Buffered and streaming SSR, build-time SSG, ISR with process-local memory or shared SQLite/Redis backends
 - Public assets with ETags and single ranges
-- Async API streaming
-- Optional JS/TS islands with load/visible/idle/limited interaction activation
+- Async API streaming and WebSocket
+- Optional JS/TS islands with load/visible/idle/interaction activation, client-side navigation and island HMR
+- Global HTTP middleware, SQLite sessions with session-bound CSRF, multipart uploads, `pynext init`, development error pages and a Linux standalone directory
+- Structured logging, metrics and OpenTelemetry tracing (real SDK)
 - Cross-platform CI and transport-labeled benchmarks
+
+The full capability list is generated from code: [FEATURES](../../FEATURES.md).
 
 ## Planned / not yet implemented
 
-- Streaming page SSR; React/RSC compatibility is a separate significant design effort
-- Shared/distributed ISR and worker coordination
-- Per-app process isolation and more resilient worker lifecycle
-- Production observability, rate limiting, security defaults and standalone packaging
+- React/RSC compatibility is a separate significant design effort and an explicit non-goal for 1.0
+- Global connection limits and security-default hardening (see [roadmap](../../ROADMAP.md))
+- DB and authentication reference apps (credential verification stays the application's responsibility)
 - Better Rust/Python data transfer and systematic profiling
 - **Exploratory Django integration** (such as ORM, auth, and admin interoperability) has been discussed as a potential direction, **but no integration exists or is promised**.
 
@@ -29,7 +32,7 @@ Consult the [production roadmap](../../PRODUCTION_ROADMAP.md) for design options
 ## Contributing
 
 1. Fork and branch from current `main`; keep changes focused.
-2. Use CPython 3.13, uv, Rust/Cargo and npm where needed.
+2. Use CPython 3.13 or 3.14, uv, Rust/Cargo and npm where needed.
 3. Run `cargo fmt --all -- --check`, `cargo test --locked --workspace --all-features` and `uv run pytest -q`.
 4. Run example build and Chromium smoke tests when touching web-facing behavior.
 5. Add tests and update **English + Korean wiki pages** when introducing/changing public behavior.

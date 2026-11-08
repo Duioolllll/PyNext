@@ -4,6 +4,8 @@
 
 本手册适用于当前检出的 **0.1.0** 实验版本代码。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
 
+> 本手册是英文手册的翻译。如内容不一致，以英文手册为准。功能列表由代码自动生成 — 参见 [FEATURES](../FEATURES.md)。
+
 ## 环境要求与首次运行
 
 需要 CPython 3.13 或 3.14、Rust/Cargo 和 [uv](https://docs.astral.sh/uv/)。受支持的环境由 CI 矩阵验证：操作系统为 Ubuntu、macOS 与 Windows（最新版本），Python 为 CPython 3.13 和 3.14，部署模式为独立 Axum 与 Uvicorn 之上的 ASGI（进程内 ASGI 模式由每个 CI 任务中的 pytest 覆盖）。浏览器冒烟测试在三个操作系统上都会运行。示例使用 island，因此还需要 Node.js 18 或更高版本和 npm，以安装 esbuild 0.28.1。

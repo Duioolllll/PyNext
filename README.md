@@ -20,11 +20,7 @@ PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust�
 
 ## 구현 현황
 
-- 파일 기반 라우팅과 중첩 레이아웃, Python 페이지·API, SSR·SSG·ISR 및 Axum·ASGI 실행을 지원합니다. API와 SSR은 스트리밍할 수 있으며 ISR은 최초 생성 시 스트리밍하고 완성된 응답을 캐시합니다.
-- JS/TS island와 클라이언트 탐색, 제한된 공유 모델을 통한 서버 DOM 재사용을 제공합니다. 개발 모드에서 JS/TS island 모듈을 전체 페이지 새로고침 없이 교체할 수 있습니다.
-- SQLite·Redis 공유 ISR, 워커 간 무효화, Redis 공유 요청 제한, 전역 HTTP 미들웨어와 multipart 업로드를 제공합니다.
-- SQLite 세션과 세션 기반 CSRF, 인증·권한 검사 연결점, WebSocket과 프로세스 내 pub/sub, 공유 리스너를 사용하는 다중 워커를 지원합니다.
-- `pynext init`, 개발 오류 페이지와 파일 감시, 구조화 로그·지표·선택적 OpenTelemetry, 로컬 이미지 WebP 변환 및 Linux standalone 디렉터리를 제공합니다.
+기능 목록은 코드에서 자동 생성됩니다: [FEATURES](docs/FEATURES.md). 요약하면 파일 기반 라우팅과 중첩 레이아웃, Python 페이지·API, SSR·SSG·ISR, Axum·ASGI 실행, JS/TS island와 클라이언트 탐색, SQLite·Redis 공유 ISR, 전역 HTTP 미들웨어, SQLite 세션과 CSRF, WebSocket, 다중 워커, `pynext init`과 Linux standalone 디렉터리를 제공합니다.
 
 공유 island 모델은 문자열 props 등을 사용하는 제한된 부분집합이며 HMR 중 island 상태가 초기화될 수 있습니다. 인증 정보 검증은 앱의 책임이고 WebSocket pub/sub은 프로세스 내부로 한정됩니다. 현재 버전은 실험 단계이므로 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하는 데 사용하지 마세요.
 

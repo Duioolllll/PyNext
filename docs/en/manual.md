@@ -4,6 +4,8 @@
 
 This manual describes the code in this checkout, corresponding to the experimental **0.1.0** version. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
 
+> Canonical source: this English manual is the single source of truth for PyNext documentation. The Korean, Japanese, and Simplified Chinese manuals are translations of it; if they disagree, this manual wins. The capability list is generated from code — see [FEATURES](../FEATURES.md).
+
 ## Requirements and first run
 
 Use CPython 3.13 or 3.14, a Rust toolchain with Cargo, and [uv](https://docs.astral.sh/uv/). Supported environments are verified by the CI matrix: Ubuntu, macOS, and Windows (latest), CPython 3.13 and 3.14, and the standalone Axum and Uvicorn-backed ASGI deploy modes (the in-process ASGI mode is covered by pytest in every CI job). Browser smoke runs on all three OSes. The example uses islands and additionally requires Node.js 18 or newer and npm to install esbuild 0.28.1.

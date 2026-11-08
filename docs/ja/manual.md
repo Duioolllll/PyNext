@@ -4,6 +4,8 @@
 
 このマニュアルは、チェックアウトした **0.1.0** の実験版のコードを対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
 
+> このマニュアルは英語マニュアルの翻訳です。内容が異なる場合は英語マニュアルが優先されます。機能一覧はコードから自動生成されています — [FEATURES](../FEATURES.md) を参照してください。
+
 ## 必要な環境と起動
 
 CPython 3.13・3.14、Rust/Cargo、[uv](https://docs.astral.sh/uv/) が必要です。対応環境は CI マトリクスで検証します。OS は Ubuntu・macOS・Windows（最新）、Python は CPython 3.13・3.14、デプロイモードはスタンドアロン Axum と Uvicorn 上の ASGI です（インプロセス ASGI モードはすべての CI ジョブで pytest が検査します）。ブラウザスモークは 3 つの OS すべてで実行します。サンプルは island を使うため、esbuild 0.28.1 のインストールに Node.js 18 以降と npm も必要です。

@@ -2,6 +2,8 @@
 
 All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
 
+The current release is **0.1.0** (top section). The `v0.7.0a1` section below is a release plan superseded by the 0.1.0 decision; its items were merged to `main` and are included in 0.1.0. The `v0.1.0` section at the bottom is the early reconstructed snapshot, not the current release.
+
 ## 0.1.0
 
 - Add Redis ISR storage with expiring leases, fenced writes and cross-worker invalidation; add Redis-backed shared rate limiting, including static and cached responses. Redis cache failures fall back locally; rate-limiter failures return 503.
@@ -29,7 +31,9 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Bound rate-limit bucket storage and select forwarded client addresses from the nearest untrusted proxy hop.
 - Document the architecture, observed limitations, and verification criteria.
 
-## v0.7.0a1 (unreleased candidate)
+## v0.7.0a1 (superseded plan — shipped in 0.1.0)
+
+The 0.7.0a1 release plan was replaced by the 0.1.0 decision; the items below were merged to `main` and are included in 0.1.0.
 
 - Add a shared SQLite ISR cache backend (`--cache-backend sqlite`, `create_app(..., cache_backend="sqlite", cache_path=...)`, default file `<project>/.pynext/isr-cache.sqlite3`) so multiple workers share ISR entries with no external service. Stale regeneration is single-flight per key through an expiring owner-token lease, shared writes are fenced by entry version so a slow generation cannot overwrite a newer result, failures preserve the old entry, and first-generation requests wait for the worker holding the lease. Responses with `Set-Cookie` or `Cache-Control: private`/`no-store` are never stored in the shared cache. The memory backend stays the default, and a Redis adapter is documented as a future option.
 - Add streaming SSR: a page function may return an async iterable of UI nodes; the layout shell is sent first, each chunk is serialized and sent as produced, and the layout suffix closes the document. Buffered rendering stays the default, streaming is SSR-only, a disconnect closes the generator, and a mid-stream error ends the stream without changing its status. See `examples/basic/app/stream/page.py`.
@@ -100,7 +104,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 - Add JavaScript/TypeScript island bundling and browser mounting.
 
-## v0.1.0
+## v0.1.0 (reconstructed early snapshot)
 
 - Introduce the Python/Rust runtime, file routing, buffered SSR, API handlers, ASGI and Axum.
 - Add SSG, public file snapshots and process-local ISR caching.

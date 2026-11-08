@@ -25,6 +25,8 @@
 | 개발과 관측 | `pynext init`, 개발 오류 페이지, 네이티브 파일 감시, JS/TS island HMR, 구조화 로그·지표·선택적 OpenTelemetry | HMR은 island 상태 보존을 보장하지 않는다. Rust 빠른 경로부터 외부 서비스까지의 전체 추적은 완성되지 않았다. |
 | 배포 | Python 3.13·3.14 패키지, 로컬 이미지 WebP 변환, Linux standalone 디렉터리 | standalone은 단일 실행 파일이 아니며 호환 시스템 라이브러리가 필요하다. 다른 OS의 standalone 패키징은 없다. |
 
+기능 목록은 코드에서 자동 생성됩니다: [FEATURES](FEATURES.md). 위 표는 각 영역의 제한 사항을 함께 적는 현황 요약이며, 기능의 유무는 생성된 목록을 기준으로 합니다.
+
 Linux·macOS·Windows에서 Python 3.13·3.14와 Axum·Uvicorn 조합을 CI로 검사한다. 공유 리스너 워커 실행·재시작은 세 OS에서, 신호 기반 수퍼바이저는 Linux·macOS에서 검사한다. 세부 계약과 보안 경계는 [아키텍처 명세](ARCHITECTURE_SPEC.md), 변경 사항은 [릴리스 노트](RELEASE_NOTES_0.1.0.md)를 참고한다.
 
 ## 권장 우선순위
