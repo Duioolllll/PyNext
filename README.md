@@ -8,7 +8,7 @@
 
 **Wiki:** [English](docs/wiki/en/Home.md) · [한국어](docs/wiki/ko/Home.md) · [Wiki index](docs/wiki/README.md)
 
-**버전:** 패키지 0.1.0 / 태그 0.1.0v · [릴리스](https://github.com/Duioolllll/PyNext/releases) · [변경 이력](CHANGELOG.md) · [아키텍처 명세](docs/ARCHITECTURE_SPEC.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
+**버전:** [패키지 0.1.0](https://pypi.org/project/pynext-framework/0.1.0/) / [릴리스 0.1.0v](https://github.com/Duioolllll/PyNext/releases/tag/0.1.0v) · [변경 이력](CHANGELOG.md) · [아키텍처 명세](docs/ARCHITECTURE_SPEC.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
 
 이 문서는 현재 체크아웃한 저장소의 코드를 설명합니다.
 
@@ -16,7 +16,25 @@ PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust�
 
 현재는 Next.js 원본의 경로 정렬·충돌 검사를 참고해 Rust 라우터를 구현하고, Python 페이지·API 및 Rust HTML 렌더러와 연결했습니다. 참고한 원본의 고정 커밋과 MIT 라이선스는 [third_party/NEXTJS.md](third_party/NEXTJS.md)에 있습니다.
 
+## 구현 현황
+
+- 파일 기반 라우팅과 중첩 레이아웃, Python 페이지·API, SSR·SSG·ISR 및 Axum·ASGI 실행을 지원합니다. API와 SSR은 스트리밍할 수 있으며 ISR은 최초 생성 시 스트리밍하고 완성된 응답을 캐시합니다.
+- JS/TS island와 클라이언트 탐색, 제한된 공유 모델을 통한 서버 DOM 재사용을 제공합니다. 개발 모드에서 JS/TS island 모듈을 전체 페이지 새로고침 없이 교체할 수 있습니다.
+- SQLite·Redis 공유 ISR, 워커 간 무효화, Redis 공유 요청 제한, 전역 HTTP 미들웨어와 multipart 업로드를 제공합니다.
+- SQLite 세션과 세션 기반 CSRF, 인증·권한 검사 연결점, WebSocket과 프로세스 내 pub/sub, 공유 리스너를 사용하는 다중 워커를 지원합니다.
+- `pynext init`, 개발 오류 페이지와 파일 감시, 구조화 로그·지표·선택적 OpenTelemetry, 로컬 이미지 WebP 변환 및 Linux standalone 디렉터리를 제공합니다.
+
+공유 island 모델은 문자열 props 등을 사용하는 제한된 부분집합이며 HMR 중 island 상태가 초기화될 수 있습니다. 인증 정보 검증은 앱의 책임이고 WebSocket pub/sub은 프로세스 내부로 한정됩니다. 현재 버전은 실험 단계이므로 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하는 데 사용하지 마세요.
+
 ## 실행
+
+CPython 3.13 또는 3.14에서 공개 패키지를 설치할 수 있습니다.
+
+```bash
+pip install pynext-framework==0.1.0
+```
+
+이 버전은 이전 개발 후보 `0.7.0a1`보다 낮으므로 기존 설치에서 전환할 때 버전을 명시하세요. 아래 명령은 저장소의 예제를 빌드하고 실행하는 방법입니다.
 
 지원 환경의 CI 매트릭스는 Ubuntu/macOS/Windows 최신 버전과 CPython 3.13·3.14를
 대상으로 합니다. 배포 모드는 독립 실행 Axum과 Uvicorn 위의 ASGI이며, ASGI 인프로세스
