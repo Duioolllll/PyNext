@@ -15,8 +15,14 @@ timeout, not by a restart.
 Graceful shutdown: SIGINT/SIGTERM to the supervisor signals every worker;
 workers finish their current ``serve()``
 shutdown (stop accepting, stop the native server, close the ISR cache)
-and the supervisor waits up to ``SHUTDOWN_TIMEOUT`` seconds before
+and the supervisor waits up to ``shutdown_timeout`` seconds before
 SIGKILLing stragglers.
+
+Rolling restart (B6): SIGHUP to the supervisor replaces workers one at
+a time — a replacement is started and must report ready before the old
+worker is asked to drain, so the shared listener keeps accepting
+throughout and a rolling restart serves no 5xx. A replacement that
+fails to become ready leaves the old worker in place.
 
 Scope and limits, stated plainly:
 
@@ -47,7 +53,10 @@ log = logging.getLogger("pynext.supervisor")
 HEARTBEAT_INTERVAL = 0.5
 HEARTBEAT_STALE_AFTER = 5.0
 SUPERVISOR_POLL_INTERVAL = 0.2
-SHUTDOWN_TIMEOUT = 5.0
+# Default graceful-shutdown budget; WorkerConfig.shutdown_timeout
+# overrides it per deployment. The old 5s default could SIGKILL a worker
+# that was still draining a request the Rust layer allows 30s for.
+SHUTDOWN_TIMEOUT = 30.0
 _MAX_RESTART_BACKOFF = 8.0
 
 
@@ -82,6 +91,12 @@ class WorkerConfig:
     observability: object = None  # ObservabilityConfig or None
     security: object = None  # SecurityConfig or None
     websocket_max_message: int = 65_536
+    # Graceful-shutdown budget (B6): how long a worker may take to drain
+    # in-flight requests and close WebSockets after SIGTERM before the
+    # supervisor SIGKILLs it. It bounds the Python drain in serve() and
+    # the native connection drain; it must cover the 30s request timeout
+    # or a slow request can still be cut off mid-flight.
+    shutdown_timeout: float = 30.0
 
 
 def _heartbeat_loop(stop, heartbeat):
@@ -141,6 +156,7 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                         max_connections_per_ip=config.max_connections_per_ip,
                         header_read_timeout_ms=config.header_read_timeout_ms,
                         body_min_rate_bytes_per_sec=config.body_min_rate_bytes_per_sec,
+                        shutdown_timeout=config.shutdown_timeout,
                         on_ready=lambda _address: ready.set())
         finally:
             shutdown_task.cancel()
@@ -216,6 +232,61 @@ class _Worker:
             self.process.join(timeout)
 
 
+def _rolling_restart(pool, config, context, listener):
+    """Replace every worker one at a time; return True if all replaced.
+
+    For each worker a replacement is started first and must report ready
+    (its ``/readyz``-equivalent readiness, via the worker ``ready``
+    event) before the old worker is asked to drain. The shared listener
+    stays open throughout — the supervisor and every live worker hold a
+    copy — so new connections keep being accepted while one worker
+    drains. A replacement that fails to start or to become ready within
+    ``shutdown_timeout`` leaves the old worker in place and aborts the
+    roll; the old worker is untouched in that case.
+    """
+    for index, old in enumerate(pool):
+        old_pid = old.pid
+        replacement = _Worker(index, config, context, listener)
+        try:
+            replacement.start()
+        except Exception:
+            log.exception("Rolling restart: replacement worker %d failed to start", index)
+            return False
+        deadline = time.monotonic() + max(config.shutdown_timeout, 30.0)
+        ready = False
+        while time.monotonic() < deadline:
+            if replacement.ready.is_set() and replacement.is_alive():
+                ready = True
+                break
+            if not replacement.is_alive():
+                break
+            time.sleep(0.2)
+        if not ready:
+            log.error("Rolling restart: replacement worker %d did not become ready; "
+                      "keeping worker %s", index, old_pid)
+            if replacement.is_alive():
+                replacement.kill()
+            replacement.join()
+            if replacement.process is not None:
+                replacement.process.close()
+            return False
+        log.info("Rolling restart: worker %d ready (pid %d); draining old worker %s",
+                 index, replacement.pid, old_pid)
+        old.terminate()
+        old.join(timeout=config.shutdown_timeout)
+        if old.is_alive():
+            log.warning("Rolling restart: old worker %d (pid %s) did not stop; killing",
+                        index, old_pid)
+            old.kill()
+            old.join()
+        if old.process is not None:
+            old.process.close()
+        pool[index] = replacement
+        log.info("Rolling restart: worker %d replaced (pid %s -> %d)",
+                 index, old_pid, replacement.pid)
+    return True
+
+
 def run_supervisor(config, *, workers):
     """Spawn and supervise ``workers`` processes. Returns an exit code.
 
@@ -245,12 +316,18 @@ def run_supervisor(config, *, workers):
     context = multiprocessing.get_context("spawn")
     pool = [_Worker(index, config, context, listener) for index in range(workers)]
     stopping = threading.Event()
+    rolling = threading.Event()
 
     def _request_stop(_signum, _frame):
         stopping.set()
 
+    def _request_roll(_signum, _frame):
+        rolling.set()
+
     old_sigint = signal.signal(signal.SIGINT, _request_stop)
     old_sigterm = signal.signal(signal.SIGTERM, _request_stop)
+    sighup = getattr(signal, "SIGHUP", None)
+    old_sighup = signal.signal(sighup, _request_roll) if sighup is not None else None
     try:
         for worker in pool:
             worker.start()
@@ -258,6 +335,9 @@ def run_supervisor(config, *, workers):
         print(f"PyNext supervisor listening on http://{display_host}:{config.port} "
               f"with {workers} workers", flush=True)
         while not stopping.is_set():
+            if rolling.is_set():
+                rolling.clear()
+                _rolling_restart(pool, config, context, listener)
             now = time.monotonic()
             for worker in pool:
                 if worker.is_alive():
@@ -270,7 +350,7 @@ def run_supervisor(config, *, workers):
                         log.warning("Worker %d (pid %d) heartbeat stale; restarting",
                                     worker.index, worker.pid)
                         worker.kill()
-                        worker.join(timeout=SHUTDOWN_TIMEOUT)
+                        worker.join(timeout=config.shutdown_timeout)
                         worker.schedule_restart(now)
                     continue
                 if worker.process is None:
@@ -287,10 +367,12 @@ def run_supervisor(config, *, workers):
     finally:
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
+        if sighup is not None:
+            signal.signal(sighup, old_sighup)
         # Graceful shutdown: SIGTERM first, then SIGKILL stragglers.
         for worker in pool:
             worker.terminate()
-        deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+        deadline = time.monotonic() + config.shutdown_timeout
         for worker in pool:
             remaining = deadline - time.monotonic()
             worker.join(timeout=max(0.0, remaining))

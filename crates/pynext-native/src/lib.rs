@@ -1279,6 +1279,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     };
     if !state.middleware_enabled
         && (parts.method == axum::http::Method::GET || parts.method == axum::http::Method::HEAD)
+        // Health probes are reserved framework paths (B6): a public
+        // asset or static page with the same name must not shadow them,
+        // so they always fall through to the Python bridge.
+        && parts.uri.path() != "/healthz"
+        && parts.uri.path() != "/readyz"
     {
         if let Some(path) = static_path(parts.uri.path()) {
             if let Some(content) = state.client_assets.get(&path) {
@@ -1600,7 +1605,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1630,7 +1635,16 @@ impl NativeServer {
         header_read_timeout_ms: u64,
         body_min_rate_bytes_per_sec: usize,
         security_headers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+        drain_timeout_secs: f64,
     ) -> PyResult<Self> {
+        // The drain bound is a shutdown budget, not a request timeout:
+        // negative or NaN values would silently become "no drain at
+        // all", so clamp them to zero instead.
+        let drain_timeout = Duration::from_secs_f64(if drain_timeout_secs.is_finite() {
+            drain_timeout_secs.max(0.0)
+        } else {
+            0.0
+        });
         let websocket_paths = websocket_paths.unwrap_or_default();
         if websocket_max_message == 0 || websocket_max_message > 16 * 1024 * 1024 {
             return Err(PyValueError::new_err(
@@ -1898,8 +1912,11 @@ impl NativeServer {
                 }
                 let _ = connection_shutdown.send(true);
                 // Drain in-flight connections, bounded so `stop()` cannot
-                // hang on a stuck connection.
-                let _ = tokio::time::timeout(Duration::from_secs(30), async {
+                // hang on a stuck connection. The bound is the Python
+                // shutdown timeout (B6): serve() already waited that long
+                // for Python handlers, so this only covers connections
+                // whose close handshake is still in flight.
+                let _ = tokio::time::timeout(drain_timeout, async {
                     while connections.join_next().await.is_some() {}
                 })
                 .await;

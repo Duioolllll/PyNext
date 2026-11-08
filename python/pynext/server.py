@@ -3,6 +3,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import logging
+import signal
 import threading
 import time
 
@@ -48,6 +49,10 @@ class _WsSession:
         self._inbox = asyncio.Queue(maxsize=_WS_QUEUE_SIZE)
         self._outbox = asyncio.Queue(maxsize=_WS_QUEUE_SIZE)
         self._future = None
+        # The WebSocket object, set by _websocket_callback once the
+        # handler's transport exists; serve() uses it to send a clean
+        # 1001 close when the server drains (B6).
+        self._ws = None
 
     def _push(self, item):
         # Apply backpressure at the socket boundary. If the handler cannot
@@ -153,6 +158,8 @@ def _websocket_callback(app, loop, path, query, headers, subprotocol=None):
                        part.strip().decode("ascii", "ignore")
                        for name, value in headers if bytes(name).lower() == b"sec-websocket-protocol"
                        for part in bytes(value).split(b",") if part.strip()])
+    session._ws = ws
+    app._register_ws_session(session)
 
     async def run_handler():
         try:
@@ -175,6 +182,7 @@ def _websocket_callback(app, loop, path, query, headers, subprotocol=None):
             # Tell the Rust side the handler is finished, so it can stop
             # waiting on the outbox without relying on the poll timeout.
             await session._outbox.put(("done",))
+            app._unregister_ws_session(session)
 
     future = asyncio.run_coroutine_threadsafe(run_handler(), loop)
     session._set_future(future)
@@ -194,7 +202,7 @@ def _submit(loop, coroutine):
 class _NativeStream:
     """Pull one chunk at a time on the owning Python event loop."""
 
-    def __init__(self, response, loop):
+    def __init__(self, response, loop, app=None):
         self._response = response
         self._loop = loop
         self._lock = threading.Lock()
@@ -202,6 +210,12 @@ class _NativeStream:
         self._pending = None
         self._closed = False
         self._context = response._native_context
+        # Counted on the app so serve() can wait out streaming bodies
+        # during a graceful drain (B6), not just handler execution.
+        self._app = app
+        if app is not None:
+            with app._inflight_lock:
+                app._inflight_streams += 1
 
     async def _pull(self):
         async with self._iterator_lock:
@@ -252,6 +266,9 @@ class _NativeStream:
                 return
             self._closed = True
             pending = self._pending
+        if self._app is not None:
+            with self._app._inflight_lock:
+                self._app._inflight_streams -= 1
         if pending is not None:
             pending.cancel()
         try:
@@ -278,7 +295,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                  max_connections=DEFAULT_MAX_CONNECTIONS,
                  max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                  header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
-                 body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC):
+                 body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
+                 shutdown_timeout=30.0):
     if observability is not None:
         app.configure_observability(observability)
     app.metrics.observe_worker_start()
@@ -340,8 +358,13 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
         # fresh ISR pages never reach the bridge (the Rust layer serves
         # them), so they are not rate-limited; see ratelimit.py. Paths
         # listed in the limiter's exempt_paths skip the check entirely.
+        # Health probes bypass rate limiting (B6): a saturated limiter
+        # must never make the process look dead to a load balancer.
+        # The check uses the raw path; encoded spellings of the same
+        # path still reach App.dispatch, which answers them as health.
+        is_health = raw_path in ("/healthz", "/readyz")
         exempt = getattr(limiter, "is_exempt", None)
-        if limiter is not None and not (exempt and exempt(raw_path)):
+        if limiter is not None and not (is_health or (exempt and exempt(raw_path))):
             key = limiter.key_for(client_ip, headers)
             try:
                 allowed, retry_after = limiter.allow(key)
@@ -358,9 +381,13 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                 apply_security_headers(response, config=app.security, production=app.production)
                 return response.status, response.headers, response.body
         app.metrics.observe_queue_enter()
+        with app._inflight_lock:
+            app._inflight += 1
         try:
             return _bridge_inner(method, raw_path, query, headers, body, cancellation, client_ip)
         finally:
+            with app._inflight_lock:
+                app._inflight -= 1
             app.metrics.observe_queue_exit()
 
     def _bridge_inner(method, raw_path, query, headers, body, cancellation, client_ip=None):
@@ -394,7 +421,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
         # Timeout/unavailable responses built here bypass dispatch, so apply
         # the headers here; routed responses already have them (idempotent).
         apply_security_headers(response, config=app.security, production=app.production)
-        body = (_NativeStream(response, loop) if isinstance(response, StreamingResponse) and not response._head_only
+        body = (_NativeStream(response, loop, app) if isinstance(response, StreamingResponse) and not response._head_only
                 else response.body)
         return response.status, response.headers, body
 
@@ -417,7 +444,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 websocket_protocols=app.websocket_protocols,
                                 websocket_max_message=app.websocket_max_message, listener=listener,
                                 security_headers=security_headers(config=app.security,
-                                                                  production=app.production))
+                                                                  production=app.production),
+                                drain_timeout_secs=shutdown_timeout)
 
 
 async def serve(app, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,
@@ -426,11 +454,14 @@ async def serve(app, host="127.0.0.1", port=3000, max_concurrent=64, acquire_tim
                 max_connections=DEFAULT_MAX_CONNECTIONS,
                 max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                 header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
-                body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC):
+                body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
+                shutdown_timeout=30.0):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
-    it on the same port after a file change.
+    it on the same port after a file change. When no ``stop_event`` is
+    given (the single-process ``pynext start`` path), SIGTERM/SIGINT on
+    the main thread set one, so a bare ``kill`` also drains gracefully.
 
     Connection limits (A4): ``max_connections`` caps concurrent TCP
     connections (excess connections are dropped at accept time, before any
@@ -441,22 +472,55 @@ async def serve(app, host="127.0.0.1", port=3000, max_concurrent=64, acquire_tim
     slower than that average after a 2-second grace window with a 408.
     These limits apply to the native (Axum) server only; the ASGI adapter
     relies on the ASGI server's own limits.
+
+    Graceful shutdown (B6), in order: the app stops advertising
+    readiness (``/readyz`` starts returning 503), live WebSocket
+    sessions get a clean 1001 close, in-flight HTTP requests and
+    streaming bodies are waited out for up to ``shutdown_timeout``
+    seconds, the native server stops accepting and drains its
+    connections (bounded by the same timeout), and finally the app
+    shuts its resources down. A request that is still running when the
+    timeout expires is abandoned: the server stops anyway and the
+    timeout is logged, rather than hanging the shutdown forever.
     """
     await app.startup()
     server = None
+    if stop_event is None:
+        stop_event = asyncio.Event()
+        if threading.current_thread() is threading.main_thread():
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, stop_event.set)
+                except (NotImplementedError, RuntimeError, ValueError):
+                    # Windows loops and non-main threads cannot install
+                    # handlers; the caller's stop_event (or Ctrl-C via
+                    # asyncio) still stops the server.
+                    pass
     try:
         server = start_native(app, asyncio.get_running_loop(), host, port, max_concurrent, acquire_timeout_ms,
                               body_capacity, body_timeout_ms, observability=observability, reuse_port=reuse_port,
                               listener=listener, max_connections=max_connections,
                               max_connections_per_ip=max_connections_per_ip,
                               header_read_timeout_ms=header_read_timeout_ms,
-                              body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec)
+                              body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
+                              shutdown_timeout=shutdown_timeout)
         print(f"PyNext listening on http://{server.address}", flush=True)
         if on_ready is not None:
             on_ready(server.address)
-        wait_event = stop_event if stop_event is not None else asyncio.Event()
-        await wait_event.wait()
+        await stop_event.wait()
     finally:
+        app.begin_drain()
+        try:
+            await app.close_websockets(timeout=min(5.0, shutdown_timeout))
+        except Exception:
+            log.exception("WebSocket drain failed")
+        try:
+            if not await app.wait_for_inflight(shutdown_timeout):
+                log.warning("Proceeding with shutdown after %.1fs with requests still in flight",
+                            shutdown_timeout)
+        except Exception:
+            log.exception("Inflight drain wait failed")
         try:
             if server is not None:
                 await asyncio.to_thread(server.stop)

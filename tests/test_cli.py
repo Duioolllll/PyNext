@@ -48,9 +48,9 @@ def test_cli_accepts_boundary_limits(tmp_path, monkeypatch):
                         seen.append(("app", path, production, cache_backend, cache_path)) or app)
 
     async def serve(received_app, host, port, max_concurrent, acquire_timeout_ms,
-                   body_capacity, body_timeout_ms):
+                   body_capacity, body_timeout_ms, shutdown_timeout):
         seen.append(("serve", received_app, host, port, max_concurrent,
-                     acquire_timeout_ms, body_capacity, body_timeout_ms))
+                     acquire_timeout_ms, body_capacity, body_timeout_ms, shutdown_timeout))
 
     monkeypatch.setattr(cli, "serve", serve)
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root),
@@ -58,7 +58,7 @@ def test_cli_accepts_boundary_limits(tmp_path, monkeypatch):
                                       "--body-capacity", "1", "--body-timeout-ms", "0"])
     cli.main()
     assert seen == [("app", root, True, "memory", None),
-                    ("serve", app, "127.0.0.1", 3000, 1, 0, 1, 0)]
+                    ("serve", app, "127.0.0.1", 3000, 1, 0, 1, 0, 30)]
 
 
 def test_cli_builds_and_starts_with_requested_settings(tmp_path, monkeypatch, capsys):
@@ -76,16 +76,36 @@ def test_cli_builds_and_starts_with_requested_settings(tmp_path, monkeypatch, ca
                         seen.append(("app", path, production, cache_backend, cache_path)) or app)
 
     async def serve(received_app, host, port, max_concurrent, acquire_timeout_ms,
-                   body_capacity, body_timeout_ms):
+                   body_capacity, body_timeout_ms, shutdown_timeout):
         seen.append(("serve", received_app, host, port, max_concurrent,
-                     acquire_timeout_ms, body_capacity, body_timeout_ms))
+                     acquire_timeout_ms, body_capacity, body_timeout_ms, shutdown_timeout))
 
     monkeypatch.setattr(cli, "serve", serve)
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--host", "localhost", "--port", "0",
                                       "--cache-backend", "sqlite", "--cache-path", str(root / "cache.sqlite3")])
     cli.main()
     assert seen[-2:] == [("app", root, True, "sqlite", str(root / "cache.sqlite3")),
-                         ("serve", app, "localhost", 0, 64, 1000, 16, 10000)]
+                         ("serve", app, "localhost", 0, 64, 1000, 16, 10000, 30)]
+
+
+def test_cli_shutdown_timeout_reaches_serve(tmp_path, monkeypatch):
+    root = tmp_path.resolve()
+    seen = []
+    app = object()
+    monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: app)
+
+    async def serve(*args, shutdown_timeout, **kwargs):
+        seen.append(shutdown_timeout)
+
+    monkeypatch.setattr(cli, "serve", serve)
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root),
+                                      "--shutdown-timeout", "5"])
+    cli.main()
+    assert seen == [5]
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root),
+                                      "--shutdown-timeout", "-1"])
+    with pytest.raises(SystemExit):
+        cli.main()
 
 
 def test_cli_security_flags_reach_app(tmp_path, monkeypatch):
