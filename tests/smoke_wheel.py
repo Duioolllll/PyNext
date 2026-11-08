@@ -10,10 +10,38 @@ from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = Path(os.environ.get("PYNEXT_DIST_DIR", ROOT / "dist"))
-wheels = list(DIST.glob("pynext_framework-*.whl"))
-sources = list(DIST.glob("pynext_framework-*.tar.gz"))
-if len(wheels) != 1 or len(sources) != 1:
-    raise RuntimeError("Expected one PyNext wheel and one source distribution")
+# PYNEXT_WHEEL selects one wheel file (used by the Wheels workflow, where
+# each job builds exactly one platform wheel). Otherwise dist/ must hold
+# exactly one wheel. PYNEXT_SKIP_SDIST=1 skips the source-distribution
+# checks (wheel jobs build no sdist).
+selected_wheel = os.environ.get("PYNEXT_WHEEL")
+if selected_wheel:
+    wheels = [Path(selected_wheel)]
+    if not wheels[0].is_file():
+        raise RuntimeError(f"PYNEXT_WHEEL does not exist: {selected_wheel}")
+else:
+    wheels = list(DIST.glob("pynext_framework-*.whl"))
+    if len(wheels) != 1:
+        raise RuntimeError("Expected one PyNext wheel")
+skip_sdist = os.environ.get("PYNEXT_SKIP_SDIST") == "1"
+if skip_sdist:
+    sources = []
+else:
+    sources = list(DIST.glob("pynext_framework-*.tar.gz"))
+    if len(sources) != 1:
+        raise RuntimeError("Expected one PyNext source distribution")
+
+# The wheel filename is pynext_framework-<version>-<python>-<abi>-<platform>.whl.
+# Linux wheels must be manylinux-tagged: a plain linux_x86_64 wheel only
+# installs on the distro it was built on, which defeats D1. Enforced only
+# when PYNEXT_REQUIRE_MANYLINUX=1 so the main CI's local `uv build` check
+# keeps its existing behaviour.
+parts = wheels[0].name.split("-")
+if len(parts) != 5 or parts[0] != "pynext_framework":
+    raise RuntimeError(f"Unexpected wheel filename: {wheels[0].name}")
+platform_tag = parts[4].removesuffix(".whl")
+if os.environ.get("PYNEXT_REQUIRE_MANYLINUX") == "1" and not platform_tag.startswith("manylinux"):
+    raise RuntimeError(f"Expected a manylinux wheel, got platform tag {platform_tag}")
 
 with ZipFile(wheels[0]) as archive:
     names = archive.namelist()
@@ -26,12 +54,13 @@ with ZipFile(wheels[0]) as archive:
     if not any(name.endswith("pynext/browser/runtime.js") for name in names):
         raise RuntimeError("Wheel is missing its browser runtime")
 
-with tarfile.open(sources[0]) as archive:
-    names = archive.getnames()
-    if not any(name.endswith("/LICENSE") for name in names):
-        raise RuntimeError("Source distribution is missing its license")
-    if not any(name.endswith("/third_party/NEXTJS.md") for name in names):
-        raise RuntimeError("Source distribution is missing third-party notices")
+if not skip_sdist:
+    with tarfile.open(sources[0]) as archive:
+        names = archive.getnames()
+        if not any(name.endswith("/LICENSE") for name in names):
+            raise RuntimeError("Source distribution is missing its license")
+        if not any(name.endswith("/third_party/NEXTJS.md") for name in names):
+            raise RuntimeError("Source distribution is missing third-party notices")
 
 with tempfile.TemporaryDirectory(prefix="pynext-wheel-check-") as directory:
     venv = Path(directory) / "venv"
@@ -68,4 +97,7 @@ with tempfile.TemporaryDirectory(prefix="pynext-wheel-check-") as directory:
         finally:
             if server is not None:
                 smoke._terminate(server)
-print("Source distribution and isolated wheel build and HTTP serving verified")
+if skip_sdist:
+    print("Isolated wheel build and HTTP serving verified")
+else:
+    print("Source distribution and isolated wheel build and HTTP serving verified")
