@@ -284,13 +284,13 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     app.metrics.observe_worker_start()
     limiter = getattr(app, "rate_limit", None)
 
-    async def call(method, raw_path, query, headers, body, submitted_at=None):
+    async def call(method, raw_path, query, headers, body, submitted_at=None, client_ip=None):
         started = time.monotonic()
         request_id, reset_context = begin_request_context(headers)
         if submitted_at is not None:
             queue_wait_var.set((started - submitted_at) * 1000)
         try:
-            response = await _call_inner(method, raw_path, query, headers, body)
+            response = await _call_inner(method, raw_path, query, headers, body, client_ip)
         finally:
             reset_context()
         # dispatch() already applied the headers to routed responses; this
@@ -301,7 +301,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
             response.headers.append((b"x-request-id", request_id.encode("ascii")))
         return response
 
-    async def _call_inner(method, raw_path, query, headers, body):
+    async def _call_inner(method, raw_path, query, headers, body, client_ip=None):
         try:
             path = _decode_path(raw_path, raw_path.encode("ascii"))
         except (ValueError, UnicodeError):
@@ -310,6 +310,18 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
             try:
                 request = Request(method.upper(), path, bytes(query),
                                   tuple((bytes(k), bytes(v)) for k, v in headers), bytes(body), _app=app)
+                # Trust-resolved client identity (A6, pynext.proxy), same
+                # values as on ASGI: without trusted proxies these are just
+                # the direct connection values. The native listener is plain
+                # HTTP, so the default scheme is "http".
+                host = next((value.decode("latin-1") for key, value in headers
+                             if key.lower() == b"host"), None)
+                info = app.proxy_trust.resolve(
+                    client_ip, tuple((bytes(k), bytes(v)) for k, v in headers),
+                    default_scheme="http", default_host=host)
+                request.state["client_ip"] = info.client_ip
+                request.state["client_scheme"] = info.scheme
+                request.state["client_host"] = info.host
                 response = await app.dispatch(request)
             except BadRequest as exc:
                 log.info("Bad request: %s", exc)
@@ -347,14 +359,14 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                 return response.status, response.headers, response.body
         app.metrics.observe_queue_enter()
         try:
-            return _bridge_inner(method, raw_path, query, headers, body, cancellation)
+            return _bridge_inner(method, raw_path, query, headers, body, cancellation, client_ip)
         finally:
             app.metrics.observe_queue_exit()
 
-    def _bridge_inner(method, raw_path, query, headers, body, cancellation):
+    def _bridge_inner(method, raw_path, query, headers, body, cancellation, client_ip=None):
         submitted_at = time.monotonic()
         try:
-            future = _submit(loop, call(method, raw_path, query, headers, body, submitted_at))
+            future = _submit(loop, call(method, raw_path, query, headers, body, submitted_at, client_ip))
         except RuntimeError:
             app.metrics.observe_worker_timeout("unavailable")
             response = Response("Service Unavailable", status=503)

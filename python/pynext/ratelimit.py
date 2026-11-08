@@ -8,7 +8,9 @@ network in front of the server: a client behind an untrusted proxy can
 spoof ``X-Forwarded-For``, so forwarded headers are honoured only when
 the direct peer is listed in ``trusted_proxies`` (spec §11: only trusted
 proxies may have their forwarded headers interpreted). With no trusted
-proxies configured, ``X-Forwarded-For`` is ignored entirely.
+proxies configured, forwarded headers are ignored entirely. All of that
+resolution lives in :mod:`pynext.proxy`; this module only owns the
+buckets.
 
 IPv6 addresses are grouped by /64 prefix, so one network (not one
 address) shares a bucket. A single host rotating addresses inside its
@@ -42,6 +44,7 @@ import time
 from collections import OrderedDict, deque
 
 from .http import Response
+from .proxy import ProxyTrust, parse_trusted_proxies
 
 _MAX_BUCKETS = 10_000
 _IPV6_PREFIX_LEN = 64
@@ -52,22 +55,11 @@ class RateLimitUnavailable(Exception):
 
 
 def _parse_trusted_proxies(trusted_proxies):
-    """Normalize trusted-proxy entries to ``ipaddress`` networks.
+    """Normalize trusted-proxy entries (kept for backward compatibility).
 
-    Each entry is an IP address (a single host) or a CIDR network.
-    Raises ``ValueError`` for anything unparseable so a typo fails at
-    startup instead of silently trusting nobody — or everybody.
+    See :func:`pynext.proxy.parse_trusted_proxies`.
     """
-    networks = []
-    for entry in trusted_proxies or ():
-        if isinstance(entry, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
-            networks.append(entry)
-            continue
-        try:
-            networks.append(ipaddress.ip_network(str(entry), strict=False))
-        except ValueError as exc:
-            raise ValueError(f"Invalid trusted proxy {entry!r}: must be an IP address or CIDR network") from exc
-    return tuple(networks)
+    return parse_trusted_proxies(trusted_proxies)
 
 
 def _parse_exempt_paths(exempt_paths):
@@ -127,7 +119,10 @@ class RateLimiter:
         self.limit = limit
         self.window_seconds = float(window_seconds)
         self._refill_per_second = limit / self.window_seconds
-        self.trusted_proxies = _parse_trusted_proxies(trusted_proxies)
+        # One shared trust decision for the limiter and the app: the
+        # forwarded-header rules live in pynext.proxy (A6).
+        self._trust = ProxyTrust(trusted_proxies)
+        self.trusted_proxies = self._trust.networks
         self.exempt_paths = _parse_exempt_paths(exempt_paths)
         # Table size and new-key admission bound; both default to the
         # module-wide cap so a burst of legitimate new clients is not
@@ -144,14 +139,7 @@ class RateLimiter:
         self._evicted = 0
 
     def _is_trusted(self, client_ip):
-        if not self.trusted_proxies or client_ip is None:
-            return False
-        try:
-            address = client_ip if isinstance(client_ip, (ipaddress.IPv4Address, ipaddress.IPv6Address)) \
-                else ipaddress.ip_address(client_ip)
-        except ValueError:
-            return False
-        return any(address in network for network in self.trusted_proxies)
+        return self._trust.is_trusted(client_ip)
 
     def is_exempt(self, path):
         """True when ``path`` (query string ignored) skips rate limiting."""
@@ -167,38 +155,19 @@ class RateLimiter:
     def key_for(self, client_ip, headers=()):
         """Derive the bucket key for a request.
 
-        ``headers`` is an iterable of ``(name, value)`` byte pairs. Starting
-        at the direct peer, walk ``X-Forwarded-For`` right-to-left only while
-        each hop is trusted. The nearest untrusted address is the key.
-        A request with no known peer address shares the ``"unknown"``
-        bucket. IPv6 addresses are grouped by /64 prefix (see
-        :func:`_bucket_key`).
+        Delegates to :meth:`pynext.proxy.ProxyTrust.resolve_client_ip`:
+        the nearest untrusted address walking the forwarded chain from the
+        direct peer, or the peer itself when nothing is trusted. A request
+        with no known peer address shares the ``"unknown"`` bucket. IPv6
+        addresses are grouped by /64 prefix (see :func:`_bucket_key`).
         """
-        if client_ip is None:
+        resolved = self._trust.resolve_client_ip(client_ip, headers)
+        if resolved is None:
             return "unknown"
         try:
-            current = ipaddress.ip_address(client_ip)
+            return _bucket_key(ipaddress.ip_address(resolved))
         except ValueError:
-            return client_ip
-        if not self._is_trusted(current):
-            return _bucket_key(current)
-        forwarded = []
-        for name, value in headers:
-            if name.lower() == b"x-forwarded-for":
-                forwarded.extend(value.decode("latin-1").split(","))
-        for candidate in reversed(forwarded):
-            if not self._is_trusted(current):
-                break
-            candidate = candidate.strip()
-            if candidate.startswith("[") and candidate.endswith("]"):
-                candidate = candidate[1:-1]
-            try:
-                address = ipaddress.ip_address(candidate)
-            except ValueError:
-                # Do not trust any hop to the left of malformed input.
-                break
-            current = address
-        return _bucket_key(current)
+            return resolved
 
     def _prune_new_keys(self, now):
         """Drop new-key admissions older than one window."""

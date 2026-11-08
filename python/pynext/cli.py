@@ -81,7 +81,8 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                   body_capacity, body_timeout_ms, cache_backend="memory", cache_path=None,
                  observability=None, rate_limit=None, security=None, websocket_max_message=MAX_WS_MESSAGE,
                  max_connections=None, max_connections_per_ip=None,
-                 header_read_timeout_ms=None, body_min_rate_bytes_per_sec=None):
+                 header_read_timeout_ms=None, body_min_rate_bytes_per_sec=None,
+                 trusted_proxies=()):
     """Serve the app in development mode, replacing changed island bundles.
 
     Other file changes restart the server on the same port and reload open
@@ -114,7 +115,8 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                 try:
                     app = create_app(root, production=False, cache_backend=cache_backend, cache_path=cache_path,
                                observability=observability, rate_limit=rate_limit, debug=True, security=security,
-                               websocket_max_message=websocket_max_message, hot_reload=True)
+                               websocket_max_message=websocket_max_message, hot_reload=True,
+                               trusted_proxies=trusted_proxies)
                 except Exception:
                     traceback.print_exc()
                     print("PyNext dev: fix the error above; watching for changes...", flush=True)
@@ -144,7 +146,8 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                 try:
                     new_app = create_app(root, production=False, cache_backend=cache_backend, cache_path=cache_path,
                                observability=observability, rate_limit=rate_limit, debug=True, security=security,
-                               websocket_max_message=websocket_max_message, hot_reload=True)
+                               websocket_max_message=websocket_max_message, hot_reload=True,
+                               trusted_proxies=trusted_proxies)
                 except Exception:
                     traceback.print_exc()
                     print("PyNext dev: keeping the previous version running; "
@@ -233,8 +236,10 @@ def main():
             command.add_argument("--rate-limit-backend", choices=("memory", "redis"), default="memory",
                                  help="per-process memory (default) or Redis via PYNEXT_REDIS_URL")
             command.add_argument("--trusted-proxy", action="append", default=[], metavar="IP_OR_CIDR",
-                                 help="peer IP or network whose X-Forwarded-For is honoured "
-                                      "for rate limiting (repeatable; default: none trusted)")
+                                 help="peer IP or network whose forwarded headers "
+                                      "(X-Forwarded-For, Forwarded, X-Forwarded-Proto, "
+                                      "X-Forwarded-Host) are honoured for rate limiting and "
+                                      "client identity (repeatable; default: none trusted)")
             command.add_argument("--rate-limit-exempt-path", action="append", default=[], metavar="PATH",
                                  help="path prefix that skips rate limiting, e.g. /healthz "
                                       "(repeatable; default: nothing is exempt)")
@@ -344,13 +349,16 @@ def main():
                                 args.body_capacity, args.body_timeout_ms,
                                 cache_backend=args.cache_backend, cache_path=args.cache_path,
                                 rate_limit=limiter, security=security,
-                                websocket_max_message=args.ws_max_message_bytes, **extra, **conn_kwargs))
+                                websocket_max_message=args.ws_max_message_bytes,
+                                trusted_proxies=args.trusted_proxy, **extra, **conn_kwargs))
         except KeyboardInterrupt:
             pass
         return
     app = create_app(root, production=args.command == "start",
                      cache_backend=args.cache_backend, cache_path=args.cache_path,
-                     rate_limit=limiter, **({"security": security} if security else {}),
+                     rate_limit=limiter,
+                     **({"trusted_proxies": args.trusted_proxy} if args.trusted_proxy else {}),
+                     **({"security": security} if security else {}),
                      **({"websocket_max_message": args.ws_max_message_bytes}
                         if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}), **extra)
     try:
