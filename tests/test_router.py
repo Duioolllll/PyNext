@@ -12,8 +12,15 @@ def test_next_source_order_and_parameters():
 
 @pytest.mark.parametrize("paths", [
     ["/blog/[id]", "/blog/[slug]"], ["/blog/[...id]/a"], ["/[id]/[id]"],
-    ["/[[...id]]"], ["/[..id]"], ["/x", "/x"],
+    ["/[[id]]"], ["/[..id]"], ["/x", "/x"],
+    ["/docs/[...p]", "/docs/[[...q]]"],
 ])
 def test_invalid_or_ambiguous_routes(paths):
     with pytest.raises(ValueError):
         _native.Router(paths)
+
+
+def test_optional_catch_all_is_valid_and_matches_zero_segments():
+    router = _native.Router(["/docs/[[...path]]"])
+    assert router.matches("/docs") == ("/docs/[[...path]]", {"path": []})
+    assert router.matches("/docs/a/b") == ("/docs/[[...path]]", {"path": ["a", "b"]})

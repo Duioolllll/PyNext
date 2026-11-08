@@ -45,9 +45,17 @@ def discover(root):
         if path.name not in ("page.py", "route.py"):
             continue
         relative_parent = path.parent.relative_to(app_dir)
-        pattern = "/" + "/".join(relative_parent.parts)
+        # Route groups (parenthesised directories) organise files but do
+        # not appear in the URL; layouts inside a group still apply.
+        parts = []
+        for part in relative_parent.parts:
+            if _route_group(part) is None:
+                parts.append(part)
+        pattern = "/" + "/".join(parts)
         if pattern in routes:
-            raise ValueError(f"A page and an API cannot share a path: {pattern}")
+            if routes[pattern]["kind"] != path.stem:
+                raise ValueError(f"A page and an API cannot share a path: {pattern}")
+            raise ValueError(f"Duplicate route path: {pattern}")
         dirs = [app_dir]
         current = app_dir
         for part in relative_parent.parts:
@@ -118,25 +126,64 @@ def _atomic_write(path, contents):
             os.unlink(name)
 
 
+def _segment_param(segment):
+    """Parse one route segment.
+
+    Returns (name, kind) where kind is "dynamic", "catch_all" or
+    "optional", or None for a static segment.
+    """
+    if not segment.startswith("["):
+        return None
+    match = re.fullmatch(r"\[(\[)?(\.\.\.)?([A-Za-z0-9_-]+)\](\])?", segment)
+    if match is None:
+        raise ValueError(f"Invalid route segment: {segment}")
+    double_open, dots, name, double_close = match.groups()
+    if bool(double_open) != bool(double_close):
+        raise ValueError(f"Invalid route segment: {segment}")
+    if double_open and not dots:
+        raise ValueError(f"Optional catch-all must use [[...name]]: {segment}")
+    kind = "optional" if double_open else ("catch_all" if dots else "dynamic")
+    return name, kind
+
+
+def _route_group(part):
+    """Return the group name for a `(group)` directory segment, else None.
+
+    Route groups do not appear in the URL. A segment that looks like a
+    group but is malformed (unbalanced or empty parentheses) is an error.
+    """
+    if not (part.startswith("(") or part.endswith(")")):
+        return None
+    match = re.fullmatch(r"\(([A-Za-z0-9_-]+)\)", part)
+    if match is None:
+        raise ValueError(f"Invalid route group: {part}")
+    return match.group(1)
+
+
 def _materialize(pattern, params):
     segments = pattern.strip("/").split("/") if pattern != "/" else []
     keys = {}
     for segment in segments:
-        match = re.fullmatch(r"\[(\.\.\.)?([A-Za-z0-9_-]+)\]", segment)
-        if match:
-            keys[match.group(2)] = bool(match.group(1))
+        parsed = _segment_param(segment)
+        if parsed:
+            keys[parsed[0]] = parsed[1]
     if not isinstance(params, dict) or set(params) != set(keys):
         raise ValueError(f"Static params for {pattern} must contain exactly {sorted(keys)}")
     output = []
     for segment in segments:
-        match = re.fullmatch(r"\[(\.\.\.)?([A-Za-z0-9_-]+)\]", segment)
-        if not match:
+        parsed = _segment_param(segment)
+        if not parsed:
             output.append(segment)
             continue
-        value = params[match.group(2)]
-        if match.group(1):
+        name, kind = parsed
+        value = params[name]
+        if kind == "catch_all":
             if not isinstance(value, list) or not value:
-                raise ValueError(f"Catch-all parameter {match.group(2)} must be a nonempty list")
+                raise ValueError(f"Catch-all parameter {name} must be a nonempty list")
+            values = value
+        elif kind == "optional":
+            if not isinstance(value, list):
+                raise ValueError(f"Optional catch-all parameter {name} must be a list")
             values = value
         else:
             values = [value]

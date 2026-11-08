@@ -48,6 +48,7 @@ def test_benchmark_distinguishes_success_from_http_and_transport_errors():
     ("axum", "loopback_http"),
     ("uvicorn", "loopback_http"),
     ("asgi", "in_process_asgi"),
+    ("starlette", "loopback_http"),
 ])
 def test_benchmark_mode_transport_labels_and_success(mode, transport):
     result = asyncio.run(run(mode, 4, 2, "/api/users", False, warmup=1))
@@ -55,6 +56,38 @@ def test_benchmark_mode_transport_labels_and_success(mode, transport):
     assert result["transport"] == transport
     assert result["successful_requests"] == 4
     assert result["errors"] == 0
+
+
+def test_starlette_reference_returns_the_same_api_payload():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "pynext_starlette_app",
+        Path(__file__).resolve().parents[1] / "benchmarks" / "starlette_app.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    async def check():
+        transport = httpx.ASGITransport(app=module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            assert (await client.get("/api/users")).json() == {"users": ["Alice", "Bob"]}
+            response = await client.post("/api/users", json={"name": "N"})
+            assert response.status_code == 201 and response.json() == {"name": "N"}
+            assert (await client.get("/")).status_code == 200
+            assert "Hello PyNext!" in (await client.get("/")).text
+            assert (await client.get("/blog/hello")).status_code == 200
+
+    asyncio.run(check())
+
+
+def test_benchmark_compare_runs_all_loopback_groups():
+    result = asyncio.run(benchmark.run_compare(4, 2, "/api/users", False, warmup=1))
+    assert [group["mode"] for group in result["groups"]] == ["axum", "uvicorn", "starlette"]
+    assert all(group["transport"] == "loopback_http" for group in result["groups"])
+    assert all(group["successful_requests"] == 4 and group["errors"] == 0 for group in result["groups"])
+    assert all(set(group["latency_ms"]) == {"p50", "p95", "p99"} for group in result["groups"])
+    assert result["conditions"]["path"] == "/api/users"
 
 
 def test_benchmark_reports_zero_success_without_fabricating_success_latency():

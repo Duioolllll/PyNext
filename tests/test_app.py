@@ -63,7 +63,7 @@ def test_asgi_lifespan_and_disconnected_request():
     asyncio.run(run())
 
 
-def test_asgi_rejects_websocket_and_oversized_multichunk_body():
+def test_asgi_websocket_without_handler_closes_and_oversized_multichunk_body():
     async def run():
         app = create_app(EXAMPLE)
         sent = []
@@ -71,12 +71,21 @@ def test_asgi_rejects_websocket_and_oversized_multichunk_body():
         async def send(message):
             sent.append(message)
 
-        async def unused_receive():
-            raise AssertionError("websocket scope should be rejected before receiving")
+        async def receive_connect():
+            return {"type": "websocket.connect"}
 
-        with pytest.raises(RuntimeError, match="Unsupported ASGI scope: websocket"):
-            await app({"type": "websocket"}, unused_receive, send)
-        assert not sent
+        # /api/users has no WebSocket handler, so the handshake is refused
+        # with a policy-violation close instead of hanging or raising.
+        await app({"type": "websocket", "path": "/api/users", "headers": [], "query_string": b""},
+                  receive_connect, send)
+        assert sent == [{"type": "websocket.close", "code": 1008}]
+
+        async def unused_receive():
+            raise AssertionError("unknown scope should be rejected before receiving")
+
+        with pytest.raises(RuntimeError, match="Unsupported ASGI scope: mystery"):
+            await app({"type": "mystery"}, unused_receive, send)
+        sent.clear()
         messages = iter([
             {"type": "http.request", "body": b"x" * 600_000, "more_body": True},
             {"type": "http.request", "body": b"y" * 500_000, "more_body": False},

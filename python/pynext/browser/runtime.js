@@ -214,10 +214,193 @@ function eachIsland(node, callback) {
   for (const element of node.querySelectorAll("[data-pynext-island]")) callback(element);
 }
 
+// ---- Client-side navigation and prefetch (finding #51) ----
+// Partial navigation: same-origin link clicks fetch the target document and
+// swap the body instead of reloading. Any failure falls back to a full
+// document navigation, so a page never breaks. The runtime is only loaded
+// on pages with islands, so partial navigation is active only there.
+const PREFETCH_MAX_ENTRIES = 20;
+const PREFETCH_MAX_BYTES = 1024 * 1024;
+const prefetchCache = new Map();
+const prefetchInflight = new Set();
+const observedLinks = new WeakSet();
+let linkObserver = null;
+let navigationToken = 0;
+
+function navigationUrl(anchor) {
+  if (!anchor || anchor.tagName !== "A") return null;
+  const href = anchor.getAttribute("href");
+  if (!href || href.startsWith("#")) return null;
+  let url;
+  try {
+    url = new URL(href, document.baseURI);
+  } catch (error) {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.origin !== window.location.origin) return null;
+  return url;
+}
+
+function isNavigable(anchor) {
+  const url = navigationUrl(anchor);
+  if (!url) return null;
+  if (anchor.hasAttribute("download")) return null;
+  const target = anchor.getAttribute("target");
+  if (target && target !== "_self") return null;
+  // A same-page hash link is the browser's job (anchor scrolling).
+  if (url.pathname === window.location.pathname && url.search === window.location.search) return null;
+  return url;
+}
+
+async function fetchPage(url) {
+  const cached = prefetchCache.get(url.href);
+  if (cached !== undefined) return cached;
+  const response = await fetch(url.href, { headers: { Accept: "text/html" } });
+  if (!response.ok) throw new Error(`Navigation fetch failed: ${response.status}`);
+  const type = response.headers.get("content-type") || "";
+  if (!type.includes("text/html")) throw new Error("Navigation fetch did not return HTML");
+  const html = await response.text();
+  if (html.length > PREFETCH_MAX_BYTES) throw new Error("Navigation page too large for partial navigation");
+  return html;
+}
+
+function swapDocument(html, url) {
+  const parsed = new DOMParser().parseFromString(html, "text/html");
+  document.body.replaceChildren(...parsed.body.childNodes);
+  if (parsed.title) document.title = parsed.title;
+  if (url.hash) {
+    const target = document.getElementById(decodeURIComponent(url.hash.slice(1)));
+    if (target) {
+      target.scrollIntoView();
+      return;
+    }
+  }
+  window.scrollTo(0, 0);
+}
+
+async function navigate(url, { push = true, onFailure = "full" } = {}) {
+  const token = ++navigationToken;
+  let html;
+  try {
+    html = await fetchPage(url);
+  } catch (error) {
+    if (onFailure === "reload") window.location.reload();
+    else window.location.href = url.href;
+    return false;
+  }
+  if (token !== navigationToken) return false;
+  try {
+    swapDocument(html, url);
+  } catch (error) {
+    if (onFailure === "reload") window.location.reload();
+    else window.location.href = url.href;
+    return false;
+  }
+  if (push) {
+    try {
+      window.history.pushState(null, "", url.href);
+    } catch (error) {
+      // The swapped content stays even if history cannot be updated.
+    }
+  }
+  scanLinks();
+  return true;
+}
+
+function prefetch(url) {
+  const key = url.href;
+  if (prefetchCache.has(key) || prefetchInflight.has(key)) return;
+  prefetchInflight.add(key);
+  fetchPage(url).then((html) => {
+    if (prefetchCache.size >= PREFETCH_MAX_ENTRIES) {
+      prefetchCache.delete(prefetchCache.keys().next().value);
+    }
+    prefetchCache.set(key, html);
+  }).catch(() => {
+    // Prefetch is best-effort; the click still navigates.
+  }).finally(() => prefetchInflight.delete(key));
+}
+
+function observeLink(anchor) {
+  if (observedLinks.has(anchor) || !isNavigable(anchor)) return;
+  observedLinks.add(anchor);
+  if (typeof window.IntersectionObserver !== "function") return;
+  try {
+    if (!linkObserver) {
+      linkObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting && entry.intersectionRatio <= 0) continue;
+          const link = entry.target;
+          linkObserver.unobserve(link);
+          const url = navigationUrl(link);
+          if (url) prefetch(url);
+        }
+      });
+    }
+    linkObserver.observe(anchor);
+  } catch (error) {
+    // Prefetch is best-effort.
+  }
+}
+
+function scanLinks() {
+  for (const anchor of document.querySelectorAll("a[href]")) observeLink(anchor);
+}
+
+function startNavigation() {
+  document.addEventListener("click", (event) => {
+    if (event.defaultPrevented || event.button !== 0 ||
+        event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    const anchor = event.target instanceof Element ? event.target.closest("a[href]") : null;
+    const url = anchor ? isNavigable(anchor) : null;
+    if (!url) return;
+    event.preventDefault();
+    void navigate(url);
+  });
+  for (const type of ["mouseover", "focusin"]) {
+    document.addEventListener(type, (event) => {
+      const anchor = event.target instanceof Element ? event.target.closest("a[href]") : null;
+      const url = anchor ? isNavigable(anchor) : null;
+      if (url) prefetch(url);
+    });
+  }
+  window.addEventListener("popstate", () => {
+    void navigate(new URL(window.location.href), { push: false, onFailure: "reload" });
+  });
+  scanLinks();
+  window.__pynextNav = {
+    navigate: (href) => {
+      let url;
+      try {
+        url = new URL(href, window.location.href);
+      } catch (error) {
+        return Promise.resolve(false);
+      }
+      return navigate(url);
+    },
+    prefetch: (href) => {
+      try {
+        prefetch(new URL(href, window.location.href));
+      } catch (error) {
+        // Ignore an unparseable debug prefetch.
+      }
+    },
+    isPrefetched: (href) => {
+      try {
+        return prefetchCache.has(new URL(href, window.location.href).href);
+      } catch (error) {
+        return false;
+      }
+    },
+  };
+}
+
 function start() {
   for (const element of document.querySelectorAll("[data-pynext-island]")) {
     scheduleIsland(element);
   }
+  startNavigation();
   new MutationObserver((records) => {
     for (const record of records) {
       for (const node of record.removedNodes) eachIsland(node, (element) => {

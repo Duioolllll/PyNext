@@ -1,7 +1,19 @@
-"""Small reproducible smoke benchmark; not a cross-framework comparison."""
+"""Small reproducible smoke benchmark, with a bounded cross-framework comparison.
+
+Modes: ``axum`` (PyNext standalone, loopback HTTP), ``uvicorn`` (the same
+PyNext ASGI app under Uvicorn, loopback HTTP), ``asgi`` (in-process
+ASGITransport, not comparable with the HTTP modes), and ``starlette`` (the
+same-feature Starlette reference app in benchmarks/starlette_app.py under
+Uvicorn, loopback HTTP). ``--compare`` runs the three loopback-HTTP groups
+(axum, uvicorn, starlette) with identical settings and prints one combined
+result. All groups share one process with the load generator, so this is a
+smoke comparison for regressions, not a production throughput claim; record
+the environment (see docs/BENCHMARKING.md) alongside any numbers quoted.
+"""
 import argparse
 import asyncio
 from collections import Counter
+import importlib.metadata
 import json
 import math
 import os
@@ -188,6 +200,21 @@ async def run(mode, count, concurrency, path, production, *, warmup=10, base_url
     uvicorn_server = uvicorn_task = uvicorn_socket = None
     if base_url:
         client = httpx.AsyncClient(base_url=base_url, timeout=30)
+    elif mode == "starlette":
+        # Same-feature reference app; the PyNext app is not built here and
+        # --production does not apply to this group. Loaded by file path
+        # because bench.py also runs as a script (no package import).
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "pynext_starlette_app",
+            Path(__file__).resolve().parent / "starlette_app.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        uvicorn_server, uvicorn_task, uvicorn_socket = await _start_uvicorn_http(module.app)
+        client = httpx.AsyncClient(
+            base_url=f"http://127.0.0.1:{uvicorn_socket.getsockname()[1]}", timeout=30)
     else:
         app = create_app(ROOT, production=production)
         if mode == "axum":
@@ -208,7 +235,8 @@ async def run(mode, count, concurrency, path, production, *, warmup=10, base_url
         transport = ("external_http" if base_url else
                      "in_process_asgi" if mode == "asgi" else "loopback_http")
         return {"mode": "external" if base_url else mode, "transport": transport, "path": path,
-                "production": None if base_url else production,
+                "production": None if base_url or mode == "starlette" else production,
+                "framework": None if base_url else "starlette" if mode == "starlette" else "pynext",
                 "python": platform.python_version(), "platform": platform.platform(), **result}
     finally:
         if uvicorn_task is not None:
@@ -223,10 +251,43 @@ async def run(mode, count, concurrency, path, production, *, warmup=10, base_url
             await app.isr.close()
 
 
+COMPARE_MODES = ("axum", "uvicorn", "starlette")
+
+
+async def run_compare(count, concurrency, path, production, *, warmup=10):
+    """Run the loopback-HTTP comparison groups with identical settings.
+
+    The in-process ``asgi`` mode is deliberately excluded: it skips the
+    network, so its numbers are not comparable with loopback HTTP.
+    """
+    groups = []
+    for mode in COMPARE_MODES:
+        groups.append(await run(mode, count, concurrency, path, production, warmup=warmup))
+    return {
+        "comparison": "pynext-vs-starlette",
+        "conditions": {
+            "path": path,
+            "requests": count,
+            "concurrency": concurrency,
+            "warmup": warmup,
+            "production": production,
+            "transport": "loopback_http (same process as load generator)",
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "uvicorn": importlib.metadata.version("uvicorn"),
+            "starlette": importlib.metadata.version("starlette"),
+            "httpx": importlib.metadata.version("httpx"),
+        },
+        "groups": groups,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("asgi", "axum", "uvicorn"), default="axum",
-                        help="asgi uses in-process ASGITransport; axum/uvicorn use loopback HTTP")
+    parser.add_argument("--mode", choices=("asgi", "axum", "uvicorn", "starlette"), default="axum",
+                        help="asgi uses in-process ASGITransport; axum/uvicorn/starlette use loopback HTTP")
+    parser.add_argument("--compare", action="store_true",
+                        help="run axum, uvicorn and starlette with identical settings and print one combined result (ignores --mode)")
     parser.add_argument("--requests", type=int, default=1000)
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=10)
@@ -250,6 +311,10 @@ def main():
             _linux_process_cpu(args.server_pid)
         except (OSError, ValueError, IndexError) as exc:
             parser.error(f"cannot read server process CPU data: {exc}")
+    if args.compare:
+        print(json.dumps(asyncio.run(run_compare(args.requests, args.concurrency, args.path,
+                                                 args.production, warmup=args.warmup)), indent=2))
+        return
     print(json.dumps(asyncio.run(run(args.mode, args.requests, args.concurrency, args.path, args.production,
                                  warmup=args.warmup, base_url=args.base_url, server_pid=args.server_pid)), indent=2))
 
