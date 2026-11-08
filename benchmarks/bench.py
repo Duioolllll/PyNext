@@ -47,7 +47,8 @@ def _percentiles(samples):
     def percentile(value):
         return round(ordered[max(0, math.ceil(len(ordered) * value) - 1)], 3)
 
-    return {"p50": round(statistics.median(ordered), 3), "p95": percentile(.95), "p99": percentile(.99)}
+    return {"p50": round(statistics.median(ordered), 3), "p95": percentile(.95),
+            "p99": percentile(.99), "p99.9": percentile(.999)}
 
 
 def _linux_process_cpu(pid):
@@ -200,7 +201,7 @@ async def run(mode, count, concurrency, path, production, *, warmup=10, base_url
     server = None
     uvicorn_server = uvicorn_task = uvicorn_socket = None
     if base_url:
-        client = httpx.AsyncClient(base_url=base_url, timeout=30)
+        client = httpx.AsyncClient(base_url=base_url, timeout=30, trust_env=False)
     elif mode == "starlette":
         # Same-feature reference app; the PyNext app is not built here and
         # --production does not apply to this group. Loaded by file path
@@ -215,18 +216,20 @@ async def run(mode, count, concurrency, path, production, *, warmup=10, base_url
         spec.loader.exec_module(module)
         uvicorn_server, uvicorn_task, uvicorn_socket = await _start_uvicorn_http(module.app)
         client = httpx.AsyncClient(
-            base_url=f"http://127.0.0.1:{uvicorn_socket.getsockname()[1]}", timeout=30)
+            base_url=f"http://127.0.0.1:{uvicorn_socket.getsockname()[1]}",
+            timeout=30, trust_env=False)
     else:
         app = create_app(ROOT, production=production)
         if mode == "axum":
             server = start_native(app, asyncio.get_running_loop(), port=0)
-            client = httpx.AsyncClient(base_url=f"http://{server.address}", timeout=30)
+            client = httpx.AsyncClient(base_url=f"http://{server.address}", timeout=30, trust_env=False)
         elif mode == "uvicorn":
             uvicorn_server, uvicorn_task, uvicorn_socket = await _start_uvicorn_http(app)
             client = httpx.AsyncClient(
-                base_url=f"http://127.0.0.1:{uvicorn_socket.getsockname()[1]}", timeout=30)
+                base_url=f"http://127.0.0.1:{uvicorn_socket.getsockname()[1]}",
+                timeout=30, trust_env=False)
         elif mode == "asgi":
-            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", trust_env=False)
         else:
             raise ValueError(f"Unsupported benchmark mode: {mode}")
     try:

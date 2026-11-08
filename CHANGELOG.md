@@ -2,6 +2,11 @@
 
 All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
 
+## Unreleased
+
+- Add a reproducible load baseline (`benchmarks/baseline.py`, roadmap C1): fixed scenarios (static, SSG, ISR hit, SSR, JSON API, SQLite DB query, streaming) with repeated measurements, p50/p95/p99/p99.9 latency, error rate, server CPU and sampled peak RSS, and recorded load-generator/server environments for separate-machine runs. The DB-query scenario uses a benchmark-only SQLite fixture app. `benchmarks/baseline-2026-11-08.json` is a same-machine smoke run, not a production claim.
+- Report p99.9 latency in `benchmarks/bench.py` percentiles.
+
 ## 0.1.0
 
 - Add Redis ISR storage with expiring leases, fenced writes and cross-worker invalidation; add Redis-backed shared rate limiting, including static and cached responses. Redis cache failures fall back locally; rate-limiter failures return 503.
