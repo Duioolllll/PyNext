@@ -2,6 +2,8 @@
 
 이 문서는 제안된 설계와 완료 기준이다. **0.1.0 준비가 아래 프로덕션 기능들을 모두 완성했다는 뜻은 아니다.** PyNext는 현재 실험 단계이며, 각 항목은 설계 검토·구현·테스트·측정을 마친 뒤 완료로 표시한다.
 
+TLS 종료는 리버스 프록시에서 수행한다. PyNext 자체는 TLS를 종료하지 않는다. ([ADR-0001](adr/0001-tls-termination.md))
+
 ## 출발점과 공통 측정
 
 현재 Axum은 정적 파일과 일부 캐시 응답을 Rust에서 처리하고, 동적 요청은 Python asyncio 루프로 넘긴다. 전역 미들웨어나 요청 제한을 등록하면 정적·캐시 요청도 Python을 거친다. 비동기 iterable API 응답과 페이지의 스트리밍 SSR을 지원한다. 기본 ISR 캐시는 프로세스별이고 SQLite 또는 Redis로 공유할 수 있다. 공유 저장소가 정상일 때는 매 조회가 무효화를 반영한다. 선택적 Redis 요청 제한, OpenTelemetry 추적, 공유 리스너 기반 다중 워커 감독자와 Linux standalone 디렉터리가 있다. 공유 리스너 워커의 실행과 재시작은 Linux·macOS·Windows CI에서 검사하고, 신호 기반 수퍼바이저는 Linux·macOS에서 검사한다. React/RSC와 서킷 브레이커는 없다.
