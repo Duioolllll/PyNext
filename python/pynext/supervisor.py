@@ -77,6 +77,7 @@ class WorkerConfig:
     max_connections_per_ip: int = 128
     header_read_timeout_ms: int = 10000
     body_min_rate_bytes_per_sec: int = 1024
+    max_waiting: int | None = None  # None keeps the native default min(max_concurrent, 64)
     rate_limit: int = 0  # 0 disables rate limiting
     rate_limit_window: float = 60.0
     rate_limit_backend: str = "memory"
@@ -157,6 +158,7 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                         header_read_timeout_ms=config.header_read_timeout_ms,
                         body_min_rate_bytes_per_sec=config.body_min_rate_bytes_per_sec,
                         shutdown_timeout=config.shutdown_timeout,
+                        max_waiting=config.max_waiting,
                         on_ready=lambda _address: ready.set())
         finally:
             shutdown_task.cancel()
