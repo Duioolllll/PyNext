@@ -79,7 +79,8 @@ async def _reload_dev_client(app, root):
 
 async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                   body_capacity, body_timeout_ms, cache_backend="memory", cache_path=None,
-                 observability=None, rate_limit=None, security=None, websocket_max_message=MAX_WS_MESSAGE):
+                 observability=None, rate_limit=None, security=None, websocket_max_message=MAX_WS_MESSAGE,
+                 shutdown_timeout=30.0):
     """Serve the app in development mode, replacing changed island bundles.
 
     Other file changes restart the server on the same port and reload open
@@ -113,6 +114,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
             server_task = asyncio.create_task(serve(app, host, current_port, max_concurrent,
                                                     acquire_timeout_ms, body_capacity, body_timeout_ms,
                                                     stop_event=stop_server, observability=observability,
+                                                    shutdown_timeout=shutdown_timeout,
                                                     on_ready=record_address))
             new_app = None
             while new_app is None:
@@ -221,6 +223,9 @@ def main():
             command.add_argument("--csp-nonce", action="store_true", help="enable CSP nonces on dynamic pages")
             command.add_argument("--ws-max-message-bytes", type=_at_least(1, "--ws-max-message-bytes"),
                                  default=MAX_WS_MESSAGE, help="WebSocket message limit in bytes (max 16777216)")
+            command.add_argument("--shutdown-timeout", type=_at_least(0, "--shutdown-timeout"), default=30,
+                                 help="seconds to let in-flight requests finish and WebSockets close "
+                                      "after SIGTERM before the server stops anyway (default 30)")
     args = parser.parse_args()
     root = Path(args.dir).resolve()
     if args.command == "init":
@@ -287,7 +292,8 @@ def main():
                               trusted_proxies=tuple(args.trusted_proxy),
                               cache_backend=args.cache_backend, cache_path=args.cache_path,
                               observability=obs_config, security=security,
-                              websocket_max_message=args.ws_max_message_bytes)
+                              websocket_max_message=args.ws_max_message_bytes,
+                              shutdown_timeout=args.shutdown_timeout)
         return run_supervisor(config, workers=args.workers)
     if args.command == "dev":
         try:
@@ -295,7 +301,8 @@ def main():
                                 args.body_capacity, args.body_timeout_ms,
                                 cache_backend=args.cache_backend, cache_path=args.cache_path,
                                 rate_limit=limiter, security=security,
-                                websocket_max_message=args.ws_max_message_bytes, **extra))
+                                websocket_max_message=args.ws_max_message_bytes,
+                                shutdown_timeout=args.shutdown_timeout, **extra))
         except KeyboardInterrupt:
             pass
         return
@@ -306,7 +313,8 @@ def main():
                         if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}), **extra)
     try:
         asyncio.run(serve(app, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
-                          args.body_capacity, args.body_timeout_ms, **extra))
+                          args.body_capacity, args.body_timeout_ms,
+                          shutdown_timeout=args.shutdown_timeout, **extra))
     except KeyboardInterrupt:
         pass
 

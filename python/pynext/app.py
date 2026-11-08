@@ -372,6 +372,17 @@ class App:
             self.resources = MappingProxyType(combined)
             self._resources_started = []
             self._started = False
+            # Graceful-shutdown state (B6): set by begin_drain() when the
+            # server stops accepting new traffic. In-flight requests and
+            # WebSocket sessions are tracked here so serve() can wait for
+            # them; the counters are touched from Rust worker threads, so
+            # they are guarded by a plain lock, never the event loop.
+            self._draining = False
+            self._ws_sessions = set()
+            self._ws_lock = threading.Lock()
+            self._inflight = 0
+            self._inflight_streams = 0
+            self._inflight_lock = threading.Lock()
         except BaseException:
             self._release_modules()
             raise
@@ -556,6 +567,7 @@ class App:
     async def shutdown(self):
         """Close resources in reverse order even when one shutdown fails."""
         error = None
+        self._draining = True
         for resource in reversed(self._resources_started):
             try:
                 await resource.shutdown()
@@ -575,6 +587,83 @@ class App:
                 log.exception("Cache shutdown failed")
         if error is not None:
             raise error
+
+    @property
+    def is_ready(self):
+        """True once startup finished and the app is not draining.
+
+        ``/readyz`` answers from this: a load balancer must stop sending
+        new traffic as soon as draining starts, while in-flight requests
+        still finish.
+        """
+        return self._started and not self._draining
+
+    def begin_drain(self):
+        """Stop advertising readiness without stopping in-flight work.
+
+        Idempotent. Called by ``server.serve()`` the moment a shutdown is
+        requested, before the native server stops accepting connections.
+        """
+        self._draining = True
+
+    def _register_ws_session(self, session):
+        with self._ws_lock:
+            self._ws_sessions.add(session)
+
+    def _unregister_ws_session(self, session):
+        with self._ws_lock:
+            self._ws_sessions.discard(session)
+
+    async def close_websockets(self, code=1001, reason="server shutting down", timeout=5.0):
+        """End every live native WebSocket session with a clean close.
+
+        Each accepted session first gets a close frame (``code`` 1001 by
+        default, "going away"), so peers see an orderly shutdown instead
+        of a dropped connection. Handlers that do not exit on their own
+        are cancelled once ``timeout`` seconds have passed. Sessions that
+        never accepted a connection have nothing to close and are only
+        waited on. Returns True when every handler finished in time.
+        """
+        with self._ws_lock:
+            sessions = list(self._ws_sessions)
+        for session in sessions:
+            ws = getattr(session, "_ws", None)
+            if ws is not None and ws.accepted and not ws.closed:
+                try:
+                    await ws.close(code, reason)
+                except Exception:
+                    log.debug("WebSocket close during drain failed", exc_info=True)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            pending = [s for s in sessions
+                       if (future := getattr(s, "_future", None)) is not None and not future.done()]
+            if not pending:
+                return True
+            if time.monotonic() >= deadline:
+                for session in pending:
+                    future = getattr(session, "_future", None)
+                    if future is not None and not future.done():
+                        future.cancel()
+                return False
+            await asyncio.sleep(0.05)
+
+    async def wait_for_inflight(self, timeout):
+        """Wait until in-flight HTTP requests and streams drain.
+
+        Returns True when nothing is in flight, False on timeout. The
+        counters are updated by the native bridge (HTTP) and by
+        ``_NativeStream`` (streaming bodies), both from Rust threads.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._inflight_lock:
+                remaining = self._inflight + self._inflight_streams
+            if remaining <= 0:
+                return True
+            if time.monotonic() >= deadline:
+                log.warning("Shutdown timed out with %d requests still in flight", remaining)
+                return False
+            await asyncio.sleep(0.05)
 
     async def revalidate(self, path):
         """Invalidate one decoded ISR path for this app instance."""
@@ -743,6 +832,28 @@ class App:
 
     async def dispatch(self, request):
         """Return a response. Exceptions are converted at the transport boundary."""
+        # Health probes are reserved framework paths (B6): they bypass
+        # middleware, CORS preflight and CSRF so a load balancer can probe
+        # a half-broken app, and an app route or public asset with the
+        # same path never shadows them. The native transport also skips
+        # rate limiting and static serving for these paths; see
+        # server.start_native and crates/pynext-native/src/lib.rs.
+        # /healthz is liveness (the process answers at all); /readyz is
+        # readiness (startup finished and not draining).
+        if request.path in ("/healthz", "/readyz"):
+            route_var.set("__health__")
+            if request.method not in {"GET", "HEAD"}:
+                return Response("Method Not Allowed", status=405,
+                                headers=[(b"allow", b"GET, HEAD")])
+            if request.path == "/healthz":
+                body = b"" if request.method == "HEAD" else b"ok"
+                return Response(body, media_type="text/plain; charset=utf-8")
+            if self.is_ready:
+                body = b"" if request.method == "HEAD" else b"ready"
+                return Response(body, media_type="text/plain; charset=utf-8")
+            return Response(b"" if request.method == "HEAD" else b"not ready", status=503,
+                            media_type="text/plain; charset=utf-8",
+                            headers=[(b"retry-after", b"1")])
         preflight = cors_preflight_response(request, config=self.security)
         if self.middleware:
             async def terminal(current):
@@ -1152,7 +1263,10 @@ class App:
             _reset_request_context()
 
     async def _handle_http(self, scope, receive, send):
-        if self.rate_limit is not None:
+        # Health probes bypass rate limiting (B6): a saturated limiter
+        # must never make the process look dead to a load balancer.
+        is_health = scope.get("path") in ("/healthz", "/readyz")
+        if self.rate_limit is not None and not is_health:
             # Check before reading the body: an over-limit request is
             # rejected without handler execution or body intake.
             client = scope.get("client")
