@@ -16,11 +16,11 @@
 | API 413 | 요청 본문 1 MiB 초과 |
 | 부하 상황 503 | 실행·본문 슬롯 용량 및 대기열 원인 진단 |
 | 요청 504 | Python 핸들러 시간 초과; 동기 스레드가 계속 실행될 수 있음 |
-| 프로세스마다 ISR 결과 차이 | 캐시/무효화는 **프로세스별**임 |
+| 프로세스마다 ISR 결과 차이 | 기본 `memory` 캐시는 프로세스별입니다. 워커 간 공유에는 `--cache-backend sqlite` 또는 `redis`를 사용하세요 |
 
 ## 점검 순서
 
-1. CPython **3.13**, Rust/Cargo, uv, islands 사용 시 Node/npm 버전을 확인합니다.
+1. CPython **3.13 또는 3.14**, Rust/Cargo, uv, islands 사용 시 Node/npm 버전을 확인합니다.
 2. `app/page.py`가 `@page()`를 사용한 `Page`를 내보내고, API는 `Response` 파생 객체를 반환하며 경로 충돌이 없는지 검사합니다.
 3. `uv run pytest -q`와 `cargo test --locked --workspace --all-features`를 실행합니다.
 4. 신뢰하는 소스에서 재빌드하고 서버를 재시작한 뒤 경로를 하나씩 확인합니다.

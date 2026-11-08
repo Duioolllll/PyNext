@@ -46,4 +46,4 @@ export function mount(element, props) {
 
 Props는 브라우저에 공개되는 JSON이며 **16 KiB** 한도입니다. 비밀 값을 넣지 마세요. 중첩 islands, 외부/npm 패키지 import, CSS import는 미지원입니다. 단일 번들은 **2 MiB**, 전체 island 자산은 **32 MiB** 이내여야 합니다. `/_pynext/` 경로는 예약되어 있습니다.
 
-실제 구현은 [examples/basic/islands](../../../examples/basic/islands), 브라우저 검증은 [tests/browser](../../../tests/browser)를 참고하세요. 클라이언트 라우팅과 HMR은 없습니다.
+실제 구현은 [examples/basic/islands](../../../examples/basic/islands), 브라우저 검증은 [tests/browser](../../../tests/browser)를 참고하세요. 클라이언트 라우팅과 island HMR(바뀐 island 모듈을 전체 새로고침 없이 교체)은 구현됐습니다. HMR 중 island 상태는 보존되지 않습니다.

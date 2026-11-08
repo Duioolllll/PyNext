@@ -4,12 +4,12 @@
 
 ## Prerequisites
 
-- CPython **3.13** (the only currently verified Python version)
+- CPython **3.13 or 3.14**
 - Rust toolchain and Cargo
 - [uv](https://docs.astral.sh/uv/)
 - Node.js **18+** and npm **only if your app contains JS/TS islands**
 
-PyNext is developed from this source repository; do not assume it is distributed through PyPI.
+PyNext is published on PyPI as `pynext-framework` (`pip install pynext-framework==0.1.0`); the steps below use this source repository.
 
 ## Run the included example
 

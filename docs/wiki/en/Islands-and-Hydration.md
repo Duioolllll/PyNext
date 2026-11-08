@@ -46,4 +46,4 @@ Use `island("hydrated-counter", props={"initial": 3}, fallback=h("button", {}, "
 
 Props are public JSON (maximum **16 KiB**) and must not contain credentials. Nested islands, external/npm-package imports and CSS imports are unsupported. One compiled bundle may be at most **2 MiB**, with **32 MiB** total island assets. `/_pynext/` is a reserved URL namespace.
 
-For actual source and behavior tests see [examples/basic/islands](../../../examples/basic/islands) and [browser tests](../../../tests/browser). Client-side router/navigation and HMR are not implemented.
+For actual source and behavior tests see [examples/basic/islands](../../../examples/basic/islands) and [browser tests](../../../tests/browser). Client-side navigation and island HMR (replacing changed island modules without a full page reload) are implemented; HMR does not preserve island state.

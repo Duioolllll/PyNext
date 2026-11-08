@@ -53,6 +53,6 @@ Synchronous Python handlers run in threads. Timeout/cancellation cannot forcibly
 
 ## Supported vs planned
 
-Implemented: file routing, buffered SSR/SSG/ISR, HTTP server, ASGI, API streaming, optional islands. Not implemented: React/RSC, streaming SSR, shared ISR across workers, per-app process isolation, standalone packaging, built-in OpenTelemetry.
+Implemented: file routing, buffered and streaming SSR, SSG, ISR (process-local memory or shared SQLite/Redis), HTTP server, ASGI, API streaming, optional islands, WebSocket, multi-worker supervisor, Linux standalone directory, and OpenTelemetry tracing (real SDK). Not implemented: React/RSC.
 
 See [HTTP and caching](HTTP-and-Caching.md) and [Roadmap and contributing](Roadmap-and-Contributing.md).
