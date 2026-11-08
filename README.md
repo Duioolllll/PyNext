@@ -129,7 +129,7 @@ store = SQLiteSessionStore(Path(__file__).parent / ".pynext" / "sessions.sqlite3
 MIDDLEWARE = [SessionMiddleware(store)]
 ```
 
-세션 미들웨어가 설치된 경우 CSRF 보호는 `session.csrf_token()`으로 발급한
+세션 미들웨어가 설치된 경우 CSRF 보호가 자동으로 켜지며 `session.csrf_token()`으로 발급한
 토큰을 해당 세션과 비교합니다. 로그인 시 `rotate()`는 CSRF 토큰도 바꾸므로
 클라이언트에 새 토큰을 전달해야 합니다. 동시 수정이나 만료·폐기와 충돌한 저장은
 409를 반환합니다. 핸들러에서 이미 수행한 외부 작업은 자동으로 되돌리지 않으므로
@@ -201,11 +201,11 @@ URL 인코딩과 multipart를 지원하고 중복 필드는 순서대로 보존�
 
 `request.query`를 읽을 때 잘못된 UTF-8 쿼리 문자열과 `await request.json()`을 읽을 때 잘못된 JSON 본문은 `BadRequest` 예외가 발생하며 HTTP 400으로 응답합니다. 쿼리의 퍼센트 인코딩을 푼 결과도 UTF-8로 검사합니다. JSON의 `NaN`과 `Infinity`도 허용하지 않습니다. 파싱은 해당 속성이나 메서드를 읽을 때 이루어지므로, 읽지 않는 요청에는 적용되지 않습니다. 앱에서 직접 `from pynext import BadRequest`로 불러와 입력 검증 오류에 사용할 수도 있습니다. 클라이언트에는 예외의 상세 내용 대신 `Bad Request`만 전송합니다. 요청 본문은 최대 1 MiB이며 초과하면 413입니다.
 
-상태 변경 API에는 CSRF 보호를 선택적으로 적용할 수 있습니다(명세 v0.2 §11). 세션 미들웨어를 사용하면 `session.csrf_token()`을 발급하고 헤더 또는 폼 필드에서 받은 토큰을 해당 세션과 비교합니다. 세션 미들웨어가 없으면 `new_csrf_token()`과 `set_csrf_cookie()`를 사용하는 double-submit 방식입니다. 핸들러에 `@csrf_protect`를 붙이거나 `create_app(..., security=SecurityConfig(csrf_enabled=True))`로 모든 상태 변경 API를 보호할 수 있으며, 토큰이 없거나 일치하지 않으면 403을 반환합니다.
+상태 변경 API에는 CSRF 보호가 적용됩니다(명세 v0.2 §11). 세션 미들웨어를 설치하면 모든 상태 변경 API가 자동으로 보호됩니다(`session.csrf_token()`을 발급하고 헤더 또는 폼 필드에서 받은 토큰을 해당 세션과 비교합니다). 세션 미들웨어가 없으면 기본적으로 꺼져 있으며, 핸들러에 `@csrf_protect`를 붙이거나 `create_app(..., security=SecurityConfig(csrf_enabled=True))`로 켤 수 있습니다. 세션이 없는 경우 `new_csrf_token()`과 `set_csrf_cookie()`를 사용하는 double-submit 방식이며, 쿠키 값은 HMAC으로 서명돼 서명이 없는 쿠키는 토큰이 일치해도 거부됩니다(서브도메인 쿠키 주입 방지). `Origin`/`Sec-Fetch-Site`도 검사해 교차 사이트·서브도메인 페이지에서 온 상태 변경 요청은 토큰이 있어도 403을 반환합니다. 토큰이 없거나 일치하지 않으면 403을 반환합니다. 명시적으로 끄려면 `SecurityConfig(csrf_enabled=False)`를 전달하세요. CSRF 쿠키는 기본적으로 `Secure`이므로 평문 `http://` 로컬 개발에서는 `csrf_cookie_secure=False`를 앱 설정과 `set_csrf_cookie()` 호출에 함께 전달하세요(`pynext dev`는 자동으로 이렇게 동작합니다).
 
-CLI의 `dev`와 `start`에서는 `--csrf`, `--csrf-cookie-secure`, 반복 가능한
+CLI의 `dev`와 `start`에서는 `--csrf`/`--no-csrf`, `--csrf-cookie-secure`/`--no-csrf-cookie-secure`, 반복 가능한
 `--cors-origin`, `--cors-credentials`, `--csp-nonce`로 같은 보안 설정을 켤 수 있습니다.
-기본값은 기존과 같이 CSRF와 nonce가 꺼져 있고 교차 출처를 허용하지 않습니다.
+`--csrf`를 지정하지 않으면 세션 미들웨어 설치 여부에 따라 자동으로 결정되며, `start`에서는 CSRF 쿠키가 기본적으로 `Secure`이고 `dev`에서는 평문 HTTP 개발을 위해 `Secure`가 꺼집니다. 기본적으로 nonce는 꺼져 있고 교차 출처를 허용하지 않습니다.
 
 교차 출처 요청은 기본적으로 허용하지 않습니다(명세 v0.2 §11). `SecurityConfig(cors_allowed_origins=("https://example.com",), ...)`로 origin·method·header를 명시하면 해당 출처의 preflight에 204와 `Access-Control-Allow-*` 헤더를 반환하고, 실제 요청에도 허용 헤더를 붙입니다. 허용되지 않은 출처의 preflight는 403이며, 실제 요청에는 CORS 헤더를 붙이지 않아 브라우저가 응답을 차단합니다. 같은 출처 요청은 CORS로 차단하지 않습니다. 자세한 내용은 [사용 설명서](docs/ko/manual.md)를 참조하세요.
 
