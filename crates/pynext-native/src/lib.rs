@@ -804,7 +804,10 @@ fn retry_after_for_timeout(timeout: Duration) -> u64 {
     (timeout.as_millis() as u64).div_ceil(1000).max(1)
 }
 
-fn busy_response(retry_after_secs: u64, security_headers: &[(Vec<u8>, Vec<u8>)]) -> AxumResponse<Body> {
+fn busy_response(
+    retry_after_secs: u64,
+    security_headers: &[(Vec<u8>, Vec<u8>)],
+) -> AxumResponse<Body> {
     apply_security_headers(
         AxumResponse::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -1391,7 +1394,12 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     drop(waiting);
                     permit
                 }
-                _ => return busy_response(retry_after_for_timeout(state.acquire_timeout), &state.security_headers),
+                _ => {
+                    return busy_response(
+                        retry_after_for_timeout(state.acquire_timeout),
+                        &state.security_headers,
+                    )
+                }
             }
         }
     };
