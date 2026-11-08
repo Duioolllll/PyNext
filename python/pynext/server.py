@@ -263,7 +263,23 @@ class _NativeStream:
 
 
 def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,
-                 body_capacity=16, body_timeout_ms=10000, observability=None, *, reuse_port=False, listener=None):
+                 body_capacity=16, body_timeout_ms=10000, observability=None, *, reuse_port=False, listener=None,
+                 max_waiting=None):
+    """Start the native server and return its handle.
+
+    Overload policy (roadmap C7): bounded wait, then reject. At most
+    ``max_concurrent`` requests run Python handlers at once; further
+    requests wait up to ``acquire_timeout_ms`` for a slot, then get
+    503 with ``Retry-After``. The wait queue holds at most ``max_waiting``
+    requests (``None`` keeps the default ``min(max_concurrent, 64)``;
+    0 means a slot must be free immediately). Each waiter can hold a
+    fully buffered request body, so the queue stays bounded: raising
+    ``max_waiting`` without raising ``acquire_timeout_ms`` does nothing,
+    and waiting indefinitely would trade 503s for memory exhaustion.
+    A 503 after the full wait carries ``Retry-After`` of
+    ``ceil(acquire_timeout_ms / 1000)`` seconds (at least 1); a 503 for
+    a full wait queue carries ``Retry-After: 1``.
+    """
     if observability is not None:
         app.configure_observability(observability)
     app.metrics.observe_worker_start()
@@ -365,6 +381,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
 
     return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store, app.asset_etags,
                                 max_concurrent=max_concurrent, acquire_timeout_ms=acquire_timeout_ms,
+                                max_waiting=max_waiting,
                                 body_capacity=body_capacity, body_timeout_ms=body_timeout_ms,
                                 websocket_paths=sorted(app.websocket_routes),
                                 websocket_callback=ws_callback,
@@ -378,18 +395,19 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
 
 async def serve(app, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,
                 body_capacity=16, body_timeout_ms=10000, stop_event=None, observability=None, *,
-                reuse_port=False, on_ready=None, listener=None):
+                reuse_port=False, on_ready=None, listener=None, max_waiting=None):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
-    it on the same port after a file change.
+    it on the same port after a file change. ``max_waiting`` is the
+    bounded execution wait-queue size; see :func:`start_native`.
     """
     await app.startup()
     server = None
     try:
         server = start_native(app, asyncio.get_running_loop(), host, port, max_concurrent, acquire_timeout_ms,
                               body_capacity, body_timeout_ms, observability=observability, reuse_port=reuse_port,
-                              listener=listener)
+                              listener=listener, max_waiting=max_waiting)
         print(f"PyNext listening on http://{server.address}", flush=True)
         if on_ready is not None:
             on_ready(server.address)

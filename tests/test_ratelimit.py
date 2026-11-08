@@ -274,9 +274,9 @@ def test_cli_passes_rate_limit_to_app(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "create_app", fake_create_app)
 
     async def serve(received_app, host, port, max_concurrent, acquire_timeout_ms,
-                    body_capacity, body_timeout_ms):
+                    body_capacity, body_timeout_ms, max_waiting=None):
         seen.append(("serve", received_app, host, port, max_concurrent,
-                     acquire_timeout_ms, body_capacity, body_timeout_ms))
+                     acquire_timeout_ms, body_capacity, body_timeout_ms, max_waiting))
 
     monkeypatch.setattr(cli, "serve", serve)
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root),

@@ -26,6 +26,8 @@ def test_cli_rejects_invalid_port_before_starting(value, monkeypatch, capsys):
     ("--acquire-timeout-ms", "not-a-number", "--acquire-timeout-ms must be an integer >= 0"),
     ("--body-timeout-ms", "-1", "--body-timeout-ms must be an integer >= 0"),
     ("--body-timeout-ms", "not-a-number", "--body-timeout-ms must be an integer >= 0"),
+    ("--max-waiting", "-1", "--max-waiting must be an integer >= 0"),
+    ("--max-waiting", "not-a-number", "--max-waiting must be an integer >= 0"),
 ])
 def test_cli_rejects_out_of_range_limits_before_starting(flag, value, message, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["pynext", "dev", flag, value])
@@ -48,9 +50,9 @@ def test_cli_accepts_boundary_limits(tmp_path, monkeypatch):
                         seen.append(("app", path, production, cache_backend, cache_path)) or app)
 
     async def serve(received_app, host, port, max_concurrent, acquire_timeout_ms,
-                   body_capacity, body_timeout_ms):
+                   body_capacity, body_timeout_ms, max_waiting=None):
         seen.append(("serve", received_app, host, port, max_concurrent,
-                     acquire_timeout_ms, body_capacity, body_timeout_ms))
+                     acquire_timeout_ms, body_capacity, body_timeout_ms, max_waiting))
 
     monkeypatch.setattr(cli, "serve", serve)
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root),
@@ -58,7 +60,26 @@ def test_cli_accepts_boundary_limits(tmp_path, monkeypatch):
                                       "--body-capacity", "1", "--body-timeout-ms", "0"])
     cli.main()
     assert seen == [("app", root, True, "memory", None),
-                    ("serve", app, "127.0.0.1", 3000, 1, 0, 1, 0)]
+                    ("serve", app, "127.0.0.1", 3000, 1, 0, 1, 0, None)]
+
+
+def test_cli_max_waiting_reaches_serve(tmp_path, monkeypatch):
+    root = tmp_path.resolve()
+    seen = []
+    app = object()
+    monkeypatch.setattr(cli, "create_app", lambda path, production, cache_backend="memory", cache_path=None,
+                        rate_limit=None, **kwargs:
+                        seen.append(("app", path, production, cache_backend, cache_path)) or app)
+
+    async def serve(received_app, host, port, max_concurrent, acquire_timeout_ms,
+                   body_capacity, body_timeout_ms, max_waiting=None):
+        seen.append(("serve", received_app, host, port, max_concurrent,
+                     acquire_timeout_ms, body_capacity, body_timeout_ms, max_waiting))
+
+    monkeypatch.setattr(cli, "serve", serve)
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--max-waiting", "0"])
+    cli.main()
+    assert seen[1] == ("serve", app, "127.0.0.1", 3000, 64, 1000, 16, 10000, 0)
 
 
 def test_cli_builds_and_starts_with_requested_settings(tmp_path, monkeypatch, capsys):
@@ -76,16 +97,16 @@ def test_cli_builds_and_starts_with_requested_settings(tmp_path, monkeypatch, ca
                         seen.append(("app", path, production, cache_backend, cache_path)) or app)
 
     async def serve(received_app, host, port, max_concurrent, acquire_timeout_ms,
-                   body_capacity, body_timeout_ms):
+                   body_capacity, body_timeout_ms, max_waiting=None):
         seen.append(("serve", received_app, host, port, max_concurrent,
-                     acquire_timeout_ms, body_capacity, body_timeout_ms))
+                     acquire_timeout_ms, body_capacity, body_timeout_ms, max_waiting))
 
     monkeypatch.setattr(cli, "serve", serve)
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--host", "localhost", "--port", "0",
                                       "--cache-backend", "sqlite", "--cache-path", str(root / "cache.sqlite3")])
     cli.main()
     assert seen[-2:] == [("app", root, True, "sqlite", str(root / "cache.sqlite3")),
-                         ("serve", app, "localhost", 0, 64, 1000, 16, 10000)]
+                         ("serve", app, "localhost", 0, 64, 1000, 16, 10000, None)]
 
 
 def test_cli_security_flags_reach_app(tmp_path, monkeypatch):

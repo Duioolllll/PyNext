@@ -63,6 +63,7 @@ class WorkerConfig:
     acquire_timeout_ms: int
     body_capacity: int
     body_timeout_ms: int
+    max_waiting: int | None = None  # None keeps the native default min(max_concurrent, 64)
     rate_limit: int = 0  # 0 disables rate limiting
     rate_limit_window: float = 60.0
     rate_limit_backend: str = "memory"
@@ -124,7 +125,7 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
             await serve(app, config.host, config.port, config.max_concurrent,
                         config.acquire_timeout_ms, config.body_capacity, config.body_timeout_ms,
                         listener=listener, stop_event=stop_event,
-                        observability=config.observability,
+                        observability=config.observability, max_waiting=config.max_waiting,
                         on_ready=lambda _address: ready.set())
         finally:
             shutdown_task.cancel()

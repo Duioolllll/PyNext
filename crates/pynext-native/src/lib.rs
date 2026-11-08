@@ -763,7 +763,15 @@ fn plain_response(status: StatusCode, body: &'static str) -> AxumResponse<Body> 
         .expect("static response is valid")
 }
 
-fn busy_response() -> AxumResponse<Body> {
+/// `Retry-After` for a request that waited the full slot-acquire timeout
+/// without getting a slot: whole seconds, at least 1. The queue was full
+/// for the whole configured wait, so telling the client to retry sooner
+/// would most likely hit the same wall.
+fn retry_after_for_timeout(timeout: Duration) -> u64 {
+    (timeout.as_millis() as u64).div_ceil(1000).max(1)
+}
+
+fn busy_response(retry_after_secs: u64) -> AxumResponse<Body> {
     AxumResponse::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
         .header("content-type", "text/plain; charset=utf-8")
@@ -771,7 +779,7 @@ fn busy_response() -> AxumResponse<Body> {
             "content-security-policy",
             "script-src 'self'; object-src 'none'",
         )
-        .header("retry-after", "1")
+        .header("retry-after", retry_after_secs.to_string())
         .body(Body::from("Server Busy"))
         .expect("busy response is valid")
 }
@@ -1157,7 +1165,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         let _body_permit = match state.body_capacity.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                return close_with_unread_body(busy_response(), parts.version);
+                return close_with_unread_body(busy_response(1), parts.version);
             }
         };
         match tokio::time::timeout(
@@ -1253,26 +1261,42 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             }
         }
     }
-    // Static/cache hits never compete with Python handler execution.
-    // Wait briefly for a slot instead of rejecting the moment the server is
-    // busy: a burst that clears within the timeout degrades gracefully, and
-    // only sustained overload gets a 503 with Retry-After. Waiting requests
-    // hold a Tokio task, not a Python worker thread. Bound this queue too:
-    // each waiter can already hold a fully buffered request body.
-    let waiting = match state.waiting_capacity.clone().try_acquire_owned() {
+    // Overload policy (roadmap C7): bounded wait, then reject. A burst
+    // that clears within the acquire timeout degrades gracefully, and only
+    // sustained overload gets a 503 with Retry-After. A request that finds
+    // a free slot takes it immediately without consuming queue capacity;
+    // only requests that must wait take a waiting permit, so `max_waiting`
+    // bounds exactly the number of waiters (0: a slot must be free at
+    // once). Waiting requests hold a Tokio task, not a Python worker
+    // thread. Bound this queue too: each waiter can already hold a fully
+    // buffered request body, so an unbounded wait would trade 503s for
+    // memory exhaustion and head-of-line latency, and probabilistic early
+    // shedding would drop requests that would have succeeded within the
+    // timeout. The queue size is configurable via `max_waiting`; the
+    // default stays `min(max_concurrent, 64)`.
+    let permit = match state.capacity.clone().try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return busy_response(),
+        Err(_) => {
+            let waiting = match state.waiting_capacity.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                // No waiting slot: the earliest a slot could free is
+                // unknown, so the advisory retry delay stays 1 second.
+                Err(_) => return busy_response(1),
+            };
+            match tokio::time::timeout(
+                state.acquire_timeout,
+                state.capacity.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => {
+                    drop(waiting);
+                    permit
+                }
+                _ => return busy_response(retry_after_for_timeout(state.acquire_timeout)),
+            }
+        }
     };
-    let permit = match tokio::time::timeout(
-        state.acquire_timeout,
-        state.capacity.clone().acquire_owned(),
-    )
-    .await
-    {
-        Ok(Ok(permit)) => permit,
-        _ => return busy_response(),
-    };
-    drop(waiting);
     let method = parts.method.to_string();
     let path = parts.uri.path().to_string();
     let query = parts.uri.query().unwrap_or("").as_bytes().to_vec();
@@ -1474,7 +1498,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1488,6 +1512,7 @@ impl NativeServer {
         asset_etags: HashMap<String, String>,
         max_concurrent: usize,
         acquire_timeout_ms: u64,
+        max_waiting: Option<usize>,
         body_capacity: usize,
         body_timeout_ms: u64,
         websocket_paths: Option<Vec<String>>,
@@ -1515,6 +1540,13 @@ impl NativeServer {
             return Err(PyValueError::new_err(
                 "max_concurrent is outside the supported range",
             ));
+        }
+        if let Some(waiting) = max_waiting {
+            if waiting > Semaphore::MAX_PERMITS {
+                return Err(PyValueError::new_err(
+                    "max_waiting is outside the supported range",
+                ));
+            }
         }
         if body_capacity == 0 || body_capacity > Semaphore::MAX_PERMITS {
             return Err(PyValueError::new_err(
@@ -1606,7 +1638,12 @@ impl NativeServer {
                 let state = Arc::new(ServerState {
                     callback,
                     capacity: Arc::new(Semaphore::new(max_concurrent)),
-                    waiting_capacity: Arc::new(Semaphore::new(max_concurrent.min(64))),
+                    // Configurable (roadmap C7); None keeps the old
+                    // default of min(max_concurrent, 64). 0 means an
+                    // execution slot must be free immediately, else 503.
+                    waiting_capacity: Arc::new(Semaphore::new(
+                        max_waiting.unwrap_or_else(|| max_concurrent.min(64)),
+                    )),
                     acquire_timeout: Duration::from_millis(acquire_timeout_ms),
                     // Body intake gets fewer slots than Python execution on
                     // purpose: a flood of slow uploads can then only take the

@@ -2,6 +2,10 @@
 
 All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
 
+## Unreleased
+
+- Redesign the overload policy (roadmap C7): make the execution wait queue configurable with `--max-waiting` / `max_waiting` (default `min(--max-concurrent, 64)`; 0 waits for nobody), keep the default policy of bounded wait then 503, and return an accurate `Retry-After` — `ceil(acquire_timeout_ms / 1000)` seconds (at least 1) after a full wait, `1` for a full wait queue. Defaults are unchanged: the old hard-coded `min(max_concurrent, 64)` queue and `Retry-After: 1` at the default 1000 ms timeout behave exactly as before.
+
 ## 0.1.0
 
 - Add Redis ISR storage with expiring leases, fenced writes and cross-worker invalidation; add Redis-backed shared rate limiting, including static and cached responses. Redis cache failures fall back locally; rate-limiter failures return 503.

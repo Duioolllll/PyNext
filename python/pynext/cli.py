@@ -38,6 +38,7 @@ def _at_least(minimum, label):
     conversion, both as tracebacks. Timeouts (--acquire-timeout-ms,
     --body-timeout-ms) allow 0: a 0ms wait is a valid "take a slot only if
     instantly free, else 503/408" mode (Duration::from_millis(0) in Rust).
+    --max-waiting also allows 0: no request waits for a slot at all.
     """
     def convert(value):
         try:
@@ -79,7 +80,8 @@ async def _reload_dev_client(app, root):
 
 async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                   body_capacity, body_timeout_ms, cache_backend="memory", cache_path=None,
-                 observability=None, rate_limit=None, security=None, websocket_max_message=MAX_WS_MESSAGE):
+                 observability=None, rate_limit=None, security=None, websocket_max_message=MAX_WS_MESSAGE,
+                 max_waiting=None):
     """Serve the app in development mode, replacing changed island bundles.
 
     Other file changes restart the server on the same port and reload open
@@ -113,7 +115,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
             server_task = asyncio.create_task(serve(app, host, current_port, max_concurrent,
                                                     acquire_timeout_ms, body_capacity, body_timeout_ms,
                                                     stop_event=stop_server, observability=observability,
-                                                    on_ready=record_address))
+                                                    on_ready=record_address, max_waiting=max_waiting))
             new_app = None
             while new_app is None:
                 changed = await _wait_for_change(watcher, server_task)
@@ -180,6 +182,9 @@ def main():
                                  help="in-flight requests before new ones wait for a slot")
             command.add_argument("--acquire-timeout-ms", type=_at_least(0, "--acquire-timeout-ms"), default=1000,
                                  help="how long a request waits for a slot before getting a 503")
+            command.add_argument("--max-waiting", type=_at_least(0, "--max-waiting"), default=None,
+                                 help="requests waiting for an execution slot before new ones get a 503"
+                                      " (default: min(--max-concurrent, 64); 0 waits for nobody)")
             command.add_argument("--body-capacity", type=_at_least(1, "--body-capacity"), default=16,
                                  help="concurrent request bodies being read before new ones get a 503")
             command.add_argument("--body-timeout-ms", type=_at_least(0, "--body-timeout-ms"), default=10000,
@@ -279,6 +284,7 @@ def main():
                               production=args.command == "start",
                               max_concurrent=args.max_concurrent,
                               acquire_timeout_ms=args.acquire_timeout_ms,
+                              max_waiting=args.max_waiting,
                               body_capacity=args.body_capacity,
                               body_timeout_ms=args.body_timeout_ms,
                               rate_limit=args.rate_limit,
@@ -295,7 +301,7 @@ def main():
                                 args.body_capacity, args.body_timeout_ms,
                                 cache_backend=args.cache_backend, cache_path=args.cache_path,
                                 rate_limit=limiter, security=security,
-                                websocket_max_message=args.ws_max_message_bytes, **extra))
+                                websocket_max_message=args.ws_max_message_bytes, max_waiting=args.max_waiting, **extra))
         except KeyboardInterrupt:
             pass
         return
@@ -306,7 +312,8 @@ def main():
                         if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}), **extra)
     try:
         asyncio.run(serve(app, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
-                          args.body_capacity, args.body_timeout_ms, **extra))
+                          args.body_capacity, args.body_timeout_ms,
+                          **({"max_waiting": args.max_waiting} if args.max_waiting is not None else {}), **extra))
     except KeyboardInterrupt:
         pass
 
