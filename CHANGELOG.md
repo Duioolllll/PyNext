@@ -13,6 +13,13 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Report p99.9 latency in `benchmarks/bench.py` percentiles.
 - Redesign the overload policy (roadmap C7): make the execution wait queue configurable with `--max-waiting` / `max_waiting` (default `min(--max-concurrent, 64)`; 0 waits for nobody), keep the default policy of bounded wait then 503, and return an accurate `Retry-After` — `ceil(acquire_timeout_ms / 1000)` seconds (at least 1) after a full wait, `1` for a full wait queue. Defaults are unchanged: the old hard-coded `min(max_concurrent, 64)` queue and `Retry-After: 1` at the default 1000 ms timeout behave exactly as before.
 
+- Add a dedicated `Wheels` workflow (D1) that prebuilds binary wheels for
+  Linux manylinux x86_64/aarch64, macOS universal2 and Windows x64 for
+  Python 3.13/3.14, verifies each wheel in an isolated virtualenv with no
+  Rust toolchain, and uploads the wheels as artifacts. See
+  `docs/WHEEL_RELEASE.md`. CI still does not upload anything to PyPI;
+  publishing stays a manual maintainer step.
+
 ## 0.1.0
 
 - Add the A1 default security headers to every response (SSR, SSG, ISR, API, static, client assets, preflight, and error pages) on both the ASGI adapter and the native server, including the Rust fast path for static and fresh ISR responses: HSTS in production only (`max-age=31536000; includeSubDomains`, configurable, omitted in development so `pynext dev` on `http://127.0.0.1` is unaffected), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`, and an extended CSP (`script-src 'self'` plus the per-request nonce when enabled, `style-src 'self'`, `object-src 'none'`, `base-uri 'self'`, `form-action 'self'`, `frame-ancestors 'none'`). All of them are configurable on `SecurityConfig` (set a field to `None`/`False` to disable that header); an explicitly set response header still wins, and the per-request CSP nonce is preserved. See `security_headers()` and `apply_security_headers()`.
