@@ -33,7 +33,7 @@ uv run python benchmarks/bench.py --compare --production --path /api/users --req
 각 그룹의 `process_peak_rss_bytes`는 별도 서버 프로세스의 RSS를 약 10ms 간격으로
 샘플링한 최댓값입니다. 짧은 피크는 놓칠 수 있으며 자식 프로세스는 포함하지
 않습니다. `process_cpu_seconds`는 부하 생성기 프로세스의 측정 구간 CPU 시간이고,
-Linux에서는 서버 PID의 CPU 시간도 별도로 기록합니다.
+서버 PID의 CPU 시간도 별도로 기록합니다.
 
 ### 기록된 비교 (2026-11-08, 1회 측정)
 
@@ -123,7 +123,7 @@ uv run pynext start --dir examples/basic --host 127.0.0.1 --port 3000
 uv run python benchmarks/bench.py --base-url http://127.0.0.1:3000 --path /api/users --requests 5000 --concurrency 32 --warmup 100
 ```
 
-이때 출력은 `mode=external`, `transport=external_http`, `process_cpu_scope=load_generator_only`입니다. Linux에서 서버 PID를 알고 있으면 `--server-pid PID`를 추가하여 **해당 PID 하나**의 CPU 시간을 별도로 수집할 수 있습니다. 자식 워커·별도 프로세스나 GPU 작업은 포함하지 않습니다. `process_peak_rss_bytes`는 부하 생성기 프로세스의 생애 최대 RSS이며 서버 RSS가 아닙니다.
+이때 출력은 `mode=external`, `transport=external_http`, `process_cpu_scope=load_generator_only`입니다. 서버 PID를 알고 있으면 `--server-pid PID`를 추가하여 **해당 PID 하나**의 CPU 시간을 별도로 수집할 수 있습니다. 자식 워커·별도 프로세스나 GPU 작업은 포함하지 않습니다. `process_peak_rss_bytes`는 부하 생성기 프로세스의 생애 최대 RSS이며 서버 RSS가 아닙니다.
 
 Uvicorn과 비교하려면 `uvicorn --app-dir examples/basic asgi:app`으로 별도 서버를 실행하고 동일한 `--base-url` 측정 방법을 사용하세요. ASGI 예제는 개발 모드이므로 프로덕션 SSG를 비교할 때는 `create_app(project_path, production=True)`를 사용한 별도 ASGI 진입점을 준비해야 합니다. 모든 구현에서 동일한 앱 경로·응답 본문·서버 설정을 유지하세요.
 

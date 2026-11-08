@@ -272,7 +272,7 @@ async def _measure_local(scenario, mode, config):
                                      timeout=30, trust_env=False) as client:
             result = await measure(client, scenario["path"], config["requests"],
                                    config["concurrency"], warmup=config["warmup"],
-                                   server_pid=server.pid if sys.platform == "linux" else None,
+                                   server_pid=server.pid,
                                    external=True)
     result["process_peak_rss_bytes"] = server.peak_rss
     result["process_peak_rss_scope"] = "server_sampled_10ms"

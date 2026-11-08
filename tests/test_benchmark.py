@@ -108,7 +108,7 @@ def test_benchmark_reports_zero_success_without_fabricating_success_latency():
 
 def test_benchmark_does_not_attribute_reused_pid_cpu(monkeypatch):
     values = iter([(2.0, 10), (3.0, 11)])
-    monkeypatch.setattr(benchmark, "_linux_process_cpu", lambda pid: next(values))
+    monkeypatch.setattr(benchmark, "_process_cpu", lambda pid: next(values))
 
     async def check():
         transport = httpx.MockTransport(lambda request: httpx.Response(200, content=b"ok"))
@@ -121,8 +121,28 @@ def test_benchmark_does_not_attribute_reused_pid_cpu(monkeypatch):
     asyncio.run(check())
 
 
+def test_process_cpu_samples_any_local_process():
+    """Server CPU sampling works on every OS, not just Linux procfs."""
+    import psutil
+
+    own_pid = os.getpid()
+    cpu, started = benchmark._process_cpu(own_pid)
+    assert cpu >= 0
+    assert started == psutil.Process(own_pid).create_time()
+    with pytest.raises(OSError):
+        benchmark._process_cpu(1 << 30)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        cpu, started = benchmark._process_cpu(child.pid)
+        assert cpu >= 0
+        assert started == psutil.Process(child.pid).create_time()
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+
+
 @pytest.mark.skipif(sys.platform != "linux" or not os.path.exists("/proc/self/stat"),
-                    reason="separate process CPU sampling requires Linux procfs")
+                    reason="stdout readiness uses select on a pipe")
 def test_benchmark_external_server_cpu_is_separate_from_load_generator():
     code = """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
