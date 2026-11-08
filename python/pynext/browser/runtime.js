@@ -338,7 +338,11 @@ async function fetchPage(url, { useCache = true } = {}) {
   const type = response.headers.get("content-type") || "";
   if (!type.toLowerCase().includes("text/html")) throw new Error("Navigation fetch did not return HTML");
   const csp = response.headers.get("content-security-policy");
-  if (csp && csp !== "script-src 'self'; object-src 'none'") {
+  // Must match the server's default policy in content_security_policy()
+  // (python/pynext/http.py); a different policy means the swapped content
+  // would run under the wrong CSP, so fall back to a full page load.
+  // Keep this in sync when the default policy changes.
+  if (csp && csp !== "script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'") {
     throw new Error("Navigation CSP requires a full page load");
   }
   const reader = response.body?.getReader();
