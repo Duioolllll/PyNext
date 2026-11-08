@@ -27,6 +27,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Fix cross-platform watcher paths and same-timestamp edits, SQLite ISR generation races and failure fallback, and exercise the correct Axum/Uvicorn browser server in CI.
 - Match dynamic WebSocket routes on the native server using the same route priority as ASGI.
 - Bound rate-limit bucket storage and select forwarded client addresses from the nearest untrusted proxy hop.
+- Harden rate limiting against key exhaustion: IPv6 addresses share the bucket of their /64 prefix, a full bucket table evicts the stalest bucket instead of denying new keys, new-key admissions are bounded by a global sliding window, and paths listed with `--rate-limit-exempt-path` (for example `/healthz`) skip rate limiting on both adapters. The same policy applies to the shared Redis limiter.
 - Document the architecture, observed limitations, and verification criteria.
 
 ## v0.7.0a1 (unreleased candidate)
