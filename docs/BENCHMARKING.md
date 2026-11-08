@@ -52,6 +52,63 @@ Linux에서는 서버 PID의 CPU 시간도 별도로 기록합니다.
 같은 조건에서 다시 측정하면 달라질 수 있습니다. Next.js 비교군은 이
 스크립트에 포함되지 않았습니다(이전 Next.js 비교는 별도 측정입니다).
 
+## C1: 재현 가능한 부하 기준선 (`benchmarks/baseline.py`)
+
+단발성 `--compare`와 달리 `benchmarks/baseline.py`는 고정된 시나리오·조건으로
+반복 측정하고, 부하 생성기와 서버 양쪽의 환경을 함께 기록한 베이스라인
+JSON을 남깁니다. 비교의 기준이 되는 파일이라, 조건이 바뀌면 새 파일을
+만들고 이전 파일과 나란히 둡니다.
+
+```bash
+# 스모크: 스크립트 동작 확인용 (50요청, 동시성 4, 1회, axum, 개발 모드)
+uv run python benchmarks/baseline.py --smoke
+# 전체 로컬 베이스라인 (기본 조건: benchmarks/baseline-config.json)
+uv run python benchmarks/baseline.py --output benchmarks/baseline-2026-11-08.json
+```
+
+기본 조건(`benchmarks/baseline-config.json`): 요청 2,000건·동시성 10·워밍업
+100·반복 3회·모드 axum/uvicorn·프로덕션 모드. 시나리오는 정적
+(`/styles/site.css`), SSG (`/about`), ISR 히트 (`/news/hello`, 워밍업이
+항목을 채우고 측정 요청은 히트), SSR (`/`), JSON API (`/api/users`), DB
+쿼리 (`/api/db-users?id=42`, 벤치마크 전용 SQLite 픽스처 앱의 기본 키
+점 조회), 스트리밍 (`/api/stream`)입니다. DB 시나리오는 벤치마크
+인프라(`benchmarks/fixtures/db-app`)이며 제품 DB 통합(로드맵 E4)이
+아닙니다.
+
+결과 JSON에는 시나리오·모드별로 반복 측정 전체와 집계(반복 간 p50/p95/
+p99/p99.9 중앙값, 성공 처리량 평균, 오류율 평균·최대, 서버 CPU 평균,
+10ms 간격 샘플링 서버 피크 RSS 평균, 부하 생성기 CPU 평균)가 들어갑니다.
+`limitations`에는 동일 머신 측정 여부, 개발 모드 여부, 반복 횟수 1회
+같은 해석 한계가 명시됩니다.
+
+### 별도 머신에서 측정하기
+
+부하 생성기와 서버를 같은 머신에 두면 처리량은 회귀 기준선일 뿐 운영
+처리량 주장이 되지 않습니다. 별도 머신 측정은 이렇게 합니다.
+
+```bash
+# 1. 서버 머신에서 환경 수집 + 서버 시작
+python benchmarks/collect_env.py --output server-env.json
+uv run pynext start --dir examples/basic --host 0.0.0.0 --port 3000
+# DB 시나리오까지 측정하려면 픽스처 서버도 띄웁니다.
+uv run python benchmarks/serve_project.py --dir benchmarks/fixtures/db-app \
+    --mode axum
+# 2. 부하 생성기 머신에서 server-env.json을 받아 실행
+python benchmarks/baseline.py --base-url http://<서버>:3000 \
+    --db-base-url http://<서버>:<픽스처-포트> \
+    --server-info server-env.json --output baseline-remote.json
+```
+
+`--server-info`가 없으면 서버 환경은 "unknown"으로 기록되고, 그
+베이스라인은 재현 조건이 불완전하다는 한계가 남습니다.
+
+### 기록된 베이스라인
+
+`benchmarks/baseline-2026-11-08.json`은 동일 머신 스모크 실행 결과입니다
+(개발 모드, 50요청, 동시성 4, 1회 반복). 운영 처리량 주장이 아니며,
+게시용 베이스라인은 별도 머신에서 기본 조건(반복 3회, 프로덕션 모드)으로
+다시 측정해야 합니다.
+
 ## 외부 HTTP 서버로 측정
 
 PyNext 서버를 별도 터미널에서 시작한 뒤:
