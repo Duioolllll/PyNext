@@ -71,6 +71,8 @@ class WorkerConfig:
     # create_app so multi-worker mode honours them (finding #42/#45).
     cache_backend: str = "memory"
     cache_path: str | None = None
+    cache_failure_policy: str = "fail_open"
+    rate_limit_failure_policy: str = "fail_closed"
     observability: object = None  # ObservabilityConfig or None
     security: object = None  # SecurityConfig or None
     websocket_max_message: int = 65_536
@@ -93,12 +95,14 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
     limiter = None
     if config.rate_limit:
         limiter_type = RedisRateLimiter if config.rate_limit_backend == "redis" else RateLimiter
-        options = ({"namespace": os.environ.get("PYNEXT_RATE_LIMIT_NAMESPACE", "default")}
+        options = ({"namespace": os.environ.get("PYNEXT_RATE_LIMIT_NAMESPACE", "default"),
+                    "failure_policy": config.rate_limit_failure_policy}
                    if config.rate_limit_backend == "redis" else {})
         limiter = limiter_type(config.rate_limit, config.rate_limit_window,
                                trusted_proxies=config.trusted_proxies, **options)
     app = create_app(config.root, production=config.production, rate_limit=limiter,
                      cache_backend=config.cache_backend, cache_path=config.cache_path,
+                     cache_failure_policy=config.cache_failure_policy,
                      observability=config.observability, debug=not config.production,
                      security=config.security, websocket_max_message=config.websocket_max_message)
 

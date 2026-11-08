@@ -4,6 +4,7 @@ from .app import App, create_app
 from .auth import require_auth, require_permission
 from .client_dsl import ClientDSLCompileError, compile_client_dsl
 from .components import h, fragment, island, layout, model_prop, page
+from .failure_policy import FAIL_CLOSED, FAIL_OPEN
 from .forms import UploadFile
 from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, Request, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, csrf_protect, new_csrf_token,
@@ -21,4 +22,4 @@ __all__ = ["App", "create_app", "h", "fragment", "island", "layout", "model_prop
            "ObservabilityConfig", "MetricsCollector", "WebSocket", "WebSocketDisconnect", "MAX_WS_MESSAGE",
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
            "Session", "SessionMiddleware", "SQLiteSessionStore", "require_auth", "require_permission",
-           "RedisRateLimiter", "WebSocketPubSub", "PubSubOverflow"]
+           "RedisRateLimiter", "WebSocketPubSub", "PubSubOverflow", "FAIL_OPEN", "FAIL_CLOSED"]

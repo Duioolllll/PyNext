@@ -48,7 +48,7 @@ Rust→Python→upstream의 trace 연결과 취소, exporter 중단 시 bounded 
 
 ## 4. 분산 ISR 및 저장소
 
-ISR 경로를 명시적으로 무효화할 수 있다. 메모리 백엔드는 프로세스 로컬이며, SQLite·Redis 공유 모드는 정상 상태에서 각 워커의 다음 조회에 무효화가 반영된다. 소유 토큰·만료가 있는 재생성 lease와 버전 fencing으로 단일 생성·오래된 결과 덮어쓰기 방지를 제공한다. 저장소 장애 시 로컬 캐시로 대체하므로 즉시 일관성이 보장되지 않는다.
+ISR 경로를 명시적으로 무효화할 수 있다. 메모리 백엔드는 프로세스 로컬이며, SQLite·Redis 공유 모드는 정상 상태에서 각 워커의 다음 조회에 무효화가 반영된다. 소유 토큰·만료가 있는 재생성 lease와 버전 fencing으로 단일 생성·오래된 결과 덮어쓰기 방지를 제공한다. 저장소 장애 시 동작은 `fail_open`/`fail_closed` 정책으로 정한다. 캐시 기본값 `fail_open`은 로컬 캐시로 대체하므로 즉시 일관성이 보장되지 않고, `fail_closed`는 503으로 응답한다.
 
 Redis 등에서 경로·빌드·로케일·정책 버전이 반영된 키, 소유자가 확인 가능한 재생성 lease, 만료·갱신, 무효화와 장애 시 동작을 설계한다. 콘텐츠는 크기 제한·무결성 해시를 적용하고, 필요하면 S3/GCS 같은 객체 저장소의 immutable blob과 원자적 버전 포인터를 분리한다. 오래된 워커가 lease 만료 후 새 결과를 덮어쓰지 못하도록 저장소에서 fencing 또는 조건부 갱신을 검증해야 한다. [Redis 분산 잠금의 안전성](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/).
 

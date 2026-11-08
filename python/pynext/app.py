@@ -21,7 +21,7 @@ from urllib.parse import quote, unquote_to_bytes
 from . import _native
 from .assets import read_public_artifacts, read_public_sources
 from .auth import check_authorization
-from .cache import CacheBusy, ISRCache
+from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
 from .client import compile_client, read_client_artifacts
 from .components import _isr_policy, _isr_query_keys, _node, bind_islands
 from .build import discover, load_manifest
@@ -304,7 +304,8 @@ def _module_key(root, relative):
 class App:
     def __init__(self, root, manifest, *, production=False, security=None, cache_backend="memory",
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
-                 resources=None, cache_url=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False):
+                 resources=None, cache_url=None, cache_failure_policy=None,
+                 websocket_max_message=MAX_WS_MESSAGE, hot_reload=False):
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
         if production and debug:
@@ -336,7 +337,8 @@ class App:
             _register_project(self._namespace)
             _package(self._namespace, Path(root).resolve(), load_initializer=False)
             self._initialize(root, manifest, production=production,
-                             cache_backend=cache_backend, cache_path=cache_path, cache_url=cache_url)
+                             cache_backend=cache_backend, cache_path=cache_path, cache_url=cache_url,
+                             cache_failure_policy=cache_failure_policy)
             configured = ()
             if "middleware.py" in manifest["sources"]:
                 configured = getattr(self._module("middleware.py"), "MIDDLEWARE", None)
@@ -384,7 +386,7 @@ class App:
         return self
 
     def _initialize(self, root, manifest, *, production=False, cache_backend="memory", cache_path=None,
-                    cache_url=None):
+                    cache_url=None, cache_failure_policy=None):
         self.root = Path(root).resolve()
         self.manifest = manifest
         self.production = production
@@ -401,7 +403,7 @@ class App:
                                              ensure_ascii=True).encode("ascii")).hexdigest()
         self.isr = ISRCache(cache_backend=cache_backend, cache_path=cache_path,
                             namespace=(build_id + ":") if cache_backend in {"sqlite", "redis"} else "",
-                            cache_url=cache_url)
+                            cache_url=cache_url, failure_policy=cache_failure_policy)
         self.static_generators = {}
         self.static_pages = {}
         self.public_assets = {}
@@ -956,7 +958,12 @@ class App:
                     # runs in the background, a miss renders synchronously.
                     cache_key = path
                     if self.isr_queries[pattern]:
-                        generation, _ = await self.isr.variant_generation(path)
+                        try:
+                            generation, _ = await self.isr.variant_generation(path)
+                        except SharedCacheUnavailable:
+                            self.metrics.observe_regeneration("failure")
+                            return Response("Service Unavailable", status=503,
+                                            headers=[(b"retry-after", b"1")])
                         encoded = json.dumps(query, ensure_ascii=True, separators=(",", ":")).encode("ascii")
                         cache_key = ("\0isr:" + hashlib.sha256(path.encode("utf-8")).hexdigest() + ":" +
                                      generation + ":" + hashlib.sha256(encoded).hexdigest())
@@ -968,6 +975,13 @@ class App:
                         self.metrics.observe_cache("busy")
                         self.metrics.observe_regeneration("failure")
                         return Response("Server Busy", status=503,
+                                        headers=[(b"retry-after", b"1")])
+                    except SharedCacheUnavailable:
+                        # fail_closed cache policy: the shared store could
+                        # not be consulted, so refuse rather than serve
+                        # from degraded state.
+                        self.metrics.observe_regeneration("failure")
+                        return Response("Service Unavailable", status=503,
                                         headers=[(b"retry-after", b"1")])
                     except TimeoutError:
                         self.metrics.observe_regeneration("failure")
@@ -1231,10 +1245,10 @@ class App:
 
 def create_app(root=".", *, production=False, security=None, cache_backend="memory", cache_path=None,
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
-               websocket_max_message=MAX_WS_MESSAGE, hot_reload=False):
+               cache_failure_policy=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False):
     root = Path(root).resolve()
     return App(root, load_manifest(root) if production else discover(root), production=production,
                security=security, cache_backend=cache_backend, cache_path=cache_path,
                observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
-               resources=resources, cache_url=cache_url, websocket_max_message=websocket_max_message,
-               hot_reload=hot_reload)
+               resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
+               websocket_max_message=websocket_max_message, hot_reload=hot_reload)

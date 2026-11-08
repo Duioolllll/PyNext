@@ -1,9 +1,13 @@
 """A bounded shared Redis token bucket using server time."""
 import hashlib
+import logging
 import math
 import os
 
+from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
 from .ratelimit import RateLimiter, RateLimitUnavailable, _MAX_BUCKETS
+
+log = logging.getLogger("pynext")
 
 _ALLOW = """
 local t = redis.call('TIME')
@@ -39,12 +43,24 @@ return {allowed, retry}
 
 
 class RedisRateLimiter(RateLimiter):
-    """Shared token buckets; a Redis outage fails closed with HTTP 503."""
+    """Shared token buckets; a Redis outage fails closed with HTTP 503.
+
+    ``failure_policy`` (roadmap item B4) decides what happens when
+    Redis is unreachable: the default ``"fail_closed"`` raises
+    :class:`RateLimitUnavailable` (the caller answers 503), while
+    ``"fail_open"`` admits the request. Failing open removes abuse
+    protection for the duration of the outage, so only use it where
+    availability matters more than limiting. The process-local
+    :class:`RateLimiter` never raises, so the policy only applies to
+    this Redis-backed limiter.
+    """
 
     blocking = True
 
-    def __init__(self, limit, window_seconds, *, url=None, namespace="default", trusted_proxies=()):
+    def __init__(self, limit, window_seconds, *, url=None, namespace="default", trusted_proxies=(),
+                 failure_policy=None):
         super().__init__(limit, window_seconds, trusted_proxies=trusted_proxies)
+        self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_CLOSED)
         if limit > 1_000_000 or not 0.001 <= self.window_seconds <= 31_536_000:
             raise ValueError("Redis rate limits require at most 1000000 tokens and a window from 0.001 to 31536000 seconds")
         url = url or os.environ.get("PYNEXT_REDIS_URL")
@@ -69,6 +85,10 @@ class RedisRateLimiter(RateLimiter):
             allowed, retry = self.client.eval(_ALLOW, 2, bucket, self._base + ":active", self.limit,
                                                max(1, math.ceil(self.window_seconds * 1000)), _MAX_BUCKETS)
         except Exception as exc:
+            if self.failure_policy == FAIL_OPEN:
+                log.warning("Redis rate limiter unavailable; admitting request (fail_open)",
+                            exc_info=True)
+                return True, None
             raise RateLimitUnavailable("Redis rate limiter unavailable") from exc
         return bool(allowed), None if allowed else int(retry)
 

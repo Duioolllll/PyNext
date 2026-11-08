@@ -184,7 +184,7 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG と ISR は `request` を受け取れず、公開コンテンツに使用します。ISR は通常クエリを無視します。`@page(render="isr", revalidate=30, query_keys=("lang",))` と `query` 引数を使用すると、許可したキーと文字列のリストだけが渡され、値ごとにキャッシュされます。パスの無効化は全クエリ変種に適用されます。Cookie または Authorization 付きの要求は共有キャッシュを迂回し `private, no-store` を返します。既定のキャッシュはプロセス内で、SQLite またはオプションの Redis（`pynext-framework[redis]` と `PYNEXT_REDIS_URL`）を共有できます。共有ストア障害時は古いローカルキャッシュにフォールバックする場合があります。`Set-Cookie` と private/no-store の応答はキャッシュしません。SSG の非同期ジェネレーターはビルド時に消費され静的ファイルとして配信されます。
+SSG と ISR は `request` を受け取れず、公開コンテンツに使用します。ISR は通常クエリを無視します。`@page(render="isr", revalidate=30, query_keys=("lang",))` と `query` 引数を使用すると、許可したキーと文字列のリストだけが渡され、値ごとにキャッシュされます。パスの無効化は全クエリ変種に適用されます。Cookie または Authorization 付きの要求は共有キャッシュを迂回し `private, no-store` を返します。既定のキャッシュはプロセス内で、SQLite またはオプションの Redis（`pynext-framework[redis]` と `PYNEXT_REDIS_URL`）を共有できます。共有ストア障害時は障害ポリシーに従います。既定値（`fail_open`、`--cache-failure-policy fail_open`）では古いローカルキャッシュにフォールバックし、`fail_closed` では 503 を返します。`Set-Cookie` と private/no-store の応答はキャッシュしません。SSG の非同期ジェネレーターはビルド時に消費され静的ファイルとして配信されます。
 
 SSG ビルドの上限は 10,000 ページで、開発モードでは SSG をリクエストごとにレンダリングします。ISR ページは `generate_static_params()` をエクスポートできず、同時生成はプロセスごとに最大 128 件です。
 
@@ -255,7 +255,7 @@ CLI フラグ `--structured-logs` / `--no-structured-logs`、`--metrics` / `--no
 
 ## レート制限
 
-レート制限はオプトインで、プロセス単位のトークンバケットです。`pynext start --rate-limit 100 --rate-limit-window 60` はクライアント IP あたり 60 秒で 100 リクエストを許可します（バーストが上限です）。制限を超えた動的リクエストは秒単位の `Retry-After` ヘッダー付きで 429 を返します。キーはクライアント IP で、`X-Forwarded-For` は `--trusted-proxy`（IP または CIDR、繰り返し指定可）で指定したピアからのものだけを信頼します。信頼できないプロキシのヘッダーは偽装可能なため無視されます。コードからは `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))` のように使います。バケットはプロセス単位で再起動すると消え、分散レート制限は未実装です。静的ファイルと新鮮な ISR ページは Python ブリッジに届く前に Rust 層が返すため、レート制限の対象外です。
+レート制限はオプトインで、プロセス単位のトークンバケットです。`pynext start --rate-limit 100 --rate-limit-window 60` はクライアント IP あたり 60 秒で 100 リクエストを許可します（バーストが上限です）。制限を超えた動的リクエストは秒単位の `Retry-After` ヘッダー付きで 429 を返します。キーはクライアント IP で、`X-Forwarded-For` は `--trusted-proxy`（IP または CIDR、繰り返し指定可）で指定したピアからのものだけを信頼します。信頼できないプロキシのヘッダーは偽装可能なため無視されます。コードからは `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))` のように使います。バケットはプロセス単位で再起動すると消えます。`--rate-limit-backend redis` を使うとバケットは共有され、Redis に到達できない場合は障害ポリシーに従います。既定値（`fail_closed`、`--rate-limit-failure-policy fail_closed`）では要求に 503 を返し、`fail_open` では要求を許可します。静的ファイルと新鮮な ISR ページは Python ブリッジに届く前に Rust 層が返すため、レート制限の対象外です。
 
 転送チェーンは右から信頼済みプロキシをたどり、最も近い非信頼アドレスを使います。中間プロキシをすべて正確に登録してください。バケットはプロセスあたり最大 10,000 個で、すべて使用中なら完全に補充されるまで新しいアドレスに 429 を返します。
 

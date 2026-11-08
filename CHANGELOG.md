@@ -2,6 +2,10 @@
 
 All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
 
+## Unreleased
+
+- Add `fail_open` / `fail_closed` failure policies for shared-backend outages (roadmap item B4): the ISR cache defaults to `fail_open` (local fallback, as before) and the Redis rate limiter defaults to `fail_closed` (503, as before); each can be flipped via `ISRCache(..., failure_policy=...)`, `RedisRateLimiter(..., failure_policy=...)`, `create_app(..., cache_failure_policy=...)`, or `--cache-failure-policy` / `--rate-limit-failure-policy`. Under `fail_closed`, an ISR page whose shared store cannot be consulted answers 503, and an invalidation that never reached the shared store raises instead of reporting success. Best-effort cache writes stay best-effort in both policies.
+
 ## 0.1.0
 
 - Add Redis ISR storage with expiring leases, fenced writes and cross-worker invalidation; add Redis-backed shared rate limiting, including static and cached responses. Redis cache failures fall back locally; rate-limiter failures return 503.
