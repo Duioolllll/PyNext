@@ -35,7 +35,7 @@ async def check_static_responses(client):
     response = await client.get("/", headers={"authorization": "Bearer example", "cookie": "session=example"})
     assert response.status_code == 200 and response.text == page_html("<p>built</p>")
     assert response.headers["vary"] == "Cookie, Authorization"
-    assert response.headers["content-security-policy"] == "script-src 'self'; object-src 'none'"
+    assert response.headers["content-security-policy"] == "script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
     assert (await client.get("/blog/hello?query=ignored")).text == page_html("<p>hello</p>")
     assert (await client.get("/blog/%ED%95%9C%EA%B8%80")).text == page_html("<p>한글</p>")
     assert (await client.get("/docs/a/b")).text == page_html("<p>a/b</p>")

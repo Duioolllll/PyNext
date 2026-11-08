@@ -4,12 +4,12 @@
 
 ## 필수 환경
 
-- **CPython 3.13** (현재 검증된 유일한 Python 버전)
+- **CPython 3.13 또는 3.14**
 - Rust 툴체인 및 Cargo
 - [uv](https://docs.astral.sh/uv/)
 - JS/TS island를 사용하는 앱에 한해 **Node.js 18 이상과 npm**
 
-현재 저장소 소스에서 실행하는 방식이 안내되어 있으며, PyPI에 게시된 패키지가 있다고 가정하면 안 됩니다.
+PyPI에 `pynext-framework`로 게시되어 있습니다(`pip install pynext-framework==0.1.0`). 아래 단계는 이 저장소 소스를 기준으로 합니다.
 
 ## 공식 예제 실행
 
@@ -61,6 +61,6 @@ uv run pynext start --dir my-site --port 3000
 | `pynext dev --dir PATH` | 소스에서 실행(수정 시 수동 재시작) |
 | `pynext start --dir PATH` | 검증된 빌드로 시작 |
 
-두 서버 명령은 `--host`, `--port`, `--max-concurrent`(기본 64), `--acquire-timeout-ms`(1000), `--body-capacity`(16), `--body-timeout-ms`(10000)을 지원합니다. 기본 바인딩 주소는 loopback입니다. 공개 프로덕션 노출은 아직 지원 대상으로 보장되지 않습니다.
+두 서버 명령은 `--host`, `--port`, `--max-concurrent`(기본 64), `--acquire-timeout-ms`(1000), `--max-waiting`(`--max-concurrent`와 64 중 작은 값), `--body-capacity`(16), `--body-timeout-ms`(10000)을 지원합니다. 기본 바인딩 주소는 loopback입니다. 공개 프로덕션 노출은 아직 지원 대상으로 보장되지 않습니다.
 
 다음 문서: [라우팅](Routing.md), [컴포넌트](Components-and-Layouts.md).

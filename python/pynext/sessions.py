@@ -3,6 +3,8 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
+import os
 import re
 import secrets
 import sqlite3
@@ -11,6 +13,8 @@ from collections.abc import MutableMapping
 from pathlib import Path
 
 from .http import Response, StreamingResponse, _add_vary, _header_values
+
+log = logging.getLogger("pynext")
 
 _COOKIE_TOKEN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _COOKIE_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
@@ -90,11 +94,173 @@ class SQLiteSessionStore:
         await asyncio.to_thread(remove)
 
     async def purge_expired(self):
-        """Remove expired rows; applications may call this from maintenance jobs."""
+        """Remove expired rows.
+
+        ``SessionMiddleware`` runs this automatically in the background
+        (see ``purge_interval``), so applications only need to call it
+        directly when they use the store without the middleware.
+        """
         def purge():
             with sqlite3.connect(self.path, timeout=5) as db:
                 return db.execute("DELETE FROM pynext_sessions WHERE expires<=?", (time.time(),)).rowcount
         return await asyncio.to_thread(purge)
+
+
+def _session_payload(data, csrf, version):
+    return json.dumps({"data": data, "csrf": csrf, "version": version}, ensure_ascii=False,
+                      separators=(",", ":"), allow_nan=False)
+
+
+def _decode_session(raw):
+    try:
+        payload = json.loads(raw)
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("invalid session data") from exc
+    if (not isinstance(payload, dict) or not isinstance(payload.get("data"), dict)
+            or not isinstance(payload.get("version"), int)):
+        raise ValueError("invalid session data")
+    return payload
+
+
+def _is_watch_error(exc):
+    """True for redis-py's WatchError, without importing redis.
+
+    Injected test clients raise their own ``WatchError``; matching on the
+    class name keeps the store usable with any Redis-compatible client.
+    """
+    return type(exc).__name__ == "WatchError"
+
+
+class RedisSessionStore:
+    """Redis session store with the same load/save/delete contract as SQLite.
+
+    Sessions are stored as one key per token (``<key_prefix>:<sha256(token)>``)
+    with a Redis TTL, so expiry needs no cleanup job: ``purge_expired`` is a
+    no-op that returns 0. Concurrent writes are fenced with the ``version``
+    embedded in the stored payload, using WATCH/MULTI optimistic locking —
+    a stale writer gets :class:`SessionConflict`, exactly like the SQLite
+    store. Pass a ``client`` (a ``redis.Redis`` or compatible object) to
+    share a connection or to inject a fake in tests; otherwise a client is
+    built from ``url`` or the ``PYNEXT_REDIS_URL`` environment variable.
+    """
+
+    def __init__(self, url=None, *, client=None, key_prefix="pynext:session"):
+        if not isinstance(key_prefix, str) or not key_prefix or len(key_prefix.encode("utf-8")) > 256:
+            raise ValueError("session key prefix must be a nonempty string up to 256 bytes")
+        self.key_prefix = key_prefix
+        self._owns_client = client is None
+        if client is not None:
+            if not all(callable(getattr(client, name, None))
+                       for name in ("get", "set", "delete", "pipeline")):
+                raise TypeError("session client must implement get, set, delete and pipeline")
+            self.client = client
+        else:
+            url = url or os.environ.get("PYNEXT_REDIS_URL")
+            if not isinstance(url, str) or not url.startswith(("redis://", "rediss://", "unix://")):
+                raise ValueError("Redis sessions require a redis://, rediss:// or unix:// URL")
+            try:
+                import redis
+            except ImportError as exc:
+                raise ValueError("Install pynext-framework[redis] to use Redis") from exc
+            self.client = redis.Redis.from_url(url, socket_timeout=1, socket_connect_timeout=1,
+                                               decode_responses=False)
+
+    def _redis_key(self, token):
+        return f"{self.key_prefix}:{_key(token)}"
+
+    def close(self):
+        """Close the Redis client this store created (a no-op for injected clients)."""
+        if self._owns_client:
+            self.client.close()
+
+    async def load(self, token):
+        def read():
+            raw = self.client.get(self._redis_key(token))
+            if raw is None:
+                return None
+            payload = _decode_session(raw)
+            return payload["data"], payload.get("csrf"), payload["version"]
+        return await asyncio.to_thread(read)
+
+    async def save(self, token, data, csrf, version, expires, *, previous_token=None):
+        payload = json.dumps({"data": data, "csrf": csrf}, ensure_ascii=False,
+                             separators=(",", ":"), allow_nan=False)
+        if len(payload.encode("utf-8")) > _MAX_SESSION_BYTES:
+            raise ValueError("session data exceeds 16384 bytes")
+        ttl_ms = max(0, int((expires - time.time()) * 1000))
+        if previous_token is not None:
+            return await asyncio.to_thread(self._rotate, previous_token, token, data, csrf, version, ttl_ms)
+        if version is None:
+            return await asyncio.to_thread(self._insert, token, data, csrf, ttl_ms)
+        return await asyncio.to_thread(self._update, token, data, csrf, version, ttl_ms)
+
+    def _insert(self, token, data, csrf, ttl_ms):
+        if ttl_ms <= 0:
+            # Already expired: nothing to store, and load() reports a miss,
+            # matching the SQLite store's expired row.
+            return 1
+        if not self.client.set(self._redis_key(token), _session_payload(data, csrf, 1),
+                               nx=True, px=ttl_ms):
+            raise SessionConflict("session already exists")
+        return 1
+
+    def _update(self, token, data, csrf, version, ttl_ms):
+        key = self._redis_key(token)
+        pipe = self.client.pipeline()
+        try:
+            pipe.watch(key)
+            raw = pipe.get(key)
+            if raw is None:
+                raise SessionConflict("session changed or expired")
+            if _decode_session(raw)["version"] != version:
+                raise SessionConflict("session changed or expired")
+            pipe.multi()
+            if ttl_ms <= 0:
+                pipe.delete(key)
+            else:
+                pipe.set(key, _session_payload(data, csrf, version + 1), px=ttl_ms)
+            pipe.execute()
+            return version + 1
+        except SessionConflict:
+            raise
+        except Exception as exc:
+            if _is_watch_error(exc):
+                raise SessionConflict("session changed or expired") from exc
+            raise
+        finally:
+            pipe.reset()
+
+    def _rotate(self, previous_token, token, data, csrf, version, ttl_ms):
+        old_key, new_key = self._redis_key(previous_token), self._redis_key(token)
+        pipe = self.client.pipeline()
+        try:
+            pipe.watch(old_key, new_key)
+            raw = pipe.get(old_key)
+            if raw is None:
+                raise SessionConflict("session changed or expired")
+            if _decode_session(raw)["version"] != version:
+                raise SessionConflict("session changed or expired")
+            pipe.multi()
+            pipe.delete(old_key)
+            if ttl_ms > 0:
+                pipe.set(new_key, _session_payload(data, csrf, 1), px=ttl_ms)
+            pipe.execute()
+            return 1
+        except SessionConflict:
+            raise
+        except Exception as exc:
+            if _is_watch_error(exc):
+                raise SessionConflict("session changed or expired") from exc
+            raise
+        finally:
+            pipe.reset()
+
+    async def delete(self, token):
+        await asyncio.to_thread(self.client.delete, self._redis_key(token))
+
+    async def purge_expired(self):
+        """No-op: Redis expires session keys with their TTL automatically."""
+        return 0
 
 
 class Session(MutableMapping):
@@ -149,9 +315,18 @@ class Session(MutableMapping):
 
 
 class SessionMiddleware:
-    """Attach ``request.state['session']`` and persist changes before sending headers."""
+    """Attach ``request.state['session']`` and persist changes before sending headers.
 
-    def __init__(self, store, *, cookie_name="pynext_session", secure=True, same_site="Lax", max_age=86400):
+    When ``purge_interval`` is set (seconds, default 3600), the middleware
+    runs the store's ``purge_expired`` in a background task while requests
+    are being served, so expired sessions are cleaned up without a separate
+    maintenance job. Pass ``purge_interval=None`` to disable it, and call
+    :meth:`close` to stop the task when the middleware is retired. Redis
+    stores expire keys with TTL, so their purge is a no-op.
+    """
+
+    def __init__(self, store, *, cookie_name="pynext_session", secure=True, same_site="Lax", max_age=86400,
+                 purge_interval=3600):
         if not isinstance(cookie_name, str) or not _COOKIE_NAME.fullmatch(cookie_name):
             raise ValueError("invalid session cookie name")
         if not isinstance(secure, bool):
@@ -160,11 +335,50 @@ class SessionMiddleware:
             raise ValueError("SameSite must be Lax, Strict, or None with Secure")
         if isinstance(max_age, bool) or not isinstance(max_age, int) or not 0 < max_age <= 31_536_000:
             raise ValueError("max_age must be an integer from 1 to 31536000")
+        if purge_interval is not None and (isinstance(purge_interval, bool)
+                                           or not isinstance(purge_interval, (int, float))
+                                           or purge_interval <= 0):
+            raise ValueError("purge_interval must be None or a number greater than 0")
         if not all(inspect.iscoroutinefunction(getattr(store, name, None))
                    for name in ("load", "save", "delete")):
             raise TypeError("session store must implement async load, save and delete")
         self.store, self.cookie_name = store, cookie_name
         self.secure, self.same_site, self.max_age = secure, same_site, max_age
+        self.purge_interval = purge_interval
+        self._purge_task = None
+
+    def _ensure_purge_task(self):
+        if self.purge_interval is None:
+            return
+        # purge_expired is optional for external stores; without it there is
+        # nothing for the background task to do.
+        if not inspect.iscoroutinefunction(getattr(self.store, "purge_expired", None)):
+            return
+        task = self._purge_task
+        if task is None or task.done():
+            self._purge_task = asyncio.get_running_loop().create_task(self._purge_loop())
+
+    async def _purge_loop(self):
+        try:
+            while True:
+                await asyncio.sleep(self.purge_interval)
+                try:
+                    await self.store.purge_expired()
+                except Exception:
+                    log.exception("Session purge failed")
+        except asyncio.CancelledError:
+            raise
+
+    async def close(self):
+        """Stop the background purge task, if one is running."""
+        task = self._purge_task
+        self._purge_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     def _cookie(self, request):
         values = []
@@ -184,6 +398,7 @@ class SessionMiddleware:
         response.headers.append((b"set-cookie", value.encode("ascii")))
 
     async def __call__(self, request, call_next):
+        self._ensure_purge_task()
         token = self._cookie(request)
         loaded = await self.store.load(token) if token is not None else None
         session = Session(*(loaded[:2]), token=token, version=loaded[2]) if loaded else Session()

@@ -144,6 +144,40 @@ def test_shared_redis_rate_bucket_is_atomic():
         second.close()
 
 
+def test_redis_rate_limiter_admits_new_keys_by_evicting_stalest_bucket():
+    namespace = "test-" + uuid.uuid4().hex
+    limiter = RedisRateLimiter(1, 60, url=URL, namespace=namespace,
+                               max_buckets=2, max_new_keys_per_window=100)
+    try:
+        assert limiter.allow("a")[0]
+        assert limiter.allow("b")[0]
+        # Table full, but a new key is admitted by evicting the stalest
+        # bucket instead of getting 429.
+        assert limiter.allow("c")[0]
+        # The evicted owner gets a fresh full bucket on its next request.
+        assert limiter.allow("a")[0]
+    finally:
+        limiter.close()
+
+
+def test_redis_rate_limiter_new_key_window_denies_only_new_keys():
+    namespace = "test-" + uuid.uuid4().hex
+    limiter = RedisRateLimiter(10, 2, url=URL, namespace=namespace, max_new_keys_per_window=2)
+    try:
+        assert limiter.allow("a")[0]
+        assert limiter.allow("b")[0]
+        allowed, retry = limiter.allow("c")
+        assert allowed is False
+        assert retry >= 1
+        # An existing key is not blocked by the new-key window.
+        assert limiter.allow("a")[0]
+        # Once the window slides, the new key is admitted.
+        time.sleep(2.2)
+        assert limiter.allow("c")[0]
+    finally:
+        limiter.close()
+
+
 @pytest.mark.parametrize("mode", ["asgi", "axum"])
 def test_shared_rate_limit_covers_static_and_fails_closed(tmp_path, mode):
     app_dir = tmp_path / "app"

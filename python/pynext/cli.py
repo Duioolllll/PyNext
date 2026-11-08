@@ -38,6 +38,7 @@ def _at_least(minimum, label):
     conversion, both as tracebacks. Timeouts (--acquire-timeout-ms,
     --body-timeout-ms) allow 0: a 0ms wait is a valid "take a slot only if
     instantly free, else 503/408" mode (Duration::from_millis(0) in Rust).
+    --max-waiting also allows 0: no request waits for a slot at all.
     """
     def convert(value):
         try:
@@ -79,12 +80,25 @@ async def _reload_dev_client(app, root):
 
 async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                   body_capacity, body_timeout_ms, cache_backend="memory", cache_path=None,
-                 observability=None, rate_limit=None, security=None, websocket_max_message=MAX_WS_MESSAGE):
+                 observability=None, rate_limit=None, security=None, websocket_max_message=MAX_WS_MESSAGE,
+                 max_connections=None, max_connections_per_ip=None,
+                 header_read_timeout_ms=None, body_min_rate_bytes_per_sec=None,
+                 trusted_proxies=(), cache_failure_policy=None, shutdown_timeout=30.0,
+                 max_waiting=None):
     """Serve the app in development mode, replacing changed island bundles.
 
     Other file changes restart the server on the same port and reload open
     pages. Broken edits retain the previous app or bundles until fixed.
     """
+    conn_kwargs = {}
+    if max_connections is not None:
+        conn_kwargs["max_connections"] = max_connections
+    if max_connections_per_ip is not None:
+        conn_kwargs["max_connections_per_ip"] = max_connections_per_ip
+    if header_read_timeout_ms is not None:
+        conn_kwargs["header_read_timeout_ms"] = header_read_timeout_ms
+    if body_min_rate_bytes_per_sec is not None:
+        conn_kwargs["body_min_rate_bytes_per_sec"] = body_min_rate_bytes_per_sec
     watcher = Watcher(root)
     watched = ", ".join(str(path.relative_to(root)) for path in watcher.watch_roots())
     print(f"PyNext dev watching {watched or 'nothing'} for changes", flush=True)
@@ -103,7 +117,10 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                 try:
                     app = create_app(root, production=False, cache_backend=cache_backend, cache_path=cache_path,
                                observability=observability, rate_limit=rate_limit, debug=True, security=security,
-                               websocket_max_message=websocket_max_message, hot_reload=True)
+                               websocket_max_message=websocket_max_message, hot_reload=True,
+                               trusted_proxies=trusted_proxies,
+                               **({"cache_failure_policy": cache_failure_policy}
+                                  if cache_failure_policy is not None else {}))
                 except Exception:
                     traceback.print_exc()
                     print("PyNext dev: fix the error above; watching for changes...", flush=True)
@@ -113,7 +130,9 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
             server_task = asyncio.create_task(serve(app, host, current_port, max_concurrent,
                                                     acquire_timeout_ms, body_capacity, body_timeout_ms,
                                                     stop_event=stop_server, observability=observability,
-                                                    on_ready=record_address))
+                                                    shutdown_timeout=shutdown_timeout,
+                                                    on_ready=record_address, max_waiting=max_waiting,
+                                                    **conn_kwargs))
             new_app = None
             while new_app is None:
                 changed = await _wait_for_change(watcher, server_task)
@@ -133,7 +152,10 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                 try:
                     new_app = create_app(root, production=False, cache_backend=cache_backend, cache_path=cache_path,
                                observability=observability, rate_limit=rate_limit, debug=True, security=security,
-                               websocket_max_message=websocket_max_message, hot_reload=True)
+                               websocket_max_message=websocket_max_message, hot_reload=True,
+                               trusted_proxies=trusted_proxies,
+                               **({"cache_failure_policy": cache_failure_policy}
+                                  if cache_failure_policy is not None else {}))
                 except Exception:
                     traceback.print_exc()
                     print("PyNext dev: keeping the previous version running; "
@@ -180,16 +202,37 @@ def main():
                                  help="in-flight requests before new ones wait for a slot")
             command.add_argument("--acquire-timeout-ms", type=_at_least(0, "--acquire-timeout-ms"), default=1000,
                                  help="how long a request waits for a slot before getting a 503")
+            command.add_argument("--max-waiting", type=_at_least(0, "--max-waiting"), default=None,
+                                 help="requests waiting for an execution slot before new ones get a 503"
+                                      " (default: min(--max-concurrent, 64); 0 waits for nobody)")
             command.add_argument("--body-capacity", type=_at_least(1, "--body-capacity"), default=16,
                                  help="concurrent request bodies being read before new ones get a 503")
             command.add_argument("--body-timeout-ms", type=_at_least(0, "--body-timeout-ms"), default=10000,
                                  help="how long a request body may take to arrive before a 408")
+            command.add_argument("--max-connections", type=_at_least(1, "--max-connections"), default=None,
+                                 help="concurrent TCP connections before new ones are dropped at accept")
+            command.add_argument("--max-connections-per-ip", type=_at_least(1, "--max-connections-per-ip"),
+                                 default=None,
+                                 help="concurrent TCP connections allowed from one client IP")
+            command.add_argument("--header-read-timeout-ms", type=_at_least(0, "--header-read-timeout-ms"),
+                                 default=None,
+                                 help="how long request headers (and idle keep-alive) may take before the "
+                                      "connection is closed")
+            command.add_argument("--body-min-rate-bytes-per-sec",
+                                 type=_at_least(0, "--body-min-rate-bytes-per-sec"), default=None,
+                                 help="minimum average body receive rate in bytes/second after a 2s grace "
+                                      "window; slower bodies get a 408 (0 disables)")
             command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis"), default="memory",
                                  help="ISR page cache backend: process-local memory (default) or a"
                                       " shared SQLite file or Redis via PYNEXT_REDIS_URL")
             command.add_argument("--cache-path", default=None,
                                  help="SQLite cache file for --cache-backend sqlite;"
                                       " defaults to <project>/.pynext/isr-cache.sqlite3")
+            command.add_argument("--cache-failure-policy", choices=("fail_open", "fail_closed"),
+                                 default="fail_open",
+                                 help="shared ISR cache behaviour when its backend is unavailable:"
+                                      " fail_open serves from the local cache (default);"
+                                      " fail_closed answers 503 instead")
             command.add_argument("--structured-logs", dest="structured_logs",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="emit one JSON object per log line (default: on)")
@@ -208,12 +251,25 @@ def main():
                                  help="rate limit window in seconds")
             command.add_argument("--rate-limit-backend", choices=("memory", "redis"), default="memory",
                                  help="per-process memory (default) or Redis via PYNEXT_REDIS_URL")
+            command.add_argument("--rate-limit-failure-policy", choices=("fail_open", "fail_closed"),
+                                 default="fail_closed",
+                                 help="Redis rate limiter behaviour when Redis is unavailable:"
+                                      " fail_closed answers 503 (default);"
+                                      " fail_open admits the request")
             command.add_argument("--trusted-proxy", action="append", default=[], metavar="IP_OR_CIDR",
-                                 help="peer IP or network whose X-Forwarded-For is honoured "
-                                      "for rate limiting (repeatable; default: none trusted)")
-            command.add_argument("--csrf", action="store_true", help="protect state-changing API requests")
-            command.add_argument("--csrf-cookie-secure", action="store_true",
-                                 help="send the double-submit CSRF cookie only over HTTPS")
+                                 help="peer IP or network whose forwarded headers "
+                                      "(X-Forwarded-For, Forwarded, X-Forwarded-Proto, "
+                                      "X-Forwarded-Host) are honoured for rate limiting and "
+                                      "client identity (repeatable; default: none trusted)")
+            command.add_argument("--rate-limit-exempt-path", action="append", default=[], metavar="PATH",
+                                 help="path prefix that skips rate limiting, e.g. /healthz "
+                                      "(repeatable; default: nothing is exempt)")
+            command.add_argument("--csrf", action=argparse.BooleanOptionalAction, default=None,
+                                 help="protect state-changing API requests (default: auto — on when a "
+                                      "session middleware is installed; --no-csrf opts out)")
+            command.add_argument("--csrf-cookie-secure", action=argparse.BooleanOptionalAction, default=None,
+                                 help="send the double-submit CSRF cookie only over HTTPS "
+                                      "(default: on for start, off for dev over plain http)")
             command.add_argument("--cors-origin", action="append", default=[], metavar="ORIGIN",
                                  help="allow this CORS origin (repeatable)")
             command.add_argument("--cors-credentials", action="store_true",
@@ -221,6 +277,9 @@ def main():
             command.add_argument("--csp-nonce", action="store_true", help="enable CSP nonces on dynamic pages")
             command.add_argument("--ws-max-message-bytes", type=_at_least(1, "--ws-max-message-bytes"),
                                  default=MAX_WS_MESSAGE, help="WebSocket message limit in bytes (max 16777216)")
+            command.add_argument("--shutdown-timeout", type=_at_least(0, "--shutdown-timeout"), default=30,
+                                 help="seconds to let in-flight requests finish and WebSockets close "
+                                      "after SIGTERM before the server stops anyway (default 30)")
     args = parser.parse_args()
     root = Path(args.dir).resolve()
     if args.command == "init":
@@ -260,53 +319,88 @@ def main():
             obs_config.tracing = args.tracing
     try:
         limiter_type = RedisRateLimiter if args.rate_limit_backend == "redis" else RateLimiter
-        options = ({"namespace": os.environ.get("PYNEXT_RATE_LIMIT_NAMESPACE", "default")}
+        options = ({"namespace": os.environ.get("PYNEXT_RATE_LIMIT_NAMESPACE", "default"),
+                    "failure_policy": args.rate_limit_failure_policy}
                    if args.rate_limit_backend == "redis" else {})
         limiter = (limiter_type(args.rate_limit, args.rate_limit_window,
-                                trusted_proxies=args.trusted_proxy, **options)
+                                trusted_proxies=args.trusted_proxy,
+                                exempt_paths=tuple(args.rate_limit_exempt_path), **options)
                    if args.rate_limit >= 1 else None)
-        security = (SecurityConfig(csrf_enabled=args.csrf, csrf_cookie_secure=args.csrf_cookie_secure,
+        security = (SecurityConfig(csrf_enabled=args.csrf,
+                                   csrf_cookie_secure=(args.csrf_cookie_secure
+                                                      if args.csrf_cookie_secure is not None
+                                                      else args.command == "start"),
                                    cors_allowed_origins=tuple(args.cors_origin),
                                    cors_allow_credentials=args.cors_credentials,
                                    csp_nonce_enabled=args.csp_nonce)
-                    if (args.csrf or args.csrf_cookie_secure or args.cors_origin or
+                    if (args.csrf is not None or args.csrf_cookie_secure is not None or args.cors_origin or
                         args.cors_credentials or args.csp_nonce) else None)
     except ValueError as exc:
         parser.error(str(exc))
     extra = {"observability": obs_config} if obs_config is not None else {}
+    # Connection limits keep the historical serve() call shape when no flag
+    # is given (see test_cli_without_observability_flags_keeps_old_call_shape):
+    # only explicitly set limits are forwarded, the rest stay at serve()'s
+    # defaults.
+    conn_kwargs = {}
+    if args.max_connections is not None:
+        conn_kwargs["max_connections"] = args.max_connections
+    if args.max_connections_per_ip is not None:
+        conn_kwargs["max_connections_per_ip"] = args.max_connections_per_ip
+    if args.header_read_timeout_ms is not None:
+        conn_kwargs["header_read_timeout_ms"] = args.header_read_timeout_ms
+    if args.body_min_rate_bytes_per_sec is not None:
+        conn_kwargs["body_min_rate_bytes_per_sec"] = args.body_min_rate_bytes_per_sec
     if args.workers > 1:
         config = WorkerConfig(root=str(root), host=args.host, port=args.port,
                               production=args.command == "start",
                               max_concurrent=args.max_concurrent,
                               acquire_timeout_ms=args.acquire_timeout_ms,
+                              max_waiting=args.max_waiting,
                               body_capacity=args.body_capacity,
                               body_timeout_ms=args.body_timeout_ms,
+                              **conn_kwargs,
                               rate_limit=args.rate_limit,
                               rate_limit_window=args.rate_limit_window,
                               rate_limit_backend=args.rate_limit_backend,
+                              rate_limit_exempt_paths=tuple(args.rate_limit_exempt_path),
+                              rate_limit_failure_policy=args.rate_limit_failure_policy,
                               trusted_proxies=tuple(args.trusted_proxy),
                               cache_backend=args.cache_backend, cache_path=args.cache_path,
+                              cache_failure_policy=args.cache_failure_policy,
                               observability=obs_config, security=security,
-                              websocket_max_message=args.ws_max_message_bytes)
+                              websocket_max_message=args.ws_max_message_bytes,
+                              shutdown_timeout=args.shutdown_timeout)
         return run_supervisor(config, workers=args.workers)
     if args.command == "dev":
         try:
             asyncio.run(run_dev(root, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
                                 args.body_capacity, args.body_timeout_ms,
                                 cache_backend=args.cache_backend, cache_path=args.cache_path,
+                                cache_failure_policy=args.cache_failure_policy,
                                 rate_limit=limiter, security=security,
-                                websocket_max_message=args.ws_max_message_bytes, **extra))
+                                websocket_max_message=args.ws_max_message_bytes,
+                                trusted_proxies=args.trusted_proxy,
+                                shutdown_timeout=args.shutdown_timeout, max_waiting=args.max_waiting,
+                                **extra, **conn_kwargs))
         except KeyboardInterrupt:
             pass
         return
     app = create_app(root, production=args.command == "start",
                      cache_backend=args.cache_backend, cache_path=args.cache_path,
-                     rate_limit=limiter, **({"security": security} if security else {}),
+                     rate_limit=limiter,
+                     **({"trusted_proxies": args.trusted_proxy} if args.trusted_proxy else {}),
+                     **({"security": security} if security else {}),
+                     **({"cache_failure_policy": args.cache_failure_policy}
+                        if args.cache_failure_policy != "fail_open" else {}),
                      **({"websocket_max_message": args.ws_max_message_bytes}
                         if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}), **extra)
     try:
         asyncio.run(serve(app, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
-                          args.body_capacity, args.body_timeout_ms, **extra))
+                          args.body_capacity, args.body_timeout_ms,
+                          shutdown_timeout=args.shutdown_timeout,
+                          **({"max_waiting": args.max_waiting} if args.max_waiting is not None else {}),
+                          **extra, **conn_kwargs))
     except KeyboardInterrupt:
         pass
 

@@ -53,8 +53,8 @@ PyO3 브리지 --> Python asyncio --> 라우트 디스패치
 
 ## 구현과 계획 구분
 
-구현됨: 파일 라우팅, 버퍼형 SSR, SSG, 프로세스별 ISR, 네이티브 HTTP 서버, ASGI, API 스트리밍, 선택적 islands.
+구현됨: 파일 라우팅, 버퍼형/스트리밍 SSR, SSG, ISR(프로세스별 메모리 또는 SQLite/Redis 공유), 네이티브 HTTP 서버, ASGI, API 스트리밍, 선택적 islands, WebSocket, 다중 워커 감독자, Linux standalone 디렉터리, OpenTelemetry 트레이싱(실제 SDK).
 
-미구현: React/RSC, 스트리밍 SSR, 워커 공유 ISR, 앱별 프로세스 격리, standalone 패키징, 내장 OpenTelemetry.
+미구현: React/RSC.
 
 다음 문서: [HTTP와 캐시](HTTP-and-Caching.md), [로드맵](Roadmap-and-Contributing.md).

@@ -10,12 +10,13 @@ The native server uses Axum/Hyper with HTTP/1.1 and **HTTP/2 prior knowledge (h2
 | --- | --- | --- |
 | `--max-concurrent` | 64 | Python execution slots |
 | `--acquire-timeout-ms` | 1000 | Wait for execution slot, then 503 |
+| `--max-waiting` | min(`--max-concurrent`, 64) | Requests waiting for an execution slot; 0 waits for nobody |
 | `--body-capacity` | 16 | Concurrent body reads |
 | `--body-timeout-ms` | 10000 | Body deadline; timeout returns 408 |
 | Body size | 1 MiB | Oversized requests return 413 |
 | HTTP/1.1 headers | 10s | Header-read deadline |
 
-The number of waiting execution requests is bounded by the smaller of the execution limit and 64. A busy execution queue can return **503** with `Retry-After: 1`. Some static/SSG/fresh anonymous ISR GET/HEAD requests bypass Python execution slots. **There is no global connection-count limit**. External ASGI servers provide their own connection/timeout policy.
+The number of waiting execution requests is bounded by `--max-waiting` (default: the smaller of the execution limit and 64; 0 means a slot must be free immediately). Overload policy is bounded wait, then reject: a request that waits the full `--acquire-timeout-ms` without a slot gets **503** with `Retry-After` of the timeout rounded up to whole seconds (at least 1), and a request rejected because the wait queue is full gets `Retry-After: 1`. The queue is not enlarged without bound and requests are not shed probabilistically: each waiter can already hold a fully buffered request body. Some static/SSG/fresh anonymous ISR GET/HEAD requests bypass Python execution slots. **There is no global connection-count limit**. External ASGI servers provide their own connection/timeout policy.
 
 ## Asset HTTP behavior
 
@@ -27,7 +28,7 @@ The built public assets, SSG output, and JS island bundles support content-deriv
 
 ## ISR boundaries
 
-The bounded ISR cache is **process-local** and uses single-flight regeneration. Fresh anonymous cache hits can bypass Python; stale entries may be served during background regeneration. `Cookie` or `Authorization` bypass the shared cache. Invalidate through `await request.revalidate("/news/example")` or `await app.revalidate(path)`, after authenticating the API caller. There is no inter-worker synchronization.
+The bounded ISR cache uses single-flight regeneration. The default `memory` backend is process-local; the `sqlite` and `redis` backends share entries across workers with expiring leases and fenced writes, so another worker's invalidation is observed on the next lookup while the store is available (local fallback during an outage may be stale). Fresh anonymous cache hits can bypass Python; stale entries may be served during background regeneration. `Cookie` or `Authorization` bypass the shared cache. Invalidate through `await request.revalidate("/news/example")` or `await app.revalidate(path)`, after authenticating the API caller.
 
 ## Safety notes
 

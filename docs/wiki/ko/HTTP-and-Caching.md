@@ -10,12 +10,13 @@
 | --- | --- | --- |
 | `--max-concurrent` | 64 | Python 실행 슬롯 |
 | `--acquire-timeout-ms` | 1000 | 슬롯 대기 후 503 |
+| `--max-waiting` | `min(--max-concurrent, 64)` | 실행 슬롯 대기 요청 수; 0이면 대기 없음 |
 | `--body-capacity` | 16 | 동시 요청 본문 수신 슬롯 |
 | `--body-timeout-ms` | 10000 | 본문 타임아웃 시 408 |
 | 본문 크기 | 1 MiB | 초과 시 413 |
 | HTTP/1.1 헤더 | 10초 | 헤더 수신 마감 시간 |
 
-실행 대기 요청의 최대 개수는 실행 제한과 64 중 작은 값입니다. 대기열 포화 시 **503**과 `Retry-After: 1`이 반환될 수 있습니다. 정적 파일·SSG·신선한 익명 ISR의 일부 GET/HEAD 요청은 Python 실행 슬롯을 우회합니다. **전체 연결 개수 제한은 없습니다.** 외부 ASGI 서버는 자체 타임아웃 정책을 사용합니다.
+실행 대기 요청의 최대 개수는 `--max-waiting`으로 정합니다(기본값은 실행 제한과 64 중 작은 값; 0이면 즉시 503). 과부하 정책은 제한된 대기 후 거절입니다. 슬롯을 기다리다 `--acquire-timeout-ms`가 지나면 **503**과 `Retry-After`(대기 타임아웃을 올림한 초, 최소 1초)를 반환하고, 대기열이 가득 차서 즉시 거절될 때는 `Retry-After: 1`입니다. 대기 중인 요청은 이미 버퍼링된 본문을 들고 있을 수 있어 대기열을 무한히 늘리거나 확률적으로 일찍 거절하지 않습니다. 정적 파일·SSG·신선한 익명 ISR의 일부 GET/HEAD 요청은 Python 실행 슬롯을 우회합니다. **전체 연결 개수 제한은 없습니다.** 외부 ASGI 서버는 자체 타임아웃 정책을 사용합니다.
 
 ## 정적 에셋 HTTP 처리
 
@@ -27,7 +28,7 @@
 
 ## ISR 범위
 
-ISR은 크기가 제한된 **프로세스별 캐시**와 single-flight 재생성을 사용합니다. 신선한 익명 결과는 Rust가 직접 전달할 수 있고, 오래된 응답은 백그라운드 재생성 중 제공될 수 있습니다. `Cookie` 또는 `Authorization`은 공유 캐시를 우회합니다. 인증을 거친 API에서 `await request.revalidate("/news/example")` 또는 `await app.revalidate(path)`를 사용할 수 있습니다. 워커 간 캐시 동기화는 없습니다.
+ISR은 크기가 제한된 캐시와 single-flight 재생성을 사용합니다. 기본 `memory` 백엔드는 프로세스별이지만, `sqlite`·`redis` 백엔드는 만료되는 lease와 fencing된 쓰기로 워커 간 항목을 공유하므로, 저장소가 정상일 때는 다른 워커의 무효화가 다음 조회에 반영됩니다(장애 중 로컬 폴백은 오래된 값을 줄 수 있습니다). 신선한 익명 결과는 Rust가 직접 전달할 수 있고, 오래된 응답은 백그라운드 재생성 중 제공될 수 있습니다. `Cookie` 또는 `Authorization`은 공유 캐시를 우회합니다. 인증을 거친 API에서 `await request.revalidate("/news/example")` 또는 `await app.revalidate(path)`를 사용할 수 있습니다.
 
 ## 안전 주의
 

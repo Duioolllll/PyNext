@@ -1,0 +1,270 @@
+name: Wheels
+
+# D1 (roadmap): prebuilt binary wheels for Linux (manylinux, x86_64 and
+# aarch64), macOS (universal2) and Windows (x64), for every supported
+# CPython version. This workflow only builds and verifies wheels; it never
+# uploads anything to PyPI. Publishing is a separate manual step documented
+# in docs/WHEEL_RELEASE.md and needs the PY_PI_KEY secret.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "pyproject.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "python/**"
+      - ".github/workflows/wheels.yml"
+      - "tests/smoke_wheel.py"
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "python/**"
+      - ".github/workflows/wheels.yml"
+      - "tests/smoke_wheel.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build source distribution
+        run: uv build --sdist --out-dir dist
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # The x86_64 and aarch64 Linux wheels used to share one job on
+  # ubuntu-latest. The aarch64 wheel was cross-built with QEMU, but the
+  # isolated-wheel check then tried to install it on the x86_64 runner,
+  # which uv rejects as platform-incompatible (PR #12 CI). Each
+  # architecture now builds and verifies on a runner of its own kind.
+  linux-wheels:
+    name: Wheel (Linux x86_64-unknown-linux-gnu, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      # manylinux: auto builds inside a manylinux container so the wheel is
+      # installable on any manylinux2014+ system, not just the runner's
+      # distro.
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-unknown-linux-gnu
+          args: --release --out dist --interpreter python${{ matrix.python-version }}
+          sccache: "true"
+          manylinux: auto
+
+      # Plain `python`, not `uv run`: the check must prove the wheel installs
+      # and runs in a fresh virtualenv with no Rust toolchain involved. The
+      # script itself only needs the stdlib plus the `uv` binary.
+      - name: Verify isolated wheel (no Rust)
+        run: python tests/smoke_wheel.py
+        env:
+          PYNEXT_DIST_DIR: dist
+          PYNEXT_SKIP_SDIST: "1"
+          PYNEXT_REQUIRE_MANYLINUX: "1"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-x86_64-unknown-linux-gnu-py${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  linux-wheels-arm:
+    name: Wheel (Linux aarch64-unknown-linux-gnu, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      # On this ARM runner the build is native: manylinux: auto uses the
+      # manylinux aarch64 image directly, no QEMU involved. The isolated
+      # wheel check below then installs and runs the wheel on the same
+      # architecture, which is what the x86_64 runner could not do.
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64-unknown-linux-gnu
+          args: --release --out dist --interpreter python${{ matrix.python-version }}
+          sccache: "true"
+          manylinux: auto
+
+      # Plain `python`, not `uv run`: the check must prove the wheel installs
+      # and runs in a fresh virtualenv with no Rust toolchain involved. The
+      # script itself only needs the stdlib plus the `uv` binary.
+      - name: Verify isolated wheel (no Rust)
+        run: python tests/smoke_wheel.py
+        env:
+          PYNEXT_DIST_DIR: dist
+          PYNEXT_SKIP_SDIST: "1"
+          PYNEXT_REQUIRE_MANYLINUX: "1"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-aarch64-unknown-linux-gnu-py${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  macos-wheels:
+    name: Wheel (macOS universal2, Python ${{ matrix.python-version }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: universal2-apple-darwin
+          args: --release --out dist --interpreter python${{ matrix.python-version }}
+          sccache: "true"
+
+      - name: Verify isolated wheel (no Rust)
+        run: python tests/smoke_wheel.py
+        env:
+          PYNEXT_DIST_DIR: dist
+          PYNEXT_SKIP_SDIST: "1"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-macos-universal2-py${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  windows-wheels:
+    name: Wheel (Windows x64, Python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          args: --release --out dist --interpreter python${{ matrix.python-version }}
+          sccache: "true"
+
+      - name: Verify isolated wheel (no Rust)
+        run: python tests/smoke_wheel.py
+        env:
+          PYNEXT_DIST_DIR: dist
+          PYNEXT_SKIP_SDIST: "1"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows-x64-py${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error

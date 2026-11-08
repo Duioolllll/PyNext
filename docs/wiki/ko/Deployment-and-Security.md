@@ -2,7 +2,7 @@
 
 [홈](Home.md) · [English](../en/Deployment-and-Security.md)
 
-**PyNext v0.6.0a2를 보안 강화가 완료된 공개 프로덕션 서버로 취급하면 안 됩니다.** 저장소도 인터넷 직접 노출 및 신뢰할 수 없는 앱 코드 실행을 권장하지 않습니다.
+**PyNext 0.1.0를 보안 강화가 완료된 공개 프로덕션 서버로 취급하면 안 됩니다.** 저장소도 인터넷 직접 노출 및 신뢰할 수 없는 앱 코드 실행을 권장하지 않습니다.
 
 ## 신뢰할 수 있는 로컬 앱 실행
 
@@ -13,7 +13,7 @@ uv run pynext start --dir examples/basic --host 127.0.0.1 --port 3000
 
 `start`는 매니페스트, 추적되는 Python·공개 파일·island 소스 해시, 생성 에셋의 무결성을 검증합니다. 그러나 **외부 의존성, 환경 변수, 외부 데이터까지 전부 추적하지는 않습니다.** 변경 후에는 재빌드가 필요합니다. 빌드 과정 자체에서 개발자가 제공한 Python 모듈이 import/실행되므로 모르는 프로젝트를 관리자 권한으로 빌드하면 안 됩니다.
 
-운영 모드 시작에도 앱 소스의 `public/` 및 `islands/` 디렉터리가 필요합니다. **Standalone 배포 산출물은 없습니다.**
+운영 모드 시작에도 앱 소스의 `public/` 및 `islands/` 디렉터리가 필요합니다. 단, Linux standalone 디렉터리(`pynext build --dir <app> --standalone`)로 배포하면 인터프리터·설치된 의존성·빌드된 앱이 `<app>/.pynext/standalone`에 묶여 제공됩니다(호환 시스템 라이브러리는 별도로 필요합니다).
 
 ## 외부 ASGI 서버
 
@@ -31,7 +31,7 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 - ISR은 공개 캐시이며 `Cookie`/`Authorization` 요청은 공유 캐시를 우회합니다.
 - 커스텀 캐시 무효화 API에는 인증·권한 검사가 필수입니다.
 - 동기 Python 작업은 타임아웃 시 강제 종료할 수 없습니다. DB 타임아웃·멱등성을 적용하세요.
-- WebSocket, 프로덕션 관측성, 전체 연결 제한, 워커 공유 캐시, 프로세스 격리는 미구현입니다.
-- 검증되지 않은 프록시 헤더를 신뢰하지 마세요. h2c를 TLS 종료 기능으로 오해해서도 안 됩니다.
+- WebSocket, 구조화 로그/지표/OpenTelemetry, 워커 공유 캐시(SQLite/Redis), 감독자를 통한 프로세스 격리, 전체 연결 제한이 구현됐습니다(네이티브 서버의 총 연결 수·IP당 상한, 헤더 읽기·느린 본문 타임아웃; `serve()`/`start_native()` 참고).
+- 검증되지 않은 프록시 헤더를 신뢰하지 마세요. h2c를 TLS 종료 기능으로 오해해서도 안 됩니다. TLS 종료는 리버스 프록시가 담당한다. [ADR-0001](../../adr/0001-tls-termination.md) 참고.
 
 자세한 설계 후보는 [프로덕션 로드맵](../../PRODUCTION_ROADMAP.md)에 있습니다. **로드맵은 완료된 기능 목록이 아닙니다.**

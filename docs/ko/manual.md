@@ -4,6 +4,8 @@
 
 이 설명서는 현재 체크아웃한 코드인 **0.1.0** 실험판를 기준으로 합니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
 
+> 이 문서는 영문 매뉴얼의 번역본입니다. 내용이 다르면 영문 매뉴얼이 우선합니다. 기능 목록은 코드에서 자동 생성됩니다 — [FEATURES](../FEATURES.md) 참고.
+
 ## 준비와 첫 실행
 
 CPython 3.13·3.14, Rust/Cargo, [uv](https://docs.astral.sh/uv/)가 필요합니다. 지원 환경은 CI 매트릭스로 검증합니다. OS는 Ubuntu·macOS·Windows(최신), Python은 CPython 3.13·3.14를 대상으로 합니다. 배포 모드는 독립 실행 Axum과 Uvicorn 위의 ASGI이며, 인프로세스 ASGI 모드는 모든 CI 잡에서 pytest가 검사합니다. 브라우저 스모크는 세 OS에서 모두 실행합니다. 예제는 island를 사용하므로 Node.js 18 이상과 npm으로 esbuild 0.28.1도 설치해야 합니다.
@@ -76,15 +78,15 @@ async def echo(request):
 
 응답의 기본 Content Security Policy는 `script-src 'self'; object-src 'none'`입니다. 브라우저에서 불러올 수 있는 스크립트가 제한되므로 클라이언트 코드를 추가할 때 이를 고려하세요. 응답 헤더와 미디어 타입의 제어 문자는 거부합니다.
 
-상태 변경 API 요청에는 CSRF 보호를 선택적으로 적용할 수 있습니다(명세 v0.2 §11). 세션 미들웨어가 있으면 토큰을 서버 세션에 결합하고, 없으면 double-submit 방식을 사용합니다. 앱이 예측할 수 없는 토큰을 발급해 `pynext_csrf` 쿠키에 담고, 클라이언트는 같은 값을 `X-CSRF-Token` 헤더(또는 `csrf_token` 폼 필드)로 돌려보냅니다. GET, HEAD, OPTIONS는 제외되며, 토큰이 없거나 일치하지 않는 그 외의 메서드는 HTTP 403을 받습니다.
+상태 변경 API 요청에는 CSRF 보호가 적용됩니다(명세 v0.2 §11). 세션 미들웨어를 설치하면 모든 상태 변경 API가 자동으로 보호되며, 토큰은 서버 세션에 결합됩니다. 세션 미들웨어가 없으면 기본적으로 꺼져 있으며, double-submit 방식을 사용합니다. 앱이 예측할 수 없는 토큰을 발급해 `pynext_csrf` 쿠키에 담고, 클라이언트는 같은 값을 `X-CSRF-Token` 헤더(또는 `csrf_token` 폼 필드)로 돌려보냅니다. 쿠키 값은 HMAC으로 서명되므로 서명이 없는 쿠키는 토큰이 일치해도 거부됩니다(서브도메인 쿠키 주입 방지). `Origin`/`Sec-Fetch-Site`도 검사해 교차 사이트·서브도메인 페이지에서 온 요청은 토큰이 있어도 거부됩니다. GET, HEAD, OPTIONS는 제외되며, 토큰이 없거나 일치하지 않는 그 외의 메서드는 HTTP 403을 받습니다.
 
 ~~~python
 from pynext import JSONResponse, csrf_protect, new_csrf_token, route, set_csrf_cookie
 
 @route("GET")
-async def get_token():
+async def get_token(request):
     token = new_csrf_token()
-    return set_csrf_cookie(JSONResponse({"token": token}), token)
+    return set_csrf_cookie(JSONResponse({"token": token}), token, config=request.security)
 
 @route("POST")
 @csrf_protect
@@ -92,7 +94,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-핸들러를 하나씩 표시하는 대신 `create_app`에 `security=SecurityConfig(csrf_enabled=True)`를 전달하면 모든 상태 변경 API 라우트를 보호할 수 있습니다. 아직 세션이 없으므로 토큰은 사용자 세션에 묶이지 않습니다. 토큰은 쿠키를 읽을 수 있는 페이지에서 요청이 왔다는 것만 증명합니다. XSS로 쿠키를 읽을 수 있는 페이지는 다른 double-submit 방식과 마찬가지로 이를 우회할 수 있습니다. 쿠키는 기본적으로 `SameSite=Lax`이며 `HttpOnly`가 아닙니다(JavaScript가 읽어야 합니다). 운영 환경에서는 `csrf_cookie_secure=True`로 설정해 HTTPS에서만 전송되게 하세요.
+세션 미들웨어가 있으면 `create_app`에 보안 설정을 따로 전달하지 않아도 CSRF가 자동으로 켜집니다. 세션이 없는데 모든 상태 변경 API 라우트를 보호하려면 `create_app`에 `security=SecurityConfig(csrf_enabled=True)`를 전달하세요. 토큰은 쿠키를 읽을 수 있는 페이지에서 요청이 왔다는 것만 증명합니다. XSS로 쿠키를 읽을 수 있는 페이지는 다른 double-submit 방식과 마찬가지로 이를 우회할 수 있습니다. 쿠키는 기본적으로 `SameSite=Lax`이며 `HttpOnly`가 아닙니다(JavaScript가 읽어야 합니다). CSRF 쿠키는 기본적으로 `Secure`이므로 평문 `http://` 로컬 개발에서는 `csrf_cookie_secure=False`를 앱 설정과 `set_csrf_cookie()` 호출에 함께 전달하세요(`pynext dev`는 자동으로 이렇게 동작합니다). 다중 워커로 배포할 때는 모든 워커가 같은 `csrf_signing_key`(또는 `PYNEXT_CSRF_SIGNING_KEY` 환경 변수)를 써야 한 워커가 발급한 쿠키를 다른 워커도 검증할 수 있습니다.
 
 교차 출처 요청은 기본적으로 허용하지 않습니다(명세 v0.2 §11). 출처를 설정하지 않으면 `Access-Control-Allow-Origin` 헤더를 보내지 않습니다. `SecurityConfig`로 정책을 `create_app`에 전달하세요.
 
@@ -184,7 +186,7 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG와 ISR 페이지는 `request`를 받을 수 없고 공개 콘텐츠에 사용해야 합니다. ISR은 기본적으로 쿼리를 무시합니다. `@page(render="isr", revalidate=30, query_keys=("lang",))`와 페이지 함수의 `query` 인자를 사용하면 허용한 키와 문자열 목록만 전달하고 값별로 캐시합니다. 경로 무효화는 모든 쿼리 변형에 적용됩니다. Cookie 또는 Authorization 요청은 공유 캐시를 우회하고 `private, no-store`로 응답합니다. 기본 캐시는 프로세스별이며 SQLite 또는 선택적 Redis(`pynext-framework[redis]`, `PYNEXT_REDIS_URL`)로 워커 간 공유할 수 있습니다. 공유 조회는 저장소를 확인하고 lease와 fencing으로 쓰기를 보호합니다. 저장소 장애 시 오래된 로컬 캐시로 대체할 수 있습니다. `Set-Cookie`와 private/no-store 응답은 캐시하지 않습니다. SSG 비동기 생성기는 빌드 중 소비되어 정적 파일로 제공됩니다. 내용을 바꾸려면 재빌드하세요.
+SSG와 ISR 페이지는 `request`를 받을 수 없고 공개 콘텐츠에 사용해야 합니다. ISR은 기본적으로 쿼리를 무시합니다. `@page(render="isr", revalidate=30, query_keys=("lang",))`와 페이지 함수의 `query` 인자를 사용하면 허용한 키와 문자열 목록만 전달하고 값별로 캐시합니다. 경로 무효화는 모든 쿼리 변형에 적용됩니다. Cookie 또는 Authorization 요청은 공유 캐시를 우회하고 `private, no-store`로 응답합니다. 기본 캐시는 프로세스별이며 SQLite 또는 선택적 Redis(`pynext-framework[redis]`, `PYNEXT_REDIS_URL`)로 워커 간 공유할 수 있습니다. 공유 조회는 저장소를 확인하고 lease와 fencing으로 쓰기를 보호합니다. 저장소 장애 시 장애 정책에 따릅니다. 기본값(`fail_open`, `--cache-failure-policy fail_open`)은 오래된 로컬 캐시로 대체하고, `fail_closed`는 503으로 응답합니다. `Set-Cookie`와 private/no-store 응답은 캐시하지 않습니다. SSG 비동기 생성기는 빌드 중 소비되어 정적 파일로 제공됩니다. 내용을 바꾸려면 재빌드하세요.
 
 SSG 빌드는 최대 10,000페이지를 생성하며 개발 모드에서는 요청마다 SSG 페이지를 렌더링합니다. ISR 페이지는 `generate_static_params()`를 내보낼 수 없고 프로세스별 동시 생성 작업은 최대 128개입니다.
 
@@ -255,9 +257,9 @@ CLI 플래그 `--structured-logs` / `--no-structured-logs`, `--metrics` / `--no-
 
 ## 요청 속도 제한
 
-요청 속도 제한은 선택 사항이며 프로세스별 토큰 버킷입니다. `pynext start --rate-limit 100 --rate-limit-window 60`은 클라이언트 IP당 60초에 100요청을 허용합니다(버스트가 곧 제한). 제한을 초과한 동적 요청은 초 단위 `Retry-After` 헤더와 함께 429를 받습니다. 키는 클라이언트 IP이며, `X-Forwarded-For`는 `--trusted-proxy`(IP 또는 CIDR, 반복 가능)로 지정한 피어에서만 신뢰합니다. 신뢰하지 않는 프록시의 헤더는 위조가 가능하므로 무시합니다. 코드에서는 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`처럼 사용합니다. 버킷은 프로세스별이며 재시작 시 사라지고, 분산 속도 제한은 아직 미구현입니다. 정적 파일과 신선한 ISR 페이지는 Python 브리지에 도달하기 전에 Rust 계층에서 제공되므로 속도 제한이 적용되지 않습니다.
+요청 속도 제한은 선택 사항이며 프로세스별 토큰 버킷입니다. `pynext start --rate-limit 100 --rate-limit-window 60`은 클라이언트 IP당 60초에 100요청을 허용합니다(버스트가 곧 제한). 제한을 초과한 동적 요청은 초 단위 `Retry-After` 헤더와 함께 429를 받습니다. 키는 클라이언트 IP이며, `X-Forwarded-For`는 `--trusted-proxy`(IP 또는 CIDR, 반복 가능)로 지정한 피어에서만 신뢰합니다. 신뢰하지 않는 프록시의 헤더는 위조가 가능하므로 무시합니다. 코드에서는 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`처럼 사용합니다. 버킷은 프로세스별이며 재시작 시 사라집니다. `--rate-limit-backend redis`를 쓰면 버킷이 공유되며, Redis에 닿지 않을 때는 장애 정책에 따릅니다. 기본값(`fail_closed`, `--rate-limit-failure-policy fail_closed`)은 503으로 응답하고, `fail_open`은 요청을 허용합니다. 정적 파일과 신선한 ISR 페이지는 Python 브리지에 도달하기 전에 Rust 계층에서 제공되므로 속도 제한이 적용되지 않습니다.
 
-전달된 주소는 오른쪽부터 신뢰하는 프록시를 거슬러 가장 가까운 비신뢰 주소를 사용합니다. 모든 중간 프록시를 정확히 등록해야 합니다. 프로세스당 버킷은 최대 10,000개이며 모두 사용 중이면 버킷이 완전히 충전될 때까지 새 주소에 429를 반환합니다.
+전달된 주소는 오른쪽부터 신뢰하는 프록시를 거슬러 가장 가까운 비신뢰 주소를 사용합니다. 모든 중간 프록시를 정확히 등록해야 합니다. 프로세스당 버킷은 최대 10,000개이며, 모두 사용 중이면 새 주소가 가장 오래된 버킷을 내보내고 들어갑니다(기존 주소가 429를 받지는 않습니다). 신규 주소 생성은 윈도우당 최대 10,000개까지의 전역 슬라이딩 윈도우로 제한합니다. IPv6 주소는 /64 접두사별로 버킷을 공유합니다. `--rate-limit-exempt-path`(예: `/healthz`)로 지정한 경로는 속도 제한을 건너뜁니다.
 
 여러 워커: `pynext start --workers 4`는 하나의 리스너를 공유하는 워커 수퍼바이저를 실행합니다. `--port 0`으로 시작하면 할당된 포트를 워커 재시작 시에도 유지합니다. 워커의 인터프리터와 이벤트 루프는 독립적이며 메모리 캐시와 기본 요청 제한은 워커별입니다. SQLite·Redis ISR과 Redis 요청 제한은 공유할 수 있습니다. 수퍼바이저가 실패한 워커를 재시작하고 종료를 조정합니다. 처리 중 중단된 요청은 실패하므로 재시도해야 합니다. 공유 리스너 워커의 실행과 재시작은 Linux·macOS·Windows CI에서 검사하며, 신호 기반 수퍼바이저 검사는 Linux·macOS에서 수행합니다.
 

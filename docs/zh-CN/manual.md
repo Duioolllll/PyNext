@@ -4,6 +4,8 @@
 
 本手册适用于当前检出的 **0.1.0** 实验版本代码。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
 
+> 本手册是英文手册的翻译。如内容不一致，以英文手册为准。功能列表由代码自动生成 — 参见 [FEATURES](../FEATURES.md)。
+
 ## 环境要求与首次运行
 
 需要 CPython 3.13 或 3.14、Rust/Cargo 和 [uv](https://docs.astral.sh/uv/)。受支持的环境由 CI 矩阵验证：操作系统为 Ubuntu、macOS 与 Windows（最新版本），Python 为 CPython 3.13 和 3.14，部署模式为独立 Axum 与 Uvicorn 之上的 ASGI（进程内 ASGI 模式由每个 CI 任务中的 pytest 覆盖）。浏览器冒烟测试在三个操作系统上都会运行。示例使用 island，因此还需要 Node.js 18 或更高版本和 npm，以安装 esbuild 0.28.1。
@@ -76,15 +78,15 @@ async def echo(request):
 
 响应默认使用 Content Security Policy `script-src 'self'; object-src 'none'`。该策略限制浏览器可加载的脚本，添加客户端代码时应予以考虑。响应头和媒体类型中的控制字符会被拒绝。
 
-状态变更类 API 请求可以选择启用 CSRF 保护（规范 v0.2 §11）。启用会话中间件时令牌绑定到服务端会话；否则采用 double-submit 模式：应用签发一个不可预测的令牌，存入 `pynext_csrf` Cookie，客户端再以 `X-CSRF-Token` 请求头（或 `csrf_token` 表单字段）回传相同的值。GET、HEAD 和 OPTIONS 不受检查；其他方法若缺少令牌或令牌不匹配，将返回 HTTP 403。
+状态变更类 API 请求适用 CSRF 保护（规范 v0.2 §11）。启用会话中间件后，全部状态变更类 API 路由会自动受到保护，令牌绑定到服务端会话。没有会话中间件时默认关闭，采用 double-submit 模式：应用签发一个不可预测的令牌，存入 `pynext_csrf` Cookie，客户端再以 `X-CSRF-Token` 请求头（或 `csrf_token` 表单字段）回传相同的值。Cookie 值经过 HMAC 签名，未签名的 Cookie 即使令牌相符也会被拒绝（防止子域 Cookie 注入）。同时还会检查 `Origin` 和 `Sec-Fetch-Site`：来自跨站或子域页面的请求即使令牌有效也会被拒绝。GET、HEAD 和 OPTIONS 不受检查；其他方法若缺少令牌或令牌不匹配，将返回 HTTP 403。
 
 ~~~python
 from pynext import JSONResponse, csrf_protect, new_csrf_token, route, set_csrf_cookie
 
 @route("GET")
-async def get_token():
+async def get_token(request):
     token = new_csrf_token()
-    return set_csrf_cookie(JSONResponse({"token": token}), token)
+    return set_csrf_cookie(JSONResponse({"token": token}), token, config=request.security)
 
 @route("POST")
 @csrf_protect
@@ -92,7 +94,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-除逐个标记处理器外，也可向 `create_app` 传入 `security=SecurityConfig(csrf_enabled=True)`，保护全部状态变更类 API 路由。由于目前没有会话，令牌不与用户会话绑定：它仅证明请求来自能够读取该 Cookie 的页面。与其他 double-submit 方案一样，能够通过 XSS 读取 Cookie 的页面可以绕过它。Cookie 默认使用 `SameSite=Lax`，且不设 `HttpOnly`（JavaScript 需要读取它）；生产环境请设置 `csrf_cookie_secure=True`，使 Cookie 仅通过 HTTPS 发送。
+启用会话中间件后，无需另传安全配置即可自动开启 CSRF。若没有会话，又想保护全部状态变更类 API 路由，可向 `create_app` 传入 `security=SecurityConfig(csrf_enabled=True)`。令牌仅证明请求来自能够读取该 Cookie 的页面。与其他 double-submit 方案一样，能够通过 XSS 读取 Cookie 的页面可以绕过它。Cookie 默认使用 `SameSite=Lax`，且不设 `HttpOnly`（JavaScript 需要读取它）；CSRF Cookie 默认带 `Secure`，在明文 `http://` 本地开发时，请同时向应用配置和 `set_csrf_cookie()` 调用传入 `csrf_cookie_secure=False`（`pynext dev` 会自动这样做）。多 worker 部署时，所有 worker 必须使用相同的 `csrf_signing_key`（或 `PYNEXT_CSRF_SIGNING_KEY` 环境变量），这样一个 worker 签发的 Cookie 才能在其他 worker 上通过验证。
 
 跨源请求默认一律拒绝（规范 v0.2 §11）：未配置来源时，不会发送 `Access-Control-Allow-Origin` 请求头。请通过 `SecurityConfig` 将策略传给 `create_app`：
 
@@ -184,7 +186,7 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG 和 ISR 页面不能接收 `request`，仅用于公开内容。ISR 默认忽略查询字符串。通过 `@page(render="isr", revalidate=30, query_keys=("lang",))` 和页面的 `query` 参数，只传入允许的键及其字符串列表，并按值分别缓存。使路径失效会使其所有查询变体失效。包含 Cookie 或 Authorization 的请求绕过共享缓存并返回 `private, no-store`。默认缓存仅在本进程内，也可使用 SQLite 或可选 Redis（`pynext-framework[redis]` 和 `PYNEXT_REDIS_URL`）在 worker 间共享；共享存储故障时可能回退到过期的本地缓存。带 `Set-Cookie` 或 private/no-store 的响应不缓存。SSG 异步生成器在构建期间消费，并作为静态文件提供。
+SSG 和 ISR 页面不能接收 `request`，仅用于公开内容。ISR 默认忽略查询字符串。通过 `@page(render="isr", revalidate=30, query_keys=("lang",))` 和页面的 `query` 参数，只传入允许的键及其字符串列表，并按值分别缓存。使路径失效会使其所有查询变体失效。包含 Cookie 或 Authorization 的请求绕过共享缓存并返回 `private, no-store`。默认缓存仅在本进程内，也可使用 SQLite 或可选 Redis（`pynext-framework[redis]` 和 `PYNEXT_REDIS_URL`）在 worker 间共享；共享存储故障时遵循故障策略：默认（`fail_open`，`--cache-failure-policy fail_open`）回退到过期的本地缓存，`fail_closed` 则返回 503。带 `Set-Cookie` 或 private/no-store 的响应不缓存。SSG 异步生成器在构建期间消费，并作为静态文件提供。
 
 SSG 构建最多生成 10,000 个页面；开发模式下每次请求都会渲染 SSG 页面。ISR 页面不能导出 `generate_static_params()`，每个进程最多并发执行 128 个生成任务。
 
@@ -255,9 +257,9 @@ OpenTelemetry 追踪默认关闭且为可选项：安装 `opentelemetry-api`（�
 
 ## 限流
 
-限流是可选项，采用按进程的令牌桶：`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的动态请求返回 429，并带有以秒为单位的 `Retry-After` 头。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失；分布式限流尚未实现。静态文件和新鲜的 ISR 页面在到达 Python 桥接之前已由 Rust 层返回，因此不受限流。
+限流是可选项，采用按进程的令牌桶：`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的动态请求返回 429，并带有以秒为单位的 `Retry-After` 头。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失。使用 `--rate-limit-backend redis` 时桶在进程间共享；Redis 不可达时遵循故障策略：默认（`fail_closed`，`--rate-limit-failure-policy fail_closed`）返回 503，`fail_open` 则放行请求。静态文件和新鲜的 ISR 页面在到达 Python 桥接之前已由 Rust 层返回，因此不受限流。
 
-转发链从右向左遍历受信任的代理，使用最近的不受信任地址。必须准确配置所有中间代理。每个进程最多保留 10,000 个桶；全部处于活跃状态时，新地址会收到 429，直到某个桶完全补充。
+转发链从右向左遍历受信任的代理，使用最近的不受信任地址。必须准确配置所有中间代理。每个进程最多保留 10,000 个桶；全部处于活跃状态时，新键会逐出最旧的桶而不是收到 429，新键的创建受全局滑动窗口限制（每个窗口最多 10,000 个新键）。IPv6 地址按 /64 前缀共享桶。用 `--rate-limit-exempt-path`（例如 `/healthz`）指定的路径跳过速率限制。
 
 多工作进程：`pynext start --workers 4` 启动共享监听套接字的监管器。使用 `--port 0` 时，动态分配的端口在 worker 重启后保持不变。各 worker 的解释器、内存缓存和默认限流独立；SQLite/Redis ISR 与 Redis 限流可以共享。监管器会重启故障 worker；中断的请求需要重试。CI 在 Linux、macOS 和 Windows 上检查共享监听套接字的 worker 启动和重启，并在 Linux 和 macOS 上运行基于信号的监管器测试。
 

@@ -4,6 +4,8 @@
 
 This manual describes the code in this checkout, corresponding to the experimental **0.1.0** version. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
 
+> Canonical source: this English manual is the single source of truth for PyNext documentation. The Korean, Japanese, and Simplified Chinese manuals are translations of it; if they disagree, this manual wins. The capability list is generated from code — see [FEATURES](../FEATURES.md).
+
 ## Requirements and first run
 
 Use CPython 3.13 or 3.14, a Rust toolchain with Cargo, and [uv](https://docs.astral.sh/uv/). Supported environments are verified by the CI matrix: Ubuntu, macOS, and Windows (latest), CPython 3.13 and 3.14, and the standalone Axum and Uvicorn-backed ASGI deploy modes (the in-process ASGI mode is covered by pytest in every CI job). Browser smoke runs on all three OSes. The example uses islands and additionally requires Node.js 18 or newer and npm to install esbuild 0.28.1.
@@ -19,6 +21,10 @@ uv run pynext start --dir examples/basic
 ~~~
 
 Open http://127.0.0.1:3000/, /about, /guides/intro, /news/example, /hydrate, /strategies, and /api/users. Stop the server with Ctrl+C.
+
+PyNext serves plain HTTP only and does not terminate TLS; see [ADR-0001](../adr/0001-tls-termination.md). For anything beyond localhost, put a TLS-terminating reverse proxy in front of it and keep PyNext bound to loopback or a trusted private network.
+
+Warning: `pynext build` imports and executes the application's Python code (page, layout, middleware and resource modules, plus SSG generators) and runs the island bundler. Only build apps you trust. To build an app you do not fully trust, use the sandboxed build recipe in [docs/SANDBOXED_BUILD.md](../SANDBOXED_BUILD.md).
 
 `pynext dev --dir examples/basic` serves source without a build and reloads when `app/`, `islands/`, `public/` or `pynext.config.py` change, restarting the server on the same port. `pynext start` uses the build manifest and fails if tracked source files changed; rebuild first. For an app without islands, Node and esbuild are not required. The repository is the installation source; no PyPI publication is implied.
 
@@ -76,15 +82,15 @@ async def echo(request):
 
 Responses default to the Content Security Policy `script-src 'self'; object-src 'none'`. This limits which scripts a browser may load; account for it when adding client code. Response headers and media types reject control characters.
 
-State-changing API requests can opt into CSRF protection (spec v0.2 §11). PyNext has no auth system yet, so protection uses the double-submit pattern: the app issues an unpredictable token, stores it in a `pynext_csrf` cookie, and the client sends the same value back in the `X-CSRF-Token` header (or a `csrf_token` form field). GET, HEAD and OPTIONS are exempt; other methods without a matching token get HTTP 403.
+State-changing API requests are CSRF-protected (spec v0.2 §11). Installing a session middleware protects every state-changing API route automatically, with the token bound to the server-side session. Without a session middleware CSRF is off by default and uses the double-submit pattern: the app issues an unpredictable token, stores it in a `pynext_csrf` cookie, and the client sends the same value back in the `X-CSRF-Token` header (or a `csrf_token` form field). The cookie value is HMAC-signed, so an unsigned cookie is rejected even when the submitted token matches (this stops subdomain cookie injection). `Origin` and `Sec-Fetch-Site` are checked too: requests from cross-site or subdomain pages get HTTP 403 even with a valid token. GET, HEAD and OPTIONS are exempt; other methods without a matching token get HTTP 403.
 
 ~~~python
 from pynext import JSONResponse, csrf_protect, new_csrf_token, route, set_csrf_cookie
 
 @route("GET")
-async def get_token():
+async def get_token(request):
     token = new_csrf_token()
-    return set_csrf_cookie(JSONResponse({"token": token}), token)
+    return set_csrf_cookie(JSONResponse({"token": token}), token, config=request.security)
 
 @route("POST")
 @csrf_protect
@@ -92,7 +98,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-Pass `security=SecurityConfig(csrf_enabled=True)` to `create_app` to protect every state-changing API route instead of marking handlers one by one. With SessionMiddleware, the token is bound to the server-side session; without it, the double-submit token proves the request came from a page that could read the cookie. A page that can read the cookie through XSS can bypass it, as with any double-submit scheme. The cookie defaults to `SameSite=Lax` without `HttpOnly` (JavaScript must read it); set `csrf_cookie_secure=True` in production so it is only sent over HTTPS.
+With SessionMiddleware, CSRF turns on automatically — no security config needed. Without sessions, pass `security=SecurityConfig(csrf_enabled=True)` to `create_app` to protect every state-changing API route instead of marking handlers one by one. The double-submit token only proves the request came from a page that could read the cookie. A page that can read the cookie through XSS can bypass it, as with any double-submit scheme. The cookie defaults to `SameSite=Lax` without `HttpOnly` (JavaScript must read it) and is `Secure` by default; for plain-`http://` local development pass `csrf_cookie_secure=False` to both the app config and `set_csrf_cookie()` (`pynext dev` does this automatically). Multi-worker deployments must share one `csrf_signing_key` (or the `PYNEXT_CSRF_SIGNING_KEY` environment variable) on every worker so a cookie issued by one worker verifies on the others.
 
 Cross-origin requests are denied by default (spec v0.2 §11): no `Access-Control-Allow-Origin` header is sent unless the origin is configured. Pass the policy to `create_app` with `SecurityConfig`:
 
@@ -184,7 +190,7 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG and ISR pages cannot accept `request` and must contain public content. ISR ignores query strings by default. To vary a page by selected keys, declare `@page(render="isr", revalidate=30, query_keys=("lang",))` and accept a `query` parameter; only listed keys and their string lists are passed to the page and included in the cache key. Revalidating a path invalidates all its query variants. Cookie or Authorization requests bypass the shared cache and return `private, no-store`. The default cache is process-local; SQLite and optional Redis (`pynext-framework[redis]`, `PYNEXT_REDIS_URL`) share entries across workers. Shared lookups consult the backend, leases and fencing protect writes, and backend failure falls back to a possibly stale local cache. `Set-Cookie` and private/no-store responses are not cached. SSG async generators are consumed during the build and served as static files. Rebuild SSG pages to update them.
+SSG and ISR pages cannot accept `request` and must contain public content. ISR ignores query strings by default. To vary a page by selected keys, declare `@page(render="isr", revalidate=30, query_keys=("lang",))` and accept a `query` parameter; only listed keys and their string lists are passed to the page and included in the cache key. Revalidating a path invalidates all its query variants. Cookie or Authorization requests bypass the shared cache and return `private, no-store`. The default cache is process-local; SQLite and optional Redis (`pynext-framework[redis]`, `PYNEXT_REDIS_URL`) share entries across workers. Shared lookups consult the backend, leases and fencing protect writes, and a backend failure follows the configured failure policy: by default (`fail_open`, `--cache-failure-policy fail_open`) it falls back to a possibly stale local cache, while `fail_closed` answers 503 instead. `Set-Cookie` and private/no-store responses are not cached. SSG async generators are consumed during the build and served as static files. Rebuild SSG pages to update them.
 
 A build produces at most 10,000 SSG pages. Development mode renders SSG pages for each request. ISR pages cannot export `generate_static_params()` and permit at most 128 concurrent generation tasks per process.
 
@@ -255,9 +261,9 @@ Measured overhead of the default observability settings (structured logs + metri
 
 ## Rate limiting
 
-Rate limiting is opt-in and per process: `pynext start --rate-limit 100 --rate-limit-window 60` allows 100 requests per client IP per 60 seconds (token bucket; the burst is the limit). Requests over the limit get 429 with a `Retry-After` header in seconds. Keys are client IPs; `X-Forwarded-For` is honoured only from peers listed with `--trusted-proxy` (repeatable, IP or CIDR) — an untrusted proxy's header is ignored because it is spoofable. Programmatic use: `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`. Buckets are per process and do not survive restarts; distributed rate limiting is still not implemented. Static files and fresh ISR pages are served by the Rust layer before the Python bridge, so they are not rate-limited.
+Rate limiting is opt-in and per process: `pynext start --rate-limit 100 --rate-limit-window 60` allows 100 requests per client IP per 60 seconds (token bucket; the burst is the limit). Requests over the limit get 429 with a `Retry-After` header in seconds. Keys are client IPs; `X-Forwarded-For` is honoured only from peers listed with `--trusted-proxy` (repeatable, IP or CIDR) — an untrusted proxy's header is ignored because it is spoofable. Programmatic use: `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`. Buckets are per process and do not survive restarts. With `--rate-limit-backend redis` buckets are shared; if Redis is unreachable the limiter follows its failure policy: by default (`fail_closed`, `--rate-limit-failure-policy fail_closed`) the request gets 503, while `fail_open` admits it. Static files and fresh ISR pages are served by the Rust layer before the Python bridge, so they are not rate-limited.
 
-The forwarded chain is walked from right to left through trusted proxies; the nearest untrusted address is used. Configure every intermediate proxy accurately. Each process keeps at most 10,000 buckets; when all are active, requests from new keys get 429 until a bucket fully refills.
+The forwarded chain is walked from right to left through trusted proxies; the nearest untrusted address is used. Configure every intermediate proxy accurately. Each process keeps at most 10,000 buckets; when all are active, a new key evicts the stalest bucket instead of getting 429, and new-key admissions are bounded by a global sliding window (at most 10,000 new keys per window). IPv6 addresses share the bucket of their /64 prefix. Paths listed with `--rate-limit-exempt-path` (for example `/healthz`) skip rate limiting.
 
 Multiple workers: `pynext start --workers 4` runs a supervisor whose worker processes share one listener. With `--port 0`, the assigned port remains stable across worker restarts. Workers have independent interpreters and event loops; memory caches and rate limits are per worker, while SQLite/Redis ISR and Redis rate limiting can be shared. The supervisor restarts failed workers and coordinates shutdown. An interrupted in-flight request fails and must be retried. CI tests shared-listener worker startup and restart on Linux, macOS, and Windows; signal-based supervisor tests run on Linux and macOS.
 

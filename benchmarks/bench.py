@@ -16,7 +16,6 @@ from collections import Counter
 import importlib.metadata
 import json
 import math
-import os
 import platform
 import socket
 import statistics
@@ -47,16 +46,26 @@ def _percentiles(samples):
     def percentile(value):
         return round(ordered[max(0, math.ceil(len(ordered) * value) - 1)], 3)
 
-    return {"p50": round(statistics.median(ordered), 3), "p95": percentile(.95), "p99": percentile(.99)}
+    return {"p50": round(statistics.median(ordered), 3), "p95": percentile(.95),
+            "p99": percentile(.99), "p99.9": percentile(.999)}
 
 
-def _linux_process_cpu(pid):
-    """Return CPU time and start ticks for one local Linux process."""
-    if sys.platform != "linux":
-        raise ValueError("--server-pid currently requires Linux")
-    # The command name is parenthesized and may contain spaces or parentheses.
-    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"), int(fields[19])
+def _process_cpu(pid):
+    """Return (CPU seconds, process start time) for one local process.
+
+    psutil reads the same counters on Linux, macOS and Windows. The
+    /proc-based reader this replaces only worked on Linux, so on macOS and
+    Windows the caller passed no server PID at all and ``server_cpu_seconds``
+    stayed None.
+    """
+    import psutil
+
+    try:
+        process = psutil.Process(pid)
+        times = process.cpu_times()
+        return times.user + times.system, process.create_time()
+    except psutil.Error as exc:
+        raise OSError(f"cannot read CPU data for PID {pid}: {exc}") from exc
 
 
 def _process_peak_rss_bytes():
@@ -108,7 +117,7 @@ async def measure(client, path, count, concurrency, *, warmup=10, server_pid=Non
                 if success:
                     successful_samples.append(latency)
 
-    server_cpu_before = _linux_process_cpu(server_pid) if server_pid is not None else None
+    server_cpu_before = _process_cpu(server_pid) if server_pid is not None else None
     started, cpu_started = time.perf_counter(), time.process_time()
     await asyncio.gather(*(worker() for _ in range(concurrency)))
     elapsed = time.perf_counter() - started
@@ -116,7 +125,7 @@ async def measure(client, path, count, concurrency, *, warmup=10, server_pid=Non
     server_cpu, server_cpu_error = None, None
     if server_cpu_before is not None:
         try:
-            cpu_after, start_after = _linux_process_cpu(server_pid)
+            cpu_after, start_after = _process_cpu(server_pid)
             if start_after != server_cpu_before[1]:
                 server_cpu_error = "server process exited or PID was reused"
             else:
@@ -194,13 +203,13 @@ async def run(mode, count, concurrency, path, production, *, warmup=10, base_url
             raise ValueError("--server-pid requires a positive PID and --base-url")
         if urlsplit(base_url).hostname not in {"localhost", "127.0.0.1", "::1"}:
             raise ValueError("--server-pid requires a loopback --base-url")
-        _linux_process_cpu(server_pid)
+        _process_cpu(server_pid)
 
     app = None
     server = None
     uvicorn_server = uvicorn_task = uvicorn_socket = None
     if base_url:
-        client = httpx.AsyncClient(base_url=base_url, timeout=30)
+        client = httpx.AsyncClient(base_url=base_url, timeout=30, trust_env=False)
     elif mode == "starlette":
         # Same-feature reference app; the PyNext app is not built here and
         # --production does not apply to this group. Loaded by file path
@@ -215,18 +224,20 @@ async def run(mode, count, concurrency, path, production, *, warmup=10, base_url
         spec.loader.exec_module(module)
         uvicorn_server, uvicorn_task, uvicorn_socket = await _start_uvicorn_http(module.app)
         client = httpx.AsyncClient(
-            base_url=f"http://127.0.0.1:{uvicorn_socket.getsockname()[1]}", timeout=30)
+            base_url=f"http://127.0.0.1:{uvicorn_socket.getsockname()[1]}",
+            timeout=30, trust_env=False)
     else:
         app = create_app(ROOT, production=production)
         if mode == "axum":
             server = start_native(app, asyncio.get_running_loop(), port=0)
-            client = httpx.AsyncClient(base_url=f"http://{server.address}", timeout=30)
+            client = httpx.AsyncClient(base_url=f"http://{server.address}", timeout=30, trust_env=False)
         elif mode == "uvicorn":
             uvicorn_server, uvicorn_task, uvicorn_socket = await _start_uvicorn_http(app)
             client = httpx.AsyncClient(
-                base_url=f"http://127.0.0.1:{uvicorn_socket.getsockname()[1]}", timeout=30)
+                base_url=f"http://127.0.0.1:{uvicorn_socket.getsockname()[1]}",
+                timeout=30, trust_env=False)
         elif mode == "asgi":
-            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", trust_env=False)
         else:
             raise ValueError(f"Unsupported benchmark mode: {mode}")
     try:
@@ -295,7 +306,7 @@ async def run_compare(count, concurrency, path, production, *, warmup=10):
             try:
                 async with httpx.AsyncClient(base_url=f"http://{address}", timeout=30, trust_env=False) as client:
                     result = await measure(client, path, count, concurrency, warmup=warmup,
-                                           server_pid=process.pid if sys.platform == "linux" else None, external=True)
+                                           server_pid=process.pid, external=True)
             finally:
                 stop.set()
                 await sampler
@@ -348,7 +359,7 @@ def main():
     parser.add_argument("--path", default="/")
     parser.add_argument("--production", action="store_true", help="use the build manifest")
     parser.add_argument("--base-url", help="benchmark an already-running HTTP server")
-    parser.add_argument("--server-pid", type=int, help="sample CPU of a separate local Linux server process")
+    parser.add_argument("--server-pid", type=int, help="sample CPU of a separate local server process")
     args = parser.parse_args()
     if args.requests < 1 or args.concurrency < 1 or args.warmup < 0:
         parser.error("requests and concurrency must be positive; warmup must be non-negative")
@@ -357,13 +368,11 @@ def main():
     if args.server_pid is not None:
         if args.server_pid < 1 or not args.base_url:
             parser.error("--server-pid requires a positive PID and --base-url")
-        if sys.platform != "linux":
-            parser.error("--server-pid currently requires Linux")
         if urlsplit(args.base_url).hostname not in {"localhost", "127.0.0.1", "::1"}:
             parser.error("--server-pid requires a loopback --base-url")
         try:
-            _linux_process_cpu(args.server_pid)
-        except (OSError, ValueError, IndexError) as exc:
+            _process_cpu(args.server_pid)
+        except OSError as exc:
             parser.error(f"cannot read server process CPU data: {exc}")
     if args.compare:
         print(json.dumps(asyncio.run(run_compare(args.requests, args.concurrency, args.path,

@@ -34,8 +34,8 @@ def test_benchmark_distinguishes_success_from_http_and_transport_errors():
         assert result["http_status_class_counts"] == {"2xx": 2, "4xx": 1, "5xx": 2}
         assert result["transport_error_counts"] == {"ReadTimeout": 1}
         assert result["attempted_requests_per_second"] > result["successful_requests_per_second"] > 0
-        assert set(result["latency_ms"]) == {"p50", "p95", "p99"}
-        assert set(result["successful_latency_ms"]) == {"p50", "p95", "p99"}
+        assert set(result["latency_ms"]) == {"p50", "p95", "p99", "p99.9"}
+        assert set(result["successful_latency_ms"]) == {"p50", "p95", "p99", "p99.9"}
         assert result["response_bytes"] == {"total": 10, "mean_per_response": 2.0}
         assert result["process_cpu_scope"] == "load_generator_and_server"
         assert result["process_peak_rss_bytes"] is None or result["process_peak_rss_bytes"] > 0
@@ -86,7 +86,7 @@ def test_benchmark_compare_runs_all_loopback_groups():
     assert [group["mode"] for group in result["groups"]] == ["axum", "uvicorn", "starlette"]
     assert all(group["transport"] == "loopback_http" for group in result["groups"])
     assert all(group["successful_requests"] == 4 and group["errors"] == 0 for group in result["groups"])
-    assert all(set(group["latency_ms"]) == {"p50", "p95", "p99"} for group in result["groups"])
+    assert all(set(group["latency_ms"]) == {"p50", "p95", "p99", "p99.9"} for group in result["groups"])
     assert len({group["server_pid"] for group in result["groups"]}) == 3
     assert all(group["process_peak_rss_bytes"] > 0 and group["process_peak_rss_scope"] == "server_sampled_10ms"
                for group in result["groups"])
@@ -108,7 +108,7 @@ def test_benchmark_reports_zero_success_without_fabricating_success_latency():
 
 def test_benchmark_does_not_attribute_reused_pid_cpu(monkeypatch):
     values = iter([(2.0, 10), (3.0, 11)])
-    monkeypatch.setattr(benchmark, "_linux_process_cpu", lambda pid: next(values))
+    monkeypatch.setattr(benchmark, "_process_cpu", lambda pid: next(values))
 
     async def check():
         transport = httpx.MockTransport(lambda request: httpx.Response(200, content=b"ok"))
@@ -121,8 +121,28 @@ def test_benchmark_does_not_attribute_reused_pid_cpu(monkeypatch):
     asyncio.run(check())
 
 
+def test_process_cpu_samples_any_local_process():
+    """Server CPU sampling works on every OS, not just Linux procfs."""
+    import psutil
+
+    own_pid = os.getpid()
+    cpu, started = benchmark._process_cpu(own_pid)
+    assert cpu >= 0
+    assert started == psutil.Process(own_pid).create_time()
+    with pytest.raises(OSError):
+        benchmark._process_cpu(1 << 30)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        cpu, started = benchmark._process_cpu(child.pid)
+        assert cpu >= 0
+        assert started == psutil.Process(child.pid).create_time()
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+
+
 @pytest.mark.skipif(sys.platform != "linux" or not os.path.exists("/proc/self/stat"),
-                    reason="separate process CPU sampling requires Linux procfs")
+                    reason="stdout readiness uses select on a pipe")
 def test_benchmark_external_server_cpu_is_separate_from_load_generator():
     code = """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

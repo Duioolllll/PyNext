@@ -1,0 +1,576 @@
+{
+  "baseline": "pynext-c1",
+  "schema_version": 1,
+  "generated_at": "2026-11-08T14:33:29.109908+00:00",
+  "conditions": {
+    "requests_per_scenario_rep": 50,
+    "concurrency": 4,
+    "warmup_requests": 5,
+    "repetitions": 1,
+    "production": false,
+    "modes": [
+      "axum"
+    ],
+    "server_workers": 1,
+    "transport": "external_http (separate server process)",
+    "loadgen_location": "same-machine",
+    "server_host": null,
+    "config_file": "/home/hatch/workspace/pynext-c1-baseline/benchmarks/baseline-config.json"
+  },
+  "environment": {
+    "load_generator": {
+      "hostname": "htch-runtime",
+      "cpu_model": "AMD EPYC 9D25 126-Core Processor",
+      "cpu_count_logical": 4,
+      "memory_total_bytes": 8319905792,
+      "os": "Linux-7.0.0-43-generic-x86_64-with-glibc2.39",
+      "machine": "x86_64",
+      "python": "3.13.18",
+      "pynext": "0.1.0",
+      "uvicorn": "0.54.0",
+      "starlette": "1.10.0",
+      "httpx": "0.28.1",
+      "psutil": "7.2.2",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
+      "node": "v24.22.1",
+      "git": {
+        "sha": "d8560f828a13e6ae5bb82bf4496fed6b4d45ecb8",
+        "dirty": true
+      }
+    },
+    "server": {
+      "hostname": "htch-runtime",
+      "cpu_model": "AMD EPYC 9D25 126-Core Processor",
+      "cpu_count_logical": 4,
+      "memory_total_bytes": 8319905792,
+      "os": "Linux-7.0.0-43-generic-x86_64-with-glibc2.39",
+      "machine": "x86_64",
+      "python": "3.13.18",
+      "pynext": "0.1.0",
+      "uvicorn": "0.54.0",
+      "starlette": "1.10.0",
+      "httpx": "0.28.1",
+      "psutil": "7.2.2",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
+      "node": "v24.22.1",
+      "git": {
+        "sha": "d8560f828a13e6ae5bb82bf4496fed6b4d45ecb8",
+        "dirty": true
+      }
+    }
+  },
+  "limitations": [
+    "same-machine run: the load generator shares CPU and memory with the server, so throughput is a regression baseline, not a production throughput claim",
+    "development mode: SSG/ISR pages are rendered on demand instead of served from a build manifest",
+    "single repetition: latency percentiles have no cross-run median; re-run with repetitions >= 3 for a publishable baseline"
+  ],
+  "scenarios": [
+    {
+      "name": "static",
+      "path": "/styles/site.css",
+      "description": "Public static asset",
+      "app": "basic",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 50,
+              "concurrency": 4,
+              "warmup_requests": 5,
+              "warmup_errors": 0,
+              "successful_requests": 50,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 50
+              },
+              "http_status_class_counts": {
+                "2xx": 50
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 0.574,
+              "attempted_requests_per_second": 87.17,
+              "successful_requests_per_second": 87.17,
+              "latency_ms": {
+                "p50": 20.052,
+                "p95": 89.456,
+                "p99": 200.631,
+                "p99.9": 200.631
+              },
+              "successful_latency_ms": {
+                "p50": 20.052,
+                "p95": 89.456,
+                "p99": 200.631,
+                "p99.9": 200.631
+              },
+              "response_bytes": {
+                "total": 11500,
+                "mean_per_response": 230.0
+              },
+              "process_cpu_seconds": 0.096,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 35184640,
+              "server_pid": 64575,
+              "server_cpu_seconds": 0.0,
+              "server_cpu_percent_one_core": 0.0,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 1,
+            "latency_ms": {
+              "p50": 20.052,
+              "p95": 89.456,
+              "p99": 200.631,
+              "p99.9": 200.631
+            },
+            "successful_requests_per_second": 87.17,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 0.0,
+            "server_peak_rss_bytes_mean": 35184640,
+            "loadgen_cpu_seconds_mean": 0.096,
+            "response_mean_bytes": 230.0
+          }
+        }
+      }
+    },
+    {
+      "name": "ssg",
+      "path": "/about",
+      "description": "SSG page, built once and served as static HTML",
+      "app": "basic",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 50,
+              "concurrency": 4,
+              "warmup_requests": 5,
+              "warmup_errors": 0,
+              "successful_requests": 50,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 50
+              },
+              "http_status_class_counts": {
+                "2xx": 50
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 0.915,
+              "attempted_requests_per_second": 54.65,
+              "successful_requests_per_second": 54.65,
+              "latency_ms": {
+                "p50": 84.645,
+                "p95": 125.939,
+                "p99": 185.492,
+                "p99.9": 185.492
+              },
+              "successful_latency_ms": {
+                "p50": 84.645,
+                "p95": 125.939,
+                "p99": 185.492,
+                "p99.9": 185.492
+              },
+              "response_bytes": {
+                "total": 47450,
+                "mean_per_response": 949.0
+              },
+              "process_cpu_seconds": 0.103,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 36417536,
+              "server_pid": 64712,
+              "server_cpu_seconds": 0.08,
+              "server_cpu_percent_one_core": 8.74,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 1,
+            "latency_ms": {
+              "p50": 84.645,
+              "p95": 125.939,
+              "p99": 185.492,
+              "p99.9": 185.492
+            },
+            "successful_requests_per_second": 54.65,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 0.08,
+            "server_peak_rss_bytes_mean": 36417536,
+            "loadgen_cpu_seconds_mean": 0.103,
+            "response_mean_bytes": 949.0
+          }
+        }
+      }
+    },
+    {
+      "name": "isr-hit",
+      "path": "/news/hello",
+      "description": "ISR page; warmup primes the entry, measured requests are hits",
+      "app": "basic",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 50,
+              "concurrency": 4,
+              "warmup_requests": 5,
+              "warmup_errors": 0,
+              "successful_requests": 50,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 50
+              },
+              "http_status_class_counts": {
+                "2xx": 50
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 0.395,
+              "attempted_requests_per_second": 126.53,
+              "successful_requests_per_second": 126.53,
+              "latency_ms": {
+                "p50": 15.154,
+                "p95": 75.541,
+                "p99": 79.714,
+                "p99.9": 79.714
+              },
+              "successful_latency_ms": {
+                "p50": 15.154,
+                "p95": 75.541,
+                "p99": 79.714,
+                "p99.9": 79.714
+              },
+              "response_bytes": {
+                "total": 47700,
+                "mean_per_response": 954.0
+              },
+              "process_cpu_seconds": 0.083,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 36085760,
+              "server_pid": 64821,
+              "server_cpu_seconds": 0.07,
+              "server_cpu_percent_one_core": 17.71,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 1,
+            "latency_ms": {
+              "p50": 15.154,
+              "p95": 75.541,
+              "p99": 79.714,
+              "p99.9": 79.714
+            },
+            "successful_requests_per_second": 126.53,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 0.07,
+            "server_peak_rss_bytes_mean": 36085760,
+            "loadgen_cpu_seconds_mean": 0.083,
+            "response_mean_bytes": 954.0
+          }
+        }
+      }
+    },
+    {
+      "name": "ssr",
+      "path": "/",
+      "description": "Server-rendered page with an island",
+      "app": "basic",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 50,
+              "concurrency": 4,
+              "warmup_requests": 5,
+              "warmup_errors": 0,
+              "successful_requests": 50,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 50
+              },
+              "http_status_class_counts": {
+                "2xx": 50
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 1.302,
+              "attempted_requests_per_second": 38.4,
+              "successful_requests_per_second": 38.4,
+              "latency_ms": {
+                "p50": 86.836,
+                "p95": 227.178,
+                "p99": 277.088,
+                "p99.9": 277.088
+              },
+              "successful_latency_ms": {
+                "p50": 86.836,
+                "p95": 227.178,
+                "p99": 277.088,
+                "p99.9": 277.088
+              },
+              "response_bytes": {
+                "total": 37750,
+                "mean_per_response": 755.0
+              },
+              "process_cpu_seconds": 0.114,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 36306944,
+              "server_pid": 64999,
+              "server_cpu_seconds": 0.09,
+              "server_cpu_percent_one_core": 6.91,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 1,
+            "latency_ms": {
+              "p50": 86.836,
+              "p95": 227.178,
+              "p99": 277.088,
+              "p99.9": 277.088
+            },
+            "successful_requests_per_second": 38.4,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 0.09,
+            "server_peak_rss_bytes_mean": 36306944,
+            "loadgen_cpu_seconds_mean": 0.114,
+            "response_mean_bytes": 755.0
+          }
+        }
+      }
+    },
+    {
+      "name": "json-api",
+      "path": "/api/users",
+      "description": "JSON API route",
+      "app": "basic",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 50,
+              "concurrency": 4,
+              "warmup_requests": 5,
+              "warmup_errors": 0,
+              "successful_requests": 50,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 50
+              },
+              "http_status_class_counts": {
+                "2xx": 50
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 1.478,
+              "attempted_requests_per_second": 33.84,
+              "successful_requests_per_second": 33.84,
+              "latency_ms": {
+                "p50": 103.616,
+                "p95": 195.325,
+                "p99": 230.589,
+                "p99.9": 230.589
+              },
+              "successful_latency_ms": {
+                "p50": 103.616,
+                "p95": 195.325,
+                "p99": 230.589,
+                "p99.9": 230.589
+              },
+              "response_bytes": {
+                "total": 1250,
+                "mean_per_response": 25.0
+              },
+              "process_cpu_seconds": 0.108,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 35655680,
+              "server_pid": 65232,
+              "server_cpu_seconds": 0.05,
+              "server_cpu_percent_one_core": 3.38,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 1,
+            "latency_ms": {
+              "p50": 103.616,
+              "p95": 195.325,
+              "p99": 230.589,
+              "p99.9": 230.589
+            },
+            "successful_requests_per_second": 33.84,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 0.05,
+            "server_peak_rss_bytes_mean": 35655680,
+            "loadgen_cpu_seconds_mean": 0.108,
+            "response_mean_bytes": 25.0
+          }
+        }
+      }
+    },
+    {
+      "name": "db-query",
+      "path": "/api/db-users?id=42",
+      "description": "SQLite point lookup by primary key over 1,000 seeded rows",
+      "app": "db",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 50,
+              "concurrency": 4,
+              "warmup_requests": 5,
+              "warmup_errors": 0,
+              "successful_requests": 50,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 50
+              },
+              "http_status_class_counts": {
+                "2xx": 50
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 1.003,
+              "attempted_requests_per_second": 49.87,
+              "successful_requests_per_second": 49.87,
+              "latency_ms": {
+                "p50": 83.294,
+                "p95": 186.999,
+                "p99": 196.971,
+                "p99.9": 196.971
+              },
+              "successful_latency_ms": {
+                "p50": 83.294,
+                "p95": 186.999,
+                "p99": 196.971,
+                "p99.9": 196.971
+              },
+              "response_bytes": {
+                "total": 1400,
+                "mean_per_response": 28.0
+              },
+              "process_cpu_seconds": 0.111,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 36380672,
+              "server_pid": 65379,
+              "server_cpu_seconds": 0.06,
+              "server_cpu_percent_one_core": 5.98,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 1,
+            "latency_ms": {
+              "p50": 83.294,
+              "p95": 186.999,
+              "p99": 196.971,
+              "p99.9": 196.971
+            },
+            "successful_requests_per_second": 49.87,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 0.06,
+            "server_peak_rss_bytes_mean": 36380672,
+            "loadgen_cpu_seconds_mean": 0.111,
+            "response_mean_bytes": 28.0
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming",
+      "path": "/api/stream",
+      "description": "Chunked NDJSON streaming response",
+      "app": "basic",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 50,
+              "concurrency": 4,
+              "warmup_requests": 5,
+              "warmup_errors": 0,
+              "successful_requests": 50,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 50
+              },
+              "http_status_class_counts": {
+                "2xx": 50
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 1.905,
+              "attempted_requests_per_second": 26.25,
+              "successful_requests_per_second": 26.25,
+              "latency_ms": {
+                "p50": 126.772,
+                "p95": 213.414,
+                "p99": 222.675,
+                "p99.9": 222.675
+              },
+              "successful_latency_ms": {
+                "p50": 126.772,
+                "p95": 213.414,
+                "p99": 222.675,
+                "p99.9": 222.675
+              },
+              "response_bytes": {
+                "total": 2050,
+                "mean_per_response": 41.0
+              },
+              "process_cpu_seconds": 0.136,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 35848192,
+              "server_pid": 65489,
+              "server_cpu_seconds": 0.1,
+              "server_cpu_percent_one_core": 5.25,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 1,
+            "latency_ms": {
+              "p50": 126.772,
+              "p95": 213.414,
+              "p99": 222.675,
+              "p99.9": 222.675
+            },
+            "successful_requests_per_second": 26.25,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 0.1,
+            "server_peak_rss_bytes_mean": 35848192,
+            "loadgen_cpu_seconds_mean": 0.136,
+            "response_mean_bytes": 41.0
+          }
+        }
+      }
+    }
+  ],
+  "skipped": []
+}

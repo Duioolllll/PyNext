@@ -4,12 +4,12 @@
 
 ## Prerequisites
 
-- CPython **3.13** (the only currently verified Python version)
+- CPython **3.13 or 3.14**
 - Rust toolchain and Cargo
 - [uv](https://docs.astral.sh/uv/)
 - Node.js **18+** and npm **only if your app contains JS/TS islands**
 
-PyNext is developed from this source repository; do not assume it is distributed through PyPI.
+PyNext is published on PyPI as `pynext-framework` (`pip install pynext-framework==0.1.0`); the steps below use this source repository.
 
 ## Run the included example
 
@@ -61,6 +61,6 @@ A project without `islands/` needs neither esbuild nor Node. The framework build
 | `pynext dev --dir PATH` | Run from source (manual restart) |
 | `pynext start --dir PATH` | Start using a validated build |
 
-Both server commands accept `--host`, `--port`, `--max-concurrent` (64), `--acquire-timeout-ms` (1000), `--body-capacity` (16), and `--body-timeout-ms` (10000). Defaults are in parentheses. Bind to loopback by default; production exposure is not supported.
+Both server commands accept `--host`, `--port`, `--max-concurrent` (64), `--acquire-timeout-ms` (1000), `--max-waiting` (min of `--max-concurrent` and 64), `--body-capacity` (16), and `--body-timeout-ms` (10000). Defaults are in parentheses. Bind to loopback by default; production exposure is not supported.
 
 Next: [Routing](Routing.md) and [Components and layouts](Components-and-Layouts.md).

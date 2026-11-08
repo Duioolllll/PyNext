@@ -66,7 +66,7 @@ with sync_playwright() as playwright:
 
     response = page.goto(base + "/", wait_until="networkidle")
     assert response.status == 200
-    assert response.headers.get("content-security-policy") == "script-src 'self'; object-src 'none'"
+    assert response.headers.get("content-security-policy") == "script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
     button = page.get_by_role("button", name="Count: 1")
     button.wait_for()
     button.click()

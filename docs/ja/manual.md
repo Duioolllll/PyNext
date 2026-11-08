@@ -4,6 +4,8 @@
 
 このマニュアルは、チェックアウトした **0.1.0** の実験版のコードを対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
 
+> このマニュアルは英語マニュアルの翻訳です。内容が異なる場合は英語マニュアルが優先されます。機能一覧はコードから自動生成されています — [FEATURES](../FEATURES.md) を参照してください。
+
 ## 必要な環境と起動
 
 CPython 3.13・3.14、Rust/Cargo、[uv](https://docs.astral.sh/uv/) が必要です。対応環境は CI マトリクスで検証します。OS は Ubuntu・macOS・Windows（最新）、Python は CPython 3.13・3.14、デプロイモードはスタンドアロン Axum と Uvicorn 上の ASGI です（インプロセス ASGI モードはすべての CI ジョブで pytest が検査します）。ブラウザスモークは 3 つの OS すべてで実行します。サンプルは island を使うため、esbuild 0.28.1 のインストールに Node.js 18 以降と npm も必要です。
@@ -76,15 +78,15 @@ async def echo(request):
 
 レスポンスの既定 Content Security Policy は `script-src 'self'; object-src 'none'` です。ブラウザーが読み込めるスクリプトが制限されるため、クライアントコードの追加時に考慮してください。レスポンスヘッダーとメディアタイプの制御文字は拒否されます。
 
-状態を変更する API リクエストには CSRF 保護を選択的に適用できます（仕様 v0.2 §11）。セッションミドルウェアがある場合はトークンをサーバー側セッションに結び付け、ない場合は double-submit 方式を使います。double-submit では予測不能なトークンを `pynext_csrf` Cookie に格納し、クライアントは同じ値を `X-CSRF-Token` ヘッダー（または `csrf_token` フォームフィールド）で送り返します。GET、HEAD、OPTIONS は対象外で、それ以外のメソッドでトークンがない、または一致しない場合は HTTP 403 を返します。
+状態を変更する API リクエストには CSRF 保護が適用されます（仕様 v0.2 §11）。セッションミドルウェアを入れると、すべての状態変更 API ルートが自動的に保護され、トークンはサーバー側セッションに結び付けられます。セッションミドルウェアがない場合は既定で無効で、double-submit 方式を使います。double-submit では予測不能なトークンを `pynext_csrf` Cookie に格納し、クライアントは同じ値を `X-CSRF-Token` ヘッダー（または `csrf_token` フォームフィールド）で送り返します。Cookie の値は HMAC で署名されるため、署名のない Cookie はトークンが一致しても拒否されます（サブドメインによる Cookie 注入を防止）。`Origin` と `Sec-Fetch-Site` も検査し、クロスサイトやサブドメインのページからのリクエストは有効なトークンがあっても拒否されます。GET、HEAD、OPTIONS は対象外で、それ以外のメソッドでトークンがない、または一致しない場合は HTTP 403 を返します。
 
 ~~~python
 from pynext import JSONResponse, csrf_protect, new_csrf_token, route, set_csrf_cookie
 
 @route("GET")
-async def get_token():
+async def get_token(request):
     token = new_csrf_token()
-    return set_csrf_cookie(JSONResponse({"token": token}), token)
+    return set_csrf_cookie(JSONResponse({"token": token}), token, config=request.security)
 
 @route("POST")
 @csrf_protect
@@ -92,7 +94,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-ハンドラーを1つずつ指定する代わりに、`create_app` に `security=SecurityConfig(csrf_enabled=True)` を渡すと、すべての状態変更 API ルートを保護できます。セッションはまだないため、トークンはユーザーセッションに紐付きません。トークンが証明するのは、Cookie を読めたページからのリクエストであることだけです。XSS で Cookie を読めるページは、他の double-submit 方式と同様にこれを回避できます。Cookie は既定で `SameSite=Lax` であり、`HttpOnly` ではありません（JavaScript が読む必要があります）。本番環境では `csrf_cookie_secure=True` を設定し、HTTPS でのみ送信されるようにしてください。
+セッションミドルウェアがある場合、セキュリティ設定を別途渡さなくても CSRF が自動的に有効になります。セッションがなく、すべての状態変更 API ルートを保護するには、`create_app` に `security=SecurityConfig(csrf_enabled=True)` を渡してください。トークンが証明するのは、Cookie を読めたページからのリクエストであることだけです。XSS で Cookie を読めるページは、他の double-submit 方式と同様にこれを回避できます。Cookie は既定で `SameSite=Lax` であり、`HttpOnly` ではありません（JavaScript が読む必要があります）。CSRF Cookie は既定で `Secure` のため、平文 `http://` でのローカル開発では `csrf_cookie_secure=False` をアプリ設定と `set_csrf_cookie()` の呼び出しの両方に渡してください（`pynext dev` は自動的にそう動作します）。マルチワーカーで運用する場合は、すべてのワーカーで同じ `csrf_signing_key`（または `PYNEXT_CSRF_SIGNING_KEY` 環境変数）を使い、あるワーカーが発行した Cookie を他のワーカーでも検証できるようにしてください。
 
 クロスオリジンリクエストは既定で拒否されます（仕様 v0.2 §11）。オリジンを設定しない限り、`Access-Control-Allow-Origin` ヘッダーは送信されません。ポリシーは `SecurityConfig` で `create_app` に渡します。
 
@@ -184,7 +186,7 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG と ISR は `request` を受け取れず、公開コンテンツに使用します。ISR は通常クエリを無視します。`@page(render="isr", revalidate=30, query_keys=("lang",))` と `query` 引数を使用すると、許可したキーと文字列のリストだけが渡され、値ごとにキャッシュされます。パスの無効化は全クエリ変種に適用されます。Cookie または Authorization 付きの要求は共有キャッシュを迂回し `private, no-store` を返します。既定のキャッシュはプロセス内で、SQLite またはオプションの Redis（`pynext-framework[redis]` と `PYNEXT_REDIS_URL`）を共有できます。共有ストア障害時は古いローカルキャッシュにフォールバックする場合があります。`Set-Cookie` と private/no-store の応答はキャッシュしません。SSG の非同期ジェネレーターはビルド時に消費され静的ファイルとして配信されます。
+SSG と ISR は `request` を受け取れず、公開コンテンツに使用します。ISR は通常クエリを無視します。`@page(render="isr", revalidate=30, query_keys=("lang",))` と `query` 引数を使用すると、許可したキーと文字列のリストだけが渡され、値ごとにキャッシュされます。パスの無効化は全クエリ変種に適用されます。Cookie または Authorization 付きの要求は共有キャッシュを迂回し `private, no-store` を返します。既定のキャッシュはプロセス内で、SQLite またはオプションの Redis（`pynext-framework[redis]` と `PYNEXT_REDIS_URL`）を共有できます。共有ストア障害時は障害ポリシーに従います。既定値（`fail_open`、`--cache-failure-policy fail_open`）では古いローカルキャッシュにフォールバックし、`fail_closed` では 503 を返します。`Set-Cookie` と private/no-store の応答はキャッシュしません。SSG の非同期ジェネレーターはビルド時に消費され静的ファイルとして配信されます。
 
 SSG ビルドの上限は 10,000 ページで、開発モードでは SSG をリクエストごとにレンダリングします。ISR ページは `generate_static_params()` をエクスポートできず、同時生成はプロセスごとに最大 128 件です。
 
@@ -255,9 +257,9 @@ CLI フラグ `--structured-logs` / `--no-structured-logs`、`--metrics` / `--no
 
 ## レート制限
 
-レート制限はオプトインで、プロセス単位のトークンバケットです。`pynext start --rate-limit 100 --rate-limit-window 60` はクライアント IP あたり 60 秒で 100 リクエストを許可します（バーストが上限です）。制限を超えた動的リクエストは秒単位の `Retry-After` ヘッダー付きで 429 を返します。キーはクライアント IP で、`X-Forwarded-For` は `--trusted-proxy`（IP または CIDR、繰り返し指定可）で指定したピアからのものだけを信頼します。信頼できないプロキシのヘッダーは偽装可能なため無視されます。コードからは `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))` のように使います。バケットはプロセス単位で再起動すると消え、分散レート制限は未実装です。静的ファイルと新鮮な ISR ページは Python ブリッジに届く前に Rust 層が返すため、レート制限の対象外です。
+レート制限はオプトインで、プロセス単位のトークンバケットです。`pynext start --rate-limit 100 --rate-limit-window 60` はクライアント IP あたり 60 秒で 100 リクエストを許可します（バーストが上限です）。制限を超えた動的リクエストは秒単位の `Retry-After` ヘッダー付きで 429 を返します。キーはクライアント IP で、`X-Forwarded-For` は `--trusted-proxy`（IP または CIDR、繰り返し指定可）で指定したピアからのものだけを信頼します。信頼できないプロキシのヘッダーは偽装可能なため無視されます。コードからは `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))` のように使います。バケットはプロセス単位で再起動すると消えます。`--rate-limit-backend redis` を使うとバケットは共有され、Redis に到達できない場合は障害ポリシーに従います。既定値（`fail_closed`、`--rate-limit-failure-policy fail_closed`）では要求に 503 を返し、`fail_open` では要求を許可します。静的ファイルと新鮮な ISR ページは Python ブリッジに届く前に Rust 層が返すため、レート制限の対象外です。
 
-転送チェーンは右から信頼済みプロキシをたどり、最も近い非信頼アドレスを使います。中間プロキシをすべて正確に登録してください。バケットはプロセスあたり最大 10,000 個で、すべて使用中なら完全に補充されるまで新しいアドレスに 429 を返します。
+転送チェーンは右から信頼済みプロキシをたどり、最も近い非信頼アドレスを使います。中間プロキシをすべて正確に登録してください。バケットはプロセスあたり最大 10,000 個で、すべて使用中なら新しいキーは最も古いバケットを追い出して入ります(既存のキーに 429 は返しません)。新規キーの作成はウィンドウあたり最大 10,000 個のグローバルスライディングウィンドウで制限します。IPv6 アドレスは /64 プレフィックスごとにバケットを共有します。`--rate-limit-exempt-path`(例: `/healthz`)で指定したパスは速度制限をスキップします。
 
 複数ワーカー: `pynext start --workers 4` は一つのリスナーを共有するスーパーバイザーを起動します。`--port 0` の場合、割り当てたポートをワーカー再起動後も維持します。各ワーカーの実行環境とメモリキャッシュ、既定のレート制限は独立しています。SQLite・Redis ISR と Redis レート制限は共有できます。ワーカーは障害時に再起動し、処理中に中断した要求は再試行が必要です。共有リスナーを使うワーカーの起動と再起動は Linux・macOS・Windows の CI で検査し、シグナルを使うスーパーバイザーのテストは Linux・macOS で実行します。
 
