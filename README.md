@@ -8,7 +8,7 @@
 
 **Wiki:** [English](docs/wiki/en/Home.md) · [한국어](docs/wiki/ko/Home.md) · [Wiki index](docs/wiki/README.md)
 
-**최신 릴리스:** [v0.6.0a2](https://github.com/Duioolllll/PyNext/releases/tag/v0.6.0a2) · 이 브랜치는 미출시 v0.7.0a1 후보 · [변경 이력](CHANGELOG.md) · [아키텍처 명세](docs/ARCHITECTURE_SPEC.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
+**최신 릴리스:** [v0.6.0a2](https://github.com/Duioolllll/PyNext/releases/tag/v0.6.0a2) · 패키지 0.1.0 / 태그 0.1.0v 릴리스 준비 중 · [변경 이력](CHANGELOG.md) · [아키텍처 명세](docs/ARCHITECTURE_SPEC.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
 
 이 문서는 현재 체크아웃한 저장소의 코드를 설명합니다.
 
@@ -18,9 +18,8 @@ PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust�
 
 ## 실행
 
-지원 환경은 CI 매트릭스로 검증합니다. OS는 Ubuntu/macOS/Windows 최신 버전,
-Python은 CPython 3.13만 지원합니다(3.14는 아직 검증되지 않아 매트릭스에
-없습니다). 배포 모드는 독립 실행 Axum과 Uvicorn 위의 ASGI이며, ASGI 인프로세스
+지원 환경의 CI 매트릭스는 Ubuntu/macOS/Windows 최신 버전과 CPython 3.13·3.14를
+대상으로 합니다. 배포 모드는 독립 실행 Axum과 Uvicorn 위의 ASGI이며, ASGI 인프로세스
 모드는 pytest가 모든 CI 잡에서 검사합니다. Rust 툴체인과
 [uv](https://docs.astral.sh/uv/)가 필요합니다. 예제의 islands를 빌드하려면
 Node.js 18 이상과 npm도 필요합니다. 브라우저 스모크는 세 OS에서 모두
@@ -33,7 +32,17 @@ uv run pynext build --dir examples/basic
 uv run pynext start --dir examples/basic
 ```
 
-브라우저에서 `http://127.0.0.1:3000/`, `/blog/hello`, `/about`, `/guides/intro`, `/news/example`, `/hydrate`, `/strategies`, `/interaction`, `/stream`, `/api/users`를 확인할 수 있습니다. `dev` 명령은 빌드 없이 소스에서 시작하고, `app/`·`islands/`·`public/`·`pynext.config.py` 변경을 감지해 같은 포트로 서버를 다시 시작합니다.
+Linux에서는 `uv run pynext build --dir examples/basic --standalone`으로 실행 파일,
+Python 표준 라이브러리, 현재 가상환경 패키지와 빌드된 앱을 포함한
+`examples/basic/.pynext/standalone` 디렉터리를 만들 수 있습니다. 디렉터리를
+옮긴 뒤 `./run --port 3000`으로 실행합니다. 출력 디렉터리가 이미 있으면
+덮어쓰지 않습니다. `--standalone-dir`로 다른 새 경로를 지정할 수 있습니다.
+빌드는 격리된 가상환경에서 수행해야 하며 서드파티 editable 설치는 지원하지
+않습니다. 결과물은 같은 CPU와 호환 Linux의 시스템 라이브러리를 필요로 합니다.
+환경 변수는 포함하지 않으며 앱과 설치된 패키지의 파일은 포함하므로 배포 전에
+내용을 확인하세요. 앱 외부 파일과 필요한 설정은 배포 환경에서 제공해야 합니다.
+
+브라우저에서 `http://127.0.0.1:3000/`, `/blog/hello`, `/about`, `/guides/intro`, `/news/example`, `/hydrate`, `/strategies`, `/interaction`, `/stream`, `/api/users`를 확인할 수 있습니다. `dev` 명령은 빌드 없이 소스에서 시작하고, `app/`·`islands/`·`public/`·`middleware.py`·`resources.py`·`pynext.config.py` 변경을 감지해 같은 포트로 서버를 다시 시작합니다.
 
 ```bash
 uv run pynext dev --dir examples/basic
@@ -48,7 +57,69 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 이 예제 ASGI 진입점은 개발 모드입니다. 운영 모드에서는 빌드 후 ASGI
 진입점에서 `create_app(project_path, production=True)`로 생성해야 SSG 산출물을 사용합니다.
 
+### 전역 HTTP 미들웨어
+
+프로젝트 루트의 `middleware.py`에서 비동기 함수의 `MIDDLEWARE` 목록을 내보내면
+CLI와 ASGI 앱에 적용됩니다. ASGI 앱은 `create_app(..., middleware=[...])`로
+함수를 추가할 수도 있습니다. 파일의 함수가 먼저 실행되고 응답은 역순으로 돌아옵니다.
+
+```python
+# middleware.py
+async def add_header(request, call_next):
+    request.state["source"] = "middleware"  # 요청마다 독립된 딕셔너리
+    response = await call_next(request)      # 최대 한 번 호출
+    response.headers.append((b"x-example", b"enabled"))
+    return response
+
+MIDDLEWARE = [add_header]
+```
+
+함수는 `Response`를 직접 반환해 요청을 중단할 수도 있습니다. 페이지, API,
+정적 파일, SSG, ISR 및 CORS preflight에 적용되며 WebSocket과 전송 계층에서
+요청을 만들기 전에 거부된 입력에는 적용되지 않습니다. 미들웨어가 등록된
+Axum 서버는 정적·fresh ISR 요청도 Python을 거치므로 처리 비용이 늘어납니다.
+운영 빌드 후 `middleware.py`를 변경하면 다시 빌드해야 합니다.
+
+### 리소스와 서버 세션
+
+DB 풀처럼 앱 수명 동안 유지할 객체는 비동기 `startup()`과 `shutdown()` 메서드를
+구현해 `create_app(..., resources={"db": resource})`에 등록합니다. CLI에서도
+사용하려면 프로젝트 루트 `resources.py`의 `RESOURCES` 딕셔너리에 등록합니다.
+요청 핸들러와 미들웨어는 `request.resources["db"]`로 접근합니다. 시작은 등록순,
+종료는 역순이며 시작이 실패하면 이미 시작한 리소스를 정리합니다. ASGI 서버는
+lifespan을 활성화해야 합니다. 저수준 `start_native()`를 직접 쓰는 경우에는
+`await app.startup()`과 `await app.shutdown()`을 직접 호출합니다. DB 드라이버,
+트랜잭션과 마이그레이션은 앱이 관리합니다.
+
+`SessionMiddleware(SQLiteSessionStore(path))`는 서버에 세션을 저장하고 브라우저에
+불투명 ID만 보냅니다. 기본 쿠키에는 `Secure`, `HttpOnly`, `SameSite=Lax`가
+설정됩니다. HTTPS가 아닌 로컬 개발에서만 `secure=False`를 명시하세요. 세션은
+`request.state["session"]`에서 딕셔너리처럼 사용하며, 로그인 시 `rotate()`,
+로그아웃 시 `invalidate()`를 호출합니다. 앱은 자격 증명을 직접 검증한 뒤
+`session["user_id"]`와 선택적 `session["permissions"]`를 설정합니다.
+`@require_auth`와 `@require_permission("name")`은 해당 서버 세션을 확인합니다.
+인증이 필요한 페이지는 SSR이어야 합니다.
+
+```python
+# middleware.py — HTTPS 배포용 예제
+from pathlib import Path
+from pynext import SessionMiddleware, SQLiteSessionStore
+
+store = SQLiteSessionStore(Path(__file__).parent / ".pynext" / "sessions.sqlite3")
+MIDDLEWARE = [SessionMiddleware(store)]
+```
+
+세션 미들웨어가 설치된 경우 CSRF 보호는 `session.csrf_token()`으로 발급한
+토큰을 해당 세션과 비교합니다. 로그인 시 `rotate()`는 CSRF 토큰도 바꾸므로
+클라이언트에 새 토큰을 전달해야 합니다. 동시 수정이나 만료·폐기와 충돌한 저장은
+409를 반환합니다. 핸들러에서 이미 수행한 외부 작업은 자동으로 되돌리지 않으므로
+앱에서 멱등성을 보장해야 합니다. SQLite 저장소의 만료 행은 유지보수 작업에서
+`await store.purge_expired()`로 정리할 수 있습니다.
+
 ## 앱 작성
+
+`pynext init --dir my-app`으로 최소 프로젝트를 만들 수 있습니다. 생성할 파일이
+이미 있으면 명령은 중단하며 기존 파일을 덮어쓰지 않습니다.
 
 ```text
 app/
@@ -78,9 +149,43 @@ async def users():
     return JSONResponse({"users": ["Alice", "Bob"]})
 ```
 
+폼과 파일 업로드는 `await request.form()`으로 읽습니다. 결과는 필드 이름을
+값 목록에 대응시키며 파일 값은 `UploadFile`입니다.
+
+```python
+from pynext import JSONResponse, UploadFile, route
+
+@route("POST")
+async def upload(request):
+    form = await request.form()
+    file = form["file"][0]
+    if not isinstance(file, UploadFile):
+        return JSONResponse({"error": "file required"}, status=400)
+    return JSONResponse({"size": len(file.data)})
+```
+
+URL 인코딩과 multipart를 지원하고 중복 필드는 순서대로 보존합니다. 요청 전체는
+기존 1 MiB 제한을 공유하며 최대 256개 필드를 메모리에서 처리합니다. 파일 이름과
+콘텐츠 형식은 클라이언트가 제공한 값이므로 저장 경로나 신뢰 판단에 바로 쓰지
+마세요. 잘못된 폼은 400으로 처리합니다. CSRF 보호는 multipart의 토큰 필드도 읽습니다.
+
+`pynext-framework[images]`를 설치하면 `/_pynext/image?src=/photo.png&w=640&q=75`로
+`public/`의 JPEG·PNG·WebP 이미지를 WebP로 변환할 수 있습니다. 너비는 1–2048,
+품질은 1–95이며 원본보다 확대하지 않습니다. 원격 URL, 애니메이션과 2천만 픽셀을
+초과하는 이미지는 처리하지 않습니다. 원본의 메타데이터는 출력에 포함하지 않습니다.
+
+`pynext dev`는 요청 처리 중 발생한 예외의 상세 페이지를 표시합니다. ASGI 앱에서는
+개발 중에만 `create_app(..., debug=True)`로 명시적으로 켤 수 있으며 프로덕션 앱은
+이 설정을 거부합니다. 상세 페이지에는 소스 경로와 예외 메시지가 포함될 수 있으므로
+개발 서버를 신뢰할 수 없는 사용자에게 노출하지 마세요.
+
 `request.query`를 읽을 때 잘못된 UTF-8 쿼리 문자열과 `await request.json()`을 읽을 때 잘못된 JSON 본문은 `BadRequest` 예외가 발생하며 HTTP 400으로 응답합니다. 쿼리의 퍼센트 인코딩을 푼 결과도 UTF-8로 검사합니다. JSON의 `NaN`과 `Infinity`도 허용하지 않습니다. 파싱은 해당 속성이나 메서드를 읽을 때 이루어지므로, 읽지 않는 요청에는 적용되지 않습니다. 앱에서 직접 `from pynext import BadRequest`로 불러와 입력 검증 오류에 사용할 수도 있습니다. 클라이언트에는 예외의 상세 내용 대신 `Bad Request`만 전송합니다. 요청 본문은 최대 1 MiB이며 초과하면 413입니다.
 
-상태 변경 API에는 CSRF 보호를 선택적으로 적용할 수 있습니다(명세 v0.2 §11). 아직 인증 시스템이 없으므로 double-submit 방식을 사용합니다. `new_csrf_token()`으로 토큰을 발급해 `set_csrf_cookie()`로 `pynext_csrf` 쿠키에 담고, 클라이언트는 같은 값을 `X-CSRF-Token` 헤더(또는 `csrf_token` 폼 필드)로 돌려보냅니다. 핸들러에 `@csrf_protect`를 붙이거나 `create_app(..., security=SecurityConfig(csrf_enabled=True))`로 모든 상태 변경 API를 보호할 수 있으며, 토큰이 없거나 일치하지 않으면 403을 반환합니다. 자세한 내용은 [사용 설명서](docs/ko/manual.md)를 참조하세요.
+상태 변경 API에는 CSRF 보호를 선택적으로 적용할 수 있습니다(명세 v0.2 §11). 세션 미들웨어를 사용하면 `session.csrf_token()`을 발급하고 헤더 또는 폼 필드에서 받은 토큰을 해당 세션과 비교합니다. 세션 미들웨어가 없으면 `new_csrf_token()`과 `set_csrf_cookie()`를 사용하는 double-submit 방식입니다. 핸들러에 `@csrf_protect`를 붙이거나 `create_app(..., security=SecurityConfig(csrf_enabled=True))`로 모든 상태 변경 API를 보호할 수 있으며, 토큰이 없거나 일치하지 않으면 403을 반환합니다.
+
+CLI의 `dev`와 `start`에서는 `--csrf`, `--csrf-cookie-secure`, 반복 가능한
+`--cors-origin`, `--cors-credentials`, `--csp-nonce`로 같은 보안 설정을 켤 수 있습니다.
+기본값은 기존과 같이 CSRF와 nonce가 꺼져 있고 교차 출처를 허용하지 않습니다.
 
 교차 출처 요청은 기본적으로 허용하지 않습니다(명세 v0.2 §11). `SecurityConfig(cors_allowed_origins=("https://example.com",), ...)`로 origin·method·header를 명시하면 해당 출처의 preflight에 204와 `Access-Control-Allow-*` 헤더를 반환하고, 실제 요청에도 허용 헤더를 붙입니다. 허용되지 않은 출처의 preflight는 403이며, 실제 요청에는 CORS 헤더를 붙이지 않아 브라우저가 응답을 차단합니다. 같은 출처 요청은 CORS로 차단하지 않습니다. 자세한 내용은 [사용 설명서](docs/ko/manual.md)를 참조하세요.
 
@@ -103,7 +208,7 @@ async def stream():
 
 청크는 문자열이나 바이트이며 개당 최대 1 MiB입니다. 프레이밍은 HTTP 서버가 처리하므로 `Content-Length`와 `Transfer-Encoding`을 직접 지정할 수 없습니다. 클라이언트 연결이 끊기거나 송신이 실패하면 비동기 생성기를 닫습니다. Axum은 청크 하나를 대기시키며 다음 청크 생성과 송신 대기 각각에 30초 제한을 둡니다. 헤더를 보낸 뒤 생성 중 오류가 나면 응답을 중단하며 이미 보낸 상태 코드를 바꿀 수 없습니다.
 
-페이지 함수도 UI 노드의 비동기 iterable을 반환하면 스트리밍 SSR로 동작합니다. 레이아웃 셸을 먼저 보내고 각 청크를 생성되는 대로 직렬화해 전송한 뒤 레이아웃 닫는 부분을 보냅니다. 기본값은 여전히 전체 버퍼를 만든 뒤 보내는 방식이며, 스트리밍은 SSR 페이지 전용입니다(SSG·ISR 페이지는 전체 본문이 필요합니다). 레이아웃은 자식을 정확히 한 번 렌더링해야 합니다. 연결이 끊기면 생성기를 닫고, 헤더 전송 후 오류가 나면 스트림을 중단합니다. [실행 가능한 예제](examples/basic/app/stream/page.py)는 `/stream`에서 확인할 수 있습니다.
+페이지 함수도 UI 노드의 비동기 iterable을 반환하면 스트리밍으로 동작합니다. 레이아웃 셸을 먼저 보내고 각 청크를 생성되는 대로 직렬화해 전송한 뒤 레이아웃 닫는 부분을 보냅니다. 레이아웃은 자식을 정확히 한 번 렌더링해야 합니다. SSG에서는 빌드 중 청크를 합쳐 정적 파일로 제공합니다. 공개 ISR의 첫 요청은 청크를 받으며, 완성된 결과만 캐시에 저장합니다. 같은 키의 다른 요청은 완료를 기다리고 stale 결과가 있으면 즉시 받습니다. SSG·ISR 스트림은 총 8 MiB와 30초로 제한하고, ISR 결과 중 2 MiB 이하만 캐시합니다. ISR 최초 요청이 연결을 끊더라도 다른 요청을 위해 생성은 계속될 수 있습니다. 헤더 전송 후 오류가 나면 스트림을 중단합니다. [실행 가능한 예제](examples/basic/app/stream/page.py)는 `/stream`에서 확인할 수 있습니다.
 
 ```python
 from pynext import h, page
@@ -116,15 +221,17 @@ async def Page():
 
 ### 클라이언트 탐색
 
-island가 있는 페이지에서는 같은 출처 링크를 클릭하면 전체 새로고침 없이 본문만 교체해 이동하고, 호버·포커스·뷰포트 진입 시 링크를 미리 가져옵니다(최대 20개, 개당 1 MiB). 실패 시에는 전체 문서 이동으로 되돌아갑니다. 자세한 내용은 [매뉴얼](docs/ko/manual.md#클라이언트-탐색)을 참고하세요.
+모든 페이지에서 같은 출처 링크를 클릭하면 가능한 경우 본문을 교체해 이동합니다. 호버·포커스·뷰포트 진입 시 미리 가져오며, 명시적으로 공개되고 재사용 가능한 응답만 최대 20개까지 보관합니다. 한 응답은 1 MiB, 동시 prefetch는 4개로 제한합니다. CSP·문서 메타데이터가 호환되지 않거나 오류가 나면 전체 문서 이동으로 되돌아갑니다. 자세한 내용은 [매뉴얼](docs/ko/manual.md#클라이언트-탐색)을 참고하세요.
 
 ### Python 클라이언트 DSL (실험적)
 
-`pynext.client_dsl.compile_client_dsl(source)`은 Python의 작고 고정된 부분집합을 JavaScript로 컴파일합니다(명세 §7.3). 리터럴, 산술·비교·불 연산, `if`/`for`/`while`, 함수 정의, `len`·`str`·`int`·`abs`·`min`·`max`·`.append()` 등을 지원하고, import·리플렉션·파일 I/O·서버 전용 이름(`open`, `os`, `Request`, `h` 등)은 컴파일 오류로 거부합니다. 자세한 목록과 의미 차이는 `pynext.client_dsl.SUPPORTED`와 `KNOWN_DIFFERENCES`를 참고하세요.
+`pynext.client_dsl.compile_client_dsl(source)`은 Python의 작고 고정된 부분집합을 JavaScript로 컴파일합니다(명세 §7.3). 리터럴, 연쇄 비교를 포함한 산술·비교·불 연산, `if`/`for`/`while`, 함수 정의, `len`·`str`·`int`·`abs`·`min`·`max`·`.append()` 등을 지원하고, import·리플렉션·파일 I/O·서버 전용 이름(`open`, `os`, `Request`, `h` 등)은 컴파일 오류로 거부합니다. [버전 1 계약](docs/CLIENT_DSL.md), `pynext.client_dsl.SUPPORTED`와 `KNOWN_DIFFERENCES`에 지원 범위와 의미 차이가 정리되어 있습니다.
 
 ### WebSocket
 
-`route.py`는 `@websocket` 핸들러를 하나 내보낼 수 있습니다. 핸들러는 `WebSocket`을 받아 `await websocket.accept()` 후 텍스트·바이너리 메시지를 주고받습니다. 상대가 끊으면 `receive()`에서 `WebSocketDisconnect`가 발생합니다. 메시지 1개는 64 KiB까지이며, 서브프로토콜 협상·브로드캐스트는 없습니다. [echo 예제](examples/basic/app/ws/echo/route.py)를 참고하세요.
+`route.py`는 `@websocket` 핸들러를 하나 내보낼 수 있습니다. 핸들러는 `WebSocket`을 받아 `await websocket.accept()` 후 텍스트·바이너리 메시지를 주고받습니다. 상대가 끊으면 `receive()`에서 `WebSocketDisconnect`가 발생합니다. 메시지는 기본 64 KiB이며 `create_app(..., websocket_max_message=...)` 또는 `--ws-max-message-bytes`로 최대 16 MiB까지 조정합니다. `@websocket(protocols=("chat.v1", "chat.v2"))`는 서버가 지정한 순서로 서브프로토콜을 선택하며, 결과는 `websocket.subprotocol`에서 확인합니다. [echo 예제](examples/basic/app/ws/echo/route.py)를 참고하세요.
+
+`WebSocketPubSub`은 한 프로세스의 이벤트 루프에서 연결 간 메시지를 전달합니다. 예를 들어 `async with broker.subscribe("news") as sub:` 안에서 `await sub.receive()`로 받고, 같은 브로커에 `await broker.publish("news", "hello")`로 보냅니다. 느린 구독자의 큐가 차면 해당 구독을 제거하고 `PubSubOverflow`를 발생시킵니다. 워커 간 메시지를 공유하거나 메시지의 영속성을 보장하지 않습니다.
 
 경로는 정적 경로, `[slug]`, 마지막 위치의 `[...path]`, 0개 이상의 세그먼트를 매칭하는 `[[...path]]`를 지원합니다. 우선순위는 정적 > 단일 동적 > catch-all > 선택적 catch-all입니다. catch-all 파라미터는 문자열 리스트이고 단일 동적 파라미터는 문자열입니다. 필수 catch-all과 선택적 catch-all을 같은 레벨에 함께 쓸 수 없습니다. 괄호 디렉터리 `app/(marketing)/` 같은 라우트 그룹은 URL에 나타나지 않고, 그룹 안의 레이아웃은 그대로 적용됩니다. 병렬·인터셉트 라우트는 아직 지원하지 않습니다. 빌드 시 경로 충돌과 잘못된 핸들러를 검사하고 `.pynext/manifest.json`에 소스 해시를 기록합니다. `start`는 빌드 후 소스가 바뀌면 재빌드를 요구합니다.
 
@@ -189,6 +296,17 @@ island("hydrated-counter", props={"initial": 3}, hydrate=True,
 
 브라우저는 기존 DOM과 `render` 결과를 비교합니다. 일치하면 기존 노드를 보존하고 `hydrate`를 호출합니다. 다르면 경고와 `data-pynext-mismatch` 표시를 남기고 `mount`로 해당 island만 다시 그립니다. 이 복구는 해당 영역의 입력 상태나 포커스를 잃을 수 있습니다. 시간·난수·로케일 등에 의한 차이가 생기지 않도록 양쪽 출력을 결정적으로 작성해야 합니다. 활성화 중 예외가 나면 `data-pynext-error="activation-failed"`를 표시합니다.
 
+`model`을 사용하면 초기 DOM의 단일 모델을 서버와 브라우저가 공유합니다.
+
+```python
+from pynext import h, island, model_prop
+
+island("shared-model", props={"name": "Ada"}, hydrate=True,
+       model=h("button", {"type": "button"}, "Hello ", model_prop("name")))
+```
+
+서버와 브라우저는 버전이 있는 동일한 모델과 props로 초기 DOM을 만들고, 일치하면 기존 노드를 유지합니다. 모듈은 이벤트 연결용 `hydrate`와 불일치 복구용 `mount`·`render`를 내보냅니다. 이 모델은 텍스트·element·fragment와 문자열 props 치환을 지원하며 속성은 정적 문자열·불리언·`None`만 허용합니다. 동적 속성·반복·클라이언트 상태 계산은 지원하지 않습니다. 모델은 최대 512개 노드, 깊이 32, 직렬화 16 KiB로 제한됩니다. [서버 예제](examples/basic/app/shared-model/page.py)와 [클라이언트 모듈](examples/basic/islands/shared-model.js)을 참고하세요.
+
 `strategy`로 각 island의 활성화 시점을 선택할 수 있습니다. `interaction`은 hydration 전용입니다.
 
 ```python
@@ -227,11 +345,11 @@ async def Page(params):
 
 ISR은 첫 요청에서 공개 HTML을 생성하고 `revalidate`초 동안 재사용합니다. 이후 `stale`초 동안은 이전 결과를 보내면서 백그라운드에서 재생성합니다. 같은 경로의 동시 요청은 하나의 생성 작업을 공유합니다. 재생성이 실패하면 기존 결과는 stale 기간까지만 제공하며, 그 뒤에는 새 생성이 완료될 때까지 기다립니다. `stale`의 기본값은 60초이며 0으로 설정하면 만료 후 기다립니다.
 
-ISR은 **공개 콘텐츠 전용**입니다. 페이지 함수는 `request`를 받을 수 없고, 익명 요청의 쿼리 문자열은 캐시 키에 포함되지 않습니다. 공유 결과를 만드는 작업은 요청의 `contextvars`를 상속하지 않습니다. `Cookie`나 `Authorization` 헤더가 있는 요청은 공유 캐시를 건너뛰어 개별 렌더링하고 `private, no-store`로 응답합니다. 앱의 전역 변수나 외부 데이터에서 사용자별 정보가 공유 결과에 섞이지 않도록 개발자가 보장해야 합니다.
+ISR은 **공개 콘텐츠 전용**입니다. 페이지 함수는 `request`를 받을 수 없고, 기본적으로 익명 요청의 쿼리 문자열은 무시합니다. `@page(render="isr", revalidate=30, query_keys=("lang",))`를 지정하고 페이지 함수에서 `query`를 받으면, 허용한 키의 문자열 목록만 전달하고 해당 값별로 별도 캐시합니다. 선언하지 않은 쿼리는 전달되지 않습니다. 경로 무효화는 모든 쿼리 변형에 적용됩니다. 공유 결과를 만드는 작업은 요청의 `contextvars`를 상속하지 않습니다. `Cookie`나 `Authorization` 헤더가 있는 요청은 공유 캐시를 건너뛰어 개별 렌더링하고 `private, no-store`로 응답합니다. 앱의 전역 변수나 외부 데이터에서 사용자별 정보가 공유 결과에 섞이지 않도록 개발자가 보장해야 합니다.
 
-이 구현은 기본적으로 프로세스별 메모리 캐시입니다. 최대 1,024개 항목·32 MiB, 항목당 2 MiB까지 저장하고 오래 사용하지 않은 항목을 제거합니다. 더 큰 페이지는 응답하지만 캐시하지 않습니다. 서버를 재시작하면 캐시가 비워지고, 여러 워커는 결과를 공유하지 않습니다. 여러 워커가 결과를 공유하려면 `--cache-backend sqlite --cache-path <파일>`로 시작하거나 `create_app(..., cache_backend="sqlite", cache_path=...)`로 만듭니다. SQLite 파일(WAL)을 모든 워커가 함께 쓰며, stale 재생성은 만료·소유 토큰이 있는 lease로 한 워커만 수행하고 저장 시 버전과 유효한 lease 소유권을 원자적으로 확인합니다. 공유 저장소가 실패하면 워커별 로컬 캐시로 대체합니다. 각 워커는 프로세스별 캐시를 앞에 두므로 다른 워커의 무효화는 공유 항목에 즉시 반영되지만 로컬 복사본은 남은 TTL 동안 유지될 수 있습니다. `Set-Cookie`나 `Cache-Control: private/no-store` 응답은 공유 캐시에 저장하지 않습니다. Redis 어댑터는 이후 과제입니다. 개발 모드에서는 캐시 없이 매번 렌더링합니다. 동적 ISR 경로는 요청 시 생성하며 `generate_static_params()`로 미리 생성하는 기능은 아직 없습니다.
+이 구현은 기본적으로 프로세스별 메모리 캐시입니다. 최대 1,024개 항목·32 MiB, 항목당 2 MiB까지 저장하고 오래 사용하지 않은 항목을 제거합니다. 더 큰 페이지는 응답하지만 캐시하지 않습니다. 여러 워커가 결과를 공유하려면 `--cache-backend sqlite --cache-path <파일>` 또는 `--cache-backend redis`를 사용합니다. Redis는 `pynext-framework[redis]` 설치와 `PYNEXT_REDIS_URL` 환경 변수가 필요합니다. Python API에서는 `create_app(..., cache_backend="redis", cache_url=...)`을 사용할 수 있습니다. 공유 저장소에서는 lease와 버전 검사를 통해 오래된 생성이 결과를 덮어쓰지 못하게 합니다. 정상 상태에서는 매 조회가 공유 저장소를 확인해 다른 워커의 무효화를 반영합니다. 저장소 장애 시 로컬 캐시로 대체하므로 이 기간에는 즉시 일관성을 보장하지 않습니다. 공유 키에는 빌드 ID가 포함됩니다. `Set-Cookie`나 `Cache-Control: private/no-store` 응답은 공유 캐시에 저장하지 않습니다. 개발 모드에서는 캐시 없이 매번 렌더링합니다.
 
-인증과 권한을 확인한 API 핸들러에서는 `await request.revalidate("/news/example")`로 같은 앱 인스턴스의 ISR 경로를 무효화할 수 있습니다. 앱을 직접 관리할 때는 `await app.revalidate(path)`를 사용합니다. 경로는 쿼리 문자열이 없는 디코딩된 경로이며 기존 캐시나 진행 중인 생성이 있었다면 `True`를 반환합니다. 이미 진행 중인 요청은 이전 결과를 받을 수 있지만 그 생성 결과가 무효화 후 캐시를 덮어쓰지는 않습니다. 메모리 백엔드에서는 다른 프로세스·워커에 전파되지 않으며, SQLite 백엔드에서는 공유 항목이 제거되지만 다른 워커의 프로세스별 복사본은 남은 TTL 동안 유지될 수 있습니다. 무효화 API를 외부에 노출할 때는 앱이 인증·권한 검사를 해야 합니다.
+인증과 권한을 확인한 API 핸들러에서는 `await request.revalidate("/news/example")`로 ISR 경로를 무효화할 수 있습니다. 앱을 직접 관리할 때는 `await app.revalidate(path)`를 사용합니다. 경로는 쿼리 문자열이 없는 디코딩된 경로입니다. 쿼리 허용 목록을 사용하는 경로는 캐시 세대가 존재했다면 `True`를 반환하며, 이미 비워진 변형이 있는지는 구분하지 않습니다. 이미 진행 중인 요청은 이전 결과를 받을 수 있지만 그 생성 결과가 무효화 후 캐시를 덮어쓰지는 않습니다. 메모리 백엔드에서는 다른 워커에 전파되지 않으며, 정상 동작 중인 SQLite·Redis 백엔드에서는 다른 워커의 다음 조회에도 반영됩니다. 무효화 API를 외부에 노출할 때는 앱이 인증·권한 검사를 해야 합니다.
 
 ### 공개 파일
 
@@ -254,11 +372,11 @@ OpenTelemetry 트레이싱은 기본으로 꺼져 있으며 선택 사항입니�
 
 - SSR은 기본적으로 Python에서 UI 트리를 만들고 Rust가 이스케이프해 직렬화하는 buffered 렌더링입니다. 페이지 함수가 UI 노드의 비동기 iterable을 반환하면 레이아웃 셸을 먼저 보내고 청크 단위로 스트리밍합니다. 문자열을 raw HTML로 삽입하는 API는 없습니다.
 - Axum의 기본 본문 수신 슬롯은 16개, Python 실행 슬롯은 64개이며 CLI에서 조정합니다. 본문 수신 제한은 기본 10초이고 HTTP/1.1 헤더 수신에도 10초 제한이 있습니다. 실행 대기열은 최대 실행 슬롯 수와 64 중 작은 값으로 제한합니다. 정적 파일과 신선한 ISR 캐시는 Python 슬롯을 건너뜁니다. 연결 총수는 제한하지 않으며 동기 함수는 504 또는 연결 해제 후에도 스레드에서 계속 실행될 수 있습니다. DB·외부 서비스 시간 제한과 쓰기 멱등성을 별도로 확보해야 합니다. 외부 ASGI 서버의 시간 제한은 해당 서버가 관리합니다.
-- 요청 속도 제한은 선택 사항이며 프로세스별 토큰 버킷입니다. `pynext start --rate-limit 100 --rate-limit-window 60`은 클라이언트 IP당 60초에 100요청을 허용하고, 초과한 동적 요청에 429와 초 단위 `Retry-After`를 반환합니다. `X-Forwarded-For`는 `--trusted-proxy`(IP 또는 CIDR, 반복 가능)로 지정한 피어에서만 신뢰합니다. 정적 파일과 신선한 ISR 페이지는 Python 브리지에 도달하기 전에 Rust 계층에서 제공되므로 속도 제한이 적용되지 않으며, 분산 속도 제한은 아직 미구현입니다.
+- 요청 속도 제한은 선택 사항입니다. `pynext start --rate-limit 100 --rate-limit-window 60`은 IP당 토큰 버킷을 적용하고 초과 요청에 429와 `Retry-After`를 반환합니다. 기본 메모리 버킷은 프로세스별이며, `--rate-limit-backend redis`는 Redis에서 모든 워커의 버킷을 공유합니다. Redis 연결은 `PYNEXT_REDIS_URL`, 앱별 구분은 `PYNEXT_RATE_LIMIT_NAMESPACE`로 설정합니다. Redis 장애 시 제한 판단을 우회하지 않고 503을 반환합니다. 정적 파일과 SSG·ISR에도 적용되며 Axum은 제한이 활성화된 경우 이 요청들을 Python으로 전달합니다. `X-Forwarded-For`는 `--trusted-proxy`로 지정한 피어에서만 신뢰합니다.
   전달된 주소는 오른쪽부터 신뢰하는 프록시를 거슬러 가장 가까운 비신뢰 주소를 사용합니다. 모든 중간 프록시를 정확히 등록해야 합니다. 프로세스당 버킷은 최대 10,000개이며 모두 사용 중이면 기존 버킷을 제거하지 않고 새 주소에 429를 반환합니다.
-- ASGI HTTP와 기본 lifespan, 비동기 API 응답 스트리밍과 연결 해제 시 비동기 작업 취소를 지원합니다. WebSocket도 ASGI와 Axum에서 지원합니다(텍스트·바이너리, close 코드, 64 KiB 메시지 제한). ASGI 적합성은 `tests/test_asgi_conformance.py`로 검증합니다(HTTP 이벤트 순서, 다중 청크 본문, 본문 크기 경계, 연결 해제, lifespan 시작·종료와 실패 시 `lifespan.*.failed` 응답). 강제 프로세스 격리는 `--workers`로 제공합니다.
-- `--workers N`으로 여러 워커 프로세스를 띄울 수 있습니다(Unix 전용, 고정 포트 필요). 상위 프로세스(수퍼바이저)가 워커를 감시하고 비정상 종료 시 재시작하며, SIGINT/SIGTERM 시 모든 워커를 정상 종료합니다. 워커는 각자 별도 프로세스·속도 제한 버킷을 가지며, ISR 캐시는 메모리 백엔드에서는 워커별이고 `--cache-backend sqlite`에서는 공유됩니다. 워커가 죽는 도중 처리하던 요청은 실패하고 클라이언트가 재시도해야 합니다. 기본값은 1(기존 단일 프로세스)입니다.
-- ISR 기본값은 단일 프로세스 메모리 구현이며 `--cache-backend sqlite`로 워커 간 공유 캐시와 단일 생성을 쓸 수 있습니다. 워커 간 즉시 무효화 전파, 버튼 이외의 상호작용 재생, 모듈 단위 핫 리로드, 프로덕션 보안 기능은 **미구현**입니다. `pynext dev`는 파일 변경 시 서버를 재시작합니다. PyNext의 hydration은 React나 React Server Components와 호환되지 않습니다. 현재 버전을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하는 데 사용하지 마세요.
+- ASGI HTTP와 기본 lifespan, 비동기 API 응답 스트리밍과 연결 해제 시 비동기 작업 취소를 지원합니다. WebSocket도 ASGI와 Axum에서 지원합니다(텍스트·바이너리, close 코드, 설정 가능한 메시지 크기). ASGI 적합성은 `tests/test_asgi_conformance.py`로 검증합니다(HTTP 이벤트 순서, 다중 청크 본문, 본문 크기 경계, 연결 해제, lifespan 시작·종료와 실패 시 `lifespan.*.failed` 응답). 강제 프로세스 격리는 `--workers`로 제공합니다.
+- `--workers N`으로 리스너를 공유하는 여러 워커 프로세스를 띄울 수 있습니다. `--port 0`이면 수퍼바이저가 포트를 할당하고 워커가 재시작해도 유지합니다. 상위 프로세스가 워커를 감시하고 비정상 종료 시 재시작하며 종료 신호를 받으면 모든 워커를 정리합니다. 기본 캐시와 속도 제한은 워커별이며 SQLite·Redis 공유 ISR과 Redis 공유 제한을 선택할 수 있습니다. 워커가 죽는 도중 처리하던 요청은 실패하고 클라이언트가 재시도해야 합니다. 기본값은 1(기존 단일 프로세스)입니다. 다중 워커 런타임은 Linux에서 검증했으며 macOS·Windows 실행 결과는 CI 확인이 필요합니다.
+- ISR 기본값은 단일 프로세스 메모리 구현이며 SQLite와 Redis 공유 백엔드를 선택할 수 있습니다. `pynext dev`는 변경된 JS/TS island 모듈을 문서 전체 새로고침 없이 교체하고 기존 정리 함수를 호출합니다. 해당 island의 상태는 초기화될 수 있습니다. Python 페이지 등 다른 파일은 서버를 재시작하고 문서를 새로고침합니다. 버튼 이외의 상호작용 재생과 프로덕션 보안 기능은 **미구현**입니다. PyNext의 hydration은 React나 React Server Components와 호환되지 않습니다. 현재 버전을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하는 데 사용하지 마세요.
 - 빌드할 때 앱 모듈을 import하므로 개발자가 작성한 Python 코드가 실행됩니다. 프로젝트를 신뢰할 수 있는 환경에서 빌드해야 합니다.
 - 페이지·레이아웃·API 파일에서 `from .helpers import name` 같은 상대 import를 사용할 수 있습니다. **0.6 변경:** 프로젝트 루트를 전역 `sys.path`에 자동 추가하지 않습니다. 기존 루트 기준 절대 import가 실패하면 상대 import로 바꾸거나 프로젝트를 Python 패키지로 설치하세요.
 - `start`의 manifest는 앱 디렉터리의 Python 파일과 `public`·`islands` 파일 변화를 검사하지만 앱 밖 의존성, 외부 데이터나 환경 변수 변화까지 추적하지 않습니다. 현재 운영 시작에도 원본 `public`과 `islands` 디렉터리가 필요합니다. 정적 산출물은 프로세스마다 메모리에 적재하며, 이전 빌드의 사용하지 않는 파일을 자동 정리하지 않습니다.
@@ -281,8 +399,8 @@ ASGI 적합성은 `tests/test_asgi_conformance.py`가 검증합니다. HTTP 이�
 고정 시드·예제 40개로 CI를 빠르게 유지), Rust 쪽은 proptest
 (`crates/pynext-router`와 `crates/pynext-native`의 단위 테스트, 케이스 64개)로
 라우트 매칭 왕복, 이스케이프 누수 없음, void 태그 처리, 임의 트리 렌더링을
-검사합니다. 렌더러의 void 목록에 있는 `embed`은 안전 태그 차단 목록에도 있어
-실제로 렌더링되지 않으므로 해당 테스트에서는 제외합니다.
+검사합니다. `embed`는 안전 태그 차단 목록에 있어 렌더링되지 않으므로 해당
+테스트에서는 제외합니다.
 
 예제를 빌드한 뒤 다음 명령으로 실제 Chromium에서 mount·hydration·CSP·정리 동작을 검사할 수 있습니다.
 
@@ -297,9 +415,10 @@ Uvicorn·Starlette 모드는 모두 실제 loopback HTTP를 사용하지만 클�
 서버가 같은 프로세스에서 실행됩니다. `asgi` 모드는 네트워크를 거치지 않는
 ASGITransport이므로 HTTP 모드와 수치를 직접 비교하면 안 됩니다.
 `--compare`는 loopback HTTP 그룹 세 가지(axum, uvicorn, starlette)를 동일
-조건으로 차례로 실행해 결합 결과를 출력합니다. 2026-11-08에 `/api/users`
+조건으로 별도 서버 프로세스에서 차례로 실행해 결합 결과와 서버 RSS 샘플을
+출력합니다. 2026-11-08에 `/api/users`
 1000요청·동시성 10으로 측정한 결과는 `benchmarks/results-2026-11-08.json`에
-있습니다. 같은 프로세스에서 잰 스모크 비교이므로 운영 처리량 주장으로
+있습니다. 이 과거 결과는 같은 프로세스에서 잰 스모크 비교이므로 운영 처리량 주장으로
 읽으면 안 됩니다. 측정 조건과 별도 프로세스 사용법은
 [벤치마크 가이드](docs/BENCHMARKING.md)를 참고하세요.
 빌드 후 `--production --path /about`을 추가하면 SSG 경로를 측정합니다.

@@ -166,9 +166,8 @@ def test_native_rate_limit_returns_429_with_retry_after(tmp_path):
                 # every window/limit = 20 seconds.
                 assert response.headers["retry-after"] == "20"
                 assert response.text == "Too Many Requests"
-                # Static files are served by the Rust layer before the
-                # bridge, so they are not rate-limited (documented scope).
-                assert (await client.get("/health.txt")).text == "healthy"
+                # Static files are covered by the same bucket.
+                assert (await client.get("/health.txt")).status_code == 429
         finally:
             await asyncio.to_thread(server.stop)
             await app.isr.close()

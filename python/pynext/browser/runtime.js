@@ -23,6 +23,67 @@ function matchesServerDOM(element, expected) {
     actualChildren.every((node, index) => node.isEqualNode(expectedChildren[index]));
 }
 
+// Shared island models are bounded data, not executable browser code.
+// Construct a detached DOM from the same model and props the server used.
+function renderSharedModel(model, props) {
+  if (!model || model.version !== 1 || !model.tree || Object.keys(model).length !== 2) {
+    throw new Error("Invalid shared island model");
+  }
+  let count = 0;
+  const validName = /^[A-Za-z][A-Za-z0-9_:-]{0,127}$/;
+  const propName = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+  const blockedTags = new Set(["script", "style", "iframe", "object", "embed"]);
+  const urlAttrs = new Set(["href", "src", "action", "formaction", "xlink:href"]);
+  const voidTags = new Set(["area", "base", "br", "col", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+  const htmlText = (value) => value.replace(/\r\n?/g, "\n").replace(/\x00/g, "\ufffd");
+
+  function render(node, depth) {
+    count += 1;
+    if (count > 512 || depth > 32 || !node || typeof node !== "object" || Array.isArray(node)) {
+      throw new Error("Invalid shared model node");
+    }
+    const keys = Object.keys(node);
+    if (node.kind === "prop" && keys.length === 2 && propName.test(node.name || "") &&
+        Object.prototype.hasOwnProperty.call(props, node.name) && typeof props[node.name] === "string") {
+      return document.createTextNode(htmlText(props[node.name]));
+    }
+    if (node.kind === "text" && keys.length === 2 && typeof node.value === "string") {
+      return document.createTextNode(htmlText(node.value));
+    }
+    if (node.kind === "fragment" && keys.length === 2 && Array.isArray(node.children)) {
+      const fragment = document.createDocumentFragment();
+      for (const child of node.children) fragment.append(render(child, depth + 1));
+      return fragment;
+    }
+    if (node.kind !== "element" || keys.length !== 4 || typeof node.tag !== "string" ||
+        !validName.test(node.tag) || blockedTags.has(node.tag.toLowerCase()) ||
+        !node.attrs || typeof node.attrs !== "object" || Array.isArray(node.attrs) ||
+        !Array.isArray(node.children) || (voidTags.has(node.tag.toLowerCase()) && node.children.length)) {
+      throw new Error("Invalid shared model element");
+    }
+    const element = document.createElement(node.tag);
+    for (const [name, value] of Object.entries(node.attrs)) {
+      const lower = name.toLowerCase();
+      if (!validName.test(name) || lower.startsWith("on") || lower.startsWith("data-pynext-") ||
+          lower === "style" || lower === "srcdoc" ||
+          !(value === null || typeof value === "boolean" || typeof value === "string")) {
+        throw new Error("Invalid shared model attribute");
+      }
+      if (value === null || value === false) continue;
+      if (urlAttrs.has(lower) && typeof value === "string" &&
+          /^(javascript|vbscript|data):/i.test(value.replace(/[\x00-\x20\x7f]/g, ""))) {
+        throw new Error("Unsafe URL in shared model");
+      }
+      element.setAttribute(name, value === true ? "" : htmlText(value));
+    }
+    for (const child of node.children) element.append(render(child, depth + 1));
+    return element;
+  }
+  const result = render(model.tree, 0);
+  result.normalize();
+  return result;
+}
+
 function interactionButton(element, target) {
   if (!(target instanceof Element) || !element.contains(target)) return null;
   // Navigation, form submission, labels and editable regions retain their
@@ -74,7 +135,9 @@ async function mountIsland(element, state) {
       if (typeof module.render !== "function" || typeof module.hydrate !== "function") {
         throw new Error("Hydrated island must export render and hydrate");
       }
-      const expected = await module.render(props);
+      const sharedModel = element.getAttribute("data-pynext-model");
+      const expected = sharedModel === null ? await module.render(props)
+        : renderSharedModel(JSON.parse(sharedModel), props);
       if (!element.isConnected || state.removed) return;
       if (matchesServerDOM(element, expected)) {
         cleanup = await module.hydrate(element, props);
@@ -217,10 +280,10 @@ function eachIsland(node, callback) {
 // ---- Client-side navigation and prefetch (finding #51) ----
 // Partial navigation: same-origin link clicks fetch the target document and
 // swap the body instead of reloading. Any failure falls back to a full
-// document navigation, so a page never breaks. The runtime is only loaded
-// on pages with islands, so partial navigation is active only there.
+// document navigation, so a page never breaks.
 const PREFETCH_MAX_ENTRIES = 20;
 const PREFETCH_MAX_BYTES = 1024 * 1024;
+const PREFETCH_MAX_INFLIGHT = 4;
 const prefetchCache = new Map();
 const prefetchInflight = new Set();
 const observedLinks = new WeakSet();
@@ -253,20 +316,68 @@ function isNavigable(anchor) {
   return url;
 }
 
-async function fetchPage(url) {
+function cachedPage(url) {
   const cached = prefetchCache.get(url.href);
-  if (cached !== undefined) return cached;
+  if (!cached) return null;
+  if (cached.expires <= Date.now()) {
+    prefetchCache.delete(url.href);
+    return null;
+  }
+  return cached.html;
+}
+
+async function fetchPage(url, { useCache = true } = {}) {
+  const cached = useCache ? cachedPage(url) : null;
+  if (cached !== null) return { html: cached, maxAge: 0 };
   const response = await fetch(url.href, { headers: { Accept: "text/html" } });
   if (!response.ok) throw new Error(`Navigation fetch failed: ${response.status}`);
+  const finalUrl = new URL(response.url);
+  if (finalUrl.origin !== url.origin || finalUrl.pathname !== url.pathname || finalUrl.search !== url.search) {
+    throw new Error("Navigation redirect requires a full page load");
+  }
   const type = response.headers.get("content-type") || "";
-  if (!type.includes("text/html")) throw new Error("Navigation fetch did not return HTML");
-  const html = await response.text();
-  if (html.length > PREFETCH_MAX_BYTES) throw new Error("Navigation page too large for partial navigation");
-  return html;
+  if (!type.toLowerCase().includes("text/html")) throw new Error("Navigation fetch did not return HTML");
+  const csp = response.headers.get("content-security-policy");
+  if (csp && csp !== "script-src 'self'; object-src 'none'") {
+    throw new Error("Navigation CSP requires a full page load");
+  }
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("Navigation response has no readable body");
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > PREFETCH_MAX_BYTES) throw new Error("Navigation page too large");
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  const html = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  const directives = (response.headers.get("cache-control") || "").toLowerCase().split(",").map((v) => v.trim());
+  const vary = (response.headers.get("vary") || "").toLowerCase().split(",").map((v) => v.trim());
+  const age = directives.map((v) => /^max-age=(\d+)$/.exec(v)).find(Boolean);
+  const safe = directives.includes("public") && !directives.some((v) => /^(private|no-store|no-cache)(=|$)/.test(v)) &&
+    !vary.some((v) => ["*", "cookie", "authorization"].includes(v));
+  return { html, maxAge: safe && age ? Math.min(Number(age[1]), 60) : 0 };
 }
 
 function swapDocument(html, url) {
   const parsed = new DOMParser().parseFromString(html, "text/html");
+  const head = (doc) => Array.from(doc.head.children).filter((node) => node.tagName !== "TITLE")
+    .map((node) => node.outerHTML).join("\n");
+  const attrs = (node) => Array.from(node.attributes).map((a) => `${a.name}=${a.value}`).sort().join("\n");
+  if (head(parsed) !== head(document) || attrs(parsed.documentElement) !== attrs(document.documentElement) ||
+      attrs(parsed.body) !== attrs(document.body)) {
+    throw new Error("Navigation document metadata changed");
+  }
   document.body.replaceChildren(...parsed.body.childNodes);
   if (parsed.title) document.title = parsed.title;
   if (url.hash) {
@@ -283,7 +394,9 @@ async function navigate(url, { push = true, onFailure = "full" } = {}) {
   const token = ++navigationToken;
   let html;
   try {
-    html = await fetchPage(url);
+    const runtime = document.querySelector('script[src^="/_pynext/static/"]');
+    if (runtime?.nonce) throw new Error("Nonce CSP requires a full page load");
+    ({ html } = await fetchPage(url));
   } catch (error) {
     if (onFailure === "reload") window.location.reload();
     else window.location.href = url.href;
@@ -310,13 +423,16 @@ async function navigate(url, { push = true, onFailure = "full" } = {}) {
 
 function prefetch(url) {
   const key = url.href;
-  if (prefetchCache.has(key) || prefetchInflight.has(key)) return;
+  if (cachedPage(url) !== null || prefetchInflight.has(key) || prefetchInflight.size >= PREFETCH_MAX_INFLIGHT) {
+    return Promise.resolve();
+  }
   prefetchInflight.add(key);
-  fetchPage(url).then((html) => {
+  return fetchPage(url, { useCache: false }).then(({ html, maxAge }) => {
+    if (!maxAge) return;
     if (prefetchCache.size >= PREFETCH_MAX_ENTRIES) {
       prefetchCache.delete(prefetchCache.keys().next().value);
     }
-    prefetchCache.set(key, html);
+    prefetchCache.set(key, { html, expires: Date.now() + maxAge * 1000 });
   }).catch(() => {
     // Prefetch is best-effort; the click still navigates.
   }).finally(() => prefetchInflight.delete(key));
@@ -377,18 +493,22 @@ function startNavigation() {
       } catch (error) {
         return Promise.resolve(false);
       }
+      if (url.origin !== window.location.origin || !["http:", "https:"].includes(url.protocol)) {
+        return Promise.resolve(false);
+      }
       return navigate(url);
     },
     prefetch: (href) => {
       try {
-        prefetch(new URL(href, window.location.href));
+        const url = new URL(href, window.location.href);
+        if (url.origin === window.location.origin && ["http:", "https:"].includes(url.protocol)) return prefetch(url);
       } catch (error) {
         // Ignore an unparseable debug prefetch.
       }
     },
     isPrefetched: (href) => {
       try {
-        return prefetchCache.has(new URL(href, window.location.href).href);
+        return cachedPage(new URL(href, window.location.href)) !== null;
       } catch (error) {
         return false;
       }
@@ -396,11 +516,59 @@ function startNavigation() {
   };
 }
 
+function startDevelopmentUpdates() {
+  const script = document.querySelector('script[data-pynext-dev]');
+  const expectedId = script && script.getAttribute("data-pynext-dev");
+  if (!/^[a-f0-9]{32}$/.test(expectedId || "")) return;
+
+  async function poll() {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 3000);
+    try {
+      const response = await fetch("/_pynext/dev/client", {
+        cache: "no-store", credentials: "same-origin", signal: controller.signal,
+      });
+      if (!response.ok) return;
+      const state = await response.json();
+      if (!state || !/^[a-f0-9]{32}$/.test(state.id || "") ||
+          !state.bundles || typeof state.bundles !== "object" || Array.isArray(state.bundles)) return;
+      if (state.id !== expectedId) {
+        window.location.reload();
+        return;
+      }
+      for (const element of document.querySelectorAll("[data-pynext-island]")) {
+        const name = element.getAttribute("data-pynext-island");
+        const digest = state.bundles[name];
+        if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) continue;
+        const url = `/_pynext/static/${digest}.js`;
+        if (element.getAttribute("data-pynext-module") === url) continue;
+        const previous = instances.get(element);
+        const wasStarted = !!(previous && previous.started);
+        dispose(element);
+        element.setAttribute("data-pynext-module", url);
+        element.removeAttribute("data-pynext-state");
+        element.removeAttribute("data-pynext-error");
+        element.removeAttribute("data-pynext-mismatch");
+        scheduleIsland(element);
+        const current = instances.get(element);
+        if (wasStarted && current) activate(element, current);
+      }
+    } catch (error) {
+      // The development server may be restarting or have a broken edit.
+    } finally {
+      window.clearTimeout(timeout);
+      window.setTimeout(poll, 1000);
+    }
+  }
+  window.setTimeout(poll, 1000);
+}
+
 function start() {
   for (const element of document.querySelectorAll("[data-pynext-island]")) {
     scheduleIsland(element);
   }
   startNavigation();
+  startDevelopmentUpdates();
   new MutationObserver((records) => {
     for (const record of records) {
       for (const node of record.removedNodes) eachIsland(node, (element) => {

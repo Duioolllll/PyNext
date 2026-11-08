@@ -311,7 +311,7 @@ def test_asgi_async_function_returning_async_iterable_streams(tmp_path):
     asyncio.run(run())
 
 
-def test_streaming_page_requires_ssr(tmp_path):
+def test_isr_streaming_page_also_streams_in_development(tmp_path):
     async def run():
         incoming, outgoing = asyncio.Queue(), asyncio.Queue()
         await incoming.put({"type": "http.request", "body": b"", "more_body": False})
@@ -324,7 +324,11 @@ def test_streaming_page_requires_ssr(tmp_path):
         app = make_project(tmp_path, stream_page=isr_page)
         task = asyncio.create_task(app(scope(), lambda: queue_receive(incoming), outgoing.put))
         start = await asyncio.wait_for(outgoing.get(), 3)
-        assert start["status"] == 500
+        assert start["status"] == 200
         await asyncio.wait_for(task, 3)
+        messages = []
+        while not outgoing.empty():
+            messages.append(await outgoing.get())
+        assert b"chunk-one" in b"".join(message.get("body", b"") for message in messages)
         await app.isr.close()
     asyncio.run(run())

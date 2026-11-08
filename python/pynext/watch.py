@@ -1,18 +1,19 @@
-"""Stdlib-only polling file watcher for ``pynext dev``.
+"""Native file notifications with snapshots for ``pynext dev``.
 
 The watcher snapshots the modification time, size and contents of every regular file under
-the watched roots (``app/``, ``islands/``, ``public/`` and
-``pynext.config.py``) and reports when the snapshot changes. Polling keeps
-the dev command dependency-free and portable; watchdog is not a project
-dependency. Changes are debounced so one save that touches several files
-restarts the server once.
+the watched roots (``app/``, ``islands/``, ``public/``, ``middleware.py``,
+``resources.py`` and ``pynext.config.py``) and reports changes. Native events
+are debounced and a periodic snapshot detects changes missed during startup.
 """
 import asyncio
+from contextlib import AsyncExitStack, aclosing
 import hashlib
+import logging
 import os
 import stat
-import time
 from pathlib import Path
+
+from watchfiles import awatch
 
 # Directories never watched: build output, bytecode caches, VCS metadata,
 # virtual environments and JS dependencies.
@@ -20,10 +21,11 @@ IGNORED_DIRS = {"__pycache__", ".git", ".pynext", ".venv", "venv", "node_modules
 
 POLL_INTERVAL_SECONDS = 0.25
 DEBOUNCE_SECONDS = 0.3
+log = logging.getLogger("pynext.watch")
 
 
 class Watcher:
-    """Poll the watched roots of one project directory for changes."""
+    """Watch the roots of one project directory for changes."""
 
     def __init__(self, root, *, interval=POLL_INTERVAL_SECONDS, debounce=DEBOUNCE_SECONDS):
         self.root = Path(root).resolve()
@@ -38,9 +40,10 @@ class Watcher:
             directory = self.root / name
             if directory.is_dir():
                 roots.append(directory)
-        config = self.root / "pynext.config.py"
-        if config.is_file():
-            roots.append(config)
+        for name in ("pynext.config.py", "middleware.py", "resources.py"):
+            config = self.root / name
+            if config.is_file():
+                roots.append(config)
         return roots
 
     def snapshot(self):
@@ -85,21 +88,69 @@ class Watcher:
         after the snapshot has been stable for ``debounce`` seconds, so one
         save that touches several files restarts the server once.
         """
-        changed = None
-        last_snapshot = self._baseline
-        stable_since = None
-        while True:
-            # Digesting public assets must not block the serving event loop.
+        def relevant(_change, path):
+            try:
+                parts = Path(path).relative_to(self.root).parts
+            except ValueError:
+                return False
+            if not parts or any(part in IGNORED_DIRS for part in parts):
+                return False
+            return parts[0] in {"app", "islands", "public"} or (
+                len(parts) == 1 and parts[0] in {"pynext.config.py", "middleware.py", "resources.py"})
+
+        async def changed_snapshot():
             current = await asyncio.to_thread(self.snapshot)
-            found = self.changed(self._baseline, current)
-            now = time.monotonic()
-            if found:
-                changed = found
-            if current != last_snapshot:
-                last_snapshot = current
-                stable_since = now
-            elif (changed is not None and stable_since is not None
-                    and now - stable_since >= self.debounce):
-                self._baseline = current
-                return changed
+            if not self.changed(self._baseline, current):
+                return None
+            while True:
+                await asyncio.sleep(self.debounce)
+                after = await asyncio.to_thread(self.snapshot)
+                if after == current:
+                    found = self.changed(self._baseline, after)
+                    if found:
+                        self._baseline = after
+                        return found
+                    return None
+                current = after
+
+        found = await changed_snapshot()
+        if found:
+            return found
+        settings = dict(watch_filter=relevant, debounce=max(1, int(self.debounce * 1000)),
+                        step=max(1, min(50, int(self.interval * 1000))), rust_timeout=1000,
+                        yield_on_timeout=True)
+        # Watch the project root non-recursively so generated output and
+        # node_modules never consume native watch descriptors. Existing source
+        # directories get separate recursive watches.
+        directories = [self.root / name for name in ("app", "islands", "public")
+                       if (self.root / name).is_dir()]
+        try:
+            async with AsyncExitStack() as stack:
+                streams = [await stack.enter_async_context(aclosing(awatch(self.root, recursive=False, **settings)))]
+                if directories:
+                    streams.append(await stack.enter_async_context(aclosing(awatch(*directories, recursive=True, **settings))))
+                tasks = {asyncio.create_task(anext(stream)): stream for stream in streams}
+                try:
+                    while tasks:
+                        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            stream = tasks.pop(task)
+                            try:
+                                task.result()
+                            except StopAsyncIteration:
+                                continue
+                            tasks[asyncio.create_task(anext(stream))] = stream
+                        found = await changed_snapshot()
+                        if found:
+                            return found
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+        except (OSError, RuntimeError):
+            log.warning("Native file watching failed; falling back to polling", exc_info=True)
+        while True:
             await asyncio.sleep(self.interval)
+            found = await changed_snapshot()
+            if found:
+                return found

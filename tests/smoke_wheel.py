@@ -34,14 +34,17 @@ with tarfile.open(sources[0]) as archive:
         raise RuntimeError("Source distribution is missing third-party notices")
 
 with tempfile.TemporaryDirectory(prefix="pynext-wheel-check-") as directory:
-    subprocess.run(["uv", "pip", "install", "--python", sys.executable, "--no-deps",
-                    "--target", directory, str(wheels[0])], cwd=ROOT, check=True)
+    venv = Path(directory) / "venv"
+    subprocess.run(["uv", "venv", "--python", sys.executable, str(venv)], cwd=ROOT, check=True)
+    wheel_python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    subprocess.run(["uv", "pip", "install", "--python", str(wheel_python), str(wheels[0])],
+                   cwd=ROOT, check=True)
     env = os.environ.copy()
-    env["PYTHONPATH"] = directory
+    env.pop("PYTHONPATH", None)
     check = ("from pathlib import Path; import pynext, sys; "
              "assert Path(pynext.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve())")
-    subprocess.run([sys.executable, "-c", check, directory], cwd=ROOT, env=env, check=True)
-    subprocess.run([sys.executable, "-m", "pynext.cli", "build", "--dir", str(ROOT / "examples/basic")],
+    subprocess.run([str(wheel_python), "-c", check, str(venv)], cwd=ROOT, env=env, check=True)
+    subprocess.run([str(wheel_python), "-m", "pynext.cli", "build", "--dir", str(ROOT / "examples/basic")],
                    cwd=ROOT, env=env, check=True)
     # Serve the example from the installed wheel as well as building it. Reuse
     # the browser smoke runner's bounded port retry and HTTP checks without
@@ -53,7 +56,7 @@ with tempfile.TemporaryDirectory(prefix="pynext-wheel-check-") as directory:
         server = None
         try:
             server, port = smoke._start_server(
-                lambda port: [sys.executable, "-m", "pynext.cli", "start", "--dir", str(ROOT / "examples/basic"),
+                lambda port: [str(wheel_python), "-m", "pynext.cli", "start", "--dir", str(ROOT / "examples/basic"),
                               "--host", "127.0.0.1", "--port", str(port)],
                 log, popen=lambda *args, **kwargs: subprocess.Popen(*args, env=env, **kwargs),
             )

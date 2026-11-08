@@ -15,9 +15,7 @@ jobs:
       matrix:
         # Compatibility matrix (finding #54, spec v0.2 section 13):
         # supported OS x supported Python version x deploy mode.
-        # requires-python is >=3.13,<3.14, so 3.13 is the only Python in
-        # the matrix; 3.14 support is unverified, not merely untested, so
-        # it is not listed until the project claims it.
+        # Python 3.13 and 3.14 are checked across all operating systems.
         # The ASGI in-process mode (httpx ASGITransport) is not a matrix
         # axis: pytest covers it in every job (see
         # test_benchmark_mode_transport_labels_and_success). The two
@@ -25,12 +23,12 @@ jobs:
         # Uvicorn, each get their own matrix leg instead.
         # Browser smoke runs on all three OSes: Playwright installs
         # without --with-deps on macOS and Windows.
-        # Tradeoff: every leg runs the full check suite (6 legs total),
+        # Tradeoff: every leg runs the full check suite,
         # not a smoke-only subset, because the suite takes minutes and
         # the matrix is small; splitting it would save little and hide
         # OS/mode-specific failures.
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.13"]
+        python-version: ["3.13", "3.14"]
         deploy: [axum, uvicorn]
     runs-on: ${{ matrix.os }}
     steps:
@@ -59,7 +57,7 @@ jobs:
           enable-cache: true
 
       - name: Install Python dependencies
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --extra images
 
       - name: Install JavaScript dependencies
         run: npm ci
@@ -74,7 +72,7 @@ jobs:
         run: cargo test --locked --workspace --all-features
 
       - name: Run Python tests
-        run: uv run pytest -q
+        run: uv run --locked --extra dev --extra images pytest -q
 
       - name: Verify example production build
         run: uv run pynext build --dir examples/basic
@@ -88,7 +86,7 @@ jobs:
       - name: Save verified distributions
         uses: actions/upload-artifact@v4
         with:
-          name: distributions-${{ runner.os }}-${{ matrix.deploy }}
+          name: distributions-${{ runner.os }}-py${{ matrix.python-version }}-${{ matrix.deploy }}
           path: |
             dist/*.whl
             dist/*.tar.gz
@@ -102,7 +100,7 @@ jobs:
       - name: Save benchmark measurements
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-${{ runner.os }}-${{ matrix.deploy }}
+          name: benchmark-${{ runner.os }}-py${{ matrix.python-version }}-${{ matrix.deploy }}
           path: benchmark-*.json
 
       - name: Install Chromium (Linux)
@@ -115,3 +113,29 @@ jobs:
 
       - name: Browser end-to-end checks
         run: uv run --with playwright==1.62.0 python tests/browser/run_smoke.py --mode ${{ matrix.deploy }}
+
+  redis:
+    name: Redis cache integration
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      PYNEXT_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      PYNEXT_TEST_REDIS_RESTART: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --extra dev --extra redis
+      - run: uv run --locked --extra dev --extra redis pytest -q tests/test_redis_cache.py tests/test_redis_faults.py tests/test_redis_restart.py tests/test_isr_query.py tests/test_streaming_isr.py

@@ -1,3 +1,4 @@
+from conftest import page_html
 import asyncio
 import json
 from html.parser import HTMLParser
@@ -80,7 +81,7 @@ def test_islands_in_both_servers_and_render_modes(tmp_path, esbuild, mode, monke
             assert result.headers["cache-control"] == "public, max-age=31536000, immutable"
             assert result.headers["x-content-type-options"] == "nosniff"
             assert (await client.post(url)).status_code == 405
-        assert (await client.get("/plain")).text == "<p>plain</p>"
+        assert (await client.get("/plain")).text == page_html("<p>plain</p>")
         assert (await client.get("/_pynext/static/not-found.js")).status_code == 404
         return runtime, attrs["data-pynext-module"]
 

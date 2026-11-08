@@ -2,11 +2,11 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [简体中文](../zh-CN/manual.md)
 
-このマニュアルは、チェックアウトした **v0.7.0a1** 未リリースの実験候補のコードを対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
+このマニュアルは、チェックアウトした **0.1.0** 未リリースの実験候補のコードを対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
 
 ## 必要な環境と起動
 
-CPython 3.13、Rust/Cargo、[uv](https://docs.astral.sh/uv/) が必要です。対応環境は CI マトリクスで検証します。OS は Ubuntu・macOS・Windows（最新）、Python は CPython 3.13 のみ（3.14 は未検証のためマトリクスに含みません）、デプロイモードはスタンドアロン Axum と Uvicorn 上の ASGI です（インプロセス ASGI モードはすべての CI ジョブで pytest が検査します）。ブラウザスモークは 3 つの OS すべてで実行します。サンプルは island を使うため、esbuild 0.28.1 のインストールに Node.js 18 以降と npm も必要です。
+CPython 3.13・3.14、Rust/Cargo、[uv](https://docs.astral.sh/uv/) が必要です。対応環境は CI マトリクスで検証します。OS は Ubuntu・macOS・Windows（最新）、Python は CPython 3.13・3.14、デプロイモードはスタンドアロン Axum と Uvicorn 上の ASGI です（インプロセス ASGI モードはすべての CI ジョブで pytest が検査します）。ブラウザスモークは 3 つの OS すべてで実行します。サンプルは island を使うため、esbuild 0.28.1 のインストールに Node.js 18 以降と npm も必要です。
 
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
@@ -22,7 +22,7 @@ http://127.0.0.1:3000/、/about、/guides/intro、/news/example、/hydrate、/st
 
 `pynext dev --dir examples/basic` はビルドなしでソースを提供し、`app/`・`islands/`・`public/`・`pynext.config.py` の変更時に同じポートでサーバーを再起動します。`pynext start` はビルド manifest を使い、追跡対象のソースが変わると再ビルドを要求します。Island を使わないアプリには Node と esbuild は不要です。上記はリポジトリからのインストールであり、PyPI 公開を意味しません。
 
-開発時の監視はサイズと更新日時が同じ変更も検知できるよう、監視ファイルを各ポーリングでハッシュします。対象が大きいほどディスク I/O が増えます。
+開発監視はネイティブ通知とファイルハッシュを使い、必要ならポーリングに切り替えます。JS/TS island の変更は該当モジュールを再ビルドし、ページ全体を再読み込みせず交換します。以前のクリーンアップが実行され、その island の状態は初期化されることがあります。他のソース変更ではサーバーを再起動してページを再読み込みします。壊れた変更では前の正常な版を維持します。`--port 0` のポートは再起動後も維持します。
 
 ## プロジェクト構造とルーティング
 
@@ -76,7 +76,7 @@ async def echo(request):
 
 レスポンスの既定 Content Security Policy は `script-src 'self'; object-src 'none'` です。ブラウザーが読み込めるスクリプトが制限されるため、クライアントコードの追加時に考慮してください。レスポンスヘッダーとメディアタイプの制御文字は拒否されます。
 
-状態を変更する API リクエストには CSRF 保護を選択的に適用できます（仕様 v0.2 §11）。認証システムはまだないため double-submit 方式を使います。アプリが予測不能なトークンを発行して `pynext_csrf` Cookie に格納し、クライアントは同じ値を `X-CSRF-Token` ヘッダー（または `csrf_token` フォームフィールド）で送り返します。GET、HEAD、OPTIONS は対象外で、それ以外のメソッドでトークンがない、または一致しない場合は HTTP 403 を返します。
+状態を変更する API リクエストには CSRF 保護を選択的に適用できます（仕様 v0.2 §11）。セッションミドルウェアがある場合はトークンをサーバー側セッションに結び付け、ない場合は double-submit 方式を使います。double-submit では予測不能なトークンを `pynext_csrf` Cookie に格納し、クライアントは同じ値を `X-CSRF-Token` ヘッダー（または `csrf_token` フォームフィールド）で送り返します。GET、HEAD、OPTIONS は対象外で、それ以外のメソッドでトークンがない、または一致しない場合は HTTP 403 を返します。
 
 ~~~python
 from pynext import JSONResponse, csrf_protect, new_csrf_token, route, set_csrf_cookie
@@ -120,7 +120,7 @@ app = create_app(".", security=SecurityConfig(
 
 ## ストリーミング SSR
 
-ページ関数は単一のツリーの代わりに UI ノードの非同期 iterable を返すことができます。レイアウトのシェルを先に送り、各チャンクを Rust が直列化して生成される順に送信し、最後にレイアウトの閉じ部分を送ります。既定は引き続き全体をバッファーする方式です。ストリーミングは SSR 専用で、SSG・ISR ページは完全なボディが必要なため、ストリーミングを指定すると失敗します。レイアウトは children をちょうど一度だけ描画しなければなりません。切断時はジェネレーターを閉じ、ヘッダー送信後のエラーはストリームを中断します。[サンプルページ](../../examples/basic/app/stream/page.py)は `/stream` で確認できます。
+ページ関数は UI ノードの非同期 iterable を返せます。SSR はレイアウトと各チャンクを生成順に送信し、SSG はビルド時に結合して静的ファイルとして配信します。公開 ISR は最初の要求にストリーミングし、同時要求は完成した結果を待つか stale を受け取ります。完成した結果のみをキャッシュします。SSG・ISR のストリームは 8 MiB・30 秒、ISR キャッシュの本文は 2 MiB が上限です。最初のクライアント切断後も生成が続く場合があります。レイアウトは children を一度だけ描画してください。[サンプル](../../examples/basic/app/stream/page.py)。
 
 ~~~python
 from pynext import h, page
@@ -164,7 +164,7 @@ async def echo(websocket: WebSocket):
         pass
 ~~~
 
-[echo の例](../../examples/basic/app/ws/echo/route.py)を参照してください。WebSocket ハンドラのないルートは close コード 1008 でハンドシェイクを拒否し、accept せずに返ったハンドラはコード 1000 で閉じられます。メッセージは 1 件あたり 64 KiB までで、それより大きいものは close コード 1009 で拒否されます。close コードは 1005・1006・1015 を除く 1000〜4999 で、reason は UTF-8 で 123 バイトまでです。サブプロトコル交渉、ブロードキャスト・pub/sub、接続間の共有状態はありません。各接続は自分のメッセージだけを受け取ります。WebSocket 専用の `route.py` は通常の HTTP リクエストに 405 で答えます。ASGI アダプタと Axum スタンドアロンサーバーの両方が WebSocket に対応しており、Axum ではハンドラ実行前にサーバーがハンドシェイクを完了するため、`accept()` は接続を accepted とするだけです。
+[echo の例](../../examples/basic/app/ws/echo/route.py)を参照してください。ASGI と Axum はテキスト・バイナリに対応します。上限の既定値は 64 KiB で、`create_app(..., websocket_max_message=...)` または `--ws-max-message-bytes` で最大 16 MiB まで設定できます。受信超過時は 1009 で閉じます。`@websocket(protocols=("chat.v1", "chat.v2"))` でサブプロトコルを選択し、`websocket.subprotocol` で確認します。`WebSocketPubSub` は `async with broker.subscribe(topic) as sub`、`await sub.receive()`、`await broker.publish(topic, message)` により単一プロセス内で配信します。遅い購読者には `PubSubOverflow` が発生し、ワーカー間配信や永続化は行いません。Axum ではハンドラー前に握手が完了します。
 
 ## SSR、SSG、ISR
 
@@ -184,11 +184,11 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG と ISR のページ関数は `request` を受け取れません。公開コンテンツにのみ使用し、環境変数や外部データが共有可能か確認してください。ISR は匿名リクエストのクエリ文字列をキャッシュキーに含めません。Cookie または Authorization があるリクエストは共有 ISR キャッシュを迂回し、`private, no-store` で返します。既定のキャッシュは上限付きの**プロセス内メモリ**であり、ワーカー間で共有・無効化されません。`--cache-backend sqlite` で起動するか `create_app(..., cache_backend="sqlite", cache_path=...)` で作成すると、すべてのワーカーが 1 つの SQLite ファイル（WAL）を共有します。stale の再生成は有効期限と所有者トークンを持つ lease によりキーごとに 1 ワーカーだけが行い、保存時にバージョンと有効な lease 所有権を原子的に検証します。共有ストアに障害があればワーカーごとのローカルキャッシュに切り替えます。各ワーカーは共有ファイルの前にプロセス内キャッシュを置くため、他ワーカーの無効化は共有エントリには即座に反映されますが、ローカルコピーは残りの TTL だけ残ることがあります。`Set-Cookie` や `Cache-Control: private/no-store` の応答は共有キャッシュに保存しません。Redis アダプターは将来の課題であり未実装です。SSG の内容を更新するには再ビルドが必要です。
+SSG と ISR は `request` を受け取れず、公開コンテンツに使用します。ISR は通常クエリを無視します。`@page(render="isr", revalidate=30, query_keys=("lang",))` と `query` 引数を使用すると、許可したキーと文字列のリストだけが渡され、値ごとにキャッシュされます。パスの無効化は全クエリ変種に適用されます。Cookie または Authorization 付きの要求は共有キャッシュを迂回し `private, no-store` を返します。既定のキャッシュはプロセス内で、SQLite またはオプションの Redis（`pynext-framework[redis]` と `PYNEXT_REDIS_URL`）を共有できます。共有ストア障害時は古いローカルキャッシュにフォールバックする場合があります。`Set-Cookie` と private/no-store の応答はキャッシュしません。SSG の非同期ジェネレーターはビルド時に消費され静的ファイルとして配信されます。
 
 SSG ビルドの上限は 10,000 ページで、開発モードでは SSG をリクエストごとにレンダリングします。ISR ページは `generate_static_params()` をエクスポートできず、同時生成はプロセスごとに最大 128 件です。
 
-認可済み API ハンドラーでは `await request.revalidate("/news/example")`、アプリを保持するコードでは `await app.revalidate(path)` を使えます。クエリ文字列を含まないデコード済み ISR パスを渡します。キャッシュまたは進行中の生成を無効化した場合は `True` です。既存リクエストは古い生成結果を受け取ることがありますが、その結果はキャッシュを再上書きしません。メモリバックエンドでは無効化はプロセス内のみで、他のワーカーには伝播しません。SQLite バックエンドでは共有エントリも削除されますが、他ワーカーのプロセス内コピーは残りの TTL だけ残ることがあります。公開するエンドポイントでは認証・認可が必要です。
+認可済み API ハンドラーでは `await request.revalidate("/news/example")`、アプリを保持するコードでは `await app.revalidate(path)` を使えます。クエリ文字列を含まないデコード済み ISR パスを渡します。キャッシュまたは進行中の生成を無効化した場合は `True` です。既存リクエストは古い生成結果を受け取ることがありますが、その結果はキャッシュを再上書きしません。メモリバックエンドでは無効化はプロセス内のみで、他のワーカーには伝播しません。SQLite バックエンドでは共有エントリも削除され、正常な共有ストアを使う他ワーカーの次の参照に反映されます。公開するエンドポイントでは認証・認可が必要です。
 
 ## 公開ファイルと islands
 
@@ -213,13 +213,15 @@ def Page():
 
 サーバー DOM を再利用するには、サーバーの fallback と `hydrate=True` を指定し、モジュールから `render`、`hydrate`、`mount` をエクスポートします。[hydrated-counter.ts](../../examples/basic/islands/hydrated-counter.ts) を参照してください。ツリーが一致しない場合はその island を再 mount するため、入力状態やフォーカスが失われる場合があります。
 
+`model_prop` を `pynext` からインポートし、`island("shared-model", props={"name": "Ada"}, hydrate=True, model=h("button", {"type": "button"}, "Hello ", model_prop("name")))` とすると、サーバーとブラウザーが同じモデルから初期 DOM を作ります。element・text・fragment、文字列 props、静的な文字列・真偽値・None 属性に対応し、16 KiB・512 ノード・深さ 32 が上限です。JS モジュールはイベント接続と不一致時の復旧に `hydrate`・`mount`・`render` をエクスポートします。動的属性・反復・クライアント状態の計算は対象外です。[サーバー例](../../examples/basic/app/shared-model/page.py)と[クライアント例](../../examples/basic/islands/shared-model.js)を参照してください。
+
 有効化の既定値は `load` です。`visible` は画面内に入った時、`idle` はアイドルコールバックを要求して有効化します。アイドルコールバックには 2 秒の timeout を要求しますが、実行が遅れる場合があります。対応 API がない場合は idle またはタイマーに切り替わります。この 3 戦略は有効化前のイベントを再生しません。
 
 `hydrate=True, strategy="interaction"` は、ユーザーが `<button type="button">` をクリックすると有効化します。[サンプルページ](../../examples/basic/app/interaction/page.py)と[モジュール](../../examples/basic/islands/interaction-counter.js)を参照してください。ローダーがその island にリスナーを登録した後の対応クリックは最大 16 件を保持し、hydration 成功後に順番に再生します。超過分は警告して破棄します。リンク、フォーム送信、入力、label、編集領域は捕捉・再生しません。リスナー登録前のイベントも捕捉できません。DOM の不一致、要素の削除、有効化の失敗時には待機イベントを破棄します。再生イベントは `isTrusted=false` の合成イベントで、ブラウザーのユーザー操作が必要な動作を保証しません。island 外のキャプチャリスナーは元と再生の両方を観測する場合があります。
 
 ## クライアント側ナビゲーション
 
-クライアントランタイムを読み込むページ（island のあるページ）では、同一オリジンのリンククリック時にフルリロードせずに遷移します。ランタイムが対象ドキュメントを取得してページ本体を差し替え、`pushState` で履歴を更新し、戻る・進むボタンも同じように動作します。リンクはホバー、キーボードフォーカス、ビューポートへの表示時にプリフェッチされます（最大 20 ページ、各 1 MiB）。200 以外の応答、HTML 以外の応答、取得エラーなど、どのような失敗でも通常のドキュメント遷移にフォールバックするため、ページが壊れることはありません。`target="_blank"` や `download` 付きのリンク、別オリジンのリンク、同一ページ内のハッシュリンクは通常のブラウザー動作のままで、JavaScript が無効の場合も同様です。`window.__pynextNav` にデバッグ用の `navigate`・`prefetch`・`isPrefetched` があります。island のないページはランタイムを読み込まないため、部分ナビゲーションは動作しません。
+すべてのページでクライアントランタイムを読み込みます。同一オリジンのリンクはメタデータと CSP が互換なら部分遷移し、それ以外は通常の遷移にフォールバックします。プリフェッチは同時 4 件、応答あたり 1 MiB までで、明示的に公開され有効な応答のみ最大 60 秒・20 件保存します。`Vary: Cookie` または `Authorization` を含む応答は保存しません。
 
 ## Python クライアント DSL（実験的）
 
@@ -235,7 +237,7 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 ビルド済みアプリは `create_app(project_path, production=True)` で作成します。ASGI のタイムアウトは使用するサーバーが管理します。Axum アダプターは Python の応答を最大 30 秒待ち、キャンセルを要求して 504 を返します。既にスレッド上で動作中の同期関数は 504 の後も実行を続け、書き込みなどを行う場合があります。書き込みの冪等性と、DB・外部サービス固有のタイムアウトを設定してください。プロセス分離は `--workers`（下記）で提供され、単一プロセスでは利用できません。ISR のキャンセルにも同じ制限があります。
 
-ワーカー間の即時無効化伝播、分散レート制限、本番環境向けの安全性強化は未実装です。OpenTelemetry スパンは、任意パッケージをインストールし、トレーシングを有効化した場合に生成されます（可観測性を参照）。ASGI 適合性は `tests/test_asgi_conformance.py` で検証します（HTTP イベント順序、チャンク分割された本体、切断、失敗パスを含む lifespan）。計画と完了基準は[プロダクションロードマップ](../PRODUCTION_ROADMAP.md)を参照してください。
+分散レート制限と本番環境向けの安全性強化は未実装です。SQLite の無効化は共有ストアが正常な間、次の参照に反映されます。OpenTelemetry スパンは、任意パッケージをインストールし、トレーシングを有効化した場合に生成されます（可観測性を参照）。ASGI 適合性は `tests/test_asgi_conformance.py` で検証します（HTTP イベント順序、チャンク分割された本体、切断、失敗パスを含む lifespan）。計画と完了基準は[プロダクションロードマップ](../PRODUCTION_ROADMAP.md)を参照してください。
 
 両アダプターのリクエスト本文は最大 1 MiB で、超過時は 413 です。Axum の既定値は本文受信 16 件、受信期限 10 秒（408）、Python 実行 64 件で、待機列は実行枠数と 64 の小さい方に制限され、満杯なら 503 です。実行数と本文設定は CLI で変更できます。HTTP/1.1 ヘッダー受信期限は 10 秒ですが、接続総数は制限しません。外部 ASGI サーバーの期限はそのサーバーで管理します。ルート以外の末尾 `/` は 308 でリダイレクトします。ビルド済み island は各 2 MiB、合計 32 MiB が上限です。
 
@@ -257,7 +259,7 @@ CLI フラグ `--structured-logs` / `--no-structured-logs`、`--metrics` / `--no
 
 転送チェーンは右から信頼済みプロキシをたどり、最も近い非信頼アドレスを使います。中間プロキシをすべて正確に登録してください。バケットはプロセスあたり最大 10,000 個で、すべて使用中なら完全に補充されるまで新しいアドレスに 429 を返します。
 
-複数ワーカー: `pynext start --workers 4` は 1 つのポートを共有する 4 つのワーカープロセスを起動するスーパーバイザーを実行します（SO_REUSEPORT、Unix 専用、固定の `--port` が必要）。スーパーバイザーは終了したワーカーやハートビートが止まったワーカーを再起動し、SIGINT/SIGTERM を全ワーカーに転送して正常終了させます（最大 5 秒、その後 SIGKILL）。各ワーカーは独立したプロセスで、インタープリター、イベントループ、ISR キャッシュ、レート制限バケットをそれぞれ持ち、状態は共有しません。ワーカーがリクエスト処理中に死ぬとそのリクエストは失敗し、クライアントが再試行する必要があります。既定はワーカー 1 個で、従来の単一プロセスと同一です。イベントループを塞ぐハンドラーはハートビートスレッドを止めないため、詰まったハンドラーは再起動ではなく 30 秒のリクエストタイムアウトで処理されます。
+複数ワーカー: `pynext start --workers 4` は一つのリスナーを共有するスーパーバイザーを起動します。`--port 0` の場合、割り当てたポートをワーカー再起動後も維持します。各ワーカーの実行環境とメモリキャッシュ、既定のレート制限は独立しています。SQLite・Redis ISR と Redis レート制限は共有できます。ワーカーは障害時に再起動し、処理中に中断した要求は再試行が必要です。Linux では実行を検証済みで、macOS・Windows では CI 確認が必要です。
 
 ## テストとトラブルシューティング
 
@@ -266,7 +268,7 @@ cargo test -p pynext-router -p pynext-cache
 uv run --extra dev pytest -q
 ~~~
 
-ルーターと HTML シリアライザには、個別の事例に加えて property-based テストもあります。Python 側は hypothesis（`tests/test_property_router_render.py`、固定シード・40 例で CI を高速に維持）、Rust 側は proptest（`crates/pynext-router` と `crates/pynext-native` の単体テスト、各 64 ケース）で、ルート照合の往復、エスケープ漏れなし、void タグ処理、任意のツリー描画を検査します。`embed` は void 一覧にありますがブロック対象タグでもあるため描画できず、対象外です。
+ルーターと HTML シリアライザには、個別の事例に加えて property-based テストもあります。Python 側は hypothesis（`tests/test_property_router_render.py`、固定シード・40 例で CI を高速に維持）、Rust 側は proptest（`crates/pynext-router` と `crates/pynext-native` の単体テスト、各 64 ケース）で、ルート照合の往復、エスケープ漏れなし、void タグ処理、任意のツリー描画を検査します。`embed` はブロック対象タグのため描画できず、対象外です。
 
 ASGI 適合性は `tests/test_asgi_conformance.py` で検証します。HTTP イベント順序、複数チャンクの本体と 1 MiB のサイズ境界、読み取り中・低速ハンドラ実行中の切断、失敗時の `lifespan.startup.failed` / `lifespan.shutdown.failed` を含む lifespan の開始・終了、ストリーミング応答のフレーム順序を扱います。lifespan 失敗時に `.failed` メッセージを送るのは、このスイートとあわせて修正した動作です。
 
@@ -284,4 +286,4 @@ uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 - Windows では npm の esbuild を Node 経由で実行します。`PYNEXT_ESBUILD` を直接設定する場合は、`.cmd`・`.bat` ではなくネイティブの `esbuild.exe` を指定してください。
 - 動的 SSG パスが 404 の場合、`generate_static_params()` に追加して再ビルドします。
 - Hydration が一致しない場合は、サーバー fallback とクライアント `render` の結果を決定的に一致させてください。
-- ワーカーごとに ISR の結果が異なる場合は、キャッシュバックエンドを確認してください。メモリバックエンドはプロセス単位であり、SQLite バックエンドでも各ワーカーのプロセス内コピーは共有無効化後も TTL が終わるまで残ることがあります。
+- ワーカーごとに ISR の結果が異なる場合は、キャッシュバックエンドを確認してください。メモリバックエンドはプロセス単位であり、SQLite バックエンドは共有ストアの障害時にプロセス内コピーへフォールバックします。

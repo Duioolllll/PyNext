@@ -6,7 +6,7 @@ ASGITransport, not comparable with the HTTP modes), and ``starlette`` (the
 same-feature Starlette reference app in benchmarks/starlette_app.py under
 Uvicorn, loopback HTTP). ``--compare`` runs the three loopback-HTTP groups
 (axum, uvicorn, starlette) with identical settings and prints one combined
-result. All groups share one process with the load generator, so this is a
+result. Comparison groups use separate server processes; this remains a
 smoke comparison for regressions, not a production throughput claim; record
 the environment (see docs/BENCHMARKING.md) alongside any numbers quoted.
 """
@@ -20,6 +20,7 @@ import os
 import platform
 import socket
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -260,9 +261,62 @@ async def run_compare(count, concurrency, path, production, *, warmup=10):
     The in-process ``asgi`` mode is deliberately excluded: it skips the
     network, so its numbers are not comparable with loopback HTTP.
     """
+    import psutil
+
     groups = []
     for mode in COMPARE_MODES:
-        groups.append(await run(mode, count, concurrency, path, production, warmup=warmup))
+        command = [sys.executable, str(Path(__file__).with_name("server_process.py")), "--mode", mode]
+        if production:
+            command.append("--production")
+        process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE,
+                                                       stderr=subprocess.DEVNULL)
+        sampler = None
+        try:
+            line = await asyncio.wait_for(process.stdout.readline(), 20)
+            if not line.startswith(b"PYNEXT_BENCH_READY "):
+                raise RuntimeError(f"{mode} benchmark server did not start")
+            address = line.decode("ascii").strip().split(" ", 1)[1]
+            server_process = psutil.Process(process.pid)
+            samples = []
+            stop = asyncio.Event()
+
+            async def sample_rss():
+                while not stop.is_set():
+                    try:
+                        samples.append(server_process.memory_info().rss)
+                    except psutil.Error:
+                        return
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=0.01)
+                    except TimeoutError:
+                        pass
+
+            sampler = asyncio.create_task(sample_rss())
+            try:
+                async with httpx.AsyncClient(base_url=f"http://{address}", timeout=30, trust_env=False) as client:
+                    result = await measure(client, path, count, concurrency, warmup=warmup,
+                                           server_pid=process.pid if sys.platform == "linux" else None, external=True)
+            finally:
+                stop.set()
+                await sampler
+            groups.append({"mode": mode, "transport": "loopback_http", "path": path,
+                           "production": None if mode == "starlette" else production,
+                           "framework": "starlette" if mode == "starlette" else "pynext",
+                           "python": platform.python_version(), "platform": platform.platform(), **result,
+                           "process_peak_rss_bytes": max(samples) if samples else None,
+                           "process_peak_rss_scope": "server_sampled_10ms",
+                           "server_pid": process.pid})
+        finally:
+            if sampler is not None and not sampler.done():
+                sampler.cancel()
+                await asyncio.gather(sampler, return_exceptions=True)
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), 5)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
     return {
         "comparison": "pynext-vs-starlette",
         "conditions": {
@@ -271,7 +325,7 @@ async def run_compare(count, concurrency, path, production, *, warmup=10):
             "concurrency": concurrency,
             "warmup": warmup,
             "production": production,
-            "transport": "loopback_http (same process as load generator)",
+            "transport": "loopback_http (separate server processes)",
             "python": platform.python_version(),
             "platform": platform.platform(),
             "uvicorn": importlib.metadata.version("uvicorn"),

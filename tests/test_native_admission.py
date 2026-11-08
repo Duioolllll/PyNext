@@ -1,3 +1,4 @@
+from conftest import page_html
 import asyncio
 
 import httpx
@@ -5,6 +6,49 @@ import httpx
 from pynext import create_app
 from pynext.build import write_manifest
 from pynext.server import start_native
+
+
+def test_shutdown_closes_idle_keepalive_after_inflight_request_finishes(tmp_path):
+    for name in ("quick", "slow"):
+        directory = tmp_path / "app" / name
+        directory.mkdir(parents=True)
+        (directory / "route.py").write_text(
+            'from pynext import Response, route\n@route("GET")\n'
+            'async def get(): return Response("ok")\n', encoding="utf-8")
+
+    async def run():
+        from pynext import Response
+        app = create_app(tmp_path)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def slow():
+            entered.set()
+            await release.wait()
+            return Response("finished")
+
+        app.entries["/slow"]["GET"] = slow
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        first = httpx.AsyncClient(base_url=f"http://{server.address}")
+        second = httpx.AsyncClient(base_url=f"http://{server.address}")
+        stop = None
+        try:
+            assert (await first.get("/quick")).text == "ok"  # Keep this connection idle and open.
+            request = asyncio.create_task(second.get("/slow"))
+            await asyncio.wait_for(entered.wait(), 5)
+            stop = asyncio.create_task(asyncio.to_thread(server.stop))
+            await asyncio.sleep(0.1)
+            assert not stop.done()
+            release.set()
+            assert (await asyncio.wait_for(request, 5)).text == "finished"
+            await asyncio.wait_for(stop, 5)
+        finally:
+            release.set()
+            await first.aclose()
+            await second.aclose()
+            if stop is None:
+                await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())
 
 
 def test_slow_request_bodies_do_not_hold_execution_or_static_capacity(tmp_path):
@@ -271,7 +315,7 @@ def test_static_pages_carry_cache_control(tmp_path):
         try:
             async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=10) as client:
                 response = await client.get("/")
-                assert response.status_code == 200 and response.text == "<p>built</p>"
+                assert response.status_code == 200 and response.text == page_html("<p>built</p>")
                 assert response.headers["cache-control"] == "public, max-age=0, must-revalidate"
         finally:
             await asyncio.to_thread(server.stop)

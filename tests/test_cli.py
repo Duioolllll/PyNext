@@ -86,3 +86,21 @@ def test_cli_builds_and_starts_with_requested_settings(tmp_path, monkeypatch, ca
     cli.main()
     assert seen[-2:] == [("app", root, True, "sqlite", str(root / "cache.sqlite3")),
                          ("serve", app, "localhost", 0, 64, 1000, 16, 10000)]
+
+
+def test_cli_security_flags_reach_app(tmp_path, monkeypatch):
+    seen = {}
+    def create_app(path, production=False, **kwargs):
+        seen.update(kwargs)
+        return object()
+    async def serve(*args, **kwargs):
+        pass
+    monkeypatch.setattr(cli, "create_app", create_app)
+    monkeypatch.setattr(cli, "serve", serve)
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path), "--csrf",
+                                      "--csrf-cookie-secure", "--cors-origin", "https://example.com",
+                                      "--cors-credentials", "--csp-nonce"])
+    cli.main()
+    security = seen["security"]
+    assert security.csrf_enabled and security.csrf_cookie_secure and security.csp_nonce_enabled
+    assert security.cors_allowed_origins == ("https://example.com",) and security.cors_allow_credentials

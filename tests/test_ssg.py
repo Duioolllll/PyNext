@@ -1,3 +1,4 @@
+from conftest import page_html
 import asyncio
 import json
 
@@ -32,18 +33,18 @@ def make_app(root):
 
 async def check_static_responses(client):
     response = await client.get("/", headers={"authorization": "Bearer example", "cookie": "session=example"})
-    assert response.status_code == 200 and response.text == "<p>built</p>"
+    assert response.status_code == 200 and response.text == page_html("<p>built</p>")
     assert response.headers["vary"] == "Cookie, Authorization"
     assert response.headers["content-security-policy"] == "script-src 'self'; object-src 'none'"
-    assert (await client.get("/blog/hello?query=ignored")).text == "<p>hello</p>"
-    assert (await client.get("/blog/%ED%95%9C%EA%B8%80")).text == "<p>한글</p>"
-    assert (await client.get("/docs/a/b")).text == "<p>a/b</p>"
+    assert (await client.get("/blog/hello?query=ignored")).text == page_html("<p>hello</p>")
+    assert (await client.get("/blog/%ED%95%9C%EA%B8%80")).text == page_html("<p>한글</p>")
+    assert (await client.get("/docs/a/b")).text == page_html("<p>a/b</p>")
     assert (await client.get("/blog/not-generated")).status_code == 404
     assert (await client.get("/docs")).status_code == 404
     assert (await client.get("/blog/a%2Fb")).status_code == 400
     head = await client.head("/")
     assert head.status_code == 200 and head.content == b""
-    assert int(head.headers["content-length"]) == len(b"<p>built</p>")
+    assert int(head.headers["content-length"]) == len(page_html("<p>built</p>").encode())
     assert (await client.post("/")).status_code == 405
     assert (await client.options("/")).status_code == 204
     assert (await client.post("/", content=b"x" * 1_048_577)).status_code == 413
@@ -73,9 +74,9 @@ def test_ssg_in_asgi_and_axum_and_python_bypass(tmp_path):
                 async def fail_dispatch(request):
                     raise AssertionError("native static hit crossed the Python boundary")
                 app.dispatch = fail_dispatch
-                assert (await client.get("/blog/hello")).text == "<p>hello</p>"
+                assert (await client.get("/blog/hello")).text == page_html("<p>hello</p>")
                 head = await client.head("/docs/a/b")
-                assert head.status_code == 200 and int(head.headers["content-length"]) == len(b"<p>a/b</p>")
+                assert head.status_code == 200 and int(head.headers["content-length"]) == len(page_html("<p>a/b</p>").encode())
                 assert (await client.get("/blog/missing")).status_code == 500
         finally:
             await asyncio.to_thread(server.stop)
@@ -102,6 +103,29 @@ def test_ssg_artifacts_integrity_and_failed_build_is_atomic(tmp_path):
     (tmp_path / ".pynext" / "static" / (digest + ".html")).write_text("corrupted")
     with pytest.raises(ValueError, match="integrity check"):
         create_app(tmp_path, production=True)
+
+
+def test_streamed_ssg_is_rendered_at_build_and_served_as_static(tmp_path):
+    app_dir = make_app(tmp_path)
+    (app_dir / "page.py").write_text(
+        'from pynext import page, h\n'
+        '@page(render="ssg")\n'
+        'async def Page():\n'
+        '    yield h("p", {}, "first")\n'
+        '    yield h("p", {}, "second")\n', encoding="utf-8")
+    manifest = write_manifest(tmp_path)
+    digest = manifest["static_pages"]["/"]["sha256"]
+    artifact = (tmp_path / ".pynext" / "static" / f"{digest}.html").read_bytes()
+    assert b"<p>first</p><p>second</p>" in artifact
+
+    async def run():
+        app = create_app(tmp_path, production=True)
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                assert (await client.get("/")).content == artifact
+        finally:
+            await app.isr.close()
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("generated", [

@@ -1,9 +1,7 @@
 """Per-process token-bucket rate limiting (spec v0.2 §11, finding #49).
 
-Each process owns its own buckets: a key that is quiet in one worker can
-still be limited in another, and limits do not survive a restart. That is
-the documented scope — distributed rate limiting (a shared bucket across
-workers or instances) is not implemented.
+The default buckets are process-local. RedisRateLimiter provides optional
+shared buckets across workers or instances.
 
 Keys are client IPs by default. An IP key is only as trustworthy as the
 network in front of the server: a client behind an untrusted proxy can
@@ -12,10 +10,8 @@ the direct peer is listed in ``trusted_proxies`` (spec §11: only trusted
 proxies may have their forwarded headers interpreted). With no trusted
 proxies configured, ``X-Forwarded-For`` is ignored entirely.
 
-Static files and fresh ISR pages are served by the Rust layer before the
-Python bridge runs, so they are not rate-limited; the limiter applies to
-requests that reach a Python handler (pages and API routes) on either
-adapter. On the Axum adapter the body has already been read by the time
+When a limiter is configured, static files and fresh ISR pages also pass
+through the Python bridge. On the Axum adapter the body has already been read by the time
 the bridge runs, so rate limiting happens at dispatch time there, after
 the body-intake limits; on the ASGI adapter the check runs before the
 body is read.
@@ -29,6 +25,10 @@ from collections import OrderedDict
 from .http import Response
 
 _MAX_BUCKETS = 10_000
+
+
+class RateLimitUnavailable(Exception):
+    """A shared limiter could not safely decide whether to admit a request."""
 
 
 def _parse_trusted_proxies(trusted_proxies):

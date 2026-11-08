@@ -1,3 +1,4 @@
+from conftest import page_html
 import asyncio
 import os
 from pathlib import Path
@@ -44,7 +45,7 @@ async def check_responses(client):
     if os.name != "nt":
         assert (await client.get("/what%3F.bin")).content == b"\x00\xff"
     assert (await client.get("/logo.txt")).content == b"public asset"
-    assert (await client.get("/something-else")).text == "<p>something-else</p>"
+    assert (await client.get("/something-else")).text == page_html("<p>something-else</p>")
     assert (await client.get("/styles%2Fsite.css")).status_code == 400
     assert (await client.post("/logo.txt")).status_code == 405
     assert (await client.options("/logo.txt")).status_code == 204

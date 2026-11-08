@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -166,11 +167,10 @@ def begin_request_context(headers):
         (queue_wait_var, queue_wait_var.set(None)),
         (render_ms_var, render_ms_var.set(None)),
     )
-    otel_token = None
-    if parsed is not None:
-        context = _extract_otel_context(headers)
-        if context is not None:
-            otel_token = _otel_context_var.set(context)
+    context = _extract_otel_context(headers) if parsed is not None else None
+    # Clear any inherited request context when this request has no valid
+    # parent, and restore the caller's context at the end of the request.
+    otel_token = _otel_context_var.set(context)
 
     def reset():
         for var, token in reversed(tokens):
@@ -178,11 +178,10 @@ def begin_request_context(headers):
                 var.reset(token)
             except ValueError:
                 pass
-        if otel_token is not None:
-            try:
-                _otel_context_var.reset(otel_token)
-            except ValueError:
-                pass
+        try:
+            _otel_context_var.reset(otel_token)
+        except ValueError:
+            pass
 
     return request_id, reset
 
@@ -551,11 +550,27 @@ def span(name, attributes=None, *, enabled=True):
     try:
         tracer = trace.get_tracer("pynext")
         context = _otel_context_var.get()
+        get_current = getattr(trace, "get_current_span", None)
+        if name != "pynext.request" and get_current is not None and get_current().get_span_context().is_valid:
+            context = None
         cm = tracer.start_as_current_span(name, context=context) if context is not None else tracer.start_as_current_span(name)
-        with cm as real:
-            wrapped = _Span(real)
-            for key, value in (attributes or {}).items():
-                wrapped.set_attribute(key, value)
-            yield wrapped
+        real = cm.__enter__()
     except Exception:
         yield _Span()
+        return
+    wrapped = _Span(real)
+    for key, value in (attributes or {}).items():
+        wrapped.set_attribute(key, value)
+    try:
+        yield wrapped
+    except BaseException:
+        try:
+            cm.__exit__(*sys.exc_info())
+        except Exception:
+            pass
+        raise
+    else:
+        try:
+            cm.__exit__(None, None, None)
+        except Exception:
+            pass

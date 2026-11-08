@@ -2,11 +2,11 @@
 
 [한국어](../ko/manual.md) · [日本語](../ja/manual.md) · [简体中文](../zh-CN/manual.md)
 
-This manual describes the code in this checkout, corresponding to the **v0.7.0a1** unreleased experimental candidate. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
+This manual describes the code in this checkout, corresponding to the **0.1.0** unreleased experimental candidate. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
 
 ## Requirements and first run
 
-Use CPython 3.13, a Rust toolchain with Cargo, and [uv](https://docs.astral.sh/uv/). Supported environments are verified by the CI matrix: Ubuntu, macOS, and Windows (latest), CPython 3.13 only (3.14 is unverified and not in the matrix), and the standalone Axum and Uvicorn-backed ASGI deploy modes (the in-process ASGI mode is covered by pytest in every CI job). Browser smoke runs on all three OSes. The example uses islands and additionally requires Node.js 18 or newer and npm to install esbuild 0.28.1.
+Use CPython 3.13 or 3.14, a Rust toolchain with Cargo, and [uv](https://docs.astral.sh/uv/). Supported environments are verified by the CI matrix: Ubuntu, macOS, and Windows (latest), CPython 3.13 and 3.14, and the standalone Axum and Uvicorn-backed ASGI deploy modes (the in-process ASGI mode is covered by pytest in every CI job). Browser smoke runs on all three OSes. The example uses islands and additionally requires Node.js 18 or newer and npm to install esbuild 0.28.1.
 
 ~~~bash
 git clone https://github.com/Duioolllll/PyNext.git
@@ -22,7 +22,7 @@ Open http://127.0.0.1:3000/, /about, /guides/intro, /news/example, /hydrate, /st
 
 `pynext dev --dir examples/basic` serves source without a build and reloads when `app/`, `islands/`, `public/` or `pynext.config.py` change, restarting the server on the same port. `pynext start` uses the build manifest and fails if tracked source files changed; rebuild first. For an app without islands, Node and esbuild are not required. The repository is the installation source; no PyPI publication is implied.
 
-The dev watcher hashes watched files on each poll to detect same-size edits with unchanged timestamps. Large watched directories increase disk I/O.
+The dev watcher uses native filesystem events and hashes watched files, falling back to polling if needed. JS/TS island edits rebuild and replace affected modules without reloading the document; cleanup runs first and that island’s state may reset. Other source changes restart the server and reload open pages. Broken edits retain the last working version. With `--port 0`, the assigned port is reused on restart.
 
 ## Project structure and routing
 
@@ -92,7 +92,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-Pass `security=SecurityConfig(csrf_enabled=True)` to `create_app` to protect every state-changing API route instead of marking handlers one by one. The token is not bound to a user session, because there is no session yet: it proves the request came from a page that could read the cookie. A page that can read the cookie through XSS can bypass it, as with any double-submit scheme. The cookie defaults to `SameSite=Lax` without `HttpOnly` (JavaScript must read it); set `csrf_cookie_secure=True` in production so it is only sent over HTTPS.
+Pass `security=SecurityConfig(csrf_enabled=True)` to `create_app` to protect every state-changing API route instead of marking handlers one by one. With SessionMiddleware, the token is bound to the server-side session; without it, the double-submit token proves the request came from a page that could read the cookie. A page that can read the cookie through XSS can bypass it, as with any double-submit scheme. The cookie defaults to `SameSite=Lax` without `HttpOnly` (JavaScript must read it); set `csrf_cookie_secure=True` in production so it is only sent over HTTPS.
 
 Cross-origin requests are denied by default (spec v0.2 §11): no `Access-Control-Allow-Origin` header is sent unless the origin is configured. Pass the policy to `create_app` with `SecurityConfig`:
 
@@ -120,7 +120,7 @@ Return `StreamingResponse` from an API handler with an asynchronous iterable of 
 
 ## Streaming SSR
 
-A page function may return an asynchronous iterable of UI nodes instead of a single tree. The layout shell is sent first, each chunk is serialized by Rust and sent as it is produced, and the layout suffix closes the document. Buffered rendering stays the default. Streaming is SSR-only: SSG and ISR pages need a complete body, so a streaming SSG or ISR page fails. Layouts must render their children exactly once. A disconnect closes the generator; an error after headers ends the stream instead of changing its status. See the [example page](../../examples/basic/app/stream/page.py), served at `/stream`.
+A page function may return an asynchronous iterable of UI nodes. SSR sends the layout shell and each serialized chunk as they are produced. SSG consumes the chunks during the build and serves the resulting static file. For a public ISR miss, the first request streams and concurrent requests wait for the completed result; stale content is served immediately. Only a complete result is cached. SSG and ISR streams are limited to 8 MiB and 30 seconds; the ISR cache stores bodies up to 2 MiB. An ISR generation can continue after its initiating client disconnects. Layouts must render children exactly once; errors after headers terminate the stream. See the [example page](../../examples/basic/app/stream/page.py).
 
 ~~~python
 from pynext import h, page
@@ -164,7 +164,7 @@ async def echo(websocket: WebSocket):
         pass
 ~~~
 
-See the [echo example](../../examples/basic/app/ws/echo/route.py). A route with no WebSocket handler refuses the handshake with close code 1008; a handler that returns without accepting is closed with code 1000. One message is limited to 64 KiB; larger messages are refused with close code 1009. Close codes must be 1000–4999 except the reserved 1005, 1006 and 1015, and the reason is limited to 123 UTF-8 bytes. There is no subprotocol negotiation, no broadcast or pub/sub, and no shared state between connections: each connection only hears its own messages. A WebSocket-only `route.py` answers plain HTTP requests with 405. Both the ASGI adapter and the Axum standalone server support WebSocket; the Axum handshake is completed by the server before the handler runs, so `accept()` there only marks the connection accepted.
+See the [echo example](../../examples/basic/app/ws/echo/route.py). Both ASGI and Axum support text and binary messages. Messages default to 64 KiB; set `create_app(..., websocket_max_message=...)` or `--ws-max-message-bytes` (up to 16 MiB). Oversized incoming messages close with code 1009. `@websocket(protocols=("chat.v1", "chat.v2"))` chooses the first server-preferred protocol offered by the client; inspect `websocket.subprotocol`. `WebSocketPubSub` provides bounded, process-local fan-out with `async with broker.subscribe(topic) as sub`, `await sub.receive()` and `await broker.publish(topic, message)`. Slow subscribers raise `PubSubOverflow`; messages are not shared across workers or persisted. Axum completes the handshake before the handler, so `accept()` there marks it accepted.
 
 ## SSR, SSG and ISR
 
@@ -184,11 +184,11 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG and ISR page functions cannot accept `request`. Use them only for public content: ensure environment variables and external data are safe to share. ISR ignores anonymous query strings in its cache key. Requests with a Cookie or Authorization header bypass the shared ISR cache and receive `private, no-store`. By default the cache is bounded and **process-local**; workers do not share or invalidate entries. Start with `--cache-backend sqlite` (or `create_app(..., cache_backend="sqlite", cache_path=...)`) to share one SQLite file (WAL) across workers: stale regeneration is single-flight per key through an expiring owner-token lease, and each shared write atomically verifies both its version and live lease ownership. If the shared backend fails, the worker falls back to its local cache. Each worker still keeps a process-local cache in front of the shared file, so another worker's invalidation reaches the shared entry at once but a local copy can live out its remaining TTL. Responses with `Set-Cookie` or `Cache-Control: private`/`no-store` are never stored in the shared cache. A Redis adapter is a future option, not implemented. Rebuild SSG pages to update them.
+SSG and ISR pages cannot accept `request` and must contain public content. ISR ignores query strings by default. To vary a page by selected keys, declare `@page(render="isr", revalidate=30, query_keys=("lang",))` and accept a `query` parameter; only listed keys and their string lists are passed to the page and included in the cache key. Revalidating a path invalidates all its query variants. Cookie or Authorization requests bypass the shared cache and return `private, no-store`. The default cache is process-local; SQLite and optional Redis (`pynext-framework[redis]`, `PYNEXT_REDIS_URL`) share entries across workers. Shared lookups consult the backend, leases and fencing protect writes, and backend failure falls back to a possibly stale local cache. `Set-Cookie` and private/no-store responses are not cached. SSG async generators are consumed during the build and served as static files. Rebuild SSG pages to update them.
 
 A build produces at most 10,000 SSG pages. Development mode renders SSG pages for each request. ISR pages cannot export `generate_static_params()` and permit at most 128 concurrent generation tasks per process.
 
-An authorized API handler can call `await request.revalidate("/news/example")`; code holding an app instance can call `await app.revalidate(path)`. Pass a decoded ISR path without a query string. The result is `True` if a cached entry or in-flight generation was invalidated. Existing requests may still receive an older in-flight result, but that result cannot repopulate the cache. With the memory backend, invalidation is process-local and is not sent to other workers; with the SQLite backend it removes the shared entry too, but other workers' process-local copies can live out their remaining TTL. Authenticate and authorize any endpoint that exposes it.
+An authorized API handler can call `await request.revalidate("/news/example")`; code holding an app instance can call `await app.revalidate(path)`. Pass a decoded ISR path without a query string. The result is `True` if a cached entry or in-flight generation was invalidated. Existing requests may still receive an older in-flight result, but that result cannot repopulate the cache. With the memory backend, invalidation is process-local and is not sent to other workers; with the SQLite backend it removes the shared entry and other workers observe that on their next lookup while the store is available. Authenticate and authorize any endpoint that exposes it.
 
 ## Public files and islands
 
@@ -213,13 +213,15 @@ The matching `islands/counter.ts` exports `mount(element, props)` and may return
 
 Use `hydrate=True` with server-rendered fallback and a module exporting `render`, `hydrate` and `mount` to reuse matching DOM. See [hydrated-counter.ts](../../examples/basic/islands/hydrated-counter.ts). If the trees differ, the island is mounted again and input state or focus can be lost.
 
+A shared model can also supply both server and browser output: `island("shared-model", props={"name": "Ada"}, hydrate=True, model=h("button", {"type": "button"}, "Hello ", model_prop("name")))`. Import `model_prop` from `pynext`. The versioned model supports element, text and fragment nodes, string-valued prop placeholders, and static string/boolean/None attributes; it is limited to 16 KiB, 512 nodes and depth 32. The JS module exports `hydrate`, `mount` and `render`; it attaches events and provides mismatch recovery. Dynamic attributes, loops and client state calculations are outside this model. See the [server example](../../examples/basic/app/shared-model/page.py) and [client module](../../examples/basic/islands/shared-model.js).
+
 The default activation strategy is `load`. `visible` activates when the island enters the viewport; `idle` requests an idle callback with a 2-second timeout. Unsupported observer/idle APIs fall back to idle/timer scheduling. An idle callback can run later than requested. These three strategies do not replay earlier events.
 
 With `hydrate=True, strategy="interaction"`, a user click on a `<button type="button">` activates the island. See the [example page](../../examples/basic/app/interaction/page.py) and [module](../../examples/basic/islands/interaction-counter.js). After the loader registers the island's listener, up to 16 supported clicks are queued and replayed in order when hydration succeeds; extra clicks are dropped with a warning. Links, form submissions, input, labels and editable regions are not intercepted or replayed. Events before listener registration are not captured. Pending clicks are discarded on a DOM mismatch, removal or activation failure. Replayed events are synthetic with `isTrusted=false` and do not guarantee operations requiring browser user activation; capture listeners outside the island may observe both the original and replayed events.
 
 ## Client-side navigation
 
-On pages that load the client runtime (pages with islands), same-origin link clicks navigate without a full reload: the runtime fetches the target document, swaps the page body, and updates history with `pushState`; the browser back/forward buttons work the same way. Links are prefetched on hover, keyboard focus, and when they enter the viewport (at most 20 prefetched pages, 1 MiB each). Any failure — a non-200 response, a non-HTML response, or a fetch error — falls back to a full document navigation, so the page never breaks. Links with `target="_blank"` or `download`, cross-origin links, and same-page hash links keep their normal browser behaviour, as does every page when JavaScript is disabled. `window.__pynextNav` exposes `navigate`, `prefetch`, and `isPrefetched` for debugging. Pages without islands do not load the runtime, so partial navigation is not active there.
+All pages load the client runtime. Same-origin links use partial navigation when document metadata and CSP are compatible; otherwise they fall back to a full load. Hover, focus and viewport prefetch use at most four concurrent requests and a 1 MiB response limit. Only explicitly public fresh responses without `Vary: Cookie` or `Authorization` are retained, for at most 60 seconds and 20 entries. Cross-origin, download and same-page hash links retain normal browser behavior. `window.__pynextNav` exposes `navigate`, `prefetch` and `isPrefetched` for debugging.
 
 ## Python client DSL (experimental)
 
@@ -235,7 +237,7 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 For a built app, create the ASGI app with `create_app(project_path, production=True)`. ASGI server timeout settings are managed by that server. The Axum adapter waits up to 30 seconds for Python and requests cancellation before returning 504. A synchronous function already running in a thread can continue after the 504, including writes. Use idempotent writes and explicit database/upstream timeouts; process isolation is available with `--workers` (below) — a single process still provides none. ISR cancellation has the same limitation.
 
-Instant cross-worker invalidation, distributed rate limiting and production hardening are not implemented. OpenTelemetry spans are emitted when the optional packages are installed and tracing is enabled (see Observability). ASGI conformance is verified by `tests/test_asgi_conformance.py` (HTTP event order, chunked bodies, disconnects, lifespan including failure paths). See [production roadmap](../PRODUCTION_ROADMAP.md) for proposed work and its acceptance criteria.
+Distributed rate limiting and production hardening are not implemented. SQLite invalidation is observed on the next lookup while the shared store is available. OpenTelemetry spans are emitted when the optional packages are installed and tracing is enabled (see Observability). ASGI conformance is verified by `tests/test_asgi_conformance.py` (HTTP event order, chunked bodies, disconnects, lifespan including failure paths). See [production roadmap](../PRODUCTION_ROADMAP.md) for proposed work and its acceptance criteria.
 
 Both adapters limit request bodies to 1 MiB and return 413 when exceeded. By default Axum permits 16 simultaneous body reads with a 10-second body deadline (408), 64 Python handlers, and at most the smaller of the handler limit and 64 waiting requests; full queues return 503. The execution and body settings can be changed with the CLI. HTTP/1.1 header reads have a 10-second deadline, but total connections remain unlimited. External ASGI servers manage their own timeouts. Non-root paths ending in a slash redirect with 308. Each compiled island is limited to 2 MiB, with 32 MiB total.
 
@@ -257,7 +259,7 @@ Rate limiting is opt-in and per process: `pynext start --rate-limit 100 --rate-l
 
 The forwarded chain is walked from right to left through trusted proxies; the nearest untrusted address is used. Configure every intermediate proxy accurately. Each process keeps at most 10,000 buckets; when all are active, requests from new keys get 429 until a bucket fully refills.
 
-Multiple workers: `pynext start --workers 4` runs a supervisor that spawns four worker processes sharing one port (SO_REUSEPORT, Unix only; a fixed `--port` is required). The supervisor restarts workers that exit or whose heartbeat goes stale, and forwards SIGINT/SIGTERM to every worker for a graceful shutdown (up to 5 seconds, then SIGKILL). Each worker is a separate process with its own interpreter, event loop, ISR cache and rate-limit buckets; state is not shared between workers. If a worker dies mid-request, that request fails and the client must retry — only the server survives, not the in-flight request. The default is one worker, which is exactly the previous single-process behaviour. A handler that blocks the event loop does not stop the worker's heartbeat thread, so a stuck handler is bounded by the 30-second request timeout rather than by a restart.
+Multiple workers: `pynext start --workers 4` runs a supervisor whose worker processes share one listener. With `--port 0`, the assigned port remains stable across worker restarts. Workers have independent interpreters and event loops; memory caches and rate limits are per worker, while SQLite/Redis ISR and Redis rate limiting can be shared. The supervisor restarts failed workers and coordinates shutdown. An interrupted in-flight request fails and must be retried. Linux execution is tested; macOS and Windows runtime results require CI confirmation.
 
 ## Tests and troubleshooting
 
@@ -279,8 +281,8 @@ hand-picked examples: hypothesis on the Python side
 fast) and proptest on the Rust side (unit tests in `crates/pynext-router` and
 `crates/pynext-native`, 64 cases each), covering route-matching round-trips,
 escaping with no leaks, void-tag handling, and rendering of arbitrary trees.
-`embed` is on the renderer's void list but also on its blocked-tag list, so
-it can never render and is excluded from those tests.
+`embed` is on the blocked-tag list, so it cannot render and is excluded from
+those tests.
 
 After building the example, run the Chromium check with:
 
@@ -296,4 +298,4 @@ Run `uv run --extra dev python benchmarks/bench.py --mode axum --requests 100 --
 - On Windows, npm's esbuild wrapper runs through Node. If setting `PYNEXT_ESBUILD` directly, use the native `esbuild.exe`, not a `.cmd` or `.bat` file.
 - If an SSG dynamic path returns 404, add it to `generate_static_params()` and rebuild.
 - If hydration reports a mismatch, make server fallback and client `render` output deterministic and equivalent.
-- If an ISR page looks different across workers, check the cache backend: the memory backend is per-process, and with the SQLite backend each worker's process-local copy can still outlive a shared invalidation until its TTL ends.
+- If an ISR page looks different across workers, check the cache backend: the memory backend is per-process, and SQLite falls back to process-local copies if the shared store is unavailable.

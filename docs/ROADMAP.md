@@ -1,7 +1,15 @@
 # 구현 현황과 로드맵
 
-현재 체크아웃은 **v0.7.0a1 미출시 실험 후보**다. 파일 기반 라우터는 정적·동적·필수/선택 catch-all과 route group을 지원하며, Python 페이지·API와 Rust 렌더러, ASGI/Axum 어댑터를 연결한다. SSG, 공개 파일, 프로세스 로컬 ISR, 선택적 SQLite 공유 ISR, JS/TS island, 제한된 버튼 클릭 재생, 비동기 스트리밍 API/SSR, WebSocket, 개발 서버 파일 감시가 구현되어 있다. Axum은 일부 정적/캐시 응답에서 Python을 건너뛴다.
+현재 체크아웃은 **패키지 0.1.0 / 태그 0.1.0v 릴리스 준비 중**이다. 파일 기반 라우터는 정적·동적·필수/선택 catch-all과 route group을 지원하며, Python 페이지·API와 Rust 렌더러, ASGI/Axum 어댑터를 연결한다. SSG, 공개 파일, 프로세스 로컬 ISR, 선택적 공유 ISR, JS/TS island, 제한된 버튼 클릭 재생, 비동기 스트리밍 API/SSR, WebSocket, 개발 서버 파일 감시가 구현되어 있다. Axum은 일부 정적/캐시 응답에서 Python을 건너뛴다.
 
 지원 범위와 현재 제한, 요청·캐시·브리지의 계약, 남은 위험과 단계별 검증 기준은 [아키텍처와 개발 명세](ARCHITECTURE_SPEC.md)를 참고한다. 더 장기적인 공유 버퍼, React/RSC, 분산 캐시, 관측성, 복구력 및 standalone 후보의 수용 조건은 [프로덕션 로드맵](PRODUCTION_ROADMAP.md)에 있다.
 
 Next.js 원본을 추가로 옮길 때는 관련 원본 경로와 커밋을 기록하고 라이선스 고지를 유지한다. React Server Components 또는 React 호환성은 별도 구현과 검증 없이는 주장하지 않는다.
+
+## 후속 구현 순서
+
+- **구현됨:** 전역 HTTP 미들웨어, 제한된 multipart 업로드, 개발 오류 페이지, `pynext init`, 리소스 수명주기, SQLite 세션·세션 기반 CSRF와 인증·권한 표시자, 보안 CLI 설정. 자격 증명 검증은 앱의 책임이다.
+- **구현됨:** SQLite·Redis 공유 ISR은 정상 상태의 다음 조회에서 워커 간 무효화를 반영하고 빌드별 키와 쿼리 허용 목록을 사용한다. 저장소 장애 시에는 로컬 캐시로 대체한다. Redis 공유 요청 제한은 정적 파일을 포함하며 장애 시 503을 반환한다.
+- **부분 구현:** Linux에서는 Python 런타임과 앱을 포함한 standalone 디렉터리를 생성한다. 호환 시스템 라이브러리가 필요하며 다른 OS용 패키징은 아직 없다. Redis 단일 노드 재시작과 TCP 단절·복구를 시험했으며, 클러스터 장애 및 split-brain은 검증하지 않았다.
+- **클라이언트와 장기 단계:** element·text·fragment와 문자열 props를 사용하는 제한된 공유 island 모델 hydration과 Python 클라이언트 DSL의 버전 1 계약을 구현했다. 동적 속성·반복·상태 계산을 포함한 전체 공통 모델은 남아 있다. JS/TS island 모듈은 전체 새로고침 없이 교체하며 island 상태 보존은 보장하지 않는다. 다른 소스는 서버 재시작 후 문서를 새로고침한다. SSG 비동기 청크는 빌드 시 정적 산출물로 결합하고 ISR은 첫 요청에 청크를 전송한 뒤 완성된 결과를 캐시한다. WebSocket 서브프로토콜·크기 설정과 프로세스 내 pubsub, 클라이언트 탐색, 로컬 이미지 최적화, 네이티브 파일 감시 및 공유 리스너 기반 다중 워커를 구현했다. Python 3.14와 다중 워커 동적 포트는 Linux에서 검증했으며 Windows 네이티브 코드는 교차 컴파일 검사만 했다. macOS·Windows 실행 CI는 확인이 필요하다.
+- Django 통합 방향은 보류한다. React/RSC 호환성은 비목표다. 사용자는 0.1.0 게시를 요청했으며, 남은 작업과 배포 검증을 마쳐야 한다.

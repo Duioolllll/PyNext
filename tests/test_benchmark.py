@@ -87,6 +87,9 @@ def test_benchmark_compare_runs_all_loopback_groups():
     assert all(group["transport"] == "loopback_http" for group in result["groups"])
     assert all(group["successful_requests"] == 4 and group["errors"] == 0 for group in result["groups"])
     assert all(set(group["latency_ms"]) == {"p50", "p95", "p99"} for group in result["groups"])
+    assert len({group["server_pid"] for group in result["groups"]}) == 3
+    assert all(group["process_peak_rss_bytes"] > 0 and group["process_peak_rss_scope"] == "server_sampled_10ms"
+               for group in result["groups"])
     assert result["conditions"]["path"] == "/api/users"
 
 

@@ -19,9 +19,8 @@ with sync_playwright() as playwright:
     page.evaluate("window.__navMarker = 'still-here'")
     link = page.get_by_role("link", name="Read a post")
 
-    # Hovering prefetches the target; the click then swaps content in place.
+    # The uncached response is fetched and the click swaps content in place.
     link.hover()
-    page.wait_for_function("() => window.__pynextNav.isPrefetched('/blog/hello') === true")
     link.click()
     expect(page).to_have_url(base + "/blog/hello")
     expect(page.get_by_text("Blog post")).to_have_count(1)
@@ -47,9 +46,39 @@ with sync_playwright() as playwright:
     page.add_init_script("window.IntersectionObserver = undefined;")
     page.goto(base + "/", wait_until="networkidle")
     assert page.evaluate("window.__pynextNav.isPrefetched('/blog/hello')") is False
-    page.get_by_role("link", name="Read a post").hover()
-    page.wait_for_function("() => window.__pynextNav.isPrefetched('/blog/hello') === true")
+    with page.expect_response(lambda response: response.url == base + "/blog/hello"):
+        page.get_by_role("link", name="Read a post").hover()
+    assert page.evaluate("window.__pynextNav.isPrefetched('/blog/hello')") is False
     no_io.close()
+
+    # Pages with no islands also start the navigation runtime.
+    context = browser.new_context()
+    page = context.new_page()
+    page.goto(base + "/blog/hello", wait_until="networkidle")
+    assert page.evaluate("typeof window.__pynextNav === 'object'")
+    page.evaluate("window.__navMarker = 'still-here'")
+    page.get_by_role("link", name="Home").click()
+    expect(page.get_by_text("Hello PyNext!")).to_have_count(1)
+    assert page.evaluate("window.__navMarker") == "still-here"
+    assert page.evaluate("window.__pynextNav.navigate('https://example.com/')") is False
+    context.close()
+
+    # Prefetch only retains explicitly public, fresh, non-personal responses.
+    context = browser.new_context()
+    page = context.new_page()
+    page.add_init_script("window.IntersectionObserver = undefined;")
+    page.goto(base + "/", wait_until="networkidle")
+    page.route("**/blog/hello?cacheable=1", lambda route: route.fulfill(
+        status=200, body="<p>public</p>", headers={"content-type": "text/html", "cache-control": "public, max-age=30"}))
+    with page.expect_response(lambda response: response.url.endswith("?cacheable=1")):
+        page.evaluate("window.__pynextNav.prefetch('/blog/hello?cacheable=1')")
+    page.wait_for_function("() => window.__pynextNav.isPrefetched('/blog/hello?cacheable=1')")
+    page.route("**/blog/hello?private=1", lambda route: route.fulfill(
+        status=200, body="<p>private</p>", headers={"content-type": "text/html", "cache-control": "private, no-store"}))
+    with page.expect_response(lambda response: response.url.endswith("?private=1")):
+        page.evaluate("window.__pynextNav.prefetch('/blog/hello?private=1')")
+    assert not page.evaluate("window.__pynextNav.isPrefetched('/blog/hello?private=1')")
+    context.close()
 
     # A failed partial navigation (404) falls back to a full document load:
     # the marker is gone and the server's 404 body is shown.

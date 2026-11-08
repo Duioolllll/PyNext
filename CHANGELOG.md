@@ -4,6 +4,26 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Add Redis ISR storage with expiring leases, fenced writes and cross-worker invalidation; add Redis-backed shared rate limiting, including static and cached responses. Redis cache failures fall back locally; rate-limiter failures return 503.
+- Add an ISR query-key allowlist and generation-based invalidation across all query variants and shared-cache workers.
+- Stream the first ISR generation while caching only complete responses; allow asynchronous SSG chunks to be consumed during the build.
+- Add WebSocket subprotocol negotiation, configurable message limits, bounded native queues and bounded process-local pub/sub.
+- Share one listener across worker processes, including dynamically assigned ports retained across restarts; the Windows runtime path still requires CI validation.
+- Extend the Python client DSL with short-circuiting chained comparisons and improve collection equality, membership and Unicode string handling.
+- Add bounded shared island models for server rendering and browser hydration using the same node tree and string props.
+- Replace updated JS/TS island modules in the development browser without a full page reload; reload documents after other source changes.
+- Gracefully stop idle HTTP keep-alive connections during native server shutdown while allowing active requests to finish.
+- Add a relocatable Linux standalone deployment directory containing the interpreter, installed dependencies and built application; compatible system libraries are still required.
+- Load client navigation on pages without islands, bound prefetch concurrency and response bytes, and cache only explicitly public fresh responses; unsafe metadata changes fall back to full navigation.
+- Add optional bounded local JPEG/PNG/WebP resizing to WebP via `pynext-framework[images]`.
+- Use native file events for development reloads with polling fallback, and reuse the initially assigned port after `--port 0` reloads.
+- Extend the supported CPython range and CI matrix to Python 3.14.
+- Run each benchmark comparison server in a separate process and report its sampled peak RSS.
+- Add async global HTTP middleware on ASGI and Axum, with request state and coverage of static, SSG, ISR and preflight requests. Register project middleware in `middleware.py` or pass it to `create_app`.
+- Add bounded URL-encoded and multipart form parsing, in-memory `UploadFile`, development error pages, and a non-overwriting `pynext init` command.
+- Add application resource lifespan hooks, SQLite-backed server sessions, session-bound CSRF tokens, authentication and permission markers, and security CLI flags. Applications remain responsible for verifying credentials.
+- Validate SQLite ISR cache hits against the shared store and namespace shared entries by build, so another worker's invalidation is observed on the next lookup while the store is available. Local fallback during an outage may be stale.
+- Verify real OpenTelemetry SDK tracing and parentage on both servers, preserve handler exceptions under tracing, and improve supervisor tests on Linux containers without the procfs `children` file.
 - Fix cross-platform watcher paths and same-timestamp edits, SQLite ISR generation races and failure fallback, and exercise the correct Axum/Uvicorn browser server in CI.
 - Match dynamic WebSocket routes on the native server using the same route priority as ASGI.
 - Bound rate-limit bucket storage and select forwarded client addresses from the nearest untrusted proxy hop.

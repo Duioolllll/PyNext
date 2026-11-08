@@ -1,3 +1,4 @@
+from conftest import page_html
 import asyncio
 import hashlib
 
@@ -73,7 +74,7 @@ async def exercise(client):
     assert response.status_code == 304 and response.content == b""
 
     response = await client.get("/")
-    assert response.status_code == 200 and response.text == "<p>rendered</p>"
+    assert response.status_code == 200 and response.text == page_html("<p>rendered</p>")
     assert response.headers["cache-control"] == "public, max-age=0, must-revalidate"
     assert response.headers["vary"] == "Cookie, Authorization"
     page_etag = response.headers["etag"]

@@ -1,5 +1,6 @@
 """Dev-mode file watching: stdlib polling watcher plus `pynext dev` reload."""
 import asyncio
+import json
 import os
 import queue
 import re
@@ -91,6 +92,25 @@ def test_watcher_wait_for_change_debounces_rapid_edits(tmp_path):
     asyncio.run(run())
 
 
+def test_native_watcher_failure_falls_back_to_polling(tmp_path, monkeypatch):
+    async def broken(*args, **kwargs):
+        raise OSError("native watches unavailable")
+        yield set()
+
+    monkeypatch.setattr("pynext.watch.awatch", broken)
+
+    async def run():
+        (tmp_path / "app").mkdir()
+        page = tmp_path / "app" / "page.py"
+        page.write_text("one")
+        watcher = Watcher(tmp_path, interval=0.02, debounce=0.02)
+        task = asyncio.create_task(watcher.wait_for_change())
+        await asyncio.sleep(0.1)
+        page.write_text("two")
+        assert await asyncio.wait_for(task, 3) == ["app/page.py"]
+    asyncio.run(run())
+
+
 def _fetch(url):
     with urllib.request.urlopen(url, timeout=5) as response:
         return response.read()
@@ -114,9 +134,8 @@ def _wait_for_content(url, marker, timeout, lines=None):
 def _next_listening_address(lines, proc, seen, timeout=30):
     """Read dev-server output until the next listening line; return its address.
 
-    A restart with ``--port 0`` binds a new ephemeral port, so the address
-    must be re-read after every reload. Every line read is appended to
-    ``seen`` so the test can assert on the reload messages afterwards.
+    Every line read is appended to ``seen`` so the test can assert on the
+    reload messages afterwards.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -130,6 +149,65 @@ def _next_listening_address(lines, proc, seen, timeout=30):
         if match:
             return match.group(1)
     raise AssertionError("dev server never printed its listening address")
+
+
+def test_dev_replaces_island_bundle_without_restarting_server(tmp_path, esbuild):
+    root = tmp_path / "project"
+    (root / "app").mkdir(parents=True)
+    (root / "islands").mkdir()
+    (root / "app" / "page.py").write_text(
+        'from pynext import h, island, page\n@page()\n'
+        'def Page(): return h("main", {}, island("counter"))\n', encoding="utf-8")
+    source = root / "islands" / "counter.js"
+    source.write_text('export function mount(el) { el.textContent = "one"; }\n', encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pynext.cli", "dev", "--dir", str(root), "--port", "0"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+    )
+    lines = queue.Queue()
+    def read_output():
+        for line in proc.stdout:
+            lines.put(line)
+    threading.Thread(target=read_output, daemon=True).start()
+    try:
+        address = _next_listening_address(lines, proc, [])
+        base = f"http://{address}"
+        assert b"data-pynext-dev=" in _fetch(base + "/")
+        state = json.loads(_fetch(base + "/_pynext/dev/client"))
+        first_url = f"/_pynext/static/{state['bundles']['counter']}.js"
+        assert b"one" in _fetch(base + first_url)
+        source.write_text('export function mount(el) { el.textContent = "two"; }\n', encoding="utf-8")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            updated = json.loads(_fetch(base + "/_pynext/dev/client"))
+            if updated["bundles"]["counter"] != state["bundles"]["counter"]:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("island bundle was not updated")
+        assert updated["id"] == state["id"] and proc.poll() is None
+        assert b"two" in _fetch(base + f"/_pynext/static/{updated['bundles']['counter']}.js")
+        assert b"one" in _fetch(base + first_url)
+        source.write_text("export function mount( { broken syntax\n", encoding="utf-8")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                line = lines.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if "keeping previous island modules" in line:
+                break
+        else:
+            raise AssertionError("invalid island edit was not reported")
+        assert json.loads(_fetch(base + "/_pynext/dev/client")) == updated
+        assert b"two" in _fetch(base + f"/_pynext/static/{updated['bundles']['counter']}.js")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
 
 
 def test_dev_reloads_edited_page_and_survives_broken_edit(tmp_path):
@@ -151,11 +229,13 @@ def test_dev_reloads_edited_page_and_survives_broken_edit(tmp_path):
     seen = []
     try:
         address = _next_listening_address(lines, proc, seen)
+        initial_address = address
         base = f"http://{address}"
         _wait_for_content(base + "/", b"version-one", timeout=10)
 
         (root / "app" / "page.py").write_text(PAGE_V2, encoding="utf-8")
         address = _next_listening_address(lines, proc, seen)
+        assert address == initial_address
         _wait_for_content(f"http://{address}/", b"version-two", timeout=15)
 
         # A broken edit must not take the server down: the old version keeps
@@ -165,6 +245,7 @@ def test_dev_reloads_edited_page_and_survives_broken_edit(tmp_path):
         assert b"version-two" in _fetch(f"http://{address}/")
         (root / "app" / "page.py").write_text(PAGE_V3, encoding="utf-8")
         address = _next_listening_address(lines, proc, seen)
+        assert address == initial_address
         _wait_for_content(f"http://{address}/", b"version-three", timeout=15)
 
         while not lines.empty():

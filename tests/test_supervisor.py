@@ -1,16 +1,19 @@
 import os
+import re
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import httpx
+import psutil
 import pytest
 
-pytestmark = pytest.mark.skipif(sys.platform != "linux",
-                                reason="multi-worker mode uses SO_REUSEPORT (Unix-only)")
+pytestmark = pytest.mark.skipif(sys.platform not in {"linux", "darwin"},
+                                reason="these supervisor tests use Unix process signals")
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -41,10 +44,9 @@ def _free_port():
 
 def _children(sup_pid):
     try:
-        text = Path(f"/proc/{sup_pid}/task/{sup_pid}/children").read_text(encoding="utf-8")
-    except OSError:
+        return [child.pid for child in psutil.Process(sup_pid).children()]
+    except psutil.Error:
         return []
-    return [int(pid) for pid in text.split()]
 
 
 def _worker_pids(sup_pid):
@@ -52,10 +54,10 @@ def _worker_pids(sup_pid):
     workers = []
     for pid in _children(sup_pid):
         try:
-            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
-        except OSError:
+            cmdline = psutil.Process(pid).cmdline()
+        except psutil.Error:
             continue
-        if b"spawn_main" in cmdline:
+        if any("spawn_main" in arg for arg in cmdline):
             workers.append(pid)
     return workers
 
@@ -71,9 +73,9 @@ def _is_alive(pid):
 
 
 class _Supervisor:
-    def __init__(self, tmp_path, workers=2):
+    def __init__(self, tmp_path, workers=2, port=None):
         _write_app(tmp_path)
-        self.port = _free_port()
+        self.port = _free_port() if port is None else port
         self.base_url = f"http://127.0.0.1:{self.port}"
         env = dict(os.environ)
         env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
@@ -85,6 +87,21 @@ class _Supervisor:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
         )
         self.output = ""
+        if self.port == 0:
+            def read_port():
+                for line in self.proc.stdout:
+                    self.output += line
+                    match = re.search(r"supervisor listening on http://127\.0\.0\.1:(\d+)", line)
+                    if match:
+                        self.port = int(match.group(1))
+                        return
+            reader = threading.Thread(target=read_port, daemon=True)
+            reader.start()
+            reader.join(timeout=30)
+            if not self.port:
+                self.stop()
+                raise AssertionError(f"supervisor did not report its assigned port: {self.output}")
+            self.base_url = f"http://127.0.0.1:{self.port}"
 
     def wait_ready(self, timeout=30):
         deadline = time.monotonic() + timeout
@@ -199,6 +216,31 @@ def test_supervisor_graceful_shutdown_stops_all_workers(tmp_path):
         sup.stop()
 
 
+def test_dynamic_port_survives_all_workers_restarting(tmp_path):
+    sup = _Supervisor(tmp_path, port=0)
+    try:
+        sup.wait_ready()
+        original = sup.wait_workers(2)
+        port = sup.port
+        for pid in original:
+            os.kill(pid, signal.SIGKILL)
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            current = _worker_pids(sup.proc.pid)
+            if len(current) == 2 and not set(original) & set(current):
+                try:
+                    if sup.get_ok().status_code == 200:
+                        break
+                except httpx.TransportError:
+                    pass
+            time.sleep(0.2)
+        else:
+            raise AssertionError("workers did not recover on their assigned port")
+        assert sup.port == port
+    finally:
+        sup.stop()
+
+
 # --- CLI wiring for --workers ---
 
 def test_cli_rejects_invalid_workers(monkeypatch, capsys):
@@ -207,8 +249,6 @@ def test_cli_rejects_invalid_workers(monkeypatch, capsys):
     for argv, message in [
         (["pynext", "start", "--workers", "0"], "--workers must be an integer >= 1"),
         (["pynext", "start", "--workers", "not-a-number"], "--workers must be an integer >= 1"),
-        (["pynext", "start", "--workers", "2", "--port", "0"],
-         "--workers > 1 requires a fixed --port"),
     ]:
         monkeypatch.setattr(sys, "argv", argv)
         monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: pytest.fail("unexpected startup"))

@@ -27,6 +27,7 @@ def verify_http(base):
         "/hydrate": "Hydrated",
         "/strategies": "Island loading strategies",
         "/interaction": "Interaction example",
+        "/shared-model": "Shared island model",
         "/blog/hello": "hello",
     }
     for path, expected in pages.items():
@@ -147,7 +148,8 @@ def main():
             )
             base = f"http://127.0.0.1:{port}"
             verify_http(base)
-            for script in ("islands_smoke.py", "interaction_smoke.py", "navigation_smoke.py"):
+            for script in ("islands_smoke.py", "interaction_smoke.py", "shared_model_smoke.py",
+                           "navigation_smoke.py", "dev_hmr_smoke.py"):
                 subprocess.run(
                     [sys.executable, str(ROOT / "tests/browser" / script), base],
                     cwd=ROOT, check=True, timeout=120,

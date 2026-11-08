@@ -117,8 +117,11 @@ def _esbuild(root):
 
 def compile_client(root, sources):
     entries = _entries(sources)
+    runtime = _runtime_bytes()
+    runtime_hash = _digest(runtime)
+    assets = {PREFIX + runtime_hash + ".js": runtime}
     if not entries:
-        return {"runtime": None, "bundles": {}, "hydration": {}, "esbuild_version": None}, {}
+        return {"runtime": runtime_hash, "bundles": {}, "hydration": {}, "esbuild_version": None}, assets
     executable = _esbuild(root)
     try:
         version = subprocess.run([*executable, "--version"], check=True, encoding="utf-8", errors="replace",
@@ -128,9 +131,6 @@ def compile_client(root, sources):
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("Unexpected esbuild version")
     directory = (root / "islands").resolve()
-    runtime = _runtime_bytes()
-    runtime_hash = _digest(runtime)
-    assets = {PREFIX + runtime_hash + ".js": runtime}
     bundles = {}
     hydration = {}
     total = len(runtime)
@@ -172,15 +172,14 @@ def read_client_artifacts(root, manifest):
     info = manifest.get("client")
     if not isinstance(info, dict) or set(info) != {"runtime", "bundles", "hydration", "esbuild_version"}:
         raise ValueError("Invalid client manifest; rebuild the application")
-    if not entries:
-        if info != {"runtime": None, "bundles": {}, "hydration": {}, "esbuild_version": None}:
-            raise ValueError("Invalid empty client manifest; rebuild the application")
-        return info, {}
+    if not entries and info != {"runtime": _digest(_runtime_bytes()), "bundles": {},
+                                "hydration": {}, "esbuild_version": None}:
+        raise ValueError("Invalid empty client manifest; rebuild the application")
     if (not isinstance(info["bundles"], dict) or set(info["bundles"]) != set(entries) or
             not isinstance(info["hydration"], dict) or set(info["hydration"]) != set(entries) or
             any(not isinstance(value, bool) for value in info["hydration"].values()) or
-            not isinstance(info["esbuild_version"], str) or
-            not re.fullmatch(r"\d+\.\d+\.\d+", info["esbuild_version"]) or
+            (bool(entries) and (not isinstance(info["esbuild_version"], str) or
+             not re.fullmatch(r"\d+\.\d+\.\d+", info["esbuild_version"]))) or
             info["runtime"] != _digest(_runtime_bytes())):
         raise ValueError("Incompatible client manifest; rebuild the application")
     if any(not isinstance(digest, str) or not _DIGEST.fullmatch(digest) for digest in info["bundles"].values()):
