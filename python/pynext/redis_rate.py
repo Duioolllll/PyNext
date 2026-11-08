@@ -11,9 +11,18 @@ log = logging.getLogger("pynext")
 
 _ALLOW = """
 local t = redis.call('TIME')
-local now = t[1] * 1000 + math.floor(t[2] / 1000)
+-- Microseconds, not milliseconds: the active set orders buckets by
+-- last-touch time, and two buckets created in the same millisecond tie.
+-- Redis breaks sorted-set ties lexicographically by member, so a tie
+-- evicted the wrong bucket (its key hash sorts first) instead of the
+-- stalest one, and the evicted owner was then denied instead of getting
+-- a fresh bucket. Two scripts can never run in the same microsecond,
+-- so microsecond scores order strictly by last touch. PEXPIRE still
+-- takes milliseconds, so the window is kept in ms separately.
+local now = t[1] * 1000000 + t[2]
 local limit = tonumber(ARGV[1])
-local window = tonumber(ARGV[2])
+local window_ms = tonumber(ARGV[2])
+local window = window_ms * 1000
 -- Prune expired active buckets and new-key admissions older than a window.
 redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
 redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now - window)
@@ -24,7 +33,7 @@ if not row[1] then
   -- brand-new keys are denied, and only until the window slides.
   if redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[4]) then
     local oldest = redis.call('ZRANGE', KEYS[3], 0, 0, 'WITHSCORES')
-    return {0, math.max(1, math.ceil((tonumber(oldest[2]) + window - now) / 1000))}
+    return {0, math.max(1, math.ceil((tonumber(oldest[2]) + window - now) / 1000000))}
   end
   -- Table full: evict the stalest active bucket instead of denying the
   -- new key. Its owner gets a fresh full bucket on its next request,
@@ -38,7 +47,7 @@ if not row[1] then
   end
   tokens = limit
   redis.call('ZADD', KEYS[3], now, KEYS[1])
-  redis.call('PEXPIRE', KEYS[3], window)
+  redis.call('PEXPIRE', KEYS[3], window_ms)
 else
   tokens = math.min(limit, tonumber(row[1]) + math.max(0, now-tonumber(row[2])) * limit / window)
 end
@@ -48,12 +57,12 @@ if tokens >= 1 then
   tokens = tokens - 1
   allowed = 1
 else
-  retry = math.max(1, math.ceil((1-tokens)*window/limit/1000))
+  retry = math.max(1, math.ceil((1-tokens)*window/limit/1000000))
 end
 redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'last', now)
-redis.call('PEXPIRE', KEYS[1], window)
+redis.call('PEXPIRE', KEYS[1], window_ms)
 redis.call('ZADD', KEYS[2], now+window, KEYS[1])
-redis.call('PEXPIRE', KEYS[2], window)
+redis.call('PEXPIRE', KEYS[2], window_ms)
 return {allowed, retry}
 """
 
