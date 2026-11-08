@@ -61,6 +61,6 @@ uv run pynext start --dir my-site --port 3000
 | `pynext dev --dir PATH` | 소스에서 실행(수정 시 수동 재시작) |
 | `pynext start --dir PATH` | 검증된 빌드로 시작 |
 
-두 서버 명령은 `--host`, `--port`, `--max-concurrent`(기본 64), `--acquire-timeout-ms`(1000), `--body-capacity`(16), `--body-timeout-ms`(10000)을 지원합니다. 기본 바인딩 주소는 loopback입니다. 공개 프로덕션 노출은 아직 지원 대상으로 보장되지 않습니다.
+두 서버 명령은 `--host`, `--port`, `--max-concurrent`(기본 64), `--acquire-timeout-ms`(1000), `--max-waiting`(`--max-concurrent`와 64 중 작은 값), `--body-capacity`(16), `--body-timeout-ms`(10000)을 지원합니다. 기본 바인딩 주소는 loopback입니다. 공개 프로덕션 노출은 아직 지원 대상으로 보장되지 않습니다.
 
 다음 문서: [라우팅](Routing.md), [컴포넌트](Components-and-Layouts.md).

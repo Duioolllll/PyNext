@@ -61,6 +61,6 @@ A project without `islands/` needs neither esbuild nor Node. The framework build
 | `pynext dev --dir PATH` | Run from source (manual restart) |
 | `pynext start --dir PATH` | Start using a validated build |
 
-Both server commands accept `--host`, `--port`, `--max-concurrent` (64), `--acquire-timeout-ms` (1000), `--body-capacity` (16), and `--body-timeout-ms` (10000). Defaults are in parentheses. Bind to loopback by default; production exposure is not supported.
+Both server commands accept `--host`, `--port`, `--max-concurrent` (64), `--acquire-timeout-ms` (1000), `--max-waiting` (min of `--max-concurrent` and 64), `--body-capacity` (16), and `--body-timeout-ms` (10000). Defaults are in parentheses. Bind to loopback by default; production exposure is not supported.
 
 Next: [Routing](Routing.md) and [Components and layouts](Components-and-Layouts.md).
