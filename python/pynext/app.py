@@ -1179,7 +1179,8 @@ class App:
             _reset_request_context()
 
     async def _handle_http(self, scope, receive, send):
-        if self.rate_limit is not None:
+        exempt = getattr(self.rate_limit, "is_exempt", None)
+        if self.rate_limit is not None and not (exempt and exempt(scope.get("path", ""))):
             # Check before reading the body: an over-limit request is
             # rejected without handler execution or body intake.
             client = scope.get("client")

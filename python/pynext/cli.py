@@ -211,6 +211,9 @@ def main():
             command.add_argument("--trusted-proxy", action="append", default=[], metavar="IP_OR_CIDR",
                                  help="peer IP or network whose X-Forwarded-For is honoured "
                                       "for rate limiting (repeatable; default: none trusted)")
+            command.add_argument("--rate-limit-exempt-path", action="append", default=[], metavar="PATH",
+                                 help="path prefix that skips rate limiting, e.g. /healthz "
+                                      "(repeatable; default: nothing is exempt)")
             command.add_argument("--csrf", action=argparse.BooleanOptionalAction, default=None,
                                  help="protect state-changing API requests (default: auto — on when a "
                                       "session middleware is installed; --no-csrf opts out)")
@@ -266,7 +269,8 @@ def main():
         options = ({"namespace": os.environ.get("PYNEXT_RATE_LIMIT_NAMESPACE", "default")}
                    if args.rate_limit_backend == "redis" else {})
         limiter = (limiter_type(args.rate_limit, args.rate_limit_window,
-                                trusted_proxies=args.trusted_proxy, **options)
+                                trusted_proxies=args.trusted_proxy,
+                                exempt_paths=tuple(args.rate_limit_exempt_path), **options)
                    if args.rate_limit >= 1 else None)
         security = (SecurityConfig(csrf_enabled=args.csrf,
                                    csrf_cookie_secure=(args.csrf_cookie_secure
@@ -290,6 +294,7 @@ def main():
                               rate_limit=args.rate_limit,
                               rate_limit_window=args.rate_limit_window,
                               rate_limit_backend=args.rate_limit_backend,
+                              rate_limit_exempt_paths=tuple(args.rate_limit_exempt_path),
                               trusted_proxies=tuple(args.trusted_proxy),
                               cache_backend=args.cache_backend, cache_path=args.cache_path,
                               observability=obs_config, security=security,

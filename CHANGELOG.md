@@ -29,6 +29,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Match dynamic WebSocket routes on the native server using the same route priority as ASGI.
 - Bound rate-limit bucket storage and select forwarded client addresses from the nearest untrusted proxy hop.
 - Turn CSRF on automatically when a session middleware is installed (`SecurityConfig(csrf_enabled=None)` is now the default; pass `csrf_enabled=False` to opt out, `True` to protect without sessions). Double-submit cookies are HMAC-signed (key from `csrf_signing_key` or `PYNEXT_CSRF_SIGNING_KEY`, otherwise a process-wide fallback key, so multi-worker deployments must share one key), and `Origin`/`Sec-Fetch-Site` are checked on state-changing requests. The CSRF cookie is `Secure` by default; `pynext dev` sends it without `Secure` over plain HTTP, `pynext start` keeps `Secure`.
+- Harden rate limiting against key exhaustion: IPv6 addresses share the bucket of their /64 prefix, a full bucket table evicts the stalest bucket instead of denying new keys, new-key admissions are bounded by a global sliding window, and paths listed with `--rate-limit-exempt-path` (for example `/healthz`) skip rate limiting on both adapters. The same policy applies to the shared Redis limiter.
 - Document the architecture, observed limitations, and verification criteria.
 
 ## v0.7.0a1 (unreleased candidate)

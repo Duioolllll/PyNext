@@ -312,8 +312,10 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     def bridge(method, raw_path, query, headers, body, cancellation, client_ip=None):
         # Rate limiting runs before any handler executes. Static files and
         # fresh ISR pages never reach the bridge (the Rust layer serves
-        # them), so they are not rate-limited; see ratelimit.py.
-        if limiter is not None:
+        # them), so they are not rate-limited; see ratelimit.py. Paths
+        # listed in the limiter's exempt_paths skip the check entirely.
+        exempt = getattr(limiter, "is_exempt", None)
+        if limiter is not None and not (exempt and exempt(raw_path)):
             key = limiter.key_for(client_ip, headers)
             try:
                 allowed, retry_after = limiter.allow(key)
