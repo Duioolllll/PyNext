@@ -34,7 +34,11 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `new_csrf_token` | `pynext.http` |
 | `new_csp_nonce` | `pynext.http` |
 | `set_csrf_cookie` | `pynext.http` |
+| `sign_csrf_token` | `pynext.http` |
 | `validate_csrf` | `pynext.http` |
+| `content_security_policy` | `pynext.http` |
+| `security_headers` | `pynext.http` |
+| `apply_security_headers` | `pynext.http` |
 | `ObservabilityConfig` | `pynext.observability` |
 | `MetricsCollector` | `pynext.observability` |
 | `WebSocket` | `pynext.http` |
@@ -47,11 +51,17 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `Session` | `pynext.sessions` |
 | `SessionMiddleware` | `pynext.sessions` |
 | `SQLiteSessionStore` | `pynext.sessions` |
+| `RedisSessionStore` | `pynext.sessions` |
 | `require_auth` | `pynext.auth` |
 | `require_permission` | `pynext.auth` |
 | `RedisRateLimiter` | `pynext.redis_rate` |
 | `WebSocketPubSub` | `pynext.pubsub` |
 | `PubSubOverflow` | `pynext.pubsub` |
+| `ProxyTrust` | `pynext.proxy` |
+| `ResolvedProxy` | `pynext.proxy` |
+| `parse_trusted_proxies` | `pynext.proxy` |
+| `FAIL_OPEN` | `pynext.failure_policy` |
+| `FAIL_CLOSED` | `pynext.failure_policy` |
 
 ## Security defaults (`SecurityConfig`)
 
@@ -59,11 +69,11 @@ Fields of `pynext.http.SecurityConfig` with their defaults.
 
 | Field | Default |
 | --- | --- |
-| `csrf_enabled` | `False` |
+| `csrf_enabled` | `None` |
 | `csrf_cookie_name` | `'pynext_csrf'` |
 | `csrf_header_name` | `'X-CSRF-Token'` |
 | `csrf_form_field` | `'csrf_token'` |
-| `csrf_cookie_secure` | `False` |
+| `csrf_cookie_secure` | `True` |
 | `csrf_cookie_samesite` | `'Lax'` |
 | `cors_allowed_origins` | `()` |
 | `cors_allowed_methods` | `('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS')` |
@@ -71,6 +81,19 @@ Fields of `pynext.http.SecurityConfig` with their defaults.
 | `cors_allow_credentials` | `False` |
 | `cors_max_age` | `600` |
 | `csp_nonce_enabled` | `False` |
+| `csrf_signing_key` | `field(default=None, repr=False)` |
+| `csrf_origin_check` | `True` |
+| `hsts_enabled` | `True` |
+| `hsts_max_age` | `31536000` |
+| `hsts_include_subdomains` | `True` |
+| `hsts_preload` | `False` |
+| `frame_options` | `'DENY'` |
+| `referrer_policy` | `'strict-origin-when-cross-origin'` |
+| `permissions_policy` | `'camera=(), microphone=(), geolocation=()'` |
+| `csp_style_src` | `"'self'"` |
+| `csp_frame_ancestors` | `"'none'"` |
+| `csp_base_uri` | `"'self'"` |
+| `csp_form_action` | `"'self'"` |
 
 ## ISR cache backends
 
@@ -108,6 +131,7 @@ Store classes in `pynext.sessions` implementing `load` / `save` / `delete`.
 
 | Store |
 | --- |
+| `RedisSessionStore` |
 | `SQLiteSessionStore` |
 
 ## Explicit non-goals
