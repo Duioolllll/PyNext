@@ -89,6 +89,7 @@ class WorkerConfig:
     rate_limit_window: float = 60.0
     rate_limit_backend: str = "memory"
     rate_limit_exempt_paths: tuple = ()
+    rate_limit_ipv6_prefix_len: int = 64  # IPv6 bucket grouping (see ratelimit.py)
     trusted_proxies: tuple = ()
     # Shared-cache / observability settings, forwarded to each worker's
     # create_app so multi-worker mode honours them (finding #42/#45).
@@ -129,7 +130,8 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                    if config.rate_limit_backend == "redis" else {})
         limiter = limiter_type(config.rate_limit, config.rate_limit_window,
                                trusted_proxies=config.trusted_proxies,
-                               exempt_paths=config.rate_limit_exempt_paths, **options)
+                               exempt_paths=config.rate_limit_exempt_paths,
+                               ipv6_prefix_len=config.rate_limit_ipv6_prefix_len, **options)
     app = create_app(config.root, production=config.production, rate_limit=limiter,
                      cache_backend=config.cache_backend, cache_path=config.cache_path,
                      cache_failure_policy=config.cache_failure_policy,
@@ -296,13 +298,21 @@ def _rolling_restart(pool, config, context, listener):
     return True
 
 
+MAX_WORKERS = 64
+"""Most worker processes worth running: beyond this the supervisor spends
+more time spawning and watching children than serving (review #4 #5:
+--workers 100000 attempted tens of thousands of processes). The CLI
+rejects larger values at parse time; run_supervisor enforces the same
+bound for direct callers."""
+
+
 def run_supervisor(config, *, workers):
     """Spawn and supervise ``workers`` processes. Returns an exit code.
 
     Blocks until SIGINT/SIGTERM, then shuts every worker down gracefully.
     """
-    if workers < 1:
-        raise ValueError("workers must be >= 1")
+    if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= MAX_WORKERS:
+        raise ValueError(f"workers must be an integer between 1 and {MAX_WORKERS}")
     # Finding #23: one CSRF signing key for every worker. Each worker
     # re-imports the framework (spawn), so a per-process fallback key
     # would differ per worker and a cookie issued by one worker would

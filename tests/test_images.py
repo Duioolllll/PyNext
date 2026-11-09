@@ -8,7 +8,29 @@ Image = pytest.importorskip("PIL.Image")
 
 from pynext import create_app
 from pynext.build import write_manifest
+from pynext.images import MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, optimize_image
 from pynext.server import start_native
+
+
+def _sample_png():
+    buffer = io.BytesIO()
+    Image.new("RGB", (80, 40), "red").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_optimize_image_rejects_out_of_range_width_and_quality():
+    # Review #4 #7: width 0 used to reach thumbnail() as a ZeroDivisionError;
+    # quality outside 1..95 was silently accepted. Both are now a clear
+    # ValueError from optimize_image itself (defense in depth: the HTTP
+    # route already guards the same range).
+    data = _sample_png()
+    assert optimize_image(data, 1, 1)
+    assert optimize_image(data, MAX_IMAGE_WIDTH, MAX_IMAGE_QUALITY)
+    for width, quality in [(0, 80), (-1, 80), (MAX_IMAGE_WIDTH + 1, 80),
+                           (20, 0), (20, MAX_IMAGE_QUALITY + 1), (20, -5),
+                           (20.5, 80), (20, 80.5), (True, 80), (20, "80")]:
+        with pytest.raises(ValueError, match="must be an integer between 1 and"):
+            optimize_image(data, width, quality)
 
 
 @pytest.mark.parametrize("mode", ["asgi", "axum"])

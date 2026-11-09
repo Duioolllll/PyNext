@@ -17,6 +17,22 @@ address) shares a bucket. A single host rotating addresses inside its
 /64 cannot mint fresh buckets, and a /64 with many hosts shares the
 limit the way one IPv4 address behind NAT does.
 
+That grouping is a tradeoff, not a cure (external audit, review #4
+follow-up). An attacker holding a whole /48 can mint 65,536 distinct
+/64s, enough to fill the 10,000-bucket table and the 10,000-per-window
+new-key window. Filling the table only evicts buckets now — an evicted
+owner gets a fresh full bucket on its next request and is never denied
+— but filling the new-key window still denies genuinely brand-new keys
+until the window slides. ``ipv6_prefix_len`` lets an operator group
+more broadly (48 groups a whole /48 into one bucket, which collapses
+that attack) at the cost of collateral blocking: every host sharing
+the prefix shares one bucket, so a busy /48 (a carrier, a campus)
+throttles its innocent users together. The default stays 64: changing
+it is an operator decision for the network being served, not a safe
+global default. Lowering ``max_new_keys_per_window`` instead only
+slows the attacker down while also admitting fewer legitimate new
+users per window, so it does not fix the exhaustion either.
+
 Bucket table pressure never blocks an existing key. The table is a
 bounded leaderboard of the most recently active keys (at most
 ``_MAX_BUCKETS``): when it is full, a new key evicts the stalest bucket
@@ -41,7 +57,7 @@ import ipaddress
 import math
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict
 
 from .http import Response
 from .proxy import ProxyTrust, parse_trusted_proxies
@@ -79,18 +95,19 @@ def _parse_exempt_paths(exempt_paths):
     return tuple(prefixes)
 
 
-def _bucket_key(address):
+def _bucket_key(address, prefix_len=_IPV6_PREFIX_LEN):
     """Collapse an address to its rate-limit bucket key.
 
-    IPv6 addresses share the bucket of their /64 prefix; IPv4-mapped
-    IPv6 addresses use their IPv4 address; IPv4 addresses are unchanged.
+    IPv6 addresses share the bucket of their ``prefix_len`` prefix;
+    IPv4-mapped IPv6 addresses use their IPv4 address; IPv4 addresses
+    are unchanged.
     """
     if isinstance(address, ipaddress.IPv6Address):
         mapped = address.ipv4_mapped
         if mapped is not None:
             return str(mapped)
-        network = ipaddress.IPv6Network(f"{address}/{_IPV6_PREFIX_LEN}", strict=False)
-        return f"{network.network_address}/{_IPV6_PREFIX_LEN}"
+        network = ipaddress.IPv6Network(f"{address}/{prefix_len}", strict=False)
+        return f"{network.network_address}/{prefix_len}"
     return str(address)
 
 
@@ -103,12 +120,16 @@ class RateLimiter:
     """
 
     def __init__(self, limit, window_seconds, *, trusted_proxies=(), exempt_paths=(),
-                 max_buckets=None, max_new_keys_per_window=None):
+                 max_buckets=None, max_new_keys_per_window=None, ipv6_prefix_len=_IPV6_PREFIX_LEN):
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("rate limit must be an integer >= 1")
         if isinstance(window_seconds, bool) or not isinstance(window_seconds, (int, float)) \
                 or not math.isfinite(window_seconds) or window_seconds <= 0:
             raise ValueError("rate limit window must be a number > 0 seconds")
+        if (isinstance(ipv6_prefix_len, bool) or not isinstance(ipv6_prefix_len, int)
+                or not 0 <= ipv6_prefix_len <= 128):
+            raise ValueError("ipv6_prefix_len must be an integer between 0 and 128")
+        self.ipv6_prefix_len = ipv6_prefix_len
         if max_buckets is not None:
             if isinstance(max_buckets, bool) or not isinstance(max_buckets, int) or max_buckets < 1:
                 raise ValueError("max_buckets must be an integer >= 1")
@@ -134,8 +155,10 @@ class RateLimiter:
         # key -> [tokens, last_seen_monotonic], most-recently-used last.
         self._buckets = OrderedDict()
         # Monotonic timestamps of new-bucket admissions in the current
-        # window (the global sliding window for new keys).
-        self._new_keys = deque()
+        # window (the global sliding window for new keys), keyed by the
+        # admitted key: the key is what tells an evicted existing key
+        # apart from a brand-new one when its bucket is gone.
+        self._new_keys = OrderedDict()
         self._evicted = 0
 
     def _is_trusted(self, client_ip):
@@ -159,21 +182,25 @@ class RateLimiter:
         the nearest untrusted address walking the forwarded chain from the
         direct peer, or the peer itself when nothing is trusted. A request
         with no known peer address shares the ``"unknown"`` bucket. IPv6
-        addresses are grouped by /64 prefix (see :func:`_bucket_key`).
+        addresses are grouped by the ``ipv6_prefix_len`` prefix (/64 by
+        default; see :func:`_bucket_key`).
         """
         resolved = self._trust.resolve_client_ip(client_ip, headers)
         if resolved is None:
             return "unknown"
         try:
-            return _bucket_key(ipaddress.ip_address(resolved))
+            return _bucket_key(ipaddress.ip_address(resolved), self.ipv6_prefix_len)
         except ValueError:
             return resolved
 
     def _prune_new_keys(self, now):
         """Drop new-key admissions older than one window."""
         cutoff = now - self.window_seconds
-        while self._new_keys and self._new_keys[0] <= cutoff:
-            self._new_keys.popleft()
+        while self._new_keys:
+            oldest = next(iter(self._new_keys.values()))
+            if oldest > cutoff:
+                break
+            self._new_keys.popitem(last=False)
 
     def _evict_one(self, now):
         """Evict one bucket to make room for a new key.
@@ -213,15 +240,20 @@ class RateLimiter:
             self._prune_new_keys(now)
             bucket = self._buckets.get(key)
             if bucket is None:
-                if len(self._new_keys) >= self.max_new_keys_per_window:
-                    oldest = self._new_keys[0]
+                # Only a brand-new key is denied by the global new-key
+                # window. A key admitted within this window whose bucket
+                # was evicted under table pressure since is an existing
+                # key: it is never denied, it gets a fresh full bucket.
+                if key not in self._new_keys and len(self._new_keys) >= self.max_new_keys_per_window:
+                    oldest = next(iter(self._new_keys.values()))
                     retry_after = max(1, math.ceil(self.window_seconds - max(0.0, now - oldest)))
                     return False, retry_after
                 if len(self._buckets) >= self.max_buckets:
                     self._evict_one(now)
                 bucket = [float(self.limit), now]
                 self._buckets[key] = bucket
-                self._new_keys.append(now)
+                self._new_keys[key] = now
+                self._new_keys.move_to_end(key)
             else:
                 elapsed = max(0.0, now - bucket[1])
                 bucket[0] = min(float(self.limit), bucket[0] + elapsed * self._refill_per_second)

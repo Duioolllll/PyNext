@@ -29,7 +29,7 @@ from .build import discover, load_manifest
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
-from .images import ImageBusy, ImageUnavailable, optimize_image
+from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .observability import (
     MetricsCollector,
     ObservabilityConfig,
@@ -1032,8 +1032,8 @@ class App:
             source = query["src"][0]
             width, quality = query["w"][0], query.get("q", ["75"])[0]
             if (not width.isascii() or not width.isdecimal() or not quality.isascii() or not quality.isdecimal() or
-                    len(width) > 4 or len(quality) > 2 or not 1 <= int(width) <= 2048 or
-                    not 1 <= int(quality) <= 95):
+                    len(width) > 4 or len(quality) > 2 or not 1 <= int(width) <= MAX_IMAGE_WIDTH or
+                    not 1 <= int(quality) <= MAX_IMAGE_QUALITY):
                 raise BadRequest("Invalid image dimensions or quality")
             asset = self.public_assets.get(source)
             if asset is None:

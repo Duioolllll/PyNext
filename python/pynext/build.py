@@ -36,14 +36,27 @@ def _check_build_paths(root):
 def discover(root):
     root = Path(root).resolve()
     app_dir = root / "app"
+    if app_dir.is_symlink():
+        raise ValueError(f"App directory must not be a symbolic link: {app_dir}")
     if not app_dir.is_dir():
         raise ValueError(f"App directory not found: {app_dir}")
+    # rglob does not descend into symlinked directories, so a symlinked
+    # directory was silently skipped (its page.py never became a route)
+    # while a symlinked file pointing outside was rejected: reject every
+    # symlink under app/ instead, like discover_public does for public/.
+    for current, dirs, files in os.walk(app_dir, followlinks=False):
+        dirs[:] = [name for name in dirs if name != "__pycache__"]
+        for name in dirs + files:
+            if (Path(current) / name).is_symlink():
+                raise ValueError(f"App symlink is not allowed: {Path(current) / name}")
     files = sorted(p for p in app_dir.rglob("*.py") if "__pycache__" not in p.parts)
     for path in files:
         if not path.resolve().is_relative_to(app_dir.resolve()):
             raise ValueError(f"Python file escapes app directory: {path}")
     for name in ("middleware.py", "resources.py"):
         extra = root / name
+        if extra.is_symlink():
+            raise ValueError(f"{name} must not be a symbolic link")
         if extra.is_file():
             if not extra.resolve().is_relative_to(root):
                 raise ValueError(f"{name} escapes project root")

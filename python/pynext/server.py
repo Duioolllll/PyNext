@@ -3,6 +3,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import logging
+import math
 import signal
 import threading
 import time
@@ -28,6 +29,19 @@ DEFAULT_HEADER_READ_TIMEOUT_MS = 10_000
 # 2-second grace window (see read_limited_body in the native crate). 0
 # disables the rate check; the whole-body timeout still applies.
 DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC = 1024
+# Upper bounds for the server limits (review #4 #5). The CLI enforces
+# these at parse time; start_native enforces them again so a direct
+# Python caller cannot smuggle a value past the CLI that overflows the
+# native usize/u64/f64 conversion (OverflowError traceback) or exhausts
+# resources (a million execution slots, a day-long shutdown drain).
+MAX_CONCURRENT = 1_000_000
+MAX_WAITING = 1_000_000
+MAX_BODY_CAPACITY = 1_000_000
+MAX_CONNECTIONS = 1_000_000
+MAX_CONNECTIONS_PER_IP = 1_000_000
+MAX_TIMEOUT_MS = 86_400_000  # 24 hours in milliseconds
+MAX_BODY_MIN_RATE_BYTES_PER_SEC = 1_000_000_000  # 1 GiB/s
+MAX_SHUTDOWN_TIMEOUT = 3600  # seconds
 _CANCEL_POLL_SECONDS = 0.05
 _WS_QUEUE_SIZE = 32
 _WS_INBOX_TIMEOUT = 1
@@ -291,6 +305,41 @@ class _NativeStream:
             pass
 
 
+def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
+                            body_capacity, body_timeout_ms, max_connections,
+                            max_connections_per_ip, header_read_timeout_ms,
+                            body_min_rate_bytes_per_sec, shutdown_timeout):
+    """Reject server limits that cannot reach the native server safely.
+
+    Counts and timeouts cross into Rust as usize/u64/f64: a value past
+    the PyO3 conversion range dies with an OverflowError traceback, and
+    an absurd-but-fitting value (a million slots, a day-long drain)
+    exhausts resources before serving anything. ``max_waiting`` may be
+    None (the native default min(max_concurrent, 64)).
+    """
+    counts = (
+        ("max_concurrent", max_concurrent, 1, MAX_CONCURRENT),
+        ("max_waiting", max_waiting, 0, MAX_WAITING),
+        ("body_capacity", body_capacity, 1, MAX_BODY_CAPACITY),
+        ("max_connections", max_connections, 1, MAX_CONNECTIONS),
+        ("max_connections_per_ip", max_connections_per_ip, 1, MAX_CONNECTIONS_PER_IP),
+        ("acquire_timeout_ms", acquire_timeout_ms, 0, MAX_TIMEOUT_MS),
+        ("body_timeout_ms", body_timeout_ms, 0, MAX_TIMEOUT_MS),
+        ("header_read_timeout_ms", header_read_timeout_ms, 0, MAX_TIMEOUT_MS),
+        ("body_min_rate_bytes_per_sec", body_min_rate_bytes_per_sec, 0,
+         MAX_BODY_MIN_RATE_BYTES_PER_SEC),
+    )
+    for name, value, minimum, maximum in counts:
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+    if (isinstance(shutdown_timeout, bool) or not isinstance(shutdown_timeout, (int, float))
+            or not math.isfinite(shutdown_timeout)
+            or not 0 <= shutdown_timeout <= MAX_SHUTDOWN_TIMEOUT):
+        raise ValueError(f"shutdown_timeout must be a number between 0 and {MAX_SHUTDOWN_TIMEOUT} seconds")
+
+
 def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,
                  body_capacity=16, body_timeout_ms=10000, observability=None, *, reuse_port=False, listener=None,
                  max_connections=DEFAULT_MAX_CONNECTIONS,
@@ -313,6 +362,10 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     ``ceil(acquire_timeout_ms / 1000)`` seconds (at least 1); a 503 for
     a full wait queue carries ``Retry-After: 1``.
     """
+    _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
+                            body_capacity, body_timeout_ms, max_connections,
+                            max_connections_per_ip, header_read_timeout_ms,
+                            body_min_rate_bytes_per_sec, shutdown_timeout)
     if observability is not None:
         app.configure_observability(observability)
     app.metrics.observe_worker_start()

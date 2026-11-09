@@ -263,7 +263,7 @@ OpenTelemetry 追踪默认关闭且为可选项：安装 `opentelemetry-api`（�
 
 限流是可选项，采用按进程的令牌桶：`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的动态请求返回 429，并带有以秒为单位的 `Retry-After` 头。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失。使用 `--rate-limit-backend redis` 时桶在进程间共享；Redis 不可达时遵循故障策略：默认（`fail_closed`，`--rate-limit-failure-policy fail_closed`）返回 503，`fail_open` 则放行请求。静态文件和新鲜的 ISR 页面在到达 Python 桥接之前已由 Rust 层返回，因此不受限流。
 
-转发链从右向左遍历受信任的代理，使用最近的不受信任地址。必须准确配置所有中间代理。每个进程最多保留 10,000 个桶；全部处于活跃状态时，新键会逐出最旧的桶而不是收到 429，新键的创建受全局滑动窗口限制（每个窗口最多 10,000 个新键）。IPv6 地址按 /64 前缀共享桶。用 `--rate-limit-exempt-path`（例如 `/healthz`）指定的路径跳过速率限制。
+转发链从右向左遍历受信任的代理，使用最近的不受信任地址。必须准确配置所有中间代理。每个进程最多保留 10,000 个桶；全部处于活跃状态时，新键会逐出最旧的桶而不是收到 429，新键的创建受全局滑动窗口限制（每个窗口最多 10,000 个新键）。IPv6 地址按 /64 前缀共享桶。这种分组是一种权衡：持有整个 /48 的攻击者可以生成 65,536 个不同的 /64，填满桶表和新键窗口，在窗口滑动之前真正的新键仍会被拒绝（被逐出的已有键不会被拒绝）。`--rate-limit-ipv6-prefix-len 48` 将整个 /48 归入一个桶，可以阻止这种攻击，但共享该前缀的所有主机也将共享一个桶，繁忙的 /48 会连带限制无辜用户；默认值保持为 64。用 `--rate-limit-exempt-path`（例如 `/healthz`）指定的路径跳过速率限制。
 
 多工作进程：`pynext start --workers 4` 启动共享监听套接字的监管器。使用 `--port 0` 时，动态分配的端口在 worker 重启后保持不变。各 worker 的解释器、内存缓存和默认限流独立；SQLite/Redis ISR 与 Redis 限流可以共享。监管器会重启故障 worker；中断的请求需要重试。CI 在 Linux、macOS 和 Windows 上检查共享监听套接字的 worker 启动和重启，并在 Linux 和 macOS 上运行基于信号的监管器测试。
 
