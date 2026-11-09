@@ -28,7 +28,7 @@ The built public assets, SSG output, and JS island bundles support content-deriv
 
 ## ISR boundaries
 
-The bounded ISR cache uses single-flight regeneration. The default `memory` backend is process-local; the `sqlite` and `redis` backends share entries across workers with expiring leases and fenced writes, so another worker's invalidation is observed on the next lookup while the store is available (local fallback during an outage may be stale). Fresh anonymous cache hits can bypass Python; stale entries may be served during background regeneration. `Cookie` or `Authorization` bypass the shared cache. Invalidate through `await request.revalidate("/news/example")` or `await app.revalidate(path)`, after authenticating the API caller.
+The bounded ISR cache uses single-flight regeneration. The default `memory` backend is process-local; the `sqlite` and `redis` backends share entries across workers with expiring leases and fenced writes, so another worker's invalidation is observed on the next lookup while the store is available (local fallback during an outage may be stale). The SQLite backend measures entry lifetimes with a monotonic clock (a wall-clock jump can neither resurrect an expired entry nor kill a fresh one) and bounds the table to 4096 entries / 128 MiB by default, dropping expired rows and evicting the oldest entries on insert. Fresh anonymous cache hits can bypass Python; stale entries may be served during background regeneration. `Cookie` or `Authorization` bypass the shared cache. Invalidate through `await request.revalidate("/news/example")` or `await app.revalidate(path)`, after authenticating the API caller.
 
 ## Safety notes
 

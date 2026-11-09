@@ -130,12 +130,44 @@ class SQLiteCacheBackend(CacheBackend):
     can share a cache with only the standard library. All statements run
     under one connection guarded by a lock, with ``BEGIN IMMEDIATE`` for
     lease and fenced-write transactions so two processes cannot both win
-    the same lease or the same version check. Timestamps use wall-clock
-    seconds; a clock jump may age entries early or late, but versions
+    the same lease or the same version check.
+
+    Lifetimes use a monotonic clock, mirroring Next.js's
+    file-system cache stamping ``lastModified`` as
+    ``performance.timeOrigin + performance.now()``: the anchor is a
+    wall-clock reading taken once when the backend opens, and every
+    lifetime decision (fresh/stale/expired, lease liveness, generation
+    expiry) advances it with ``time.monotonic()``, so a wall-clock jump
+    can neither resurrect an expired entry nor kill a fresh one while
+    this process runs. Stored timestamps stay real wall-clock seconds
+    so rows remain comparable across processes and restarts; a process
+    opened after a jump anchors on the post-jump clock, and a
+    forward jump can only make entries look younger to an
+    already-running process (safe: stale is served longer). Versions
     still fence every write.
+
+    The table is bounded: at most ``max_entries`` rows and
+    ``max_bytes`` of key+body bytes (defaults 4096 entries / 128 MiB).
+    Every insert first drops expired rows (never one a live lease is
+    regenerating) and expired leases, then evicts the oldest entries
+    until the caps hold, so keys that are never read again cannot grow
+    the file without bound. ``None`` selects the default cap.
     """
 
-    def __init__(self, path):
+    DEFAULT_MAX_ENTRIES = 4096
+    DEFAULT_MAX_BYTES = 128 * 1024 * 1024
+
+    def __init__(self, path, max_entries=None, max_bytes=None):
+        for name, value in (("max_entries", max_entries), ("max_bytes", max_bytes)):
+            if value is not None and (not isinstance(value, int)
+                                      or isinstance(value, bool) or value <= 0):
+                raise ValueError(
+                    f"SQLite cache {name} must be a positive integer or None, got {value!r}")
+        self.max_entries = self.DEFAULT_MAX_ENTRIES if max_entries is None else max_entries
+        self.max_bytes = self.DEFAULT_MAX_BYTES if max_bytes is None else max_bytes
+        # Monotonic-clock anchor (see class docstring).
+        self._wall_anchor = time.time()
+        self._mono_anchor = time.monotonic()
         path = os.fspath(path)
         if os.path.isdir(path):
             raise ValueError(f"SQLite cache path is a directory: {path}")
@@ -166,6 +198,96 @@ class SQLiteCacheBackend(CacheBackend):
         except sqlite3.Error as exc:
             raise ValueError(f"Cannot open SQLite cache at {path}: {exc}") from exc
 
+    def _now(self):
+        """Wall-clock seconds advanced by the monotonic clock.
+
+        All lifetime decisions read through here instead of
+        ``time.time()``. Stored timestamps are real wall-clock seconds
+        (see the class docstring); this value tracks them in the
+        no-jump case and ignores wall-clock jumps afterwards.
+        """
+        return self._wall_anchor + (time.monotonic() - self._mono_anchor)
+
+    def _enforce_capacity(self, exclude_key=None):
+        """Drop expired rows/leases, then evict the oldest entries
+        until the entry-count and byte caps hold.
+
+        Called after an insert, with the lock held and no transaction
+        open; also backing :meth:`prune`. Best-effort: a failure is
+        logged and never fails the insert that triggered the cleanup.
+        The key just inserted is never evicted by its own insert, and
+        an expired entry under a live lease is kept so the regenerating
+        worker's fenced write still finds its version.
+        """
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = self._now()
+                self._conn.execute(
+                    "DELETE FROM leases WHERE expires_at <= ?", (now,))
+                self._conn.execute(
+                    "DELETE FROM entries WHERE rowid IN ("
+                    " SELECT rowid FROM entries"
+                    " WHERE generated_at + fresh_for + stale_for <= ?"
+                    " AND NOT EXISTS (SELECT 1 FROM leases WHERE leases.key = entries.key"
+                    " AND leases.expires_at > ?) LIMIT 512)",
+                    (now, now))
+                count, total = self._conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(body) + LENGTH(key)), 0)"
+                    " FROM entries").fetchone()
+                if count > self.max_entries:
+                    # Delete exactly the surplus oldest rows: a bare
+                    # LIMIT would overshoot and evict fresh entries too.
+                    if exclude_key is None:
+                        params: tuple = (count - self.max_entries,)
+                        exclusion = ""
+                    else:
+                        params = (exclude_key, count - self.max_entries)
+                        exclusion = "WHERE key != ?"
+                    self._conn.execute(
+                        "DELETE FROM entries WHERE key IN ("
+                        " SELECT key FROM entries " + exclusion +
+                        " ORDER BY generated_at ASC, key ASC LIMIT ?)",
+                        params)
+                    total = self._conn.execute(
+                        "SELECT COALESCE(SUM(LENGTH(body) + LENGTH(key)), 0)"
+                        " FROM entries").fetchone()[0]
+                if total > self.max_bytes:
+                    # Delete the oldest prefix whose combined size covers
+                    # the byte surplus: a row goes while the bytes older
+                    # than it are still below the surplus, which is the
+                    # smallest prefix that brings the total under the cap.
+                    if exclude_key is None:
+                        params = (total - self.max_bytes,)
+                        exclusion = ""
+                    else:
+                        params = (exclude_key, total - self.max_bytes)
+                        exclusion = "WHERE key != ?"
+                    self._conn.execute(
+                        "DELETE FROM entries WHERE key IN ("
+                        " SELECT key FROM ("
+                        "  SELECT key, SUM(LENGTH(body) + LENGTH(key)) OVER ("
+                        "   ORDER BY generated_at ASC, key ASC)"
+                        "   - (LENGTH(body) + LENGTH(key)) AS older_bytes"
+                        "  FROM entries " + exclusion +
+                        " ) WHERE older_bytes < ?)",
+                        params)
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+        except sqlite3.Error:
+            log.warning("Shared cache capacity enforcement failed", exc_info=True)
+            return False
+        return True
+
+    def prune(self):
+        """Delete expired rows/leases and evict oldest entries until the
+        caps hold. Returns True when the cleanup ran without error."""
+        with self._lock:
+            return self._enforce_capacity()
+
     def _read_entry(self, key, now):
         for _ in range(3):
             row = self._conn.execute(
@@ -193,7 +315,7 @@ class SQLiteCacheBackend(CacheBackend):
                 self._conn.commit()
                 if deleted:
                     return SharedEntry("expired", None, version, 0.0, 0.0)
-                now = time.time()
+                now = self._now()
                 continue
             if age < fresh_for:
                 return SharedEntry("fresh", body, version, fresh_for - age, stale_for)
@@ -204,7 +326,7 @@ class SQLiteCacheBackend(CacheBackend):
     def lookup(self, key):
         with self._lock:
             try:
-                entry = self._read_entry(key, time.time())
+                entry = self._read_entry(key, self._now())
             except sqlite3.Error:
                 log.warning("Shared cache lookup failed for %s", key, exc_info=True)
                 return ("miss", None)
@@ -218,7 +340,7 @@ class SQLiteCacheBackend(CacheBackend):
         for repopulating the process-local cache."""
         with self._lock:
             try:
-                return self._read_entry(key, time.time())
+                return self._read_entry(key, self._now())
             except sqlite3.Error as exc:
                 raise SharedCacheUnavailable("Shared cache lookup failed") from exc
 
@@ -238,7 +360,9 @@ class SQLiteCacheBackend(CacheBackend):
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
-                    now = time.time()
+                    # Lifetime checks read the monotonic clock; the stored
+                    # timestamp stays real wall-clock (see class docstring).
+                    now = self._now()
                     if owner is not None:
                         lease = self._conn.execute(
                             "SELECT owner, expires_at FROM leases WHERE key = ?", (key,)
@@ -267,13 +391,14 @@ class SQLiteCacheBackend(CacheBackend):
                         " ON CONFLICT(key) DO UPDATE SET body=excluded.body,"
                         " generated_at=excluded.generated_at, fresh_for=excluded.fresh_for,"
                         " stale_for=excluded.stale_for, version=excluded.version",
-                        (key, bytes(body), now, float(fresh_seconds), float(stale_seconds), version),
+                        (key, bytes(body), time.time(), float(fresh_seconds), float(stale_seconds), version),
                     )
                     self._conn.execute("COMMIT")
                 except BaseException:
                     if self._conn.in_transaction:
                         self._conn.execute("ROLLBACK")
                     raise
+                self._enforce_capacity(exclude_key=key)
                 return True
             except sqlite3.Error:
                 log.warning("Shared cache insert failed for %s", key, exc_info=True)
@@ -300,7 +425,9 @@ class SQLiteCacheBackend(CacheBackend):
         """Get or replace a path generation atomically across workers."""
         with self._lock:
             try:
-                now = time.time()
+                # Expiry checks read the monotonic clock; the stored
+                # timestamp stays real wall-clock (see class docstring).
+                now = self._now()
                 if not invalidate:
                     row = self._conn.execute(
                         "SELECT token FROM variant_generations WHERE key=? AND expires_at>?",
@@ -319,7 +446,7 @@ class SQLiteCacheBackend(CacheBackend):
                         self._conn.execute(
                             "INSERT INTO variant_generations(key, token, expires_at) VALUES(?,?,?) "
                             "ON CONFLICT(key) DO UPDATE SET token=excluded.token, expires_at=excluded.expires_at",
-                            (key, token, now + _VARIANT_GENERATION_TTL))
+                            (key, token, time.time() + _VARIANT_GENERATION_TTL))
                         self._conn.execute(
                             "DELETE FROM variant_generations WHERE key IN "
                             "(SELECT key FROM variant_generations WHERE expires_at<=? LIMIT 128)", (now,))
@@ -344,7 +471,9 @@ class SQLiteCacheBackend(CacheBackend):
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
-                    now = time.time()
+                    # Liveness reads the monotonic clock; the stored
+                    # expiry stays real wall-clock (see class docstring).
+                    now = self._now()
                     row = self._conn.execute(
                         "SELECT owner, expires_at FROM leases WHERE key = ?", (key,)
                     ).fetchone()
@@ -359,7 +488,7 @@ class SQLiteCacheBackend(CacheBackend):
                         "INSERT INTO leases (key, owner, expires_at, version) VALUES (?, ?, ?, ?)"
                         " ON CONFLICT(key) DO UPDATE SET owner=excluded.owner,"
                         " expires_at=excluded.expires_at, version=excluded.version",
-                        (key, owner, now + ttl, version),
+                        (key, owner, time.time() + ttl, version),
                     )
                     self._conn.execute("COMMIT")
                 except BaseException:
@@ -387,7 +516,7 @@ class SQLiteCacheBackend(CacheBackend):
         with self._lock:
             try:
                 row = self._conn.execute("SELECT 1 FROM leases WHERE key=? AND owner=? AND expires_at>?",
-                                         (key, owner, time.time())).fetchone()
+                                         (key, owner, self._now())).fetchone()
                 return row is not None
             except sqlite3.Error as exc:
                 raise SharedCacheUnavailable("Shared cache lease lookup failed") from exc
@@ -416,7 +545,7 @@ def _is_storable(response):
 
 class ISRCache:
     def __init__(self, cache_backend="memory", cache_path=None, namespace="", cache_url=None,
-                 failure_policy=None):
+                 failure_policy=None, sqlite_max_entries=None, sqlite_max_bytes=None):
         """Create an ISR cache.
 
         ``failure_policy`` (roadmap item B4) decides what happens when
@@ -428,6 +557,11 @@ class ISRCache:
         for the ``memory`` backend, which has no shared store. It
         governs the read/decision path (lookup, lease, generation);
         best-effort writes stay best-effort — see ``failure_policy``.
+
+        ``sqlite_max_entries`` / ``sqlite_max_bytes`` tune the SQLite
+        backend's capacity caps (``None`` selects the backend defaults,
+        currently 4096 entries / 128 MiB); they are ignored for the
+        other backends.
         """
         if cache_backend not in ("memory", "sqlite", "redis"):
             raise ValueError(
@@ -435,6 +569,8 @@ class ISRCache:
             )
         self.backend_name = cache_backend
         self._cache_path = cache_path
+        self._sqlite_max_entries = sqlite_max_entries
+        self._sqlite_max_bytes = sqlite_max_bytes
         if cache_backend == "sqlite" and cache_path is not None:
             path = os.fspath(cache_path)
             uri_prefix = b"file:" if isinstance(path, bytes) else "file:"
@@ -450,7 +586,8 @@ class ISRCache:
         if cache_backend == "sqlite":
             if cache_path is None:
                 raise ValueError("cache_path is required when cache_backend is 'sqlite'")
-            self.shared = SQLiteCacheBackend(self._cache_path)
+            self.shared = SQLiteCacheBackend(
+                self._cache_path, max_entries=sqlite_max_entries, max_bytes=sqlite_max_bytes)
         elif cache_backend == "redis":
             from .redis_cache import RedisCacheBackend
             self.shared = RedisCacheBackend(self._cache_url)
@@ -466,7 +603,9 @@ class ISRCache:
         # A previous shutdown or failed app startup closes the shared store.
         # Reopening must restore it rather than silently falling back to L1.
         if self.shared is None and self.backend_name == "sqlite":
-            self.shared = SQLiteCacheBackend(self._cache_path)
+            self.shared = SQLiteCacheBackend(
+                self._cache_path, max_entries=self._sqlite_max_entries,
+                max_bytes=self._sqlite_max_bytes)
         elif self.shared is None and self.backend_name == "redis":
             from .redis_cache import RedisCacheBackend
             self.shared = RedisCacheBackend(self._cache_url)
