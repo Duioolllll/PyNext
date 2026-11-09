@@ -40,6 +40,13 @@ postgres = [
     "aiosqlite>=0.20,<1",
     "asyncpg>=0.30,<1",
 ]
+django = [
+    "Django>=5.2.8,<5.3",
+]
+django-postgres = [
+    "Django>=5.2.8,<5.3",
+    "psycopg[binary]>=3.2,<4",
+]
 
 [project.scripts]
 pynext = "pynext.cli:main"

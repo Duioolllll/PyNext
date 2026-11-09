@@ -106,6 +106,63 @@ def test_invalid_url_does_not_expose_credentials():
     asyncio.run(run())
 
 
+def test_concurrent_startup_and_shutdown_are_serialized(tmp_path):
+    async def run():
+        db = Database(f"sqlite:///{(tmp_path / 'lifecycle.sqlite3').as_posix()}")
+        results = await asyncio.gather(db.startup(), db.startup(), return_exceptions=True)
+        assert sum(result is None for result in results) == 1
+        assert sum(isinstance(result, RuntimeError) for result in results) == 1
+        await db.shutdown()
+
+        starting = asyncio.create_task(db.startup())
+        await asyncio.sleep(0)
+        await db.shutdown()
+        await starting
+        with pytest.raises(RuntimeError, match="has not started"):
+            _ = db.engine
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("url", ["sqlite://", "sqlite:///:memory:",
+                                 "sqlite+aiosqlite:///file:memorytest?mode=memory&cache=shared&uri=true"])
+def test_memory_sqlite_transactions_cannot_commit_each_others_work(url):
+    async def run():
+        db = Database(url)
+        await db.startup()
+        try:
+            async with db.engine.begin() as conn:
+                await conn.execute(text("CREATE TABLE entries (name TEXT)"))
+            entered, attempted, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+            async def rollback_first():
+                with pytest.raises(ValueError, match="rollback"):
+                    async with db.transaction() as session:
+                        await session.execute(text("INSERT INTO entries VALUES ('first')"))
+                        entered.set()
+                        await release.wait()
+                        raise ValueError("rollback")
+
+            async def commit_second():
+                await entered.wait()
+                attempted.set()
+                async with db.transaction() as session:
+                    await session.execute(text("INSERT INTO entries VALUES ('second')"))
+
+            first = asyncio.create_task(rollback_first())
+            second = asyncio.create_task(commit_second())
+            await asyncio.wait_for(attempted.wait(), 5)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(first, second), 5)
+            async with db.session() as session:
+                assert (await session.execute(text("SELECT name FROM entries"))).scalars().all() == ["second"]
+                with pytest.raises(RuntimeError, match="nested sessions"):
+                    async with db.session():
+                        pass
+        finally:
+            await db.shutdown()
+    asyncio.run(run())
+
+
 def test_later_resource_failure_disposes_database(tmp_path):
     folder = tmp_path / "app"
     folder.mkdir()
@@ -131,6 +188,26 @@ def test_later_resource_failure_disposes_database(tmp_path):
         # A failed app startup must not leave the database resource unusable.
         await db.startup()
         await db.shutdown()
+    asyncio.run(run())
+
+
+def test_concurrent_app_startup_keeps_database_available(tmp_path):
+    folder = tmp_path / "app"
+    folder.mkdir()
+    (folder / "route.py").write_text(
+        'from pynext import Response, route\n@route("GET")\ndef get(): return Response("ok")\n',
+        encoding="utf-8")
+    db = Database(f"sqlite:///{(tmp_path / 'concurrent.sqlite3').as_posix()}")
+    app = create_app(tmp_path, resources={"db": db})
+
+    async def run():
+        await asyncio.gather(app.startup(), app.startup())
+        try:
+            assert app.is_ready
+            async with db.session() as session:
+                assert (await session.execute(text("SELECT 1"))).scalar_one() == 1
+        finally:
+            await app.shutdown()
     asyncio.run(run())
 
 

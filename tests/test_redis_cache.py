@@ -48,6 +48,24 @@ def test_redis_lease_fencing_expiry_and_invalidation(backend):
     assert cache.lookup(key) == ("miss", None)
 
 
+def test_reopening_restores_redis_shared_backend(backend):
+    observer, key = backend
+
+    async def run():
+        cache = ISRCache(cache_backend="redis", cache_url=URL)
+        try:
+            assert cache.shared.insert(key, b"cached", 60, 0)
+            await cache.close()
+            assert cache.shared is None
+            cache.open()
+            assert cache.shared is not None
+            assert cache.shared.lookup(key) == ("fresh", b"cached")
+            assert observer.lookup(key) == ("fresh", b"cached")
+        finally:
+            await cache.close()
+    asyncio.run(run())
+
+
 def test_redis_workers_share_and_invalidate_without_serving_stale(backend):
     cache, key = backend
 

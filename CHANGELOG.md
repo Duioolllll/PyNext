@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Add an optional, bounded Django ORM/form resource with lifecycle-managed worker cleanup; Django HTTP apps and templates remain out of scope.
+- Serialize overlapping SQLite memory-database sessions and application/database lifecycle transitions, and reopen shared ISR stores after startup failure or shutdown.
 - Add an optional SQLAlchemy async `Database` resource for SQLite and PostgreSQL, with lifespan-managed connection pools and explicit session and transaction contexts. Include PostgreSQL integration CI and an Alembic guide.
 - Generate health endpoints and server-limit controls in the capability table, and align TLS roadmap wording with ADR-0001.
 - Add a Redis session store (`RedisSessionStore`, `pynext-framework[redis]` or `PYNEXT_REDIS_URL`) sharing login, rotation and logout across nodes with TTL expiry and version-fenced writes; the session store interface (load/save/delete) is unchanged so external stores keep working.
