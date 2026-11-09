@@ -815,7 +815,7 @@ class App:
     def __init__(self, root, manifest, *, production=False, security=None,
                  cache_backend=DEFAULT_CONFIG.cache_backend,
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
-                 resources=None, cache_url=None, cache_failure_policy=None,
+                 resources=None, cache_url=None, cache_failure_policy=None, cache_handler=None,
                  websocket_max_message=DEFAULT_CONFIG.websocket_max_message, hot_reload=False,
                  trusted_proxies=None, sync_workers=32, sync_wait_timeout=ASGI_DECISION_TIMEOUT,
                  sync_queue_limit=None, render_workers=None, session_workers=None,
@@ -947,7 +947,7 @@ class App:
                     raise TypeError("resources.py must export a RESOURCES dict")
             self._initialize(root, manifest, production=production,
                              cache_backend=cache_backend, cache_path=cache_path, cache_url=cache_url,
-                             cache_failure_policy=cache_failure_policy)
+                             cache_failure_policy=cache_failure_policy, cache_handler=cache_handler)
             configured = ()
             if "middleware.py" in manifest["sources"]:
                 configured = getattr(self._module("middleware.py"), "MIDDLEWARE", None)
@@ -1337,7 +1337,7 @@ class App:
         return self
 
     def _initialize(self, root, manifest, *, production=False, cache_backend="memory", cache_path=None,
-                    cache_url=None, cache_failure_policy=None):
+                    cache_url=None, cache_failure_policy=None, cache_handler=None):
         self.root = Path(root).resolve()
         self.manifest = manifest
         self.production = production
@@ -1382,8 +1382,10 @@ class App:
         build_id = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"),
                                              ensure_ascii=True).encode("ascii")).hexdigest()
         self.isr = ISRCache(cache_backend=cache_backend, cache_path=cache_path,
-                            namespace=(build_id + ":") if cache_backend in {"sqlite", "redis"} else "",
-                            cache_url=cache_url, failure_policy=cache_failure_policy)
+                            namespace=(build_id + ":") if cache_backend in {"sqlite", "redis"}
+                            or cache_handler is not None else "",
+                            cache_url=cache_url, failure_policy=cache_failure_policy,
+                            cache_handler=cache_handler)
         self.static_generators = {}
         self.static_pages = {}
         self.public_assets = {}
@@ -3635,7 +3637,7 @@ class App:
 def create_app(root=".", *, production=False, security=None, cache_backend=DEFAULT_CONFIG.cache_backend,
                cache_path=None,
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
-               cache_failure_policy=None, websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
+               cache_failure_policy=None, cache_handler=None, websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
                hot_reload=False,
                trusted_proxies=None, sync_workers=32, sync_wait_timeout=ASGI_DECISION_TIMEOUT,
                sync_queue_limit=None, render_workers=None, session_workers=None,
@@ -3661,4 +3663,4 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                strict_ssg=strict_ssg,
                headers=headers, revalidate_secret=revalidate_secret,
                body_timeout_ms=body_timeout_ms, handler_timeout_ms=handler_timeout_ms,
-               response_timeout_ms=response_timeout_ms)
+               response_timeout_ms=response_timeout_ms, cache_handler=cache_handler)
