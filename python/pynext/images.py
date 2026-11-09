@@ -5,6 +5,12 @@ import warnings
 
 MAX_IMAGE_PIXELS = 20_000_000
 MAX_IMAGE_OUTPUT = 16 * 1024 * 1024
+# Output bounds for optimize_image (review #4 #7). The HTTP image route
+# enforces the same range; the function itself must too, so a direct
+# caller cannot reach thumbnail() with width 0 (ZeroDivisionError) or
+# pass a quality Pillow silently accepts outside its documented range.
+MAX_IMAGE_WIDTH = 2048
+MAX_IMAGE_QUALITY = 95
 _slots = threading.BoundedSemaphore(4)
 
 
@@ -17,6 +23,10 @@ class ImageBusy(Exception):
 
 
 def optimize_image(data, width, quality):
+    if isinstance(width, bool) or not isinstance(width, int) or not 1 <= width <= MAX_IMAGE_WIDTH:
+        raise ValueError(f"Image width must be an integer between 1 and {MAX_IMAGE_WIDTH}")
+    if isinstance(quality, bool) or not isinstance(quality, int) or not 1 <= quality <= MAX_IMAGE_QUALITY:
+        raise ValueError(f"Image quality must be an integer between 1 and {MAX_IMAGE_QUALITY}")
     try:
         from PIL import Image, ImageOps, UnidentifiedImageError, features
     except ImportError as exc:
