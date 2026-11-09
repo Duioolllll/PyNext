@@ -301,7 +301,10 @@ def main():
     if args.command == "build":
         if args.standalone_dir and not args.standalone:
             parser.error("--standalone-dir requires --standalone")
-        manifest = write_manifest(root)
+        try:
+            manifest = write_manifest(root)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
         print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"

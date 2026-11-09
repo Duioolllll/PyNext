@@ -131,6 +131,18 @@ def test_cli_shutdown_timeout_reaches_serve(tmp_path, monkeypatch):
         cli.main()
 
 
+def test_cli_build_reports_manifest_errors_instead_of_traceback(tmp_path, monkeypatch, capsys):
+    def failing_manifest(path):
+        raise ValueError("Application sources changed during build; retry the build")
+
+    monkeypatch.setattr(cli, "write_manifest", failing_manifest)
+    monkeypatch.setattr(sys, "argv", ["pynext", "build", "--dir", str(tmp_path)])
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert "Application sources changed during build" in capsys.readouterr().err
+
+
 def test_cli_security_flags_reach_app(tmp_path, monkeypatch):
     seen = {}
     def create_app(path, production=False, **kwargs):
