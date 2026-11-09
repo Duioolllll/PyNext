@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Standard middleware results (track D P2-1): a middleware may now state its outcome explicitly with `MiddlewareResult` (`next` / `rewrite` / `redirect` / `response`, plus `rewrite_request()` and `redirect_response()` helpers). Calling `call_next` with a rewritten request is a rewrite: the path is validated with the same `_decode_path` the transports use at the edge, routing is re-evaluated against the rewritten request, rate limiting is decided once on the original path, and at most 5 rewrites run per request (fail-closed 500 after that). Returning a plain `Response` keeps working, and a 3xx response with a `Location` header is still a redirect.
+
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.
