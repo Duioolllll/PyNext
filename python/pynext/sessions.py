@@ -21,6 +21,23 @@ _COOKIE_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _MAX_SESSION_BYTES = 16_384
 
 
+def _check_json_serializable(key, value):
+    """Raise a key-named error if ``value`` cannot be stored as JSON.
+
+    Session data is persisted with ``json.dumps(..., allow_nan=False)``,
+    so a non-serializable value used to surface only after the handler
+    had run — as a bare ``TypeError`` from the middleware save, i.e. a
+    500 with no pointer at the offending assignment. Validating here,
+    at assignment time, fails fast with the key in the message.
+    """
+    try:
+        json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise type(exc)(
+            f"session value for key {key!r} is not JSON-serializable: {exc}"
+        ) from exc
+
+
 class SessionConflict(Exception):
     """The session was changed or revoked while this request was running."""
 
@@ -57,6 +74,8 @@ class SQLiteSessionStore:
         return await asyncio.to_thread(read)
 
     async def save(self, token, data, csrf, version, expires, *, previous_token=None):
+        for key, value in data.items():
+            _check_json_serializable(key, value)
         payload = json.dumps({"data": data, "csrf": csrf}, ensure_ascii=False,
                              separators=(",", ":"), allow_nan=False)
         if len(payload.encode("utf-8")) > _MAX_SESSION_BYTES:
@@ -183,6 +202,8 @@ class RedisSessionStore:
         return await asyncio.to_thread(read)
 
     async def save(self, token, data, csrf, version, expires, *, previous_token=None):
+        for key, value in data.items():
+            _check_json_serializable(key, value)
         payload = json.dumps({"data": data, "csrf": csrf}, ensure_ascii=False,
                              separators=(",", ":"), allow_nan=False)
         if len(payload.encode("utf-8")) > _MAX_SESSION_BYTES:
@@ -279,6 +300,8 @@ class Session(MutableMapping):
 
     def __init__(self, data=None, csrf=None, token=None, version=None):
         self._data = data if data is not None else {}
+        for key, value in self._data.items():
+            _check_json_serializable(key, value)
         self._csrf = csrf
         self._token = token
         self._version = version
@@ -292,6 +315,10 @@ class Session(MutableMapping):
     def __setitem__(self, key, value):
         if self._invalidated:
             raise RuntimeError("session has been invalidated")
+        # Fail here, at assignment time, with the key named — not after
+        # the handler returns, when the middleware save would raise a
+        # bare TypeError and the request would answer 500.
+        _check_json_serializable(key, value)
         self._data[key] = value
 
     def __delitem__(self, key):
