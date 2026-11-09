@@ -1452,8 +1452,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     }
     // Decide admission from headers before polling the body. In particular,
     // an over-limit Expect: 100-continue request must never be told to upload.
+    let decoded_path = static_path(parts.uri.path());
     if state.http_rate_limit_callback.is_some() {
-        let Some(path) = static_path(parts.uri.path()) else {
+        let Some(path) = decoded_path.as_ref() else {
             return close_with_unread_body(
                 plain_response(
                     StatusCode::BAD_REQUEST,
@@ -1464,7 +1465,8 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             );
         };
         if path != "/healthz" && path != "/readyz" {
-            if let Some(mut response) = rate_limit_denial(&state, &parts, path, false).await {
+            if let Some(mut response) = rate_limit_denial(&state, &parts, path.clone(), false).await
+            {
                 if parts.method == axum::http::Method::HEAD {
                     *response.body_mut() = Body::empty();
                 }
@@ -1539,10 +1541,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         // Health probes are reserved framework paths (B6): a public
         // asset or static page with the same name must not shadow them,
         // so they always fall through to the Python bridge.
-        && parts.uri.path() != "/healthz"
-        && parts.uri.path() != "/readyz"
+        && !matches!(decoded_path.as_deref(), Some("/healthz" | "/readyz"))
     {
-        if let Some(path) = static_path(parts.uri.path()) {
+        if let Some(path) = decoded_path {
             if let Some(content) = state.client_assets.get(&path) {
                 return static_response(
                     &parts,
