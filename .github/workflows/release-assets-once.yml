@@ -1,0 +1,96 @@
+name: Attach verified 0.1.1 release assets
+on:
+  push:
+    branches: [codex/release-0.1.1-assets]
+    paths: [.github/workflows/release-assets-once.yml]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify provenance and collect passing workflow artifacts
+        run: |
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          repo = os.environ['GITHUB_REPOSITORY']
+          for run_id, name in [('42586501601', 'Wheels'), ('42586501496', 'Supply chain and container checks')]:
+              run = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/actions/runs/{run_id}']))
+              assert run['name'] == name and run['conclusion'] == 'success'
+              assert run['head_repository']['full_name'] == repo
+              tree = lambda ref: subprocess.check_output(['git', 'rev-parse', f'{ref}^{{tree}}']).strip()
+              assert tree(run['head_sha']) == tree('v0.1.1')
+          PY
+          gh run download 42586501601 --dir artifacts/wheels
+          gh run download 42586501496 --dir artifacts/security
+          mkdir -p native-source assets
+          git archive v0.1.1 Cargo.lock Cargo.toml LICENSE | tar -x -C native-source
+      - name: Generate native Cargo.lock inventory
+        uses: anchore/sbom-action@fffec3d851af758d56fee099cf3fbf8aa8779843
+        env:
+          SYFT_OVERRIDE_DEFAULT_CATALOGERS: rust-cargo-lock-cataloger
+        with:
+          path: native-source
+          format: cyclonedx-json
+          syft-version: v1.57.0
+          output-file: assets/native.cdx.json
+          upload-artifact: false
+      - name: Verify files, attach reports and publish the existing draft
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, shutil, subprocess, tarfile, tomllib
+          from pathlib import Path
+          from urllib.request import urlopen
+          from zipfile import ZipFile
+          from email.parser import BytesParser
+          assets = Path('assets')
+          wheels = list(Path('artifacts/wheels').rglob('*.whl'))
+          sources = list(Path('artifacts/wheels').rglob('*.tar.gz'))
+          assert len(wheels) == 8 and len(sources) == 1
+          with urlopen('https://pypi.org/pypi/pynext-framework/0.1.1/json') as response:
+              published = {p['filename']: p['digests']['sha256'] for p in json.load(response)['urls']}
+          for file in wheels + sources:
+              assert hashlib.sha256(file.read_bytes()).hexdigest() == published[file.name]
+              if file.suffix == '.whl':
+                  with ZipFile(file) as wheel:
+                      names = set(wheel.namelist())
+                      metadata = BytesParser().parsebytes(wheel.read(next(n for n in names if n.endswith('.dist-info/METADATA'))))
+                      assert metadata['Name'] == 'pynext-framework' and metadata['Version'] == '0.1.1'
+                      assert {'pynext/py.typed', 'pynext/__init__.pyi', 'pynext/http.pyi'} <= names
+              shutil.copy2(file, assets / file.name)
+          security = Path('artifacts/security')
+          dependency = security / 'dependency-security-reports'
+          container = security / 'container-security-reports'
+          assert not any(p['vulns'] for p in json.loads((dependency / 'python-audit.json').read_text())['dependencies'])
+          assert json.loads((dependency / 'cargo-audit.json').read_text())['vulnerabilities']['count'] == 0
+          assert json.loads((dependency / 'npm-audit.json').read_text())['metadata']['vulnerabilities']['total'] == 0
+          assert not any(p.get('Vulnerabilities') for p in json.loads((container / 'image-audit.json').read_text())['Results'])
+          lock = tomllib.loads(Path('native-source/Cargo.lock').read_text())
+          bom = json.loads((assets / 'native.cdx.json').read_text())
+          assert {(p['name'], p['version']) for p in lock['package']} <= {(p['name'], p.get('version')) for p in bom['components']}
+          for source in [dependency / 'python.cdx.json', dependency / 'python-audit.json', dependency / 'cargo-audit.json', dependency / 'npm-audit.json', container / 'image.spdx.json', container / 'image-audit.json']:
+              shutil.copy2(source, assets / source.name)
+          for source in ['benchmarks/baseline-2026-11-09-production.json', 'docs/evidence/0.1.1-local.json']:
+              (assets / Path(source).name).write_bytes(subprocess.check_output(['git', 'show', 'v0.1.1:' + source]))
+          (assets / 'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in sorted(assets.iterdir())))
+          repo = os.environ['GITHUB_REPOSITORY']
+          release = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/releases/tags/v0.1.1']))
+          existing = {p['name']: p for p in release['assets']}
+          for file in sorted(assets.iterdir()):
+              if file.name in existing:
+                  verify = Path('existing-assets')
+                  verify.mkdir(exist_ok=True)
+                  subprocess.run(['gh', 'release', 'download', 'v0.1.1', '--pattern', file.name, '--dir', str(verify)], check=True)
+                  assert (verify / file.name).read_bytes() == file.read_bytes()
+              else:
+                  subprocess.run(['gh', 'release', 'upload', 'v0.1.1', str(file)], check=True)
+          subprocess.run(['gh', 'release', 'edit', 'v0.1.1', '--draft=false', '--latest'], check=True)
+          PY
