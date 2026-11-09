@@ -33,6 +33,54 @@ def _project(tmp_path):
     return tmp_path
 
 
+@pytest.mark.parametrize("backend", ["memory", "redis"])
+def test_configured_limiter_preserves_native_static_fast_path(tmp_path, monkeypatch, backend):
+    _project(tmp_path)
+    public = tmp_path / "public"
+    public.mkdir()
+    (public / "asset.txt").write_bytes(b"asset")
+    if backend == "redis":
+        pytest.importorskip("redis")
+        url = os.environ.get("PYNEXT_TEST_REDIS_URL")
+        if not url:
+            pytest.skip("PYNEXT_TEST_REDIS_URL is not set")
+        limiter = RedisRateLimiter(4, 60, url=url, namespace=uuid.uuid4().hex)
+    else:
+        limiter = RateLimiter(4, 60)
+
+    async def run():
+        app = create_app(tmp_path, rate_limit=limiter)
+        python_dispatches = []
+        dispatch = app.dispatch
+
+        async def observed_dispatch(request):
+            python_dispatches.append(request.path)
+            return await dispatch(request)
+
+        monkeypatch.setattr(app, "dispatch", observed_dispatch)
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", trust_env=False) as client:
+                response = await client.get("/asset.txt")
+                assert response.status_code == 200 and response.content == b"asset"
+                etag = response.headers["etag"]
+                response = await client.head("/asset.txt")
+                assert response.status_code == 200 and response.content == b""
+                response = await client.get("/asset.txt", headers={"If-None-Match": etag})
+                assert response.status_code == 304 and response.content == b""
+                response = await client.get("/asset.txt", headers={"Range": "bytes=0-1"})
+                assert response.status_code == 206 and response.content == b"as"
+                assert (await client.get("/asset.txt")).status_code == 429
+                assert python_dispatches == []
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.shutdown()
+            if backend == "redis":
+                limiter.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("expect_continue", [False, True])
 @pytest.mark.parametrize("backend", ["memory", "redis"])
 def test_native_rejects_exhausted_client_before_body_intake(tmp_path, expect_continue, backend):

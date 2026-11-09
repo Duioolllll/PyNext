@@ -535,7 +535,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 websocket_auth_callback=ws_auth_callback,
                                 reuse_port=reuse_port,
                                 route_patterns=app.router.ordered_routes(),
-                                middleware_enabled=bool(app.middleware) or limiter is not None or app.hot_reload,
+                                middleware_enabled=bool(app.middleware) or app.hot_reload,
                                 shared_cache_enabled=app.isr.shared is not None,
                                 websocket_protocols=app.websocket_protocols,
                                 websocket_max_message=app.websocket_max_message, listener=listener,
