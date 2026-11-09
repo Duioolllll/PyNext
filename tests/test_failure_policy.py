@@ -268,3 +268,30 @@ def test_cli_passes_failure_policies(tmp_path, monkeypatch):
                                            "namespace": "default",
                                            "failure_policy": "fail_open"})
     assert seen["app"][2]["cache_failure_policy"] == "fail_closed"
+
+
+def test_cache_fail_open_invalidate_reports_local_removal_only():
+    """Review #4 #20: in fail_open, True means local removal succeeded.
+
+    The shared removal fails (backend down) while the local removal
+    succeeds, and invalidate() returns True. That True does not
+    guarantee the shared entry is gone — shared removal is best-effort
+    in fail_open mode — which is what the docstring and manual now say.
+    """
+    cache = _cache_with_failing_backend("fail_open")
+    calls = []
+
+    async def run():
+        assert await cache.get_or_render("/page", POLICY, _render_once(calls)) == b"hello"
+        assert cache.store.lookup("/page")[0] == "fresh"
+        assert await cache.invalidate("/page") is True
+        assert cache.store.lookup("/page")[0] == "miss"
+    asyncio.run(run())
+
+
+def test_invalidate_docstring_states_fail_open_semantics():
+    doc = ISRCache.invalidate.__doc__ or ""
+    assert "fail_open" in doc
+    assert "best-effort" in doc
+    assert "does not guarantee the shared entry is gone" in doc
+    assert "fail_closed" in doc
