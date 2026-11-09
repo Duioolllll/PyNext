@@ -389,7 +389,7 @@ fn render(py: Python<'_>, tree_json: &str, nonce: Option<&str>) -> PyResult<Stri
             return Err(PyValueError::new_err("Invalid CSP nonce"));
         }
     }
-    py.allow_threads(|| {
+    py.detach(|| {
         let node: Value =
             serde_json::from_str(tree_json).map_err(|e| PyValueError::new_err(e.to_string()))?;
         let mut result = String::new();
@@ -435,13 +435,11 @@ struct ServerState {
     websocket_max_message: usize,
     ws_callback: Option<Py<PyAny>>,
     ws_origin_callback: Option<Py<PyAny>>,
-    // Rate-limit check for WebSocket handshakes (review #4 #21): the
-    // HTTP bridge checks the limiter before dispatch, but the upgrade
-    // branch never reached it. The Python callback mirrors bridge():
-    // it returns (allowed, retry_after_seconds) and raises
-    // RateLimitUnavailable when the limiter cannot decide, which the
-    // upgrade branch answers with 503 like the bridge does.
+    // Header-stage admission, shared by HTTP and WebSocket handshakes.
+    // Checks use a separate bounded budget from body intake and handlers.
     ws_rate_limit_callback: Option<Py<PyAny>>,
+    http_rate_limit_callback: Option<Py<PyAny>>,
+    rate_limit_capacity: Arc<Semaphore>,
     ws_origin_capacity: Arc<Semaphore>,
     ws_auth_callback: Option<Py<PyAny>>,
     ws_auth_capacity: Arc<Semaphore>,
@@ -474,7 +472,7 @@ enum BridgeBody {
 
 fn close_stream(stream: Arc<Py<PyAny>>) {
     tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let _ = stream.bind(py).call_method0("close");
         });
     });
@@ -498,7 +496,7 @@ fn streaming_body(stream: Py<PyAny>, permit: OwnedSemaphorePermit) -> Body {
             };
             let next_stream = Arc::clone(&stream);
             let next = tokio::task::spawn_blocking(move || {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     next_stream
                         .bind(py)
                         .call_method0("next_chunk")?
@@ -950,7 +948,7 @@ enum WsPush {
 async fn ws_call(session: &Arc<Py<PyAny>>, method: &'static str, arg: WsPush) -> bool {
     let session = Arc::clone(session);
     tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let bound = session.bind(py);
             match arg {
                 WsPush::Text(text) => bound.call_method1(method, (text,)),
@@ -968,7 +966,7 @@ async fn ws_call(session: &Arc<Py<PyAny>>, method: &'static str, arg: WsPush) ->
 async fn ws_is_done(session: &Arc<Py<PyAny>>) -> bool {
     let session = Arc::clone(session);
     tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             session
                 .bind(py)
                 .call_method0("_is_done")
@@ -991,7 +989,7 @@ async fn ws_take_outgoing(session: &Arc<Py<PyAny>>, timeout: Duration) -> Option
     let session = Arc::clone(session);
     let millis = timeout.as_millis() as u64;
     tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let item = session.bind(py).call_method1("_take_outgoing", (millis,))?;
             let item = item.extract::<Option<(
                 String,
@@ -1038,7 +1036,7 @@ async fn run_ws_session(
     mut socket: WebSocket,
 ) {
     let Some(ws_callback) =
-        Python::with_gil(|py| state.ws_callback.as_ref().map(|cb| cb.clone_ref(py)))
+        Python::attach(|py| state.ws_callback.as_ref().map(|cb| cb.clone_ref(py)))
     else {
         let _ = socket
             .send(ws_close_frame(1011, "websocket setup failed"))
@@ -1046,7 +1044,7 @@ async fn run_ws_session(
         return;
     };
     let session = tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let session = ws_callback
                 .bind(py)
                 .call1((path, query, headers, protocol))?;
@@ -1166,6 +1164,84 @@ async fn run_ws_session(
     }
 }
 
+async fn rate_limit_denial(
+    state: &Arc<ServerState>,
+    parts: &axum::http::request::Parts,
+    path: String,
+    is_websocket: bool,
+) -> Option<AxumResponse<Body>> {
+    let callback = if is_websocket {
+        &state.ws_rate_limit_callback
+    } else {
+        &state.http_rate_limit_callback
+    };
+    callback.as_ref()?;
+    let unavailable = || {
+        let mut response = plain_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable",
+            &state.security_headers,
+        );
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        response
+    };
+    let Ok(permit) = Arc::clone(&state.rate_limit_capacity).try_acquire_owned() else {
+        return Some(unavailable());
+    };
+    let headers: Vec<(Vec<u8>, Vec<u8>)> = parts
+        .headers
+        .iter()
+        .map(|(name, value)| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
+        .collect();
+    let peer = parts
+        .extensions
+        .get::<PeerAddr>()
+        .map(|addr| addr.0.ip().to_string());
+    let rate_state = Arc::clone(state);
+    let decision = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            // A timed-out blocking task retains its permit until it exits.
+            let _permit = permit;
+            Python::attach(|py| -> PyResult<(bool, Option<u64>)> {
+                let raw_headers = PyList::empty(py);
+                for (name, value) in &headers {
+                    raw_headers.append((PyBytes::new(py, name), PyBytes::new(py, value)))?;
+                }
+                let callback = if is_websocket {
+                    &rate_state.ws_rate_limit_callback
+                } else {
+                    &rate_state.http_rate_limit_callback
+                };
+                callback
+                    .as_ref()
+                    .expect("callback checked above")
+                    .bind(py)
+                    .call1((path, raw_headers, peer))?
+                    .extract()
+            })
+        }),
+    )
+    .await;
+    match decision {
+        Ok(Ok(Ok((true, _)))) => None,
+        Ok(Ok(Ok((false, retry_after)))) => {
+            let mut response = plain_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too Many Requests",
+                &state.security_headers,
+            );
+            if let Ok(value) = HeaderValue::from_str(&retry_after.unwrap_or(1).max(1).to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            Some(response)
+        }
+        _ => Some(unavailable()),
+    }
+}
+
 async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> AxumResponse<Body> {
     let (parts, body) = request.into_parts();
     // A WebSocket upgrade is decided here, before any body handling: the
@@ -1193,73 +1269,8 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         if !state.websocket_paths.contains(&pattern) {
             return plain_response(StatusCode::NOT_FOUND, "Not Found", &state.security_headers);
         }
-        // Rate limiting runs before the origin check and the 101: the
-        // HTTP bridge applies the same limiter before dispatch, but the
-        // upgrade branch never reached it, so handshakes were unmetered.
-        // A denied handshake gets 429 with Retry-After, exactly like an
-        // over-limit HTTP request; a callback failure or timeout fails
-        // closed with 503, like the bridge does. The check shares the
-        // bounded Python-check capacity with the origin check, so stalled
-        // callbacks cannot queue without bound.
-        if state.ws_rate_limit_callback.is_some() {
-            let Ok(permit) = Arc::clone(&state.ws_origin_capacity).try_acquire_owned() else {
-                return plain_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Service Unavailable",
-                    &state.security_headers,
-                );
-            };
-            let rate_path = path.clone();
-            let rate_headers: Vec<(Vec<u8>, Vec<u8>)> = parts
-                .headers
-                .iter()
-                .map(|(name, value)| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
-                .collect();
-            let rate_peer = parts
-                .extensions
-                .get::<PeerAddr>()
-                .map(|addr| addr.0.ip().to_string());
-            let rate_state = Arc::clone(&state);
-            let decision = tokio::time::timeout(
-                Duration::from_secs(2),
-                tokio::task::spawn_blocking(move || {
-                    // The permit stays with the task even if the timeout expires.
-                    let _permit = permit;
-                    Python::with_gil(|py| -> PyResult<(bool, Option<u64>)> {
-                        rate_state
-                            .ws_rate_limit_callback
-                            .as_ref()
-                            .expect("callback checked above")
-                            .bind(py)
-                            .call1((rate_path, rate_headers, rate_peer))?
-                            .extract()
-                    })
-                }),
-            )
-            .await;
-            match decision {
-                Ok(Ok(Ok((true, _)))) => {}
-                Ok(Ok(Ok((false, retry_after)))) => {
-                    let mut response = plain_response(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "Too Many Requests",
-                        &state.security_headers,
-                    );
-                    if let Ok(value) =
-                        HeaderValue::from_str(&retry_after.unwrap_or(1).max(1).to_string())
-                    {
-                        response.headers_mut().insert(header::RETRY_AFTER, value);
-                    }
-                    return response;
-                }
-                _ => {
-                    return plain_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Service Unavailable",
-                        &state.security_headers,
-                    );
-                }
-            }
+        if let Some(response) = rate_limit_denial(&state, &parts, path.clone(), true).await {
+            return response;
         }
         // Origin policy must run before the HTTP 101 response. Limit the
         // Python checks separately so stalled callbacks cannot queue without
@@ -1293,7 +1304,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             tokio::task::spawn_blocking(move || {
                 // The permit stays with the task even if the timeout expires.
                 let _permit = permit;
-                Python::with_gil(|py| -> PyResult<bool> {
+                Python::attach(|py| -> PyResult<bool> {
                     let headers = PyList::empty(py);
                     for (name, value) in &origin_headers {
                         headers.append((PyBytes::new(py, name), PyBytes::new(py, value)))?;
@@ -1359,7 +1370,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             tokio::task::spawn_blocking(move || {
                 // The permit stays with the task even if the timeout expires.
                 let _permit = auth_permit;
-                Python::with_gil(|py| -> PyResult<Option<bool>> {
+                Python::attach(|py| -> PyResult<Option<bool>> {
                     let headers = PyList::empty(py);
                     for (name, value) in &auth_headers {
                         headers.append((PyBytes::new(py, name), PyBytes::new(py, value)))?;
@@ -1439,6 +1450,32 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             parts.version,
         );
     }
+    // Decide admission from headers before polling the body. In particular,
+    // an over-limit Expect: 100-continue request must never be told to upload.
+    if state.http_rate_limit_callback.is_some() {
+        let Some(path) = static_path(parts.uri.path()) else {
+            return close_with_unread_body(
+                plain_response(
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request",
+                    &state.security_headers,
+                ),
+                parts.version,
+            );
+        };
+        if path != "/healthz" && path != "/readyz" {
+            if let Some(mut response) = rate_limit_denial(&state, &parts, path, false).await {
+                if parts.method == axum::http::Method::HEAD {
+                    *response.body_mut() = Body::empty();
+                }
+                return if body.is_end_stream() {
+                    response
+                } else {
+                    close_with_unread_body(response, parts.version)
+                };
+            }
+        }
+    }
     // Empty requests do not compete with clients currently uploading bodies.
     let body = if body.is_end_stream() {
         Bytes::new()
@@ -1495,6 +1532,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         }
     };
     if !state.middleware_enabled
+        // Origin-bearing responses, including static ranges and 304s,
+        // use the same Python CORS policy as ASGI.
+        && !parts.headers.contains_key(header::ORIGIN)
         && (parts.method == axum::http::Method::GET || parts.method == axum::http::Method::HEAD)
         // Health probes are reserved framework paths (B6): a public
         // asset or static page with the same name must not shadow them,
@@ -1625,7 +1665,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         .map(|peer| peer.0.ip().to_string());
     let security_headers = state.security_headers.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let result = Python::with_gil(|py| {
+        let result = Python::attach(|py| {
             let cb = state.callback.bind(py);
             let token = Py::new(
                 py,
@@ -1843,7 +1883,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1878,6 +1918,7 @@ impl NativeServer {
         websocket_origin_callback: Option<Py<PyAny>>,
         websocket_rate_limit_callback: Option<Py<PyAny>>,
         websocket_auth_callback: Option<Py<PyAny>>,
+        http_rate_limit_callback: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -2052,6 +2093,8 @@ impl NativeServer {
                     ws_callback: websocket_callback,
                     ws_origin_callback: websocket_origin_callback,
                     ws_rate_limit_callback: websocket_rate_limit_callback,
+                    http_rate_limit_callback,
+                    rate_limit_capacity: Arc::new(Semaphore::new(64)),
                     ws_origin_capacity: Arc::new(Semaphore::new(64)),
                     ws_auth_callback: websocket_auth_callback,
                     ws_auth_capacity: Arc::new(Semaphore::new(64)),
@@ -2204,7 +2247,7 @@ impl NativeServer {
             let _ = shutdown.send(());
         }
         if let Some(thread) = self.thread.take() {
-            py.allow_threads(move || {
+            py.detach(move || {
                 let _ = thread.join();
             });
         }

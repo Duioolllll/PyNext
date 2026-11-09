@@ -46,10 +46,11 @@ the table to reset buckets. Existing keys are never denied by table
 pressure.
 
 When a limiter is configured, static files and fresh ISR pages also pass
-through the Python bridge. On the Axum adapter the body has already been read by the time
-the bridge runs, so rate limiting happens at dispatch time there, after
-the body-intake limits; on the ASGI adapter the check runs before the
-body is read. Paths listed in ``exempt_paths`` skip the check entirely
+through the Python bridge. Both adapters check admission from headers,
+before reading the body or executing a handler. Each admitted request
+consumes one token even if the upload is abandoned or later fails a body
+or execution limit; it is never charged again by the native bridge.
+Paths listed in ``exempt_paths`` skip the check entirely
 (for example health-check endpoints that load balancers must always
 reach); nothing is exempt by default.
 """
@@ -68,6 +69,15 @@ _IPV6_PREFIX_LEN = 64
 
 class RateLimitUnavailable(Exception):
     """A shared limiter could not safely decide whether to admit a request."""
+
+
+def _is_exempt_path(limiter, path):
+    """Use decoded-path matching while preserving custom exemption hooks."""
+    exempt = getattr(limiter, "is_exempt", None)
+    decoded_exempt = getattr(limiter, "is_exempt_path", None)
+    if decoded_exempt and (exempt is None or getattr(exempt, "__func__", None) is RateLimiter.is_exempt):
+        return bool(decoded_exempt(path))
+    return bool(exempt and exempt(path))
 
 
 def _parse_trusted_proxies(trusted_proxies):
@@ -166,9 +176,15 @@ class RateLimiter:
 
     def is_exempt(self, path):
         """True when ``path`` (query string ignored) skips rate limiting."""
+        if not path:
+            return False
+        return self.is_exempt_path(str(path).split("?", 1)[0])
+
+    def is_exempt_path(self, path):
+        """Match an already decoded URL path, preserving literal ``?`` characters."""
         if not self.exempt_paths or not path:
             return False
-        path = str(path).split("?", 1)[0]
+        path = str(path)
         for prefix in self.exempt_paths:
             base = prefix.rstrip("/") or "/"
             if path == prefix or path == base or path.startswith(base + "/"):

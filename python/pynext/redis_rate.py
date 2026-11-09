@@ -93,7 +93,7 @@ class RedisRateLimiter(RateLimiter):
     """Shared token buckets; a Redis outage fails closed with HTTP 503.
 
     Bucket keys are the ``/64``-grouped keys from :meth:`RateLimiter.key_for`
-    (the app and native bridge call ``key_for`` before ``allow``). Table
+    (the transports call ``key_for`` before ``allow``). Table
     pressure follows the same policy as the in-process limiter: a new key
     evicts the stalest active bucket instead of being denied, and only
     the global new-key sliding window can deny a brand-new key.

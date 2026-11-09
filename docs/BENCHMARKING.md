@@ -94,7 +94,7 @@ uv run pynext start --dir examples/basic --host 0.0.0.0 --port 3000
 uv run python benchmarks/serve_project.py --dir benchmarks/fixtures/db-app \
     --mode axum
 # 2. 부하 생성기 머신에서 server-env.json을 받아 실행
-python benchmarks/baseline.py --base-url http://<서버>:3000 \
+python benchmarks/baseline.py --base-url http://<서버>:3000 --modes axum \
     --db-base-url http://<서버>:<픽스처-포트> \
     --server-info server-env.json --output baseline-remote.json
 ```
@@ -104,7 +104,7 @@ python benchmarks/baseline.py --base-url http://<서버>:3000 \
 
 ### 기록된 베이스라인
 
-`benchmarks/baseline-2026-11-08.json`은 동일 머신 스모크 실행 결과입니다
+`benchmarks/baseline-2026-11-08.json`은 초기 동일 머신 스모크 실행 결과입니다
 (개발 모드, 50요청, 동시성 4, 1회 반복). 운영 처리량 주장이 아니며,
 게시용 베이스라인은 별도 머신에서 기본 조건(반복 3회, 프로덕션 모드)으로
 다시 측정해야 합니다.
@@ -134,3 +134,50 @@ Uvicorn과 비교하려면 `uvicorn --app-dir examples/basic asgi:app`으로 별
 최소한 CPU 모델과 코어 수, 운영체제, Python/Rust/Uvicorn/HTTP 클라이언트 버전, 서버 워커 수, 요청 경로와 응답 크기, 캐시 상태, TLS/프로토콜, 워밍업 횟수, 동시성, 전체 요청 수를 기록하세요. 서로 다른 경로(예: 정적 캐시 히트와 동적 API)를 비교하려면 작업 부하를 분리하고 결과를 구분해야 합니다.
 
 CI의 40요청·동시성 4 테스트는 Axum/Uvicorn이 올바르게 응답하는지 확인하는 **스모크 테스트**일 뿐 성능 회귀 임계값으로 사용하지 않습니다. 프레임워크 간 처리량 우위는 별도 검증 결과로만 주장하세요.
+
+### 프로덕션 빌드 반복 측정 (2026-11-09)
+
+원본: [`baseline-2026-11-09-production.json`](../benchmarks/baseline-2026-11-09-production.json).
+코드 `36cee854`(측정 시작 시 깨끗한 작업 트리), Python 3.14.9, PyO3 0.29.3,
+단일 워커, 평문 loopback, **서버·부하 생성기 동일 머신**이다. 각 시나리오·서버별
+2,000요청 × 3회, 동시성 10, 회당 워밍업 100으로 측정했다. DB 픽스처까지
+프로덕션 manifest를 사용했다. 측정 84,000요청의 HTTP 오류는 0건이다.
+독립 서버 프로세스의 CPU·10ms 샘플링 RSS와 전체 반복값은 원본에 있다.
+
+RPS는 반복 간 평균이고, 지연 백분위는 반복 간 중앙값이다. 이 수치만으로
+서버 순위나 운영 처리량을 보장하지 않는다.
+
+| 시나리오 | 서버 | 성공 RPS 평균 | p95 ms | p99 ms | p99.9 ms | HTTP 오류 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| static | axum | 902.73 | 8.46 | 25.89 | 1450.80 | 0 |
+| static | uvicorn | 225.88 | 47.30 | 48.93 | 51.90 | 0 |
+| ssg | axum | 955.88 | 7.54 | 10.31 | 2071.45 | 0 |
+| ssg | uvicorn | 223.19 | 48.17 | 51.03 | 53.21 | 0 |
+| isr-hit | axum | 913.91 | 8.06 | 10.86 | 2164.88 | 0 |
+| isr-hit | uvicorn | 224.71 | 48.37 | 52.32 | 57.17 | 0 |
+| ssr | axum | 730.57 | 46.20 | 82.78 | 126.44 | 0 |
+| ssr | uvicorn | 210.18 | 52.64 | 56.57 | 60.10 | 0 |
+| json-api | axum | 881.11 | 35.27 | 69.63 | 311.69 | 0 |
+| json-api | uvicorn | 219.31 | 52.04 | 60.83 | 75.69 | 0 |
+| db-query | axum | 750.55 | 44.31 | 86.18 | 264.13 | 0 |
+| db-query | uvicorn | 218.03 | 51.18 | 54.19 | 60.50 | 0 |
+| streaming | axum | 182.29 | 58.58 | 64.82 | 71.78 | 0 |
+| streaming | uvicorn | 187.70 | 55.97 | 60.54 | 71.82 | 0 |
+
+Axum의 정적·SSG·ISR에서는 p99.9가 약 1.45–2.16초였다. 오류가 없다는 이유로
+이 꼬리 지연을 숨기거나 SLO를 충족했다고 판단하지 않는다. 별도 머신에서
+반복·프로파일링하기 전에는 원인을 확정할 수 없다. DB는 하나의 연결을
+직렬화한 SQLite 픽스처이며 운영 DB 풀 성능이 아니다. 스트리밍 경로는 예제의
+의도적인 지연을 포함한다. TLS 프록시·실제 운영 DB·다중 워커·장기간 측정은
+[전체 로드맵](PRODUCTION_ROADMAP.md)의 C1/C2/C5/C6에 남아 있다.
+
+초기 측정도 [`baseline-2026-11-09-initial.json`](../benchmarks/baseline-2026-11-09-initial.json)에
+보존했다. 초기 코드는 `8cb69a07`, Python 3.13.5/PyO3 0.25.1로 최종 측정과
+조건이 다르다. DB에서 476건의 HTTP 오류와 별도 재현의 잘못된 200 응답을
+발견했고, 공유 연결 접근을 직렬화한 뒤 동시성 20으로 총 1,000쿼리의 회귀 검증과 전체
+반복 측정을 다시 수행했다. 초기 DB 처리량은 정상 동작의 기준선으로 사용하지 않는다.
+
+장시간 실행에서 로그 파이프가 차서 서버가 멈추지 않도록 stdout/stderr를
+계속 비우며 오류 진단 꼬리는 최대 8 KiB만 보관한다. 외부 URL만으로 별도
+물리 머신이라고 추정하지 않으며 `loadgen_location=external-unverified`를 쓴다.
+외부 실행은 실제 서버에 맞는 `--modes` 한 개만 지정해야 한다.

@@ -233,14 +233,16 @@ def _signed_headers(token, *, origin=None, fetch_site=None, host=b"test"):
 
 @pytest.mark.parametrize("origin,allowed", [
     ("http://test", True),            # same origin
+    ("http://test:80", True),         # explicit default port
+    ("https://test", False),          # another scheme is another origin
+    ("http://test:443", False),       # another port is another origin
+    ("http://test/path", False),
+    ("http://user@test", False),
     ("http://evil.example", False),   # forged cross-site origin
     ("http://sub.test", False),       # subdomain is a different origin
     ("null", False),                  # sandboxed / opaque origin
     ("not-a-url", False),             # malformed origin fails closed
 ])
-# Note: only the host is compared, not the scheme — Request carries no
-# scheme, and an attacker that can serve the app's own host already
-# controls it. A different scheme on the same host is not a new vector.
 def test_validate_csrf_origin_check(origin, allowed):
     token = new_csrf_token()
     request = Request("POST", "/api/echo", headers=_signed_headers(token, origin=origin))
@@ -251,6 +253,32 @@ def test_validate_csrf_origin_check_requires_host():
     token = new_csrf_token()
     request = Request("POST", "/api/echo",
                       headers=_signed_headers(token, origin="http://test", host=None))
+    assert not validate_csrf(request)
+
+
+@pytest.mark.parametrize("host,scheme,origin,allowed", [
+    ("test:443", "https", "https://TEST", True),
+    ("test", "https", "http://test", False),
+    ("test:8443", "https", "https://test:8443", True),
+    ("test:8443", "https", "https://test", False),
+    ("[::1]:8443", "https", "https://[::1]:8443", True),
+    ("[::1]:8443", "https", "https://[::1]", False),
+])
+def test_csrf_compares_effective_origin(host, scheme, origin, allowed):
+    token = new_csrf_token()
+    request = Request("POST", "/", headers=_signed_headers(token, origin=origin, host=host.encode()),
+                      state={"client_scheme": scheme})
+    assert validate_csrf(request) is allowed
+
+
+@pytest.mark.parametrize("extra", [
+    (b"origin", b"http://test"),
+    (b"host", b"test"),
+    (b"origin", b"http://te\xffst"),
+])
+def test_csrf_rejects_ambiguous_origin_headers(extra):
+    token = new_csrf_token()
+    request = Request("POST", "/", headers=_signed_headers(token, origin="http://test") + (extra,))
     assert not validate_csrf(request)
 
 

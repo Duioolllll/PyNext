@@ -13,7 +13,7 @@ from .app import _decode_path, _invoke
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
                    WebSocketDisconnect, apply_security_headers, security_headers)
 from .observability import begin_request_context, queue_wait_var
-from .ratelimit import RateLimitUnavailable, rate_limited_response
+from .ratelimit import _is_exempt_path
 from .ws_origin import websocket_origin_allowed
 
 log = logging.getLogger("pynext")
@@ -371,13 +371,13 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     app.metrics.observe_worker_start()
     limiter = getattr(app, "rate_limit", None)
 
-    async def call(method, raw_path, query, headers, body, submitted_at=None, client_ip=None):
+    async def call(method, raw_path, query, headers, body, submitted_at=None, client_ip=None, cancel_event=None):
         started = time.monotonic()
         request_id, reset_context = begin_request_context(headers)
         if submitted_at is not None:
             queue_wait_var.set((started - submitted_at) * 1000)
         try:
-            response = await _call_inner(method, raw_path, query, headers, body, client_ip)
+            response = await _call_inner(method, raw_path, query, headers, body, client_ip, cancel_event)
         finally:
             reset_context()
         # dispatch() already applied the headers to routed responses; this
@@ -388,7 +388,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
             response.headers.append((b"x-request-id", request_id.encode("ascii")))
         return response
 
-    async def _call_inner(method, raw_path, query, headers, body, client_ip=None):
+    async def _call_inner(method, raw_path, query, headers, body, client_ip=None, cancel_event=None):
         try:
             path = _decode_path(raw_path, raw_path.encode("ascii"))
         except (ValueError, UnicodeError):
@@ -396,7 +396,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
         else:
             try:
                 request = Request(method.upper(), path, bytes(query),
-                                  tuple((bytes(k), bytes(v)) for k, v in headers), bytes(body), _app=app)
+                                  tuple((bytes(k), bytes(v)) for k, v in headers), bytes(body), _app=app,
+                                  _cancel_event=cancel_event if cancel_event is not None else threading.Event())
                 # Trust-resolved client identity (A6, pynext.proxy), same
                 # values as on ASGI: without trusted proxies these are just
                 # the direct connection values. The native listener is plain
@@ -423,32 +424,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
         return response
 
     def bridge(method, raw_path, query, headers, body, cancellation, client_ip=None):
-        # Rate limiting runs before any handler executes. Static files and
-        # fresh ISR pages never reach the bridge (the Rust layer serves
-        # them), so they are not rate-limited; see ratelimit.py. Paths
-        # listed in the limiter's exempt_paths skip the check entirely.
-        # Health probes bypass rate limiting (B6): a saturated limiter
-        # must never make the process look dead to a load balancer.
-        # The check uses the raw path; encoded spellings of the same
-        # path still reach App.dispatch, which answers them as health.
-        is_health = raw_path in ("/healthz", "/readyz")
-        exempt = getattr(limiter, "is_exempt", None)
-        if limiter is not None and not (is_health or (exempt and exempt(raw_path))):
-            key = limiter.key_for(client_ip, headers)
-            try:
-                allowed, retry_after = limiter.allow(key)
-            except RateLimitUnavailable:
-                response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
-                if method.upper() == "HEAD":
-                    response.body = b""
-                apply_security_headers(response, config=app.security, production=app.production)
-                return response.status, response.headers, response.body
-            if not allowed:
-                response = rate_limited_response(retry_after)
-                if method.upper() == "HEAD":
-                    response.body = b""
-                apply_security_headers(response, config=app.security, production=app.production)
-                return response.status, response.headers, response.body
+        # The native header-stage callback has already charged this
+        # request, before acquiring body or Python execution capacity.
         app.metrics.observe_queue_enter()
         with app._inflight_lock:
             app._inflight += 1
@@ -461,8 +438,9 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
 
     def _bridge_inner(method, raw_path, query, headers, body, cancellation, client_ip=None):
         submitted_at = time.monotonic()
+        cancel_event = threading.Event()
         try:
-            future = _submit(loop, call(method, raw_path, query, headers, body, submitted_at, client_ip))
+            future = _submit(loop, call(method, raw_path, query, headers, body, submitted_at, client_ip, cancel_event))
         except RuntimeError:
             app.metrics.observe_worker_timeout("unavailable")
             response = Response("Service Unavailable", status=503)
@@ -470,6 +448,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
             deadline = time.monotonic() + REQUEST_TIMEOUT
             while True:
                 if cancellation.cancelled() or not loop.is_running():
+                    cancel_event.set()
                     future.cancel()
                     app.metrics.observe_worker_timeout("unavailable")
                     response = Response("Service Unavailable", status=503)
@@ -479,6 +458,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                     break
                 except concurrent.futures.TimeoutError:
                     if time.monotonic() >= deadline:
+                        cancel_event.set()
                         future.cancel()
                         app.metrics.observe_worker_timeout("timeout")
                         response = Response("Gateway Timeout", status=504)
@@ -500,16 +480,14 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     def ws_origin_callback(headers, peer_ip):
         return websocket_origin_allowed(headers, peer_ip, "http", app.proxy_trust, app.security)
 
-    # WebSocket handshakes run through the same limiter as HTTP requests
-    # (review #4 #21): the Rust upgrade branch calls this before the
-    # origin check and the 101. It returns bridge()'s (allowed,
-    # retry_after) pair; exempt paths skip the check, and a
-    # RateLimitUnavailable propagates so Rust answers 503, like bridge().
-    ws_rate_limit_callback = None
+    # One charge per request, including WebSocket handshakes. Rust runs
+    # this before polling HTTP bodies or accepting upgrades. Health
+    # probes are skipped by the HTTP transport; configured exemptions
+    # apply to both transports using their strictly decoded paths.
+    rate_limit_callback = None
     if limiter is not None:
-        def ws_rate_limit_callback(path, headers, peer_ip):
-            exempt = getattr(limiter, "is_exempt", None)
-            if exempt and exempt(path):
+        def rate_limit_callback(path, headers, peer_ip):
+            if _is_exempt_path(limiter, path):
                 return True, None
             key = limiter.key_for(peer_ip, headers)
             return limiter.allow(key)
@@ -552,7 +530,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 websocket_paths=sorted(app.websocket_routes),
                                 websocket_callback=ws_callback,
                                 websocket_origin_callback=ws_origin_callback,
-                                websocket_rate_limit_callback=ws_rate_limit_callback,
+                                websocket_rate_limit_callback=rate_limit_callback,
+                                http_rate_limit_callback=rate_limit_callback,
                                 websocket_auth_callback=ws_auth_callback,
                                 reuse_port=reuse_port,
                                 route_patterns=app.router.ordered_routes(),

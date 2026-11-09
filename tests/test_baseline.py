@@ -114,6 +114,22 @@ def test_db_fixture_returns_a_seeded_row():
     asyncio.run(check())
 
 
+def test_db_fixture_shared_connection_is_safe_under_concurrent_queries():
+    from pynext import create_app
+    async def exercise():
+        app = create_app(ROOT / "benchmarks/fixtures/db-app")
+        await app.startup()
+        try:
+            db = app.resources["db"]
+            for _ in range(50):
+                ids = list(range(1, 21))
+                rows = await asyncio.gather(*(asyncio.to_thread(db.query, i) for i in ids))
+                assert rows == [{"id": i, "name": f"user-{i:04d}"} for i in ids]
+        finally:
+            await app.shutdown()
+    asyncio.run(exercise())
+
+
 def test_baseline_smoke_run_writes_p99_9_and_environment(tmp_path):
     config = {"requests": 4, "concurrency": 2, "warmup": 1, "repetitions": 1,
               "modes": ["axum"], "scenarios": ["json-api", "db-query"],
@@ -144,5 +160,25 @@ def test_baseline_external_unreachable_server_records_errors_not_crash(tmp_path)
     aggregate = result["scenarios"][0]["results"]["axum"]["aggregate"]
     assert aggregate["error_rate_max"] == 1
     assert aggregate["latency_ms"]["p50"] is None
-    assert result["conditions"]["loadgen_location"] == "separate-machine"
+    assert result["conditions"]["loadgen_location"] == "external-unverified"
     assert result["environment"]["server"]["environment"].startswith("unknown")
+
+
+def test_external_baseline_does_not_label_one_server_as_two_transports(tmp_path):
+    config = {"requests": 2, "concurrency": 1, "warmup": 0, "repetitions": 1,
+              "modes": ["axum", "uvicorn"], "scenarios": ["json-api"], "production": True}
+    with pytest.raises(ValueError, match="one --modes"):
+        asyncio.run(baseline.run_baseline(config, output=tmp_path / "out.json", base_url="http://127.0.0.1:1"))
+
+
+def test_benchmark_server_drains_logs_without_unbounded_buffering():
+    async def exercise():
+        command = [sys.executable, "-c", (
+            "import os, time; print('PYNEXT_BENCH_READY 127.0.0.1:1', flush=True); "
+            "os.write(2, b'x' * 1000000 + b'complete'); time.sleep(30)")]
+        async with baseline._ServerProcess(command) as server:
+            async with asyncio.timeout(3):
+                while not server._stderr_tail.endswith(b'complete'):
+                    await asyncio.sleep(0.01)
+            assert len(server._stderr_tail) <= 8192
+    asyncio.run(exercise())

@@ -1,0 +1,100 @@
+name: Supply chain and container checks
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --all-extras
+      - run: npm ci
+      - name: Generate Python CycloneDX SBOM
+        run: |
+          mkdir -p security-reports
+          uv run --locked --all-extras cyclonedx-py environment .venv/bin/python --output-format JSON --output-file security-reports/python.cdx.json
+          uv export --locked --all-extras --no-emit-project --output-file security-reports/python-requirements.txt
+      - name: Audit locked Python dependencies
+        run: uv run --locked --all-extras pip-audit --no-deps --disable-pip --requirement security-reports/python-requirements.txt --format json --output security-reports/python-audit.json
+      - name: Audit JavaScript build dependencies
+        if: success() || failure()
+        run: npm audit --audit-level=low --json > security-reports/npm-audit.json
+      - name: Install Rust audit tool
+        if: success() || failure()
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Audit locked Rust dependencies
+        if: success() || failure()
+        run: cargo audit --json > security-reports/cargo-audit.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-security-reports
+          path: security-reports/
+          if-no-files-found: error
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runtime image
+        run: |
+          docker build --tag pynext-example:ci .
+          mkdir -p security-reports
+      - name: Verify non-root, read-only serving and SIGTERM drain
+        run: python tests/smoke_docker.py --image pynext-example:ci
+      - name: Generate image SPDX SBOM
+        uses: anchore/sbom-action@fffec3d851af758d56fee099cf3fbf8aa8779843 # v0.24.3
+        with:
+          image: pynext-example:ci
+          format: spdx-json
+          output-file: security-reports/image.spdx.json
+          upload-artifact: false
+      - name: Scan runtime image
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: pynext-example:ci
+          format: json
+          output: security-reports/image-audit.json
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          scanners: vuln
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-security-reports
+          path: security-reports/
+          if-no-files-found: error
+
+  typing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --extra typing --extra database
+      - run: uv build --wheel
+      - name: Check installed public API with mypy and pyright
+        shell: bash
+        run: uv run --locked --extra typing --extra database python scripts/check_typing.py --wheel dist/*.whl
+      - name: Check declared signatures against runtime
+        run: uv run --locked --extra typing --extra database python -m mypy.stubtest pynext.http pynext.components pynext.routing pynext.app pynext.sessions pynext.pubsub pynext.ratelimit pynext.proxy pynext.observability pynext.server --ignore-missing-stub

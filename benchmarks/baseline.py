@@ -142,6 +142,9 @@ def aggregate(repetitions):
 
 def ensure_build():
     """Build examples/basic when --production is requested without a manifest."""
+    if not (DB_FIXTURE_DIR / ".pynext/manifest.json").is_file():
+        subprocess.run([sys.executable, "-m", "pynext.cli", "build", "--dir", str(DB_FIXTURE_DIR)],
+                       check=True, capture_output=True, timeout=600)
     if MANIFEST.is_file():
         return None
     pynext = shutil.which("pynext")
@@ -167,6 +170,8 @@ class _ServerProcess:
         self._rss_samples = []
         self._sampler = None
         self._psutil_process = None
+        self._stderr_tail = bytearray()
+        self._drainers = []
 
     async def __aenter__(self):
         import psutil
@@ -174,22 +179,28 @@ class _ServerProcess:
         self.process = await asyncio.create_subprocess_exec(
             *self.command, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
+
+        async def drain(stream, tail=None):
+            while chunk := await stream.read(8192):
+                if tail is not None:
+                    tail.extend(chunk)
+                    del tail[:-8192]
+
+        # Access logs must not fill a PIPE and stall an otherwise healthy
+        # server in a repeated run. Retain only a bounded diagnostic tail.
+        self._drainers.append(asyncio.create_task(drain(self.process.stderr, self._stderr_tail)))
         try:
             line = await asyncio.wait_for(self.process.stdout.readline(), 30)
         except TimeoutError as exc:
             await self._stop_process()
             raise RuntimeError(f"benchmark server did not start: {' '.join(self.command)}") from exc
         if not line.startswith(self.ready_prefix.encode()):
-            detail = ""
-            try:
-                err = await asyncio.wait_for(self.process.stderr.read(), 5)
-                detail = err.decode("utf-8", "replace").strip()[-2000:]
-            except (TimeoutError, ValueError):
-                pass
             await self._stop_process()
+            detail = self._stderr_tail.decode("utf-8", "replace").strip()[-2000:]
             raise RuntimeError(
                 f"benchmark server did not start: {' '.join(self.command)}\n{detail}")
         self.address = line.decode("ascii").strip().split(" ", 1)[1]
+        self._drainers.append(asyncio.create_task(drain(self.process.stdout)))
         server_process = psutil.Process(self.process.pid)
         self._psutil_process = server_process
         stop = asyncio.Event()
@@ -217,6 +228,8 @@ class _ServerProcess:
             except TimeoutError:
                 self.process.kill()
                 await self.process.wait()
+        if self._drainers:
+            await asyncio.gather(*self._drainers)
 
     @property
     def pid(self):
@@ -252,15 +265,11 @@ def _server_command(mode, app, production):
         return command
     command = [sys.executable, str(HERE / "serve_project.py"), "--mode", mode]
     if app == "db":
-        # The fixture app has no build manifest and no islands, so it always
-        # runs in development mode; its resources.py is discovered by
-        # create_app. The measured path is the DB query itself, which is
-        # identical in both modes.
         command += ["--dir", str(DB_FIXTURE_DIR)]
     else:
         command += ["--dir", str(BASIC_DIR)]
-        if production:
-            command.append("--production")
+    if production:
+        command.append("--production")
     return command
 
 
@@ -316,11 +325,13 @@ async def run_baseline(config, *, output, base_url=None, db_base_url=None,
     selected = [s for s in SCENARIOS if s["name"] in config["scenarios"]]
     modes = list(config["modes"])
     external = base_url is not None
+    if external and len(modes) != 1:
+        raise ValueError("external baseline requires one --modes value matching the running server")
     limitations = []
     if external:
         limitations.append(
-            "external server: load generator and server are on different "
-            "hosts; server environment comes from --server-info when given")
+            "external server: host separation is unverified; server "
+            "environment comes from --server-info when given")
         if server_info is None:
             limitations.append(
                 "no --server-info given: server hardware/software is unknown, "
@@ -356,8 +367,8 @@ async def run_baseline(config, *, output, base_url=None, db_base_url=None,
         "modes": modes,
         "server_workers": 1 if not external else "unknown (external server; see server-info)",
         "transport": "external_http (separate server process)" if not external
-        else "external_http (separate host)",
-        "loadgen_location": "separate-machine" if external else "same-machine",
+        else "external_http (host separation unverified)",
+        "loadgen_location": "external-unverified" if external else "same-machine",
         "server_host": server_host,
         "config_file": str(config.get("_config_path", DEFAULT_CONFIG)),
     }

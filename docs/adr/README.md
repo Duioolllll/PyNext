@@ -16,3 +16,4 @@
 | 번호 | 제목 | 상태 |
 | --- | --- | --- |
 | [0001](0001-tls-termination.md) | TLS 종료는 리버스 프록시에서 수행한다 | Accepted |
+| [0002](0002-sync-cancellation.md) | 동기 핸들러의 협력적 취소와 용량 유지 | Proposed (구현, PR 검토 대상) |
