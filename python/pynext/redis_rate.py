@@ -28,7 +28,7 @@ local t = redis.call('TIME')
 -- so the window is kept in ms separately.
 -- Precision: scores are integer microseconds since the epoch, held in
 -- Lua doubles. At the current epoch (~1.79e15 us) and even with the
--- maximum one-year window (~1.83e15 us), the unit in the last place
+-- maximum score (now + the one-year window, ~1.83e15 us), the unit in the last place
 -- is 0.25 us, so integer microsecond scores are exact; they stay exact
 -- until 2^53 us (~year 2255). Realistic windows of minutes to hours
 -- are far inside the exact range.

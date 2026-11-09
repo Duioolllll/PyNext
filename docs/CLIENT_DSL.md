@@ -24,6 +24,11 @@ conversion and error behaviors differ. The maintained list is
 parsing and exceptions. Applications must not depend on unsupported Python
 behavior or use DSL output as a security boundary.
 
+Non-finite float literals are rejected at compile time. This does not
+enforce finite runtime values: `float("Infinity")`, `float("nan")`, or
+arithmetic such as `1e308 * 1e308` can still produce JavaScript Infinity
+or NaN. Runtime results are not checked for finiteness.
+
 `tests/test_client_dsl.py` executes representative source in Python and the
 compiled result in Node, including Unicode, collection equality, chained
 comparison evaluation, reserved names and range limits. Those checks establish

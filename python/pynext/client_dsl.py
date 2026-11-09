@@ -59,7 +59,10 @@ KNOWN_DIFFERENCES = (
     "types can follow JavaScript coercion rather than Python operator semantics",
     "range() is materialized as an array and is limited to 100000 items",
     "non-finite float literals (inf, -inf, nan) are rejected: JSON has no "
-    "Infinity or NaN, so they cannot be represented in a browser bundle",
+    "Infinity or NaN literal representation",
+    "runtime float() conversions and arithmetic can still produce Infinity "
+    "or NaN (for example float('Infinity') or 1e308 * 1e308); results are not "
+    "checked for finiteness",
 )
 
 

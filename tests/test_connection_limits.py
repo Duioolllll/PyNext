@@ -285,7 +285,7 @@ def test_cli_connection_limit_flags_reach_serve(tmp_path, monkeypatch):
 @pytest.mark.parametrize("flag,value,message", [
     ("--max-connections", "0", "--max-connections must be an integer >= 1"),
     ("--max-connections", "-1", "--max-connections must be an integer >= 1"),
-    ("--max-connections", "nope", "--max-connections must be an integer >= 1"),
+    ("--max-connections", "nope", "--max-connections must be an integer in [1, 1000000]"),
     ("--max-connections-per-ip", "0", "--max-connections-per-ip must be an integer >= 1"),
     ("--header-read-timeout-ms", "-1", "--header-read-timeout-ms must be an integer >= 0"),
     ("--body-min-rate-bytes-per-sec", "-1",

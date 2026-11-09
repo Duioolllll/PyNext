@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Reject non-object JSON build manifests with a clear rebuild error, clean up newly created scaffold ancestors on failure, warn when a partial standalone bundle cannot be removed, and include both bounds in non-integer CLI count errors. Align the roadmap audit totals and document DSL runtime non-finite values, best-effort logout, WebSocket pre-flight limits and shared-only invalidation results (review #5 N1–N13).
+
 ## 0.1.1 (2026-11-09)
 
 - Enforce authorization for WebSocket upgrades (review #4 #1, behavior change): the global middleware chain and the handler's `@require_auth`/`@require_permission` policy now run before the handshake completes on both the ASGI and native servers, so a denied upgrade is rejected instead of an accepted socket leaking data. Handlers that need the identity must re-derive it from the socket (for example from a session cookie the middleware validated); the pre-flight `request.state` is not passed to the handler, and a session rotation/invalidation during the pre-flight is not supported because its `set-cookie` would be discarded.
