@@ -7,6 +7,8 @@ from .components import h, fragment, island, layout, model_prop, page
 from .database import Database
 from .django import DjangoBusyError, DjangoResource
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN
+from .fetch_cache import (FetchCacheDecision, apply_fetch_revalidate, decide_fetch_cache, fetch_cache_store_key,
+                          generate_fetch_cache_key, generate_simple_fetch_cache_key)
 from .forms import UploadFile
 from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_security_headers,
@@ -30,4 +32,6 @@ __all__ = ["App", "create_app", "h", "fragment", "island", "layout", "model_prop
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
            "Session", "SessionMiddleware", "SQLiteSessionStore", "RedisSessionStore", "require_auth", "require_permission",
            "RedisRateLimiter", "WebSocketPubSub", "PubSubOverflow",
-           "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies", "FAIL_OPEN", "FAIL_CLOSED"]
+           "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies", "FAIL_OPEN", "FAIL_CLOSED",
+           "FetchCacheDecision", "apply_fetch_revalidate", "decide_fetch_cache", "fetch_cache_store_key",
+           "generate_fetch_cache_key", "generate_simple_fetch_cache_key"]

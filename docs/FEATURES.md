@@ -66,6 +66,12 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `parse_trusted_proxies` | `pynext.proxy` |
 | `FAIL_OPEN` | `pynext.failure_policy` |
 | `FAIL_CLOSED` | `pynext.failure_policy` |
+| `FetchCacheDecision` | `pynext.fetch_cache` |
+| `apply_fetch_revalidate` | `pynext.fetch_cache` |
+| `decide_fetch_cache` | `pynext.fetch_cache` |
+| `fetch_cache_store_key` | `pynext.fetch_cache` |
+| `generate_fetch_cache_key` | `pynext.fetch_cache` |
+| `generate_simple_fetch_cache_key` | `pynext.fetch_cache` |
 
 ## Security defaults (`SecurityConfig`)
 
