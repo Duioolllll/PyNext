@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from pynext import create_app
-from pynext.build import write_manifest
+from pynext.build import BuildError, write_manifest
 from pynext.server import start_native
 
 
@@ -137,7 +137,7 @@ def test_ssg_artifacts_integrity_and_failed_build_is_atomic(tmp_path):
                       for entry in manifest["static_pages"].values()}
     source = app / "blog" / "[slug]" / "page.py"
     source.write_text(source.read_text(encoding="utf-8").replace('return [{"slug": "hello"}, {"slug": "한글"}]', 'raise RuntimeError("build failed")'), encoding="utf-8")
-    with pytest.raises(RuntimeError, match="build failed"):
+    with pytest.raises(BuildError, match="build failed"):
         write_manifest(tmp_path)
     assert path.read_bytes() == original
     for digest, content in original_blobs.items():

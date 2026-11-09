@@ -201,6 +201,16 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
             await asyncio.gather(server_task, return_exceptions=True)
 
 
+def _nonnegative_float(value):
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--lock-timeout must be a number >= 0") from exc
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("--lock-timeout must be a number >= 0")
+    return number
+
+
 def _positive_float(value):
     try:
         number = float(value)
@@ -225,6 +235,9 @@ def main():
         if name == "build":
             command.add_argument("--standalone", action="store_true", help="create a Linux standalone directory")
             command.add_argument("--standalone-dir", default=None, help="new output directory for --standalone")
+            command.add_argument("--lock-timeout", type=_nonnegative_float, default=30.0,
+                                 help="seconds to wait for another build to finish before failing "
+                                      "(default 30; 0 fails immediately)")
         if name != "build":
             command.add_argument("--host", default="127.0.0.1")
             command.add_argument("--port", type=_port, default=3000)
@@ -348,14 +361,17 @@ def main():
         if args.standalone_dir and not args.standalone:
             parser.error("--standalone-dir requires --standalone")
         try:
-            manifest = write_manifest(root)
+            # write_manifest and build_standalone each take the build
+            # lock, so a second build waits (up to --lock-timeout) and a
+            # standalone copy always sees one consistent, completed build.
+            manifest = write_manifest(root, lock_timeout=args.lock_timeout)
+            print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
-        print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
             try:
-                build_standalone(root, output)
+                build_standalone(root, output, lock_timeout=args.lock_timeout)
             except (OSError, ValueError) as exc:
                 parser.error(str(exc))
             print(f"Created standalone directory in {output}")
