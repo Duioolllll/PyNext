@@ -24,6 +24,7 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `page` | `pynext.components` |
 | `route` | `pynext.routing` |
 | `websocket` | `pynext.routing` |
+| `Database` | `pynext.database` |
 | `BadRequest` | `pynext.http` |
 | `Request` | `pynext.http` |
 | `Response` | `pynext.http` |
@@ -114,6 +115,26 @@ Backends accepted by `ISRCache` (`--cache-backend`, `create_app(..., cache_backe
 | `init` | create a minimal application |
 | `start` | Start the built application (production mode). |
 
+## Server controls (`pynext dev` / `pynext start`)
+
+CLI defaults of `None` defer to server defaults; see the manual for scope and units.
+
+| Option | CLI default |
+| --- | --- |
+| `--max-connections` | `None` |
+| `--max-connections-per-ip` | `None` |
+| `--max-waiting` | `None` |
+| `--shutdown-timeout` | `30` |
+
+## Health endpoints
+
+Reserved GET/HEAD paths; readiness reflects startup and draining, not upstream health.
+
+| Path |
+| --- |
+| `/healthz` |
+| `/readyz` |
+
 ## Island activation strategies
 
 Strategies accepted by `island()` / `page()` in `pynext.components`.
@@ -139,4 +160,4 @@ Store classes in `pynext.sessions` implementing `load` / `save` / `delete`.
 | Item | Status |
 | --- | --- |
 | React / React Server Components | Explicit non-goal for 1.0 (see docs/ROADMAP.md). |
-| Django integration | Direction undecided (ORM use vs ASGI sub-app mount); no integration exists. |
+| Django integration | Deferred; ORM/forms only under consideration. ASGI sub-apps and templates are out of scope. |
