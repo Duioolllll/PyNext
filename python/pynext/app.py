@@ -1189,13 +1189,48 @@ class App:
         return {path: list(getattr(handler, "__pynext_websocket_protocols__", ()))
                 for path, handler in self.websocket_entries.items()}
 
-    async def _handle_websocket(self, scope, receive, send):
+    async def _websocket_rate_limit_denied(self, scope, path):
+        """Return the denial response for an over-limit WS handshake, else ``None``.
+
+        Mirrors the native upgrade branch (review #4 #21): WebSocket
+        handshakes share the HTTP limiter's bucket per client IP, so one
+        token is charged per handshake attempt, exempt paths skip the
+        check, no configured limiter means no change, and a limiter that
+        cannot decide fails closed with 503, like ``_handle_http``. The
+        caller answers with the returned response before the accept, so a
+        denied handshake is an HTTP 429 with ``Retry-After``, never an
+        accepted socket closed afterwards.
+
+        Composition with ``_authorize_websocket`` (Track A, separate
+        branch): the pre-flight runs a synthetic GET through the
+        middleware chain only — it never passes through ``_handle_http``,
+        where the HTTP limiter lives — so it consumes no token. This
+        check is therefore the single charge per handshake attempt. Do
+        not add a second limiter call inside ``_authorize_websocket`` or
+        the pre-flight, or each handshake would cost two tokens; if a
+        middleware-based limiter is ever introduced, the pre-flight must
+        be exempted from it instead.
+        """
+        if self.rate_limit is None:
+            return None
+        exempt = getattr(self.rate_limit, "is_exempt", None)
+        if exempt and exempt(path):
+            return None
         client = scope.get("client")
-        peer_ip = client[0] if client else None
-        if not websocket_origin_allowed(scope.get("headers", []), peer_ip, scope.get("scheme") or "ws",
-                                        self.proxy_trust, self.security):
-            await send({"type": "websocket.close", "code": 1008})
-            return
+        client_ip = client[0] if client else None
+        key = self.rate_limit.key_for(client_ip, scope.get("headers", []))
+        try:
+            if getattr(self.rate_limit, "blocking", False):
+                allowed, retry_after = await asyncio.to_thread(self.rate_limit.allow, key)
+            else:
+                allowed, retry_after = self.rate_limit.allow(key)
+        except RateLimitUnavailable:
+            return Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
+        if not allowed:
+            return rate_limited_response(retry_after)
+        return None
+
+    async def _handle_websocket(self, scope, receive, send):
         try:
             path = _decode_path(scope["path"], scope.get("raw_path"))
         except (ValueError, UnicodeError):
@@ -1212,6 +1247,27 @@ class App:
         if handler is None:
             # No route, or a route with no WebSocket handler: refuse the
             # handshake with a policy-violation close instead of hanging.
+            # Unknown paths consume no token: the native upgrade branch
+            # answers 404 before its rate-limit check, and this mirrors it.
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        # Rate limiting runs before the origin check and the accept, in
+        # the same relative order as the native upgrade branch (route
+        # lookup, then rate limit, then origin, then 101): a denied
+        # handshake is answered as an HTTP 429 with Retry-After via
+        # websocket.http.response.start, before any websocket.connect is
+        # read, so the socket is never accepted and then closed.
+        denied = await self._websocket_rate_limit_denied(scope, path)
+        if denied is not None:
+            apply_security_headers(denied, config=self.security, production=self.production)
+            await send({"type": "websocket.http.response.start", "status": denied.status,
+                        "headers": denied.headers})
+            await send({"type": "websocket.http.response.body", "body": denied.body})
+            return
+        client = scope.get("client")
+        peer_ip = client[0] if client else None
+        if not websocket_origin_allowed(scope.get("headers", []), peer_ip, scope.get("scheme") or "ws",
+                                        self.proxy_trust, self.security):
             await send({"type": "websocket.close", "code": 1008})
             return
         offered = scope.get("subprotocols", [])

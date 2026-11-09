@@ -381,6 +381,96 @@ def test_native_websocket_handshake_is_rate_limited():
     _run(run())
 
 
+async def _asgi_handshake(app, path="/ws/echo"):
+    """Drive one ASGI WebSocket handshake, returning the sent messages.
+
+    The scripted connection offers a connect followed by a disconnect, so
+    an accepted handshake runs the echo handler briefly and ends cleanly
+    with just ``websocket.accept`` sent. A denied handshake never reads
+    the connect: it is answered with ``websocket.http.response.start``
+    (429 + Retry-After) and ``websocket.http.response.body`` instead.
+    """
+    conn = _ScriptedConnection([
+        {"type": "websocket.connect"},
+        {"type": "websocket.disconnect", "code": 1000},
+    ])
+    await app({"type": "websocket", "path": path, "headers": SAME_ORIGIN_HEADERS,
+               "query_string": b"", "client": ("127.0.0.1", 50000)},
+              conn.receive, conn.send)
+    return conn.sent
+
+
+def _asgi_denied(sent):
+    """Assert ``sent`` is a 429 + Retry-After handshake denial; return the delay."""
+    assert sent[0]["type"] == "websocket.http.response.start", sent
+    assert sent[0]["status"] == 429, sent
+    headers = dict(sent[0]["headers"])
+    assert b"retry-after" in headers, sent
+    assert sent[1] == {"type": "websocket.http.response.body", "body": b"Too Many Requests"}, sent
+    return int(headers[b"retry-after"])
+
+
+def test_asgi_websocket_handshake_is_rate_limited():
+    import httpx
+
+    from pynext.ratelimit import RateLimiter
+
+    async def run():
+        # One token per 60s for the whole client IP: the first handshake
+        # succeeds, the second is refused with 429 + Retry-After, and the
+        # socket is never accepted.
+        app = create_app(EXAMPLE, rate_limit=RateLimiter(1, 60.0))
+        try:
+            assert await _asgi_handshake(app) == [{"type": "websocket.accept"}]
+            retry_after = _asgi_denied(await _asgi_handshake(app))
+            assert 1 <= retry_after <= 60
+        finally:
+            await app.isr.close()
+
+        # An exempt WebSocket path skips the check entirely.
+        app = create_app(EXAMPLE, rate_limit=RateLimiter(1, 60.0, exempt_paths=("/ws/echo",)))
+        try:
+            for _ in range(2):
+                assert await _asgi_handshake(app) == [{"type": "websocket.accept"}]
+        finally:
+            await app.isr.close()
+
+        # No limiter configured: behaviour is unchanged, handshakes are
+        # unlimited.
+        app = create_app(EXAMPLE)
+        try:
+            for _ in range(2):
+                assert await _asgi_handshake(app) == [{"type": "websocket.accept"}]
+        finally:
+            await app.isr.close()
+
+        # A generous limit does not disturb normal clients: five
+        # consecutive handshakes all succeed.
+        app = create_app(EXAMPLE, rate_limit=RateLimiter(100, 60.0))
+        try:
+            for _ in range(5):
+                assert await _asgi_handshake(app) == [{"type": "websocket.accept"}]
+        finally:
+            await app.isr.close()
+
+        # HTTP requests and handshakes share one bucket per client IP:
+        # a routed page consumes the token, so the handshake after it is
+        # refused; once the window refills the handshake succeeds again.
+        app = create_app(EXAMPLE, rate_limit=RateLimiter(1, 2.0))
+        try:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
+                assert (await client.get("/")).status_code == 200
+            retry_after = _asgi_denied(await _asgi_handshake(app))
+            assert 1 <= retry_after <= 2
+            await asyncio.sleep(2.5)
+            assert await _asgi_handshake(app) == [{"type": "websocket.accept"}]
+        finally:
+            await app.isr.close()
+
+    _run(run())
+
+
 def test_axum_websocket_echo_and_oversized_close():
     async def run():
         app = create_app(EXAMPLE)
