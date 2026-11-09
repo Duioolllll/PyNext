@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import gc
+import math
 import os
 import sys
 import traceback
@@ -180,7 +181,11 @@ def _positive_float(value):
         number = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("--rate-limit-window must be a number > 0") from exc
-    if number <= 0:
+    # float("nan") and float("inf") parse fine but are not usable windows:
+    # nan passes the <= 0 check (comparisons are False) and only survived
+    # because RateLimiter.__init__ rejects non-finite windows downstream.
+    # Reject them here so the CLI reports the bad flag instead.
+    if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError("--rate-limit-window must be a number > 0")
     return number
 
