@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import gc
+import math
 import os
 import sys
 import traceback
@@ -205,7 +206,11 @@ def _positive_float(value):
         number = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("--rate-limit-window must be a number > 0") from exc
-    if number <= 0:
+    # float("nan") and float("inf") parse fine but are not usable windows:
+    # nan passes the <= 0 check (comparisons are False) and only survived
+    # because RateLimiter.__init__ rejects non-finite windows downstream.
+    # Reject them here so the CLI reports the bad flag instead.
+    if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError("--rate-limit-window must be a number > 0")
     return number
 
@@ -342,7 +347,10 @@ def main():
     if args.command == "build":
         if args.standalone_dir and not args.standalone:
             parser.error("--standalone-dir requires --standalone")
-        manifest = write_manifest(root)
+        try:
+            manifest = write_manifest(root)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
         print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"

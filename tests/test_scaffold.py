@@ -32,3 +32,40 @@ def test_init_refuses_to_overwrite_any_target(tmp_path, monkeypatch):
         cli.main()
     assert (tmp_path / "README.md").read_text() == "keep"
     assert not (tmp_path / "app" / "page.py").exists()
+
+
+def _fail_readme_open(monkeypatch):
+    from pathlib import Path
+
+    real_open = Path.open
+
+    def failing_open(self, *args, **kwargs):
+        if self.name == "README.md":
+            raise OSError("simulated disk failure")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+
+
+def test_init_failure_leaves_nothing_behind(tmp_path, monkeypatch):
+    from pynext.scaffold import init_project
+
+    _fail_readme_open(monkeypatch)
+    project = tmp_path / "fresh"
+    with pytest.raises(OSError, match="simulated disk failure"):
+        init_project(project)
+    assert not project.exists()
+
+
+def test_init_failure_keeps_pre_existing_root_but_removes_created_app_dir(tmp_path, monkeypatch):
+    from pynext.scaffold import init_project
+
+    _fail_readme_open(monkeypatch)
+    project = tmp_path / "existing"
+    project.mkdir()
+    (project / "keep.txt").write_text("keep")
+    with pytest.raises(OSError, match="simulated disk failure"):
+        init_project(project)
+    assert (project / "keep.txt").read_text() == "keep"
+    assert not (project / "app").exists()
+    assert not (project / "README.md").exists()

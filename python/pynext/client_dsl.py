@@ -17,6 +17,7 @@ says so instead of guessing: see :data:`KNOWN_DIFFERENCES`.
 
 import ast
 import json
+import math
 
 __all__ = ["ClientDSLCompileError", "compile_client_dsl", "DSL_VERSION", "SUPPORTED", "KNOWN_DIFFERENCES"]
 
@@ -57,6 +58,8 @@ KNOWN_DIFFERENCES = (
     "arithmetic and ordering involving strings, lists, booleans or mixed "
     "types can follow JavaScript coercion rather than Python operator semantics",
     "range() is materialized as an array and is limited to 100000 items",
+    "non-finite float literals (inf, -inf, nan) are rejected: JSON has no "
+    "Infinity or NaN, so they cannot be represented in a browser bundle",
 )
 
 
@@ -409,6 +412,12 @@ class _Compiler:
                 self.fail(node, "integer is outside the JavaScript safe-integer range")
             return str(value)
         if isinstance(value, float):
+            # json.dumps(float("inf")) emits the bare word Infinity, which
+            # is not valid JSON (JSON.parse rejects it) and would silently
+            # change meaning in a browser bundle, so reject non-finite
+            # floats at compile time instead of emitting them.
+            if not math.isfinite(value):
+                self.fail(node, "non-finite float literals (inf, -inf, nan) are not supported")
             return json.dumps(value)
         if isinstance(value, str):
             return json.dumps(value, ensure_ascii=True)

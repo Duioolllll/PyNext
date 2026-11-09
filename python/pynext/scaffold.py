@@ -27,10 +27,20 @@ def init_project(root):
         target = root / relative
         if target.exists() or target.is_symlink():
             raise FileExistsError(f"Refusing to overwrite {target}")
-    root.mkdir(parents=True, exist_ok=True)
-    app_dir.mkdir(exist_ok=True)
+    # Remember which directories this run creates so a failure part-way
+    # through leaves nothing behind: a failed scaffold used to leave an
+    # empty root/app behind (the files were removed, the dirs were not).
+    root_existed = root.exists()
+    app_existed = app_dir.exists()
     created = []
+    created_dirs = []
     try:
+        root.mkdir(parents=True, exist_ok=True)
+        if not root_existed:
+            created_dirs.append(root)
+        app_dir.mkdir(exist_ok=True)
+        if not app_existed:
+            created_dirs.append(app_dir)
         for relative, content in _FILES.items():
             target = root / relative
             with target.open("x", encoding="utf-8", newline="\n") as output:
@@ -39,5 +49,12 @@ def init_project(root):
     except OSError:
         for target in created:
             target.unlink(missing_ok=True)
+        # Deepest first; only remove dirs this run created, and only when
+        # they are empty (a non-empty dir means something else owns it).
+        for directory in reversed(created_dirs):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
         raise
     return root
