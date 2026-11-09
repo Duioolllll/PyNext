@@ -339,12 +339,14 @@ class _LiveSupervisor:
     """Two-worker supervisor serving the CSRF app above, no shared key
     configured anywhere: the supervisor must generate and share one."""
 
-    def __init__(self, tmp_path, extra_argv=()):
+    def __init__(self, tmp_path, extra_argv=(), extra_env=None):
         _write_csrf_app(tmp_path)
         self.port = _free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
         env = dict(os.environ)
         env.pop("PYNEXT_CSRF_SIGNING_KEY", None)
+        if extra_env:
+            env.update(extra_env)
         env["PYTHONPATH"] = str(ROOT / "python") + os.pathsep + env.get("PYTHONPATH", "")
         env["NO_PROXY"] = "localhost,127.0.0.1"
         env["no_proxy"] = "localhost,127.0.0.1"
@@ -449,6 +451,35 @@ def test_csrf_cookie_issued_by_one_worker_validates_on_the_other(tmp_path):
         else:
             raise AssertionError("cookie did not validate on replacement workers")
         assert sup.post_echo(cookie, token).status_code == 201
+        # Rolling restart (SIGHUP) replaces workers one at a time; the
+        # replacements reuse the supervisor's shared key, so the cookie
+        # issued before the roll must still validate afterwards.
+        rolled_from = sup.wait_workers(2)
+        sup.proc.send_signal(signal.SIGHUP)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            current = _worker_pids(sup.proc.pid)
+            if len(current) == 2 and not set(rolled_from) & set(current):
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError("workers were not replaced by the rolling restart")
+        assert sup.post_echo(cookie, token).status_code == 201
+    finally:
+        sup.stop()
+
+
+@pytestmark_live
+def test_csrf_cookie_validates_across_workers_with_env_key(tmp_path):
+    """Same cross-worker check with the key supplied via the environment."""
+    sup = _LiveSupervisor(tmp_path, extra_env={
+        "PYNEXT_CSRF_SIGNING_KEY": "a-long-enough-env-key"})
+    try:
+        sup.wait_ready()
+        sup.wait_workers(2)
+        cookie, token = sup.issue_token()
+        for _ in range(20):
+            assert sup.post_echo(cookie, token).status_code == 201
     finally:
         sup.stop()
 
