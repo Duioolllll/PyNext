@@ -29,7 +29,8 @@ from .components import _isr_policy, _isr_query_keys, _node, bind_islands
 from .build import discover, load_manifest
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
-                   apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
+                   apply_security_headers, cors_preflight_response, filter_internal_headers,
+                   new_csp_nonce, validate_csrf)
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .observability import (
     MetricsCollector,
@@ -1531,6 +1532,13 @@ class App:
                         return
                     await send({"type": "lifespan.shutdown.complete"})
                     return
+        # Boundary hygiene (Next.js `filterInternalHeaders` at the
+        # router-server entry point): strip internal-only headers before
+        # any handler sees them — the request context, rate-limit and
+        # proxy-trust decisions, the middleware chain, and the WebSocket
+        # pre-flight all read from this same scope.
+        if scope["type"] in ("http", "websocket"):
+            scope["headers"] = filter_internal_headers(scope.get("headers", []))
         if scope["type"] == "websocket":
             if "path" not in scope:
                 # A websocket scope without a path cannot be routed; reject
