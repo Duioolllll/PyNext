@@ -8,6 +8,7 @@ import inspect
 import json
 import keyword
 import logging
+import os
 import re
 import sys
 import threading
@@ -15,6 +16,7 @@ import time
 import traceback
 import uuid
 import weakref
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from urllib.parse import quote, unquote_to_bytes
@@ -52,6 +54,62 @@ log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
 ASGI_DECISION_CAPACITY = 64
 ASGI_DECISION_TIMEOUT = 2.0
+
+# Development error page (P1-3): how much of a traceback the dev page keeps.
+# The tail is kept so the frames nearest the failure survive; anything cut
+# off the front is announced on the page instead of silently disappearing.
+_DEV_TRACEBACK_MAX_CHARS = 16384
+_DEV_EDITOR_URL_TEMPLATE = "vscode://file/{path}:{line}"
+_DEV_ERROR_COUNT_LIMIT = 512
+_FRAME_RE = re.compile(r'^(?P<indent>[ \t]*)File "(?P<path>[^"]+)", line (?P<line>\d+), in (?P<func>.*)$')
+
+
+def _editor_url_template():
+    """Editor link template for dev traceback frames.
+
+    ``PYNEXT_EDITOR_URL`` overrides the default ``vscode://`` template; it
+    must contain ``{path}`` and ``{line}`` placeholders (e.g.
+    ``idea://open?file={path}&line={line}``). A malformed value falls back
+    to the default instead of breaking the error page.
+    """
+    template = os.environ.get("PYNEXT_EDITOR_URL") or _DEV_EDITOR_URL_TEMPLATE
+    if "{path}" not in template or "{line}" not in template:
+        return _DEV_EDITOR_URL_TEMPLATE
+    return template
+
+
+def _dev_error_digest(exc):
+    """Short stable digest for a dev error page: type + message + origin frame."""
+    origin = ""
+    tb = exc.__traceback__
+    while tb is not None:
+        origin = f"{tb.tb_frame.f_code.co_filename}:{tb.tb_lineno}"
+        tb = tb.tb_next
+    raw = f"{type(exc).__module__}.{type(exc).__qualname__}:{exc}\n{origin}"
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _render_dev_traceback(text):
+    """HTML-escape traceback text, linking ``File "...", line N`` frames.
+
+    The link opens the frame in the editor (see :func:`_editor_url_template`).
+    Lines that do not match a frame are escaped verbatim, so chained
+    exceptions (``During handling of the above exception ...``) survive.
+    """
+    template = _editor_url_template()
+    rendered = []
+    for line in text.splitlines():
+        match = _FRAME_RE.match(line)
+        if match is None:
+            rendered.append(html.escape(line))
+            continue
+        href = template.format(path=quote(match.group("path"), safe="/:"),
+                               line=match.group("line"))
+        rendered.append(
+            f"{html.escape(match.group('indent'))}File &quot;<a href=\"{html.escape(href, quote=True)}\">"
+            f"{html.escape(match.group('path'))}</a>&quot;, line {match.group('line')}, "
+            f"in {html.escape(match.group('func'))}")
+    return "\n".join(rendered)
 
 
 class _SyncHandlerBusy(Exception):
@@ -343,6 +401,9 @@ class App:
             raise ValueError("hot_reload requires development debug mode")
         self.debug = debug
         self.hot_reload = hot_reload
+        # Dev error page occurrence counts, keyed by _dev_error_digest().
+        # Bounded so a crash loop cannot grow memory without limit.
+        self._dev_error_counts = {}
         self._dev_id = uuid.uuid4().hex if hot_reload else None
         if (isinstance(websocket_max_message, bool) or not isinstance(websocket_max_message, int) or
                 not 1 <= websocket_max_message <= 16 * 1024 * 1024):
@@ -627,9 +688,37 @@ class App:
     def error_response(self, exc):
         if not self.debug:
             return Response("Internal Server Error", status=500)
-        details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-16384:]
+        digest = _dev_error_digest(exc)
+        if digest not in self._dev_error_counts and len(self._dev_error_counts) >= _DEV_ERROR_COUNT_LIMIT:
+            self._dev_error_counts.clear()
+        count = self._dev_error_counts.get(digest, 0) + 1
+        self._dev_error_counts[digest] = count
+        full = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        truncated = len(full) > _DEV_TRACEBACK_MAX_CHARS
+        omitted = len(full) - _DEV_TRACEBACK_MAX_CHARS if truncated else 0
+        details = full[-_DEV_TRACEBACK_MAX_CHARS:] if truncated else full
+        request_id = get_request_id() or "unknown"
+        route = route_var.get() or "unknown"
+        occurred = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        header = (
+            "<dl>"
+            f"<dt>Exception</dt><dd>{html.escape(type(exc).__qualname__ + ': ' + str(exc))}</dd>"
+            f"<dt>Request ID</dt><dd>{html.escape(request_id)}</dd>"
+            f"<dt>Route</dt><dd>{html.escape(route)}</dd>"
+            f"<dt>Digest</dt><dd>{digest}</dd>"
+            f"<dt>Time</dt><dd>{occurred}</dd>"
+            f"<dt>Occurrences</dt><dd>Seen {count} time{'s' if count != 1 else ''} in this process</dd>"
+            "</dl>"
+        )
+        notice = ""
+        if truncated:
+            notice = (
+                f"<p>Traceback truncated: showing the last {_DEV_TRACEBACK_MAX_CHARS:,} of "
+                f"{len(full):,} characters ({omitted:,} characters omitted from the start).</p>"
+            )
         body = ("<!DOCTYPE html><html><head><title>PyNext development error</title></head>"
-                "<body><h1>Development error</h1><pre>" + html.escape(details) + "</pre></body></html>")
+                "<body><h1>Development error</h1>"
+                + header + notice + "<pre>" + _render_dev_traceback(details) + "</pre></body></html>")
         return Response(body, status=500, media_type="text/html; charset=utf-8",
                         headers=[(b"cache-control", b"no-store")])
 
