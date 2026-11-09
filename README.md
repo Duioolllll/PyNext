@@ -104,8 +104,11 @@ DB 풀처럼 앱 수명 동안 유지할 객체는 비동기 `startup()`과 `shu
 요청 핸들러와 미들웨어는 `request.resources["db"]`로 접근합니다. 시작은 등록순,
 종료는 역순이며 시작이 실패하면 이미 시작한 리소스를 정리합니다. ASGI 서버는
 lifespan을 활성화해야 합니다. 저수준 `start_native()`를 직접 쓰는 경우에는
-`await app.startup()`과 `await app.shutdown()`을 직접 호출합니다. DB 드라이버,
-트랜잭션과 마이그레이션은 앱이 관리합니다.
+`await app.startup()`과 `await app.shutdown()`을 직접 호출합니다. 선택적
+`Database` 리소스는 현재 개발 중이며 공개된 0.1.0 패키지에는 아직 포함되지
+않습니다. 이 리소스는 SQLite·PostgreSQL용 SQLAlchemy async 엔진과 명시적인
+세션·트랜잭션을 제공합니다. 모델과 마이그레이션은 앱에서 관리합니다.
+[DB 연동과 Alembic 안내](docs/DATABASE.md)를 참고하세요.
 
 `SessionMiddleware(SQLiteSessionStore(path))`는 서버에 세션을 저장하고 브라우저에
 불투명 ID만 보냅니다. 기본 쿠키에는 `Secure`, `HttpOnly`, `SameSite=Lax`가

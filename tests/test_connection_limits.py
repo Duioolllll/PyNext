@@ -74,9 +74,16 @@ def test_total_connection_limit_closes_excess_connections(tmp_path):
                 await writer.drain()
                 first = await asyncio.wait_for(reader.readline(), timeout=5)
                 assert first == b"", first
+            except (ConnectionResetError, BrokenPipeError):
+                # A connection rejected at accept can be reset rather than
+                # closed with EOF when unread request bytes are in flight.
+                pass
             finally:
                 writer.close()
-                await writer.wait_closed()
+                try:
+                    await writer.wait_closed()
+                except (ConnectionResetError, BrokenPipeError):
+                    pass
             # Closing one idle connection frees its slot for a new client.
             # The server notices the close asynchronously, so retry for a
             # couple of seconds (a loaded runner may schedule the
@@ -126,9 +133,15 @@ def test_per_ip_connection_limit_closes_excess_from_same_ip(tmp_path):
                 await writer.drain()
                 first = await asyncio.wait_for(reader.readline(), timeout=5)
                 assert first == b"", first
+            except (ConnectionResetError, BrokenPipeError):
+                # Rejection may reset a socket with unread request bytes.
+                pass
             finally:
                 writer.close()
-                await writer.wait_closed()
+                try:
+                    await writer.wait_closed()
+                except (ConnectionResetError, BrokenPipeError):
+                    pass
         finally:
             for _, writer in idle:
                 writer.close()

@@ -35,3 +35,10 @@ def test_generated_feature_table_is_fresh():
     assert result.returncode == 0, (
         "docs/FEATURES.md is stale:\n" + result.stdout + result.stderr
     )
+
+
+def test_feature_table_includes_health_and_server_controls():
+    table = (ROOT / "docs" / "FEATURES.md").read_text(encoding="utf-8")
+    for feature in ("/healthz", "/readyz", "--max-waiting", "--max-connections",
+                    "--max-connections-per-ip", "--shutdown-timeout"):
+        assert f"`{feature}`" in table
