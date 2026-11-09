@@ -28,6 +28,16 @@ Warning: `pynext build` imports and executes the application's Python code (page
 
 `pynext dev --dir examples/basic` serves source without a build and reloads when `app/`, `islands/`, `public/` or `pynext.config.py` change, restarting the server on the same port. `pynext start` uses the build manifest and fails if tracked source files changed; rebuild first. For an app without islands, Node and esbuild are not required. The repository is the installation source; no PyPI publication is implied.
 
+### Build modes
+
+A plain `pynext build` runs both build stages: compiling the island bundles with esbuild, then rendering the static pages. The stages can be run separately (the Next.js `experimentalBuildMode` `compile` / `generate` split):
+
+- `pynext build --only-islands` bundles the islands and updates the manifest without rendering static pages. It reuses the static pages of an earlier build when the sources still match; when an island bundle changed, those pages are stale (they embed the old bundle digest), so the manifest drops the generate stage until the pages are re-rendered.
+- `pynext build --only-static` renders the static pages from the island bundles of an earlier compile, without re-running esbuild. It fails when there is no earlier compile, or when island sources changed since that compile — run `--only-islands` first in that case.
+- `pynext start` refuses a partial build and names the missing stage, so a half-built app is never served by mistake.
+
+`pynext build --static-only` exports a static-only site: the rendered SSG pages, public assets and island bundles, laid out as plain files (one `index.html` per page, assets at their URL paths, bundles under `_pynext/static/`) in `.pynext/export` (or `--export-dir <dir>`), servable with `python -m http.server --directory <dir>` and no PyNext server. This is deliberately narrow, not a full static-export mode: apps with dynamic SSR, ISR or API routes are refused instead of being silently degraded. `--static-only` runs a complete build first and cannot be combined with `--only-islands`, `--only-static` or `--standalone`.
+
 The dev watcher uses native filesystem events and hashes watched files, falling back to polling if needed. JS/TS island edits rebuild and replace affected modules without reloading the document; cleanup runs first and that island’s state may reset. Other source changes restart the server and reload open pages. Broken edits retain the last working version. With `--port 0`, the assigned port is reused on restart.
 
 ## Project structure and routing

@@ -1,15 +1,42 @@
-"""Discover and validate the build inputs, then write a versioned manifest."""
+"""Discover and validate the build inputs, then write a versioned manifest.
+
+Build modes (Next.js ``experimentalBuildMode`` equivalent, track E P3-12):
+
+- ``compile`` (``pynext build --only-islands``): bundle the island modules
+  with esbuild and record them in the manifest, without rendering static
+  pages. Static pages rendered by an earlier build are reused when the
+  sources still match; when the island digests changed, the reused pages
+  are stale (they embed the old bundle digests), so the ``generate`` stage
+  is dropped from the manifest until it runs again.
+- ``generate`` (``pynext build --only-static``): render the static pages
+  (and public assets) from the island bundles of an earlier compile, without
+  re-running esbuild. Island sources must be unchanged since that compile.
+- ``full`` (plain ``pynext build``): both stages, as before.
+
+A manifest records the stages it completed in ``stages``; ``load_manifest``
+refuses a partial manifest so ``pynext start`` fails with an actionable
+message instead of serving a half-built app. Manifests written before this
+feature have no ``stages`` key and are treated as complete.
+
+Static-only export (``pynext build --static-only``) is intentionally narrow:
+it exports the rendered SSG pages, public assets and island bundles into a
+plain directory servable with ``python -m http.server``. It is *not* a
+full ``output: export`` port (REPORT.md §4.3): apps with dynamic SSR, ISR
+or API routes are refused instead of being silently degraded.
+"""
 import hashlib
 import asyncio
 import json
 import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 
 from . import _native
 from .assets import discover_public
-from .client import discover_client
+from .client import PREFIX as CLIENT_PREFIX
+from .client import discover_client, read_client_artifacts
 
 MANIFEST = ".pynext/manifest.json"
 VERSION = 9
@@ -20,6 +47,12 @@ MAX_STATIC_PAGES = 10_000
 MAX_STATIC_PAGE_BYTES = 8 * 1024 * 1024
 MAX_STREAMED_STATIC_BYTES = MAX_STATIC_PAGE_BYTES
 MAX_STREAMED_STATIC_SECONDS = 30
+
+# Build stages, in the order they run. A full build completes both.
+STAGES = ("compile", "generate")
+# Keys of a manifest that describe the discovered sources. Two builds agree
+# on these exactly when nothing relevant changed between them.
+_DISCOVER_KEYS = ("schema_version", "routes", "sources", "public_sources", "client_sources")
 
 
 def _hash(path):
@@ -106,37 +139,262 @@ def discover(root):
             "public_sources": public_sources, "client_sources": discover_client(root)}
 
 
-def write_manifest(root):
-    root = Path(root).resolve()
-    _check_build_paths(root)
-    manifest = discover(root)
-    # Loading user code and running its generators are intentional build steps.
-    from .app import App
-    app = App(root, manifest)
-    rendered = asyncio.run(_render_static_pages(app))
-    if discover(root) != manifest:
-        raise ValueError("Application sources changed during build; retry the build")
-    manifest["render_modes"] = app.render_modes
-    manifest["isr_policies"] = app.isr_policies
-    manifest["isr_queries"] = app.isr_queries
-    manifest["client"] = app.client_manifest
-    manifest["static_pages"] = {}
+def _normalize_stages(stages):
+    """Validate a requested stage set and return it in canonical order."""
+    if stages is None:
+        return list(STAGES)
+    selected = [stage for stage in STAGES if stage in set(stages)]
+    if not selected or len(selected) != len(set(stages)):
+        raise ValueError(
+            f"Build stages must be a non-empty subset of {list(STAGES)}: {sorted(stages)!r}")
+    return selected
+
+
+def _read_manifest_file(root):
+    """Read the existing manifest, or None when no build exists yet."""
+    target = root / MANIFEST
+    if not target.is_file():
+        return None
+    try:
+        saved = json.loads(target.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"Invalid build manifest {target}: {exc}; rebuild the application") from exc
+    if not isinstance(saved, dict):
+        raise ValueError(
+            f"Invalid build manifest {target}: expected a JSON object; rebuild the application")
+    if saved.get("schema_version") != VERSION:
+        raise ValueError("Incompatible manifest version; rebuild the application")
+    return saved
+
+
+def _write_manifest_file(root, manifest):
+    target = root / MANIFEST
+    _atomic_write(target, (json.dumps(manifest, ensure_ascii=False, indent=2) +
+                           "\n").encode("utf-8"))
+
+
+def _write_client_files(root, client_assets):
+    for path, body in client_assets.items():
+        digest = path.rsplit("/", 1)[1].removesuffix(".js")
+        _atomic_write(root / ".pynext" / "static" / f"{digest}.js", body)
+
+
+def _write_public_files(root, public_assets):
+    assets = {}
+    for path, (body, media_type) in public_assets.items():
+        digest = hashlib.sha256(body).hexdigest()
+        _atomic_write(root / ".pynext" / "static" / f"{digest}.asset", body)
+        assets[path] = {"sha256": digest, "content_type": media_type}
+    return assets
+
+
+def _write_static_files(root, rendered):
+    static_pages = {}
     for path, (pattern, body) in rendered.items():
         digest = hashlib.sha256(body).hexdigest()
         destination = root / ".pynext" / "static" / f"{digest}.html"
         _atomic_write(destination, body)
-        manifest["static_pages"][path] = {"pattern": pattern, "sha256": digest}
-    manifest["assets"] = {}
-    for path, (body, media_type) in app.public_assets.items():
-        digest = hashlib.sha256(body).hexdigest()
-        _atomic_write(root / ".pynext" / "static" / f"{digest}.asset", body)
-        manifest["assets"][path] = {"sha256": digest, "content_type": media_type}
-    for path, body in app.client_assets.items():
-        digest = path.rsplit("/", 1)[1].removesuffix(".js")
-        _atomic_write(root / ".pynext" / "static" / f"{digest}.js", body)
-    target = root / MANIFEST
-    _atomic_write(target, (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        static_pages[path] = {"pattern": pattern, "sha256": digest}
+    return static_pages
+
+
+def _check_sources_unchanged(root, manifest):
+    if discover(root) != manifest:
+        raise ValueError("Application sources changed during build; retry the build")
+
+
+def _finish_manifest(root, manifest, app, rendered, *, previous=None):
+    """Fill a discovered manifest with build outputs and write it.
+
+    ``rendered`` is the ``_render_static_pages`` result (or None for a
+    compile-only build, which reuses the previous static pages). ``previous``
+    is the manifest of an earlier build whose static pages/assets may be
+    reused; it is ignored when ``rendered`` is given.
+    """
+    manifest["render_modes"] = app.render_modes
+    manifest["isr_policies"] = app.isr_policies
+    manifest["isr_queries"] = app.isr_queries
+    manifest["client"] = app.client_manifest
+    if rendered is None:
+        if previous is not None:
+            manifest["static_pages"] = previous.get("static_pages", {})
+            manifest["assets"] = previous.get("assets", {})
+        else:
+            manifest["static_pages"] = {}
+            manifest["assets"] = {}
+    else:
+        manifest["static_pages"] = _write_static_files(root, rendered)
+        manifest["assets"] = _write_public_files(root, app.public_assets)
+    _write_client_files(root, app.client_assets)
+    _write_manifest_file(root, manifest)
     return manifest
+
+
+def write_manifest(root, stages=None):
+    """Build the application, or only the requested stages.
+
+    ``stages`` is a subset of ``("compile", "generate")``; the default is
+    both (a full build). See the module docstring for what each stage does
+    and what a partial build reuses from the previous one.
+    """
+    root = Path(root).resolve()
+    _check_build_paths(root)
+    selected = _normalize_stages(stages)
+    if selected == list(STAGES):
+        manifest = discover(root)
+        # Loading user code and running its generators are intentional build steps.
+        from .app import App
+        app = App(root, manifest)
+        rendered = asyncio.run(_render_static_pages(app))
+        _check_sources_unchanged(root, manifest)
+        manifest["stages"] = list(STAGES)
+        return _finish_manifest(root, manifest, app, rendered)
+    if selected == ["compile"]:
+        return _write_compile_only_manifest(root)
+    return _write_generate_only_manifest(root)
+
+
+def _write_compile_only_manifest(root):
+    """Compile island bundles without rendering static pages."""
+    manifest = discover(root)
+    # Loading user code is an intentional build step; the App also validates
+    # the routes and computes the render modes / ISR policies.
+    from .app import App
+    app = App(root, manifest)
+    previous = _read_manifest_file(root)
+    previous_client = previous.get("client") if isinstance(previous, dict) else None
+    reused = (previous is not None and isinstance(previous_client, dict) and
+              isinstance(previous_client.get("bundles"), dict) and
+              {key: previous.get(key) for key in _DISCOVER_KEYS} ==
+              {key: manifest.get(key) for key in _DISCOVER_KEYS})
+    _check_sources_unchanged(root, manifest)
+    if reused:
+        # Static pages embed island bundle digests, so they stay valid only
+        # while the bundles are unchanged. A changed digest drops the
+        # generate stage: the pages are stale until they are re-rendered.
+        old_digests = {previous.get("client", {}).get("runtime"),
+                       *previous.get("client", {}).get("bundles", {}).values()}
+        new_digests = {app.client_manifest.get("runtime"),
+                       *app.client_manifest.get("bundles", {}).values()}
+        previous_stages = previous.get("stages") or list(STAGES)
+        stages = [stage for stage in STAGES
+                  if stage == "compile" or
+                  (stage in previous_stages and old_digests == new_digests)]
+    else:
+        previous = None
+        stages = ["compile"]
+    manifest["stages"] = stages
+    return _finish_manifest(root, manifest, app, None, previous=previous)
+
+
+def _write_generate_only_manifest(root):
+    """Render static pages from the island bundles of an earlier compile."""
+    manifest = discover(root)
+    previous = _read_manifest_file(root)
+    if previous is None:
+        raise ValueError("No previous build found; run `pynext build --only-islands` first")
+    if "compile" not in (previous.get("stages") or list(STAGES)):
+        raise ValueError(
+            "Island bundles were not compiled; run `pynext build --only-islands` first")
+    if previous.get("client_sources") != manifest["client_sources"]:
+        raise ValueError("Island sources changed since the last compile; "
+                         "run `pynext build --only-islands` first")
+    client_manifest, client_assets = read_client_artifacts(root, previous)
+    # Loading user code and running its generators are intentional build steps.
+    # The client bundles are reused from the previous compile, so esbuild
+    # does not run again.
+    from .app import App
+    app = App(root, manifest, reuse_client=(client_manifest, client_assets))
+    rendered = asyncio.run(_render_static_pages(app))
+    _check_sources_unchanged(root, manifest)
+    previous_stages = previous.get("stages") or list(STAGES)
+    manifest["stages"] = [stage for stage in STAGES
+                          if stage == "generate" or stage in previous_stages]
+    return _finish_manifest(root, manifest, app, rendered)
+
+
+def export_static(root, manifest=None, output=None):
+    """Export a static-only site: SSG pages, public assets, island bundles.
+
+    The output directory holds plain files (``index.html`` per page, public
+    assets at their URL paths, island bundles under ``_pynext/static/``) and
+    is servable with ``python -m http.server --directory <output>`` without
+    a PyNext server. Apps with dynamic SSR, ISR or API routes are refused:
+    there is no server to run them, and silently dropping them would ship a
+    broken site. This is deliberately not a full ``output: export`` port.
+    """
+    root = Path(root).resolve()
+    if manifest is None:
+        manifest = load_manifest(root)
+    dynamic = sorted(pattern for pattern, mode in manifest.get("render_modes", {}).items()
+                     if mode != "ssg")
+    api = sorted(pattern for pattern, spec in manifest.get("routes", {}).items()
+                 if spec.get("kind") == "route")
+    if dynamic or api:
+        blocked = [f"{pattern} (render={manifest['render_modes'][pattern]})" for pattern in dynamic]
+        blocked += [f"{pattern} (API route)" for pattern in api]
+        raise ValueError("Static-only export cannot include dynamic routes: " + ", ".join(blocked) +
+                         "; make them SSG or remove them first")
+    static_dir = root / ".pynext" / "static"
+    output = Path(output) if output is not None else root / ".pynext" / "export"
+    if not output.is_absolute():
+        output = (root / output).resolve()
+    if output.is_symlink():
+        raise ValueError(f"Export directory must not be a symbolic link: {output}")
+    if output == root or root / "app" in output.parents or root / "public" in output.parents:
+        raise ValueError(f"Export directory must not overlap the application sources: {output}")
+    if output.exists() and any(output.iterdir()):
+        if output != root / ".pynext" / "export":
+            raise ValueError(
+                f"Export directory is not empty: {output}; remove it or choose another directory")
+        shutil.rmtree(output)
+    output.mkdir(parents=True, exist_ok=True)
+    try:
+        pages = 0
+        for path, entry in sorted(manifest.get("static_pages", {}).items()):
+            digest = entry["sha256"]
+            body = _read_static_file(static_dir, f"{digest}.html", digest)
+            relative = ("index.html" if path == "/" else
+                        "/".join(path.strip("/").split("/")) + "/index.html")
+            target = output / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+            pages += 1
+        assets = 0
+        for path, entry in sorted(manifest.get("assets", {}).items()):
+            digest = entry["sha256"]
+            body = _read_static_file(static_dir, f"{digest}.asset", digest)
+            target = output / path.lstrip("/")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+            assets += 1
+        bundles = 0
+        client = manifest.get("client", {})
+        if not isinstance(client, dict) or not isinstance(client.get("bundles", {}), dict):
+            raise ValueError("Invalid client manifest; rebuild the application")
+        for digest in {client.get("runtime"), *client.get("bundles", {}).values()}:
+            if digest is None:
+                continue
+            body = _read_static_file(static_dir, f"{digest}.js", digest)
+            target = output / CLIENT_PREFIX.lstrip("/") / f"{digest}.js"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+            bundles += 1
+    except BaseException:
+        shutil.rmtree(output, ignore_errors=True)
+        raise
+    return {"pages": pages, "assets": assets, "bundles": bundles, "output": str(output)}
+
+
+def _read_static_file(static_dir, name, digest):
+    file = static_dir / name
+    if not file.resolve().is_relative_to(static_dir.resolve()) or not file.is_file():
+        raise ValueError(f"Missing build output {name}; rebuild the application")
+    body = file.read_bytes()
+    if hashlib.sha256(body).hexdigest() != digest:
+        raise ValueError(f"Build output {name} failed integrity check; rebuild the application")
+    return body
 
 
 def _atomic_write(path, contents):
@@ -325,6 +583,18 @@ def load_manifest(root):
         raise ValueError(f"Invalid build manifest {target}: expected a JSON object; rebuild the application")
     if saved.get("schema_version") != VERSION:
         raise ValueError("Incompatible manifest version; rebuild the application")
+    stages = saved.get("stages")
+    if stages is not None:
+        # Manifests written before build stages existed have no key and are
+        # treated as complete builds.
+        if not isinstance(stages, list) or not set(stages) <= set(STAGES):
+            raise ValueError("Invalid build stages in manifest; rebuild the application")
+        if "compile" not in stages:
+            raise ValueError("Island bundles were not compiled; "
+                             "run `pynext build --only-islands` or a full `pynext build` first")
+        if "generate" not in stages:
+            raise ValueError("Static pages were not generated; "
+                             "run `pynext build --only-static` or a full `pynext build` first")
     expected = discover(root)
     if {key: saved.get(key) for key in expected} != expected:
         raise ValueError("Application sources changed since build; run `pynext build` again")

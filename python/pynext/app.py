@@ -331,7 +331,7 @@ class App:
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
                  resources=None, cache_url=None, cache_failure_policy=None,
                  websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
-                 trusted_proxies=None, sync_workers=32):
+                 trusted_proxies=None, sync_workers=32, reuse_client=None):
         if isinstance(sync_workers, bool) or not isinstance(sync_workers, int) or not 1 <= sync_workers <= 1024:
             raise ValueError("sync_workers must be an integer from 1 to 1024")
         self.sync_workers = sync_workers
@@ -385,7 +385,7 @@ class App:
                     raise TypeError("resources.py must export a RESOURCES dict")
             self._initialize(root, manifest, production=production,
                              cache_backend=cache_backend, cache_path=cache_path, cache_url=cache_url,
-                             cache_failure_policy=cache_failure_policy)
+                             cache_failure_policy=cache_failure_policy, reuse_client=reuse_client)
             configured = ()
             if "middleware.py" in manifest["sources"]:
                 configured = getattr(self._module("middleware.py"), "MIDDLEWARE", None)
@@ -485,7 +485,11 @@ class App:
         return self
 
     def _initialize(self, root, manifest, *, production=False, cache_backend="memory", cache_path=None,
-                    cache_url=None, cache_failure_policy=None):
+                    cache_url=None, cache_failure_policy=None, reuse_client=None):
+        # ``reuse_client`` is a build-internal (manifest, assets) pair from an
+        # earlier compile: the generate-only build stage reuses those bundles
+        # instead of running esbuild again. It is ignored in production,
+        # where the bundles always come from the manifest.
         self.root = Path(root).resolve()
         self.manifest = manifest
         self.production = production
@@ -595,7 +599,10 @@ class App:
                 raise ValueError("A public file conflicts with a generated page; rebuild the application")
         else:
             self.public_assets = read_public_sources(self.root, manifest["public_sources"])
-            self.client_manifest, self.client_assets = compile_client(self.root, manifest["client_sources"])
+            if reuse_client is not None:
+                self.client_manifest, self.client_assets = reuse_client
+            else:
+                self.client_manifest, self.client_assets = compile_client(self.root, manifest["client_sources"])
         assets = {**self.static_pages, **self.client_assets,
                   **{path: body for path, (body, _) in self.public_assets.items()}}
         self.asset_etags = {path: f'"{hashlib.sha256(body).hexdigest()}"' for path, body in assets.items()}

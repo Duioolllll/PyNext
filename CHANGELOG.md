@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Split the build into stages (Next.js `experimentalBuildMode` equivalent): `pynext build --only-islands` compiles the island bundles without rendering static pages, and `pynext build --only-static` renders the static pages from an earlier compile without re-running esbuild. A compile-only build reuses earlier static pages while the island digests are unchanged and drops the generate stage once they change; `pynext start` refuses a partial build and names the missing stage. `pynext build --static-only` exports a static-only site (SSG pages, public assets and island bundles as plain files under `.pynext/export`, or `--export-dir`) servable with `python -m http.server` and no PyNext server; apps with dynamic SSR, ISR or API routes are refused rather than silently degraded. This is deliberately not a full `output: export` port.
+
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.

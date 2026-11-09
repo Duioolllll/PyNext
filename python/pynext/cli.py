@@ -8,7 +8,7 @@ import traceback
 from pathlib import Path
 
 from .app import create_app
-from .build import write_manifest
+from .build import export_static, write_manifest
 from .client import compile_client, discover_client
 from .http import MAX_WS_MESSAGE, SecurityConfig
 from .observability import ObservabilityConfig
@@ -225,6 +225,20 @@ def main():
         if name == "build":
             command.add_argument("--standalone", action="store_true", help="create a Linux standalone directory")
             command.add_argument("--standalone-dir", default=None, help="new output directory for --standalone")
+            command.add_argument("--only-islands", action="store_true",
+                                 help="compile only: bundle the island modules and update the manifest"
+                                      " without rendering static pages (Next.js 'compile' build mode)")
+            command.add_argument("--only-static", action="store_true",
+                                 help="generate only: render the static pages from the island bundles of"
+                                      " an earlier compile, without re-running the bundler"
+                                      " (Next.js 'generate' build mode)")
+            command.add_argument("--static-only", action="store_true",
+                                 help="export a static-only site (SSG pages, public assets and island"
+                                      " bundles) to a directory servable without a server; refuses apps"
+                                      " with dynamic, ISR or API routes")
+            command.add_argument("--export-dir", default=None,
+                                 help="output directory for --static-only"
+                                      " (default: <project>/.pynext/export)")
         if name != "build":
             command.add_argument("--host", default="127.0.0.1")
             command.add_argument("--port", type=_port, default=3000)
@@ -347,11 +361,40 @@ def main():
     if args.command == "build":
         if args.standalone_dir and not args.standalone:
             parser.error("--standalone-dir requires --standalone")
+        if args.only_islands and args.only_static:
+            parser.error("--only-islands and --only-static are mutually exclusive; "
+                         "run a plain `pynext build` for both stages")
+        if args.static_only and (args.only_islands or args.only_static):
+            parser.error("--static-only runs a complete build first; combine it with "
+                         "neither --only-islands nor --only-static")
+        if args.export_dir and not args.static_only:
+            parser.error("--export-dir requires --static-only")
+        if args.standalone and (args.only_islands or args.only_static):
+            parser.error("--standalone requires a complete build; combine it with "
+                         "neither --only-islands nor --only-static")
         try:
-            manifest = write_manifest(root)
+            if args.only_islands:
+                manifest = write_manifest(root, stages=("compile",))
+            elif args.only_static:
+                manifest = write_manifest(root, stages=("generate",))
+            else:
+                manifest = write_manifest(root)
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
-        print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
+        if args.only_islands:
+            print(f"Compiled {len(manifest['client']['bundles'])} island bundles in {root / '.pynext'}")
+        elif args.only_static:
+            print(f"Generated {len(manifest['static_pages'])} static pages in {root / '.pynext'}")
+        else:
+            print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
+        if args.static_only:
+            output = Path(args.export_dir) if args.export_dir else None
+            try:
+                summary = export_static(root, manifest, output)
+            except (OSError, ValueError) as exc:
+                parser.error(str(exc))
+            print(f"Exported {summary['pages']} static pages to {summary['output']}")
+            print(f"Serve with: python -m http.server --directory {summary['output']}")
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
             try:
