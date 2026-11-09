@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Segment config inheritance (Next.js `reduceAppConfig`): layouts can declare an ISR policy with `@layout(revalidate=..., stale=...)`; ISR pages inherit unset values from ancestor layouts and only win with a shorter `revalidate` / smaller `stale`. An ISR page with no `revalidate` anywhere in its layout chain fails at load; a longer page value is overridden with a build-time warning naming both files. Layout policies are recorded in the build manifest (schema version 10), so changing one requires a rebuild.
+
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.

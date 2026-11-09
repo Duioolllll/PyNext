@@ -12,7 +12,7 @@ from .assets import discover_public
 from .client import discover_client
 
 MANIFEST = ".pynext/manifest.json"
-VERSION = 9
+VERSION = 10
 MAX_STATIC_PAGES = 10_000
 # One cap for every static page rendered at build time, streaming or
 # not: a non-streaming page used to have no size limit at all while a
@@ -118,6 +118,7 @@ def write_manifest(root):
         raise ValueError("Application sources changed during build; retry the build")
     manifest["render_modes"] = app.render_modes
     manifest["isr_policies"] = app.isr_policies
+    manifest["layout_policies"] = app.layout_policies
     manifest["isr_queries"] = app.isr_queries
     manifest["client"] = app.client_manifest
     manifest["static_pages"] = {}

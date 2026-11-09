@@ -228,12 +228,76 @@ def bind_islands(tree, manifest, *, include_runtime=True, dev_id=None):
     return {"kind": "fragment", "children": [bound, runtime]}
 
 
+def _segment_value(name, value, *, allow_zero):
+    """Validate one ISR segment value; None means 'not set by this segment'."""
+    if value is None:
+        return None
+    if value is False:
+        raise ValueError(f"{name}=False (on-demand ISR) is not supported yet")
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+            value < 0 or (not allow_zero and value == 0) or value > 604_800 or not math.isfinite(value)):
+        raise ValueError(f"{name} must be a finite {'non-negative' if allow_zero else 'positive'} number of seconds, at most 604800")
+    return float(value)
+
+
+def _partial_isr_policy(revalidate, stale):
+    """A segment policy where either value may be unset (None)."""
+    return {"revalidate": _segment_value("revalidate", revalidate, allow_zero=False),
+            "stale": _segment_value("stale", stale, allow_zero=True)}
+
+
+def reduce_segment_config(policies):
+    """Combine layout (root-first) and page segment policies.
+
+    Follows the Next.js ``reduceAppConfig`` rules (``build/utils.ts``):
+    a ``revalidate`` number beats ``False``, and among numbers the shortest
+    wins; ``False`` only wins when no segment sets a number. ``stale`` takes
+    the smallest set value. ``None`` means the segment does not set that key.
+
+    ``policies`` is an iterable of ``(source, policy)`` pairs in
+    root-layout-first order, each policy a ``{"revalidate": number|False|None,
+    "stale": number|None}`` dict. Returns ``(effective, winners)`` where
+    ``effective`` is ``{"revalidate": float|False|None, "stale": float|None}``
+    and ``winners`` maps each key to the ``(source, value)`` that set the
+    effective value (or ``None`` when nothing set it).
+    """
+    effective = {"revalidate": None, "stale": None}
+    winners = {"revalidate": None, "stale": None}
+    for source, policy in policies:
+        if not isinstance(policy, dict) or set(policy) != {"revalidate", "stale"}:
+            raise ValueError(f"Invalid segment policy from {source}")
+        revalidate = policy["revalidate"]
+        if revalidate is not None:
+            if revalidate is False:
+                if effective["revalidate"] is None:
+                    effective["revalidate"] = False
+                    winners["revalidate"] = (source, False)
+            elif (isinstance(revalidate, bool) or not isinstance(revalidate, (int, float)) or
+                    not math.isfinite(revalidate)):
+                raise ValueError(f"Invalid revalidate in segment policy from {source}")
+            elif (effective["revalidate"] is None or effective["revalidate"] is False or
+                    revalidate < effective["revalidate"]):
+                effective["revalidate"] = float(revalidate)
+                winners["revalidate"] = (source, float(revalidate))
+        stale = policy["stale"]
+        if stale is not None:
+            if (isinstance(stale, bool) or not isinstance(stale, (int, float)) or
+                    not math.isfinite(stale)):
+                raise ValueError(f"Invalid stale in segment policy from {source}")
+            if effective["stale"] is None or stale < effective["stale"]:
+                effective["stale"] = float(stale)
+                winners["stale"] = (source, float(stale))
+    return effective, winners
+
+
 def _isr_policy(revalidate, stale):
-    for name, value, allow_zero in (("revalidate", revalidate, False), ("stale", stale, True)):
-        if (isinstance(value, bool) or not isinstance(value, (int, float)) or
-                value < 0 or (not allow_zero and value == 0) or value > 604_800 or not math.isfinite(value)):
-            raise ValueError(f"{name} must be a finite {'non-negative' if allow_zero else 'positive'} number of seconds, at most 604800")
-    return {"revalidate": float(revalidate), "stale": float(stale)}
+    revalidate = _segment_value("revalidate", revalidate, allow_zero=False)
+    stale = _segment_value("stale", stale, allow_zero=True)
+    if revalidate is None:
+        raise ValueError("revalidate must be a finite positive number of seconds, at most 604800")
+    if stale is None:
+        raise ValueError("stale must be a finite non-negative number of seconds, at most 604800")
+    return {"revalidate": revalidate, "stale": stale}
 
 
 def _isr_query_keys(keys):
@@ -249,7 +313,11 @@ def page(*, render="ssr", revalidate=None, stale=None, query_keys=()):
     if render not in {"ssr", "ssg", "isr"}:
         raise ValueError("render must be 'ssr', 'ssg', or 'isr'")
     if render == "isr":
-        policy = _isr_policy(revalidate, 60.0 if stale is None else stale)
+        # Either value may be omitted: the effective policy is resolved at
+        # app load from the layout chain (see reduce_segment_config), so a
+        # page can inherit revalidate/stale from its layouts. An ISR page
+        # with no revalidate anywhere in its chain fails at app load.
+        policy = _partial_isr_policy(revalidate, stale)
         query_keys = _isr_query_keys(query_keys)
     else:
         if revalidate is not None or stale is not None or query_keys:
@@ -264,6 +332,19 @@ def page(*, render="ssr", revalidate=None, stale=None, query_keys=()):
     return decorate
 
 
-def layout(fn):
-    fn.__pynext_layout__ = True
-    return fn
+def layout(fn=None, *, revalidate=None, stale=None):
+    """Mark a layout function, optionally declaring a section ISR policy.
+
+    Both ``@layout`` and ``@layout(revalidate=60, stale=120)`` work. A policy
+    on a layout is the default for ISR pages below it: a page (or nearer
+    layout) only wins with a shorter value, per ``reduce_segment_config``.
+    Non-ISR pages ignore the policy.
+    """
+    policy = _partial_isr_policy(revalidate, stale)
+    def decorate(target):
+        target.__pynext_layout__ = True
+        target.__pynext_layout_policy__ = policy
+        return target
+    if fn is None:
+        return decorate
+    return decorate(fn)

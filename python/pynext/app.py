@@ -25,7 +25,7 @@ from .assets import read_public_artifacts, read_public_sources
 from .auth import check_authorization
 from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
 from .client import compile_client, read_client_artifacts
-from .components import _isr_policy, _isr_query_keys, _node, bind_islands
+from .components import _isr_policy, _isr_query_keys, _node, _partial_isr_policy, bind_islands, reduce_segment_config
 from .build import discover, load_manifest
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
@@ -494,6 +494,7 @@ class App:
         self.websocket_entries = {}
         self.render_modes = {}
         self.isr_policies = {}
+        self.layout_policies = {}
         self.isr_queries = {}
         if cache_backend == "sqlite" and cache_path is None:
             cache_path = self.root / ".pynext" / "isr-cache.sqlite3"
@@ -522,17 +523,68 @@ class App:
                 if mode in {"ssg", "isr"} and getattr(fn, "__pynext_auth__", False):
                     raise ValueError(f"{mode.upper()} page {spec['entry']} cannot require authentication")
                 self.render_modes[pattern] = mode
+                layouts = []
+                layout_policies = []
+                for relative in spec["layouts"]:
+                    layout_fn = getattr(self._module(relative), "Layout", None)
+                    if not callable(layout_fn) or not getattr(layout_fn, "__pynext_layout__", False):
+                        raise ValueError(f"{relative} must export a @layout Layout function")
+                    _check_signature(layout_fn, {"children"}, relative)
+                    if "children" not in inspect.signature(layout_fn).parameters:
+                        raise ValueError(f"{relative} must accept children")
+                    layouts.append(layout_fn)
+                    raw_layout_policy = getattr(layout_fn, "__pynext_layout_policy__", None)
+                    if raw_layout_policy is not None:
+                        if not isinstance(raw_layout_policy, dict) or set(raw_layout_policy) != {"revalidate", "stale"}:
+                            raise ValueError(f"Invalid layout policy in {relative}")
+                        try:
+                            layout_policy = _partial_isr_policy(raw_layout_policy["revalidate"],
+                                                                raw_layout_policy["stale"])
+                        except ValueError as exc:
+                            raise ValueError(f"Invalid layout policy in {relative}: {exc}") from exc
+                        if layout_policy["revalidate"] is not None or layout_policy["stale"] is not None:
+                            layout_policies.append((relative, layout_policy))
                 if mode == "isr":
-                    policy = getattr(fn, "__pynext_cache_policy__", None)
-                    if not isinstance(policy, dict) or set(policy) != {"revalidate", "stale"}:
+                    raw_policy = getattr(fn, "__pynext_cache_policy__", None)
+                    if not isinstance(raw_policy, dict) or set(raw_policy) != {"revalidate", "stale"}:
                         raise ValueError(f"Invalid ISR policy in {spec['entry']}")
                     try:
-                        policy = _isr_policy(policy["revalidate"], policy["stale"])
+                        page_policy = _partial_isr_policy(raw_policy["revalidate"], raw_policy["stale"])
                     except ValueError as exc:
                         raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
+                    if layout_policies:
+                        self.layout_policies[pattern] = [
+                            {"source": source, "revalidate": policy["revalidate"], "stale": policy["stale"]}
+                            for source, policy in layout_policies]
+                    # Segment config inheritance (Next.js reduceAppConfig):
+                    # layouts set the section policy, a page only wins with a
+                    # shorter revalidate / smaller stale. Warn when the page
+                    # explicitly asked for a value it does not get, naming
+                    # both files so the override is never silent.
+                    effective, winners = reduce_segment_config(
+                        [*layout_policies, (spec["entry"], page_policy)])
+                    for key in ("revalidate", "stale"):
+                        page_value = page_policy[key]
+                        if (page_value is not None and page_value is not False and
+                                effective[key] != page_value):
+                            winner_source, winner_value = winners[key]
+                            log.warning(
+                                "ISR %s=%s in %s is overridden by %s=%s from %s for route %s; "
+                                "a child segment only wins with a shorter %s",
+                                key, page_value, spec["entry"], key, winner_value,
+                                winner_source, pattern, key)
+                    if effective["revalidate"] is None:
+                        raise ValueError(
+                            f"ISR page {spec['entry']} must set revalidate or inherit it from a layout")
+                    if effective["revalidate"] is False:
+                        raise ValueError(
+                            f"ISR page {spec['entry']} resolves to revalidate=False (on-demand ISR), "
+                            "which is not supported yet")
+                    policy = _isr_policy(effective["revalidate"],
+                                         60.0 if effective["stale"] is None else effective["stale"])
+                    self.isr_policies[pattern] = policy
                     if getattr(module, "generate_static_params", None) is not None:
                         raise ValueError(f"ISR page {spec['entry']} cannot export generate_static_params yet")
-                    self.isr_policies[pattern] = policy
                     try:
                         query_keys = _isr_query_keys(getattr(fn, "__pynext_cache_query__", ()))
                     except ValueError as exc:
@@ -550,15 +602,6 @@ class App:
                     if not dynamic and generator is not None:
                         raise ValueError(f"Static SSG page {spec['entry']} cannot export generate_static_params")
                     self.static_generators[pattern] = generator
-                layouts = []
-                for relative in spec["layouts"]:
-                    layout_fn = getattr(self._module(relative), "Layout", None)
-                    if not callable(layout_fn) or not getattr(layout_fn, "__pynext_layout__", False):
-                        raise ValueError(f"{relative} must export a @layout Layout function")
-                    _check_signature(layout_fn, {"children"}, relative)
-                    if "children" not in inspect.signature(layout_fn).parameters:
-                        raise ValueError(f"{relative} must accept children")
-                    layouts.append(layout_fn)
                 self.entries[pattern] = (fn, layouts)
             else:
                 handlers = {}
@@ -586,6 +629,8 @@ class App:
                 raise ValueError("Render modes changed since build; run `pynext build` again")
             if manifest.get("isr_policies") != self.isr_policies:
                 raise ValueError("ISR policies changed since build; run `pynext build` again")
+            if manifest.get("layout_policies") != self.layout_policies:
+                raise ValueError("Layout policies changed since build; run `pynext build` again")
             if manifest.get("isr_queries") != self.isr_queries:
                 raise ValueError("ISR query keys changed since build; run `pynext build` again")
             self.client_manifest, self.client_assets = read_client_artifacts(self.root, manifest)
