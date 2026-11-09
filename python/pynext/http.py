@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote_to_bytes
 
 from .forms import parse_form
-from .ws_origin import canonical_origin
+from .ws_origin import canonical_origin, parse_origin_pattern
 
 
 class BadRequest(Exception):
@@ -244,15 +244,20 @@ class SecurityConfig:
     once, before the 101 response, in :func:`pynext.ws_origin.websocket_origin_allowed`,
     and a denied handshake is answered HTTP 403 and logged (never a
     silent close). Allowlist semantics: ``websocket_allowed_origins``
-    holds exact serialized HTTP(S) origins — scheme, host and port all
-    take part in the comparison, with the default port implied
-    (``https://client.example`` matches ``:443`` and nothing else);
-    ``*``, ``null``, userinfo, paths, queries and fragments are
-    rejected as values, and a request carrying a duplicate or
-    unparseable ``Origin`` (or duplicate ``Host``) is denied. Without
-    an allowlist hit the origin must equal the request's effective
-    origin (``Host`` header, resolved through :class:`ProxyTrust` for
-    trusted proxies only). A missing ``Origin`` is denied unless
+    holds exact serialized HTTP(S) origins or wildcard patterns —
+    scheme, host and port all take part in the comparison, with the
+    default port implied (``https://client.example`` matches ``:443``
+    and nothing else); ``*`` matches exactly one DNS label
+    (``https://*.example.com``) and ``**`` — only as the leftmost
+    label — matches one or more leading labels
+    (``https://**.example.com``), and a pattern must keep at least two
+    literal labels, so ``https://*.com`` is rejected; ``null``,
+    userinfo, paths, queries and fragments are rejected as values,
+    and a request carrying a duplicate or unparseable ``Origin`` (or
+    duplicate ``Host``) is denied. Without an allowlist hit the origin
+    must equal the request's effective origin (``Host`` header,
+    resolved through :class:`ProxyTrust` for trusted proxies only). A
+    missing ``Origin`` is denied unless
     ``websocket_allow_missing_origin`` opts non-browser clients in
     explicitly. Origin checking does not replace authentication: the
     header is client-controlled and can be forged or omitted.
@@ -319,7 +324,7 @@ class SecurityConfig:
         if isinstance(self.websocket_allowed_origins, (str, bytes)):
             raise TypeError("websocket_allowed_origins must be a sequence of origins")
         self.websocket_allowed_origins = tuple(self.websocket_allowed_origins)
-        origin_keys = [canonical_origin(origin) for origin in self.websocket_allowed_origins]
+        origin_keys = [parse_origin_pattern(origin) for origin in self.websocket_allowed_origins]
         if any(origin is None for origin in origin_keys):
             raise ValueError("websocket_allowed_origins must contain valid HTTP(S) origins")
         key = self.csrf_signing_key
