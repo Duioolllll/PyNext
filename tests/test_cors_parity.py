@@ -16,6 +16,9 @@ def test_native_static_cors_matches_asgi(tmp_path, origins, credentials):
     (tmp_path / "app").mkdir()
     (tmp_path / "app/page.py").write_text(
         'from pynext import h, page\n@page(render="ssg")\ndef Page(): return h("p", {}, "hello")\n')
+    (tmp_path / "app/news").mkdir()
+    (tmp_path / "app/news/page.py").write_text(
+        'from pynext import h, page\n@page(render="isr", revalidate=60)\ndef Page(): return h("p", {}, "news")\n')
     (tmp_path / "public").mkdir()
     (tmp_path / "public/data.txt").write_text("0123456789")
     write_manifest(tmp_path)
@@ -27,8 +30,8 @@ def test_native_static_cors_matches_asgi(tmp_path, origins, credentials):
         try:
             async with httpx.AsyncClient(base_url=f"http://{server.address}") as native, \
                     httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as asgi:
-                for path in ("/", "/data.txt"):
-                    etag = (await asgi.get(path)).headers["etag"]
+                for path in ("/", "/data.txt", "/news"):
+                    etag = (await asgi.get(path)).headers.get("etag", '"not-current"')
                     for origin in ("https://client.example", "https://denied.example", "http://test:80"):
                         for method, extra in (
                             ("GET", {}), ("HEAD", {}), ("GET", {"range": "bytes=1-3"}),
@@ -40,6 +43,11 @@ def test_native_static_cors_matches_asgi(tmp_path, origins, credentials):
                             right = await asgi.request(method, path, headers=headers)
                             assert left.status_code == right.status_code, (path, method, origin, extra)
                             assert left.content == right.content
+                            if path == "/data.txt" and method == "GET":
+                                if "range" in extra:
+                                    assert left.status_code == 206
+                                if "if-none-match" in extra:
+                                    assert left.status_code == 304
                             relevant = lambda response: {
                                 key: value for key, value in response.headers.items()
                                 if key.startswith("access-control-") or key == "vary"}

@@ -1,0 +1,2251 @@
+{
+  "baseline": "pynext-c1",
+  "schema_version": 1,
+  "generated_at": "2026-11-09T07:50:08.216832+00:00",
+  "conditions": {
+    "requests_per_scenario_rep": 2000,
+    "concurrency": 10,
+    "warmup_requests": 100,
+    "repetitions": 3,
+    "production": true,
+    "modes": [
+      "axum",
+      "uvicorn"
+    ],
+    "server_workers": 1,
+    "transport": "external_http (separate server process)",
+    "loadgen_location": "same-machine",
+    "server_host": null,
+    "config_file": "/workspace/PyNext/benchmarks/baseline-config.json"
+  },
+  "environment": {
+    "load_generator": {
+      "hostname": "d4aadd89d683",
+      "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+      "cpu_count_logical": 5,
+      "memory_total_bytes": 35743748096,
+      "os": "Linux-6.18.57-x86_64-with-glibc2.41",
+      "machine": "x86_64",
+      "python": "3.13.5",
+      "pynext": "0.1.1",
+      "uvicorn": "0.54.0",
+      "starlette": "1.10.0",
+      "httpx": "0.28.1",
+      "psutil": "7.2.2",
+      "rustc": null,
+      "cargo": null,
+      "node": "v24.22.1",
+      "git": {
+        "sha": "8cb69a07eae81e2fc0d99df4fb57ce7aeb45bced",
+        "dirty": false
+      }
+    },
+    "server": {
+      "hostname": "d4aadd89d683",
+      "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+      "cpu_count_logical": 5,
+      "memory_total_bytes": 35743748096,
+      "os": "Linux-6.18.57-x86_64-with-glibc2.41",
+      "machine": "x86_64",
+      "python": "3.13.5",
+      "pynext": "0.1.1",
+      "uvicorn": "0.54.0",
+      "starlette": "1.10.0",
+      "httpx": "0.28.1",
+      "psutil": "7.2.2",
+      "rustc": null,
+      "cargo": null,
+      "node": "v24.22.1",
+      "git": {
+        "sha": "8cb69a07eae81e2fc0d99df4fb57ce7aeb45bced",
+        "dirty": false
+      }
+    }
+  },
+  "limitations": [
+    "same-machine run: the load generator shares CPU and memory with the server, so throughput is a regression baseline, not a production throughput claim"
+  ],
+  "scenarios": [
+    {
+      "name": "static",
+      "path": "/styles/site.css",
+      "description": "Public static asset",
+      "app": "basic",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.228,
+              "attempted_requests_per_second": 897.63,
+              "successful_requests_per_second": 897.63,
+              "latency_ms": {
+                "p50": 6.326,
+                "p95": 9.209,
+                "p99": 13.752,
+                "p99.9": 2203.376
+              },
+              "successful_latency_ms": {
+                "p50": 6.326,
+                "p95": 9.209,
+                "p99": 13.752,
+                "p99.9": 2203.376
+              },
+              "response_bytes": {
+                "total": 460000,
+                "mean_per_response": 230.0
+              },
+              "process_cpu_seconds": 2.228,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 31719424,
+              "server_pid": 118625,
+              "server_cpu_seconds": 0.08,
+              "server_cpu_percent_one_core": 3.59,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.459,
+              "attempted_requests_per_second": 813.31,
+              "successful_requests_per_second": 813.31,
+              "latency_ms": {
+                "p50": 6.585,
+                "p95": 34.161,
+                "p99": 66.282,
+                "p99.9": 1200.603
+              },
+              "successful_latency_ms": {
+                "p50": 6.585,
+                "p95": 34.161,
+                "p99": 66.282,
+                "p99.9": 1200.603
+              },
+              "response_bytes": {
+                "total": 460000,
+                "mean_per_response": 230.0
+              },
+              "process_cpu_seconds": 2.459,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 31580160,
+              "server_pid": 118631,
+              "server_cpu_seconds": 0.09,
+              "server_cpu_percent_one_core": 3.66,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.309,
+              "attempted_requests_per_second": 866.36,
+              "successful_requests_per_second": 866.36,
+              "latency_ms": {
+                "p50": 6.788,
+                "p95": 22.043,
+                "p99": 87.359,
+                "p99.9": 541.839
+              },
+              "successful_latency_ms": {
+                "p50": 6.788,
+                "p95": 22.043,
+                "p99": 87.359,
+                "p99.9": 541.839
+              },
+              "response_bytes": {
+                "total": 460000,
+                "mean_per_response": 230.0
+              },
+              "process_cpu_seconds": 2.286,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 31686656,
+              "server_pid": 118637,
+              "server_cpu_seconds": 0.08,
+              "server_cpu_percent_one_core": 3.47,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 6.585,
+              "p95": 22.043,
+              "p99": 66.282,
+              "p99.9": 1200.603
+            },
+            "successful_requests_per_second": 859.1,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 0.083,
+            "server_peak_rss_bytes_mean": 31662080,
+            "loadgen_cpu_seconds_mean": 2.324,
+            "response_mean_bytes": 230.0
+          }
+        },
+        "uvicorn": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 8.899,
+              "attempted_requests_per_second": 224.73,
+              "successful_requests_per_second": 224.73,
+              "latency_ms": {
+                "p50": 44.022,
+                "p95": 47.945,
+                "p99": 49.309,
+                "p99.9": 55.212
+              },
+              "successful_latency_ms": {
+                "p50": 44.022,
+                "p95": 47.945,
+                "p99": 49.309,
+                "p99.9": 55.212
+              },
+              "response_bytes": {
+                "total": 460000,
+                "mean_per_response": 230.0
+              },
+              "process_cpu_seconds": 2.353,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34140160,
+              "server_pid": 118643,
+              "server_cpu_seconds": 1.01,
+              "server_cpu_percent_one_core": 11.35,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 8.967,
+              "attempted_requests_per_second": 223.04,
+              "successful_requests_per_second": 223.04,
+              "latency_ms": {
+                "p50": 44.115,
+                "p95": 48.788,
+                "p99": 51.766,
+                "p99.9": 56.393
+              },
+              "successful_latency_ms": {
+                "p50": 44.115,
+                "p95": 48.788,
+                "p99": 51.766,
+                "p99.9": 56.393
+              },
+              "response_bytes": {
+                "total": 460000,
+                "mean_per_response": 230.0
+              },
+              "process_cpu_seconds": 2.399,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34025472,
+              "server_pid": 118645,
+              "server_cpu_seconds": 1.02,
+              "server_cpu_percent_one_core": 11.37,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 8.831,
+              "attempted_requests_per_second": 226.47,
+              "successful_requests_per_second": 226.47,
+              "latency_ms": {
+                "p50": 44.008,
+                "p95": 45.254,
+                "p99": 48.346,
+                "p99.9": 53.401
+              },
+              "successful_latency_ms": {
+                "p50": 44.008,
+                "p95": 45.254,
+                "p99": 48.346,
+                "p99.9": 53.401
+              },
+              "response_bytes": {
+                "total": 460000,
+                "mean_per_response": 230.0
+              },
+              "process_cpu_seconds": 2.282,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34058240,
+              "server_pid": 118647,
+              "server_cpu_seconds": 0.96,
+              "server_cpu_percent_one_core": 10.87,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 44.022,
+              "p95": 47.945,
+              "p99": 49.309,
+              "p99.9": 55.212
+            },
+            "successful_requests_per_second": 224.747,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 0.997,
+            "server_peak_rss_bytes_mean": 34074624,
+            "loadgen_cpu_seconds_mean": 2.345,
+            "response_mean_bytes": 230.0
+          }
+        }
+      }
+    },
+    {
+      "name": "ssg",
+      "path": "/about",
+      "description": "SSG page, built once and served as static HTML",
+      "app": "basic",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.129,
+              "attempted_requests_per_second": 939.31,
+              "successful_requests_per_second": 939.31,
+              "latency_ms": {
+                "p50": 6.21,
+                "p95": 7.39,
+                "p99": 10.808,
+                "p99.9": 2107.927
+              },
+              "successful_latency_ms": {
+                "p50": 6.21,
+                "p95": 7.39,
+                "p99": 10.808,
+                "p99.9": 2107.927
+              },
+              "response_bytes": {
+                "total": 1898000,
+                "mean_per_response": 949.0
+              },
+              "process_cpu_seconds": 2.129,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 31633408,
+              "server_pid": 118664,
+              "server_cpu_seconds": 0.1,
+              "server_cpu_percent_one_core": 4.7,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 1.758,
+              "attempted_requests_per_second": 1137.72,
+              "successful_requests_per_second": 1137.72,
+              "latency_ms": {
+                "p50": 6.509,
+                "p95": 8.582,
+                "p99": 31.41,
+                "p99.9": 531.054
+              },
+              "successful_latency_ms": {
+                "p50": 6.509,
+                "p95": 8.582,
+                "p99": 31.41,
+                "p99.9": 531.054
+              },
+              "response_bytes": {
+                "total": 1898000,
+                "mean_per_response": 949.0
+              },
+              "process_cpu_seconds": 1.741,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 31899648,
+              "server_pid": 118670,
+              "server_cpu_seconds": 0.06,
+              "server_cpu_percent_one_core": 3.41,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.024,
+              "attempted_requests_per_second": 988.22,
+              "successful_requests_per_second": 988.22,
+              "latency_ms": {
+                "p50": 6.132,
+                "p95": 7.57,
+                "p99": 11.821,
+                "p99.9": 1869.874
+              },
+              "successful_latency_ms": {
+                "p50": 6.132,
+                "p95": 7.57,
+                "p99": 11.821,
+                "p99.9": 1869.874
+              },
+              "response_bytes": {
+                "total": 1898000,
+                "mean_per_response": 949.0
+              },
+              "process_cpu_seconds": 2.009,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 31703040,
+              "server_pid": 118763,
+              "server_cpu_seconds": 0.08,
+              "server_cpu_percent_one_core": 3.95,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 6.21,
+              "p95": 7.57,
+              "p99": 11.821,
+              "p99.9": 1869.874
+            },
+            "successful_requests_per_second": 1021.75,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 0.08,
+            "server_peak_rss_bytes_mean": 31745365,
+            "loadgen_cpu_seconds_mean": 1.96,
+            "response_mean_bytes": 949.0
+          }
+        },
+        "uvicorn": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 8.875,
+              "attempted_requests_per_second": 225.34,
+              "successful_requests_per_second": 225.34,
+              "latency_ms": {
+                "p50": 44.018,
+                "p95": 47.787,
+                "p99": 49.965,
+                "p99.9": 54.193
+              },
+              "successful_latency_ms": {
+                "p50": 44.018,
+                "p95": 47.787,
+                "p99": 49.965,
+                "p99.9": 54.193
+              },
+              "response_bytes": {
+                "total": 1898000,
+                "mean_per_response": 949.0
+              },
+              "process_cpu_seconds": 2.237,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 33882112,
+              "server_pid": 118769,
+              "server_cpu_seconds": 0.96,
+              "server_cpu_percent_one_core": 10.82,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 8.843,
+              "attempted_requests_per_second": 226.16,
+              "successful_requests_per_second": 226.16,
+              "latency_ms": {
+                "p50": 44.008,
+                "p95": 46.472,
+                "p99": 50.097,
+                "p99.9": 54.35
+              },
+              "successful_latency_ms": {
+                "p50": 44.008,
+                "p95": 46.472,
+                "p99": 50.097,
+                "p99.9": 54.35
+              },
+              "response_bytes": {
+                "total": 1898000,
+                "mean_per_response": 949.0
+              },
+              "process_cpu_seconds": 2.214,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 33914880,
+              "server_pid": 118772,
+              "server_cpu_seconds": 0.94,
+              "server_cpu_percent_one_core": 10.63,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 8.891,
+              "attempted_requests_per_second": 224.94,
+              "successful_requests_per_second": 224.94,
+              "latency_ms": {
+                "p50": 44.016,
+                "p95": 48.01,
+                "p99": 50.746,
+                "p99.9": 56.755
+              },
+              "successful_latency_ms": {
+                "p50": 44.016,
+                "p95": 48.01,
+                "p99": 50.746,
+                "p99.9": 56.755
+              },
+              "response_bytes": {
+                "total": 1898000,
+                "mean_per_response": 949.0
+              },
+              "process_cpu_seconds": 2.324,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 33935360,
+              "server_pid": 118773,
+              "server_cpu_seconds": 1.02,
+              "server_cpu_percent_one_core": 11.47,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 44.016,
+              "p95": 47.787,
+              "p99": 50.097,
+              "p99.9": 54.35
+            },
+            "successful_requests_per_second": 225.48,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 0.973,
+            "server_peak_rss_bytes_mean": 33910784,
+            "loadgen_cpu_seconds_mean": 2.258,
+            "response_mean_bytes": 949.0
+          }
+        }
+      }
+    },
+    {
+      "name": "isr-hit",
+      "path": "/news/hello",
+      "description": "ISR page; warmup primes the entry, measured requests are hits",
+      "app": "basic",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.249,
+              "attempted_requests_per_second": 889.24,
+              "successful_requests_per_second": 889.24,
+              "latency_ms": {
+                "p50": 6.405,
+                "p95": 9.583,
+                "p99": 13.027,
+                "p99.9": 2230.03
+              },
+              "successful_latency_ms": {
+                "p50": 6.405,
+                "p95": 9.583,
+                "p99": 13.027,
+                "p99.9": 2230.03
+              },
+              "response_bytes": {
+                "total": 1908000,
+                "mean_per_response": 954.0
+              },
+              "process_cpu_seconds": 2.248,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 32014336,
+              "server_pid": 118789,
+              "server_cpu_seconds": 0.08,
+              "server_cpu_percent_one_core": 3.56,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 1.859,
+              "attempted_requests_per_second": 1075.63,
+              "successful_requests_per_second": 1075.63,
+              "latency_ms": {
+                "p50": 6.976,
+                "p95": 10.62,
+                "p99": 16.049,
+                "p99.9": 112.967
+              },
+              "successful_latency_ms": {
+                "p50": 6.976,
+                "p95": 10.62,
+                "p99": 16.049,
+                "p99.9": 112.967
+              },
+              "response_bytes": {
+                "total": 1908000,
+                "mean_per_response": 954.0
+              },
+              "process_cpu_seconds": 1.858,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 31887360,
+              "server_pid": 118797,
+              "server_cpu_seconds": 0.08,
+              "server_cpu_percent_one_core": 4.3,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.052,
+              "attempted_requests_per_second": 974.73,
+              "successful_requests_per_second": 974.73,
+              "latency_ms": {
+                "p50": 5.974,
+                "p95": 7.443,
+                "p99": 10.84,
+                "p99.9": 2033.721
+              },
+              "successful_latency_ms": {
+                "p50": 5.974,
+                "p95": 7.443,
+                "p99": 10.84,
+                "p99.9": 2033.721
+              },
+              "response_bytes": {
+                "total": 1908000,
+                "mean_per_response": 954.0
+              },
+              "process_cpu_seconds": 2.05,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 31834112,
+              "server_pid": 118805,
+              "server_cpu_seconds": 0.07,
+              "server_cpu_percent_one_core": 3.41,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 6.405,
+              "p95": 9.583,
+              "p99": 13.027,
+              "p99.9": 2033.721
+            },
+            "successful_requests_per_second": 979.867,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 0.077,
+            "server_peak_rss_bytes_mean": 31911936,
+            "loadgen_cpu_seconds_mean": 2.052,
+            "response_mean_bytes": 954.0
+          }
+        },
+        "uvicorn": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 8.891,
+              "attempted_requests_per_second": 224.95,
+              "successful_requests_per_second": 224.95,
+              "latency_ms": {
+                "p50": 44.051,
+                "p95": 48.367,
+                "p99": 51.034,
+                "p99.9": 53.236
+              },
+              "successful_latency_ms": {
+                "p50": 44.051,
+                "p95": 48.367,
+                "p99": 51.034,
+                "p99.9": 53.236
+              },
+              "response_bytes": {
+                "total": 1908000,
+                "mean_per_response": 954.0
+              },
+              "process_cpu_seconds": 2.41,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34557952,
+              "server_pid": 118813,
+              "server_cpu_seconds": 1.17,
+              "server_cpu_percent_one_core": 13.16,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 9.016,
+              "attempted_requests_per_second": 221.84,
+              "successful_requests_per_second": 221.84,
+              "latency_ms": {
+                "p50": 44.213,
+                "p95": 50.005,
+                "p99": 54.762,
+                "p99.9": 77.18
+              },
+              "successful_latency_ms": {
+                "p50": 44.213,
+                "p95": 50.005,
+                "p99": 54.762,
+                "p99.9": 77.18
+              },
+              "response_bytes": {
+                "total": 1908000,
+                "mean_per_response": 954.0
+              },
+              "process_cpu_seconds": 2.473,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34582528,
+              "server_pid": 118816,
+              "server_cpu_seconds": 1.11,
+              "server_cpu_percent_one_core": 12.31,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 8.803,
+              "attempted_requests_per_second": 227.18,
+              "successful_requests_per_second": 227.18,
+              "latency_ms": {
+                "p50": 44.004,
+                "p95": 45.737,
+                "p99": 48.45,
+                "p99.9": 53.469
+              },
+              "successful_latency_ms": {
+                "p50": 44.004,
+                "p95": 45.737,
+                "p99": 48.45,
+                "p99.9": 53.469
+              },
+              "response_bytes": {
+                "total": 1908000,
+                "mean_per_response": 954.0
+              },
+              "process_cpu_seconds": 2.352,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34603008,
+              "server_pid": 118819,
+              "server_cpu_seconds": 1.09,
+              "server_cpu_percent_one_core": 12.38,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 44.051,
+              "p95": 48.367,
+              "p99": 51.034,
+              "p99.9": 53.469
+            },
+            "successful_requests_per_second": 224.657,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 1.123,
+            "server_peak_rss_bytes_mean": 34581162,
+            "loadgen_cpu_seconds_mean": 2.412,
+            "response_mean_bytes": 954.0
+          }
+        }
+      }
+    },
+    {
+      "name": "ssr",
+      "path": "/",
+      "description": "Server-rendered page with an island",
+      "app": "basic",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.942,
+              "attempted_requests_per_second": 679.76,
+              "successful_requests_per_second": 679.76,
+              "latency_ms": {
+                "p50": 7.619,
+                "p95": 45.886,
+                "p99": 78.6,
+                "p99.9": 142.904
+              },
+              "successful_latency_ms": {
+                "p50": 7.619,
+                "p95": 45.886,
+                "p99": 78.6,
+                "p99.9": 142.904
+              },
+              "response_bytes": {
+                "total": 1510000,
+                "mean_per_response": 755.0
+              },
+              "process_cpu_seconds": 2.91,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 33943552,
+              "server_pid": 118821,
+              "server_cpu_seconds": 1.86,
+              "server_cpu_percent_one_core": 63.22,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.804,
+              "attempted_requests_per_second": 713.38,
+              "successful_requests_per_second": 713.38,
+              "latency_ms": {
+                "p50": 7.55,
+                "p95": 46.123,
+                "p99": 80.95,
+                "p99.9": 124.756
+              },
+              "successful_latency_ms": {
+                "p50": 7.55,
+                "p95": 46.123,
+                "p99": 80.95,
+                "p99.9": 124.756
+              },
+              "response_bytes": {
+                "total": 1510000,
+                "mean_per_response": 755.0
+              },
+              "process_cpu_seconds": 2.802,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 33714176,
+              "server_pid": 118845,
+              "server_cpu_seconds": 1.86,
+              "server_cpu_percent_one_core": 66.34,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.719,
+              "attempted_requests_per_second": 735.69,
+              "successful_requests_per_second": 735.69,
+              "latency_ms": {
+                "p50": 7.055,
+                "p95": 45.501,
+                "p99": 81.678,
+                "p99.9": 121.99
+              },
+              "successful_latency_ms": {
+                "p50": 7.055,
+                "p95": 45.501,
+                "p99": 81.678,
+                "p99.9": 121.99
+              },
+              "response_bytes": {
+                "total": 1510000,
+                "mean_per_response": 755.0
+              },
+              "process_cpu_seconds": 2.718,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 33574912,
+              "server_pid": 118878,
+              "server_cpu_seconds": 1.74,
+              "server_cpu_percent_one_core": 64.0,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 7.55,
+              "p95": 45.886,
+              "p99": 80.95,
+              "p99.9": 124.756
+            },
+            "successful_requests_per_second": 709.61,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 1.82,
+            "server_peak_rss_bytes_mean": 33744213,
+            "loadgen_cpu_seconds_mean": 2.81,
+            "response_mean_bytes": 755.0
+          }
+        },
+        "uvicorn": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 9.504,
+              "attempted_requests_per_second": 210.45,
+              "successful_requests_per_second": 210.45,
+              "latency_ms": {
+                "p50": 47.651,
+                "p95": 53.562,
+                "p99": 56.311,
+                "p99.9": 59.323
+              },
+              "successful_latency_ms": {
+                "p50": 47.651,
+                "p95": 53.562,
+                "p99": 56.311,
+                "p99.9": 59.323
+              },
+              "response_bytes": {
+                "total": 1510000,
+                "mean_per_response": 755.0
+              },
+              "process_cpu_seconds": 2.418,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 35520512,
+              "server_pid": 118898,
+              "server_cpu_seconds": 1.95,
+              "server_cpu_percent_one_core": 20.52,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 9.579,
+              "attempted_requests_per_second": 208.78,
+              "successful_requests_per_second": 208.78,
+              "latency_ms": {
+                "p50": 47.914,
+                "p95": 53.065,
+                "p99": 56.119,
+                "p99.9": 60.821
+              },
+              "successful_latency_ms": {
+                "p50": 47.914,
+                "p95": 53.065,
+                "p99": 56.119,
+                "p99.9": 60.821
+              },
+              "response_bytes": {
+                "total": 1510000,
+                "mean_per_response": 755.0
+              },
+              "process_cpu_seconds": 2.318,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 35508224,
+              "server_pid": 118907,
+              "server_cpu_seconds": 1.85,
+              "server_cpu_percent_one_core": 19.31,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 9.383,
+              "attempted_requests_per_second": 213.15,
+              "successful_requests_per_second": 213.15,
+              "latency_ms": {
+                "p50": 47.105,
+                "p95": 52.729,
+                "p99": 56.61,
+                "p99.9": 63.281
+              },
+              "successful_latency_ms": {
+                "p50": 47.105,
+                "p95": 52.729,
+                "p99": 56.61,
+                "p99.9": 63.281
+              },
+              "response_bytes": {
+                "total": 1510000,
+                "mean_per_response": 755.0
+              },
+              "process_cpu_seconds": 2.377,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 35581952,
+              "server_pid": 118918,
+              "server_cpu_seconds": 1.94,
+              "server_cpu_percent_one_core": 20.68,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 47.651,
+              "p95": 53.065,
+              "p99": 56.311,
+              "p99.9": 60.821
+            },
+            "successful_requests_per_second": 210.793,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 1.913,
+            "server_peak_rss_bytes_mean": 35536896,
+            "loadgen_cpu_seconds_mean": 2.371,
+            "response_mean_bytes": 755.0
+          }
+        }
+      }
+    },
+    {
+      "name": "json-api",
+      "path": "/api/users",
+      "description": "JSON API route",
+      "app": "basic",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.44,
+              "attempted_requests_per_second": 819.72,
+              "successful_requests_per_second": 819.72,
+              "latency_ms": {
+                "p50": 7.125,
+                "p95": 37.02,
+                "p99": 85.351,
+                "p99.9": 150.025
+              },
+              "successful_latency_ms": {
+                "p50": 7.125,
+                "p95": 37.02,
+                "p99": 85.351,
+                "p99.9": 150.025
+              },
+              "response_bytes": {
+                "total": 50000,
+                "mean_per_response": 25.0
+              },
+              "process_cpu_seconds": 2.436,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 32669696,
+              "server_pid": 118929,
+              "server_cpu_seconds": 1.06,
+              "server_cpu_percent_one_core": 43.44,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.553,
+              "attempted_requests_per_second": 783.39,
+              "successful_requests_per_second": 783.39,
+              "latency_ms": {
+                "p50": 7.041,
+                "p95": 41.239,
+                "p99": 80.016,
+                "p99.9": 157.562
+              },
+              "successful_latency_ms": {
+                "p50": 7.041,
+                "p95": 41.239,
+                "p99": 80.016,
+                "p99.9": 157.562
+              },
+              "response_bytes": {
+                "total": 50000,
+                "mean_per_response": 25.0
+              },
+              "process_cpu_seconds": 2.551,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 32600064,
+              "server_pid": 118945,
+              "server_cpu_seconds": 0.99,
+              "server_cpu_percent_one_core": 38.78,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.552,
+              "attempted_requests_per_second": 783.76,
+              "successful_requests_per_second": 783.76,
+              "latency_ms": {
+                "p50": 6.709,
+                "p95": 40.76,
+                "p99": 96.292,
+                "p99.9": 387.922
+              },
+              "successful_latency_ms": {
+                "p50": 6.709,
+                "p95": 40.76,
+                "p99": 96.292,
+                "p99.9": 387.922
+              },
+              "response_bytes": {
+                "total": 50000,
+                "mean_per_response": 25.0
+              },
+              "process_cpu_seconds": 2.552,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 32616448,
+              "server_pid": 118961,
+              "server_cpu_seconds": 1.01,
+              "server_cpu_percent_one_core": 39.58,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 7.041,
+              "p95": 40.76,
+              "p99": 85.351,
+              "p99.9": 157.562
+            },
+            "successful_requests_per_second": 795.623,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 1.02,
+            "server_peak_rss_bytes_mean": 32628736,
+            "loadgen_cpu_seconds_mean": 2.513,
+            "response_mean_bytes": 25.0
+          }
+        },
+        "uvicorn": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 8.907,
+              "attempted_requests_per_second": 224.54,
+              "successful_requests_per_second": 224.54,
+              "latency_ms": {
+                "p50": 44.024,
+                "p95": 48.08,
+                "p99": 51.315,
+                "p99.9": 59.662
+              },
+              "successful_latency_ms": {
+                "p50": 44.024,
+                "p95": 48.08,
+                "p99": 51.315,
+                "p99.9": 59.662
+              },
+              "response_bytes": {
+                "total": 50000,
+                "mean_per_response": 25.0
+              },
+              "process_cpu_seconds": 2.388,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 33939456,
+              "server_pid": 118972,
+              "server_cpu_seconds": 1.08,
+              "server_cpu_percent_one_core": 12.12,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 9.079,
+              "attempted_requests_per_second": 220.28,
+              "successful_requests_per_second": 220.28,
+              "latency_ms": {
+                "p50": 44.18,
+                "p95": 50.802,
+                "p99": 55.77,
+                "p99.9": 59.82
+              },
+              "successful_latency_ms": {
+                "p50": 44.18,
+                "p95": 50.802,
+                "p99": 55.77,
+                "p99.9": 59.82
+              },
+              "response_bytes": {
+                "total": 50000,
+                "mean_per_response": 25.0
+              },
+              "process_cpu_seconds": 2.336,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34152448,
+              "server_pid": 118979,
+              "server_cpu_seconds": 1.07,
+              "server_cpu_percent_one_core": 11.79,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 8.927,
+              "attempted_requests_per_second": 224.03,
+              "successful_requests_per_second": 224.03,
+              "latency_ms": {
+                "p50": 44.046,
+                "p95": 48.58,
+                "p99": 52.541,
+                "p99.9": 58.582
+              },
+              "successful_latency_ms": {
+                "p50": 44.046,
+                "p95": 48.58,
+                "p99": 52.541,
+                "p99.9": 58.582
+              },
+              "response_bytes": {
+                "total": 50000,
+                "mean_per_response": 25.0
+              },
+              "process_cpu_seconds": 2.224,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34131968,
+              "server_pid": 119129,
+              "server_cpu_seconds": 0.97,
+              "server_cpu_percent_one_core": 10.87,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 44.046,
+              "p95": 48.58,
+              "p99": 52.541,
+              "p99.9": 59.662
+            },
+            "successful_requests_per_second": 222.95,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 1.04,
+            "server_peak_rss_bytes_mean": 34074624,
+            "loadgen_cpu_seconds_mean": 2.316,
+            "response_mean_bytes": 25.0
+          }
+        }
+      }
+    },
+    {
+      "name": "db-query",
+      "path": "/api/db-users?id=42",
+      "description": "SQLite point lookup by primary key over 1,000 seeded rows",
+      "app": "db",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 1976,
+              "errors": 24,
+              "error_rate": 0.012,
+              "http_status_counts": {
+                "200": 1976,
+                "404": 13,
+                "500": 11
+              },
+              "http_status_class_counts": {
+                "2xx": 1976,
+                "4xx": 13,
+                "5xx": 11
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.848,
+              "attempted_requests_per_second": 702.21,
+              "successful_requests_per_second": 693.78,
+              "latency_ms": {
+                "p50": 7.311,
+                "p95": 36.32,
+                "p99": 67.733,
+                "p99.9": 126.755
+              },
+              "successful_latency_ms": {
+                "p50": 7.302,
+                "p95": 36.476,
+                "p99": 71.016,
+                "p99.9": 133.453
+              },
+              "response_bytes": {
+                "total": 55827,
+                "mean_per_response": 27.91
+              },
+              "process_cpu_seconds": 2.842,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34009088,
+              "server_pid": 119289,
+              "server_cpu_seconds": 1.35,
+              "server_cpu_percent_one_core": 47.4,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 1928,
+              "errors": 72,
+              "error_rate": 0.036,
+              "http_status_counts": {
+                "200": 1928,
+                "404": 40,
+                "500": 32
+              },
+              "http_status_class_counts": {
+                "2xx": 1928,
+                "4xx": 40,
+                "5xx": 32
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.729,
+              "attempted_requests_per_second": 732.97,
+              "successful_requests_per_second": 706.58,
+              "latency_ms": {
+                "p50": 7.466,
+                "p95": 43.226,
+                "p99": 79.393,
+                "p99.9": 148.77
+              },
+              "successful_latency_ms": {
+                "p50": 7.445,
+                "p95": 43.148,
+                "p99": 79.393,
+                "p99.9": 164.344
+              },
+              "response_bytes": {
+                "total": 55452,
+                "mean_per_response": 27.73
+              },
+              "process_cpu_seconds": 2.72,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34172928,
+              "server_pid": 119316,
+              "server_cpu_seconds": 1.48,
+              "server_cpu_percent_one_core": 54.24,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 1944,
+              "errors": 56,
+              "error_rate": 0.028,
+              "http_status_counts": {
+                "200": 1944,
+                "404": 29,
+                "500": 27
+              },
+              "http_status_class_counts": {
+                "2xx": 1944,
+                "4xx": 29,
+                "5xx": 27
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 2.983,
+              "attempted_requests_per_second": 670.39,
+              "successful_requests_per_second": 651.62,
+              "latency_ms": {
+                "p50": 7.929,
+                "p95": 48.403,
+                "p99": 84.444,
+                "p99.9": 158.099
+              },
+              "successful_latency_ms": {
+                "p50": 7.92,
+                "p95": 48.537,
+                "p99": 86.666,
+                "p99.9": 168.696
+              },
+              "response_bytes": {
+                "total": 55570,
+                "mean_per_response": 27.79
+              },
+              "process_cpu_seconds": 2.954,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34267136,
+              "server_pid": 119341,
+              "server_cpu_seconds": 1.63,
+              "server_cpu_percent_one_core": 54.64,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 7.445,
+              "p95": 43.148,
+              "p99": 79.393,
+              "p99.9": 164.344
+            },
+            "successful_requests_per_second": 683.993,
+            "error_rate_mean": 0.025,
+            "error_rate_max": 0.036,
+            "errors_total": 152,
+            "server_cpu_seconds_mean": 1.487,
+            "server_peak_rss_bytes_mean": 34149717,
+            "loadgen_cpu_seconds_mean": 2.839,
+            "response_mean_bytes": 27.81
+          }
+        },
+        "uvicorn": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 1846,
+              "errors": 154,
+              "error_rate": 0.077,
+              "http_status_counts": {
+                "200": 1846,
+                "404": 79,
+                "500": 75
+              },
+              "http_status_class_counts": {
+                "2xx": 1846,
+                "4xx": 79,
+                "5xx": 75
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 9.617,
+              "attempted_requests_per_second": 207.96,
+              "successful_requests_per_second": 191.94,
+              "latency_ms": {
+                "p50": 47.73,
+                "p95": 55.209,
+                "p99": 62.058,
+                "p99.9": 80.816
+              },
+              "successful_latency_ms": {
+                "p50": 47.573,
+                "p95": 55.209,
+                "p99": 62.288,
+                "p99.9": 86.157
+              },
+              "response_bytes": {
+                "total": 54879,
+                "mean_per_response": 27.44
+              },
+              "process_cpu_seconds": 3.026,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 35332096,
+              "server_pid": 119366,
+              "server_cpu_seconds": 1.89,
+              "server_cpu_percent_one_core": 19.65,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 1914,
+              "errors": 86,
+              "error_rate": 0.043,
+              "http_status_counts": {
+                "200": 1914,
+                "404": 46,
+                "500": 40
+              },
+              "http_status_class_counts": {
+                "2xx": 1914,
+                "4xx": 46,
+                "5xx": 40
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 9.244,
+              "attempted_requests_per_second": 216.36,
+              "successful_requests_per_second": 207.06,
+              "latency_ms": {
+                "p50": 44.693,
+                "p95": 52.281,
+                "p99": 56.757,
+                "p99.9": 60.338
+              },
+              "successful_latency_ms": {
+                "p50": 44.602,
+                "p95": 52.287,
+                "p99": 56.757,
+                "p99.9": 60.338
+              },
+              "response_bytes": {
+                "total": 55384,
+                "mean_per_response": 27.69
+              },
+              "process_cpu_seconds": 2.604,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 35504128,
+              "server_pid": 119376,
+              "server_cpu_seconds": 1.77,
+              "server_cpu_percent_one_core": 19.15,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 1916,
+              "errors": 84,
+              "error_rate": 0.042,
+              "http_status_counts": {
+                "200": 1916,
+                "404": 51,
+                "500": 33
+              },
+              "http_status_class_counts": {
+                "2xx": 1916,
+                "4xx": 51,
+                "5xx": 33
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 9.403,
+              "attempted_requests_per_second": 212.69,
+              "successful_requests_per_second": 203.76,
+              "latency_ms": {
+                "p50": 46.814,
+                "p95": 53.167,
+                "p99": 56.241,
+                "p99.9": 59.35
+              },
+              "successful_latency_ms": {
+                "p50": 46.604,
+                "p95": 53.167,
+                "p99": 56.241,
+                "p99.9": 59.35
+              },
+              "response_bytes": {
+                "total": 55355,
+                "mean_per_response": 27.68
+              },
+              "process_cpu_seconds": 2.582,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 35311616,
+              "server_pid": 119413,
+              "server_cpu_seconds": 1.68,
+              "server_cpu_percent_one_core": 17.87,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 46.604,
+              "p95": 53.167,
+              "p99": 56.757,
+              "p99.9": 60.338
+            },
+            "successful_requests_per_second": 200.92,
+            "error_rate_mean": 0.054,
+            "error_rate_max": 0.077,
+            "errors_total": 324,
+            "server_cpu_seconds_mean": 1.78,
+            "server_peak_rss_bytes_mean": 35382613,
+            "loadgen_cpu_seconds_mean": 2.737,
+            "response_mean_bytes": 27.603
+          }
+        }
+      }
+    },
+    {
+      "name": "streaming",
+      "path": "/api/stream",
+      "description": "Chunked NDJSON streaming response",
+      "app": "basic",
+      "results": {
+        "axum": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 10.847,
+              "attempted_requests_per_second": 184.38,
+              "successful_requests_per_second": 184.38,
+              "latency_ms": {
+                "p50": 53.827,
+                "p95": 56.212,
+                "p99": 58.184,
+                "p99.9": 65.08
+              },
+              "successful_latency_ms": {
+                "p50": 53.827,
+                "p95": 56.212,
+                "p99": 58.184,
+                "p99.9": 65.08
+              },
+              "response_bytes": {
+                "total": 82000,
+                "mean_per_response": 41.0
+              },
+              "process_cpu_seconds": 2.714,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 33116160,
+              "server_pid": 119423,
+              "server_cpu_seconds": 2.54,
+              "server_cpu_percent_one_core": 23.42,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 10.847,
+              "attempted_requests_per_second": 184.39,
+              "successful_requests_per_second": 184.39,
+              "latency_ms": {
+                "p50": 53.766,
+                "p95": 56.925,
+                "p99": 63.593,
+                "p99.9": 70.18
+              },
+              "successful_latency_ms": {
+                "p50": 53.766,
+                "p95": 56.925,
+                "p99": 63.593,
+                "p99.9": 70.18
+              },
+              "response_bytes": {
+                "total": 82000,
+                "mean_per_response": 41.0
+              },
+              "process_cpu_seconds": 2.753,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 33107968,
+              "server_pid": 119443,
+              "server_cpu_seconds": 2.63,
+              "server_cpu_percent_one_core": 24.25,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 10.891,
+              "attempted_requests_per_second": 183.64,
+              "successful_requests_per_second": 183.64,
+              "latency_ms": {
+                "p50": 53.936,
+                "p95": 57.571,
+                "p99": 61.781,
+                "p99.9": 66.833
+              },
+              "successful_latency_ms": {
+                "p50": 53.936,
+                "p95": 57.571,
+                "p99": 61.781,
+                "p99.9": 66.833
+              },
+              "response_bytes": {
+                "total": 82000,
+                "mean_per_response": 41.0
+              },
+              "process_cpu_seconds": 2.77,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 33075200,
+              "server_pid": 119464,
+              "server_cpu_seconds": 2.63,
+              "server_cpu_percent_one_core": 24.15,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 53.827,
+              "p95": 56.925,
+              "p99": 61.781,
+              "p99.9": 66.833
+            },
+            "successful_requests_per_second": 184.137,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 2.6,
+            "server_peak_rss_bytes_mean": 33099776,
+            "loadgen_cpu_seconds_mean": 2.746,
+            "response_mean_bytes": 41.0
+          }
+        },
+        "uvicorn": {
+          "repetitions": [
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 10.626,
+              "attempted_requests_per_second": 188.21,
+              "successful_requests_per_second": 188.21,
+              "latency_ms": {
+                "p50": 52.731,
+                "p95": 55.814,
+                "p99": 60.8,
+                "p99.9": 65.403
+              },
+              "successful_latency_ms": {
+                "p50": 52.731,
+                "p95": 55.814,
+                "p99": 60.8,
+                "p99.9": 65.403
+              },
+              "response_bytes": {
+                "total": 82000,
+                "mean_per_response": 41.0
+              },
+              "process_cpu_seconds": 2.684,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34160640,
+              "server_pid": 119483,
+              "server_cpu_seconds": 1.31,
+              "server_cpu_percent_one_core": 12.33,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 10.637,
+              "attempted_requests_per_second": 188.02,
+              "successful_requests_per_second": 188.02,
+              "latency_ms": {
+                "p50": 52.734,
+                "p95": 55.773,
+                "p99": 60.754,
+                "p99.9": 65.781
+              },
+              "successful_latency_ms": {
+                "p50": 52.734,
+                "p95": 55.773,
+                "p99": 60.754,
+                "p99.9": 65.781
+              },
+              "response_bytes": {
+                "total": 82000,
+                "mean_per_response": 41.0
+              },
+              "process_cpu_seconds": 2.724,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34258944,
+              "server_pid": 119507,
+              "server_cpu_seconds": 1.33,
+              "server_cpu_percent_one_core": 12.5,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            },
+            {
+              "requests": 2000,
+              "concurrency": 10,
+              "warmup_requests": 100,
+              "warmup_errors": 0,
+              "successful_requests": 2000,
+              "errors": 0,
+              "error_rate": 0.0,
+              "http_status_counts": {
+                "200": 2000
+              },
+              "http_status_class_counts": {
+                "2xx": 2000
+              },
+              "transport_error_counts": {},
+              "elapsed_seconds": 10.654,
+              "attempted_requests_per_second": 187.72,
+              "successful_requests_per_second": 187.72,
+              "latency_ms": {
+                "p50": 52.683,
+                "p95": 54.823,
+                "p99": 62.718,
+                "p99.9": 72.761
+              },
+              "successful_latency_ms": {
+                "p50": 52.683,
+                "p95": 54.823,
+                "p99": 62.718,
+                "p99.9": 72.761
+              },
+              "response_bytes": {
+                "total": 82000,
+                "mean_per_response": 41.0
+              },
+              "process_cpu_seconds": 2.542,
+              "process_cpu_scope": "load_generator_only",
+              "process_peak_rss_bytes": 34160640,
+              "server_pid": 119509,
+              "server_cpu_seconds": 1.28,
+              "server_cpu_percent_one_core": 12.01,
+              "server_cpu_error": null,
+              "process_peak_rss_scope": "server_sampled_10ms"
+            }
+          ],
+          "aggregate": {
+            "repetitions": 3,
+            "latency_ms": {
+              "p50": 52.731,
+              "p95": 55.773,
+              "p99": 60.8,
+              "p99.9": 65.781
+            },
+            "successful_requests_per_second": 187.983,
+            "error_rate_mean": 0.0,
+            "error_rate_max": 0.0,
+            "errors_total": 0,
+            "server_cpu_seconds_mean": 1.307,
+            "server_peak_rss_bytes_mean": 34193408,
+            "loadgen_cpu_seconds_mean": 2.65,
+            "response_mean_bytes": 41.0
+          }
+        }
+      }
+    }
+  ],
+  "skipped": []
+}

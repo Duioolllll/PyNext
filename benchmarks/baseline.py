@@ -325,6 +325,8 @@ async def run_baseline(config, *, output, base_url=None, db_base_url=None,
     selected = [s for s in SCENARIOS if s["name"] in config["scenarios"]]
     modes = list(config["modes"])
     external = base_url is not None
+    if external and len(modes) != 1:
+        raise ValueError("external baseline requires one --modes value matching the running server")
     limitations = []
     if external:
         limitations.append(

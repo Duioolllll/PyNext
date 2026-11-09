@@ -4,6 +4,14 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Apply one CORS policy to native static/SSG/ISR responses and ASGI, including range, conditional, HEAD and preflight responses.
+- Abort superseded client navigation and fence both late successes and failures; cover ignored aborts and browser history in Chromium on Axum and Uvicorn.
+- Compare CSRF Origin scheme, canonical host and effective port using the trusted proxy identity; reject duplicate and non-ASCII Origin/Host headers.
+- Add cooperative request cancellation and retain bounded synchronous handler capacity until threads actually finish (`sync_workers=32` by default); document the limits for external side effects.
+- Record repeated production-build benchmarks, drain server log pipes, and serialize the benchmark fixture's shared SQLite connection after reproducing concurrent cursor corruption.
+- Add a multi-stage non-root Docker example, read-only/SIGTERM smoke checks, Python/image SBOMs and Python/npm/Rust/image vulnerability CI. Upgrade Pillow to 13 and PyO3 to the fixed 0.29 series.
+- Ship public API stubs and `py.typed` in wheels/sdists; check installed-wheel consumers with mypy and pyright. Implementation details and remaining production gates live in `docs/RUNTIME_HARDENING.md`.
+
 ## 0.1.1 (2026-11-09)
 
 - Enforce authorization for WebSocket upgrades (review #4 #1, behavior change): the global middleware chain and the handler's `@require_auth`/`@require_permission` policy now run before the handshake completes on both the ASGI and native servers, so a denied upgrade is rejected instead of an accepted socket leaking data. Handlers that need the identity must re-derive it from the socket (for example from a session cookie the middleware validated); the pre-flight `request.state` is not passed to the handler, and a session rotation/invalidation during the pre-flight is not supported because its `set-cookie` would be discarded.

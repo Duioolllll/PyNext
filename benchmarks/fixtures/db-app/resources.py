@@ -12,6 +12,7 @@ example app.
 import os
 import sqlite3
 import tempfile
+import threading
 
 
 class SQLiteBenchmarkDB:
@@ -22,6 +23,7 @@ class SQLiteBenchmarkDB:
     def __init__(self):
         self.path = None
         self.connection = None
+        self._query_lock = threading.Lock()
 
     async def startup(self):
         handle, self.path = tempfile.mkstemp(prefix="pynext-bench-db-", suffix=".sqlite3")
@@ -36,8 +38,13 @@ class SQLiteBenchmarkDB:
 
     def query(self, user_id):
         """Return one row by id. Runs in a thread; see the route handler."""
-        row = self.connection.execute(
-            "SELECT id, name FROM users WHERE id = ?", (user_id,)).fetchone()
+        # check_same_thread=False permits cross-thread access, but does not
+        # protect Python's statement cache/cursor lifetime. A connection is
+        # never used concurrently; this fixture measures one shared SQLite
+        # connection, not a production connection pool.
+        with self._query_lock:
+            row = self.connection.execute(
+                "SELECT id, name FROM users WHERE id = ?", (user_id,)).fetchone()
         if row is None:
             return None
         return {"id": row[0], "name": row[1]}

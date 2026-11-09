@@ -1040,6 +1040,9 @@ class App:
             except BadRequest:
                 status = 400
                 raise
+            except _SyncHandlerBusy:
+                status = 503
+                raise
             except Exception:
                 status = 500
                 raise

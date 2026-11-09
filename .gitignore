@@ -8,3 +8,5 @@ __pycache__/
 .pynext/
 dist/
 node_modules/
+.mypy_cache/
+security-reports/
