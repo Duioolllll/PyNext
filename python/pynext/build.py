@@ -616,6 +616,7 @@ def _nearest_boundary(dirs, filename, root):
         loaded = load_env(root, mode="production")
         manifest = _run_stage("discover", discover, root)
         app, rendered = _run_stage("render", _build_app_and_render, root, manifest)
+        isr_static_paths = _run_stage("isr-warmup", lambda: asyncio.run(_enumerate_isr_static_paths(app)))
         _run_stage("validate", _validate_unchanged, root, manifest)
         # Catch-all normalization over the enumerated static paths (reduced port
         # of Next.js normalizeCatchAllRoutes): report which static pages a
@@ -633,6 +634,8 @@ def _nearest_boundary(dirs, filename, root):
         manifest["isr_policies"] = app.isr_policies
         manifest["layout_policies"] = app.layout_policies
         manifest["isr_queries"] = app.isr_queries
+        manifest["ssg_fallback"] = app.ssg_fallback
+        manifest["isr_static_paths"] = isr_static_paths
         manifest["dynamic_modes"] = app.dynamic_modes
         manifest["client"] = app.client_manifest
         # Prerender report: dynamic accesses recorded while rendering SSG pages
@@ -777,6 +780,57 @@ def _materialize(pattern, params):
     return "/" + "/".join(output)
 
 
+async def _materialize_params(app, pattern, generator):
+    """Call a ``generate_static_params`` generator and materialize its paths.
+
+    Shared by SSG rendering and ISR warmup enumeration so both validate
+    the same way: the generator must return a list, every entry must
+    materialize to a distinct reachable path, and no generated path may
+    be shadowed by a public file. Raises ``ValueError`` on any violation
+    so a bad generator fails the build instead of surfacing at request
+    time.
+    """
+    from .app import _invoke
+    params_list = [{}] if generator is None else await _invoke(generator)
+    if not isinstance(params_list, list):
+        raise ValueError(f"generate_static_params for {pattern} must return a list")
+    paths = []
+    seen = set()
+    for params in params_list:
+        path = _materialize(pattern, params)
+        if path in seen:
+            raise ValueError(f"Duplicate generated path: {path}")
+        seen.add(path)
+        if path in app.public_assets:
+            raise ValueError(f"Public file shadows a generated page: {path}")
+        match = app.router.matches(path)
+        if match is None or match[0] != pattern:
+            raise ValueError(f"Generated path {path} is not reachable through {pattern}")
+        paths.append(path)
+    return paths
+
+
+async def _enumerate_isr_static_paths(app):
+    """Enumerate (but do not render) ISR ``generate_static_params`` paths.
+
+    The paths are recorded in the manifest so ``pynext start`` can warm
+    the ISR cache from them; rendering itself happens at startup, in the
+    background, so a slow data source never blocks the build or the
+    server from starting.
+    """
+    enumerated = {}
+    total = 0
+    for pattern, generator in app.isr_generators.items():
+        if generator is None:
+            continue
+        paths = await _materialize_params(app, pattern, generator)
+        total += len(paths)
+        if total > MAX_STATIC_PAGES:
+            raise ValueError(f"Static page limit ({MAX_STATIC_PAGES}) exceeded")
+        enumerated[pattern] = paths
+    return enumerated
+
+
 async def _render_static_pages(app):
     """Render every static page, isolating failures per page.
 
@@ -788,7 +842,6 @@ async def _render_static_pages(app):
     would be a 404 in production — but the report is complete and the
     good pages were all rendered.
     """
-    from .app import _invoke
     from .http import StreamingResponse
     rendered = {}
     failures = []

@@ -293,14 +293,11 @@ def test_loaded_isr_policy_does_not_alias_page_metadata(tmp_path):
     assert app.isr_policies["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0, "expire": 31.0}
 
 
-def test_isr_rejects_request_access_and_static_generator(tmp_path):
+def test_isr_rejects_request_access(tmp_path):
     source = make_project(tmp_path)
     original = source.read_text()
     source.write_text(original.replace("async def Page(params):", "async def Page(request, params):"))
     with pytest.raises(ValueError, match="cannot accept request"):
-        write_manifest(tmp_path)
-    source.write_text(original + '\ndef generate_static_params(): return []\n')
-    with pytest.raises(ValueError, match="cannot export generate_static_params"):
         write_manifest(tmp_path)
 
 
