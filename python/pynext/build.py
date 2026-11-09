@@ -26,6 +26,7 @@ or API routes are refused instead of being silently degraded.
 """
 import hashlib
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -1420,9 +1421,8 @@ async def _render_static_pages(app):
     would be a 404 in production — but the report is complete and the
     good pages were all rendered.
     """
-    from .app import _invoke
+    from .app import _invoke, _strip_client_runtime
     from .http import StreamingResponse
-    rendered = {}
     rendered = {}
     failures = []
     rendered_params = {}
@@ -1473,7 +1473,26 @@ async def _render_static_pages(app):
                         [("file", entry), ("parameters", _short_repr(params))],
                         ["Return only parameter values that match the route pattern",
                          "Check that the parameter names match the [param] segments of the route"]))
-                response = await app.render_page(pattern, None, params)
+                # The prelude inspection in _streaming_page_response pulls the
+                # first chunk inside render_page, so for streaming pages the
+                # build time limit must cover the render call too — otherwise a
+                # page that never yields would stall the build past the limit
+                # instead of failing it. Non-streaming pages keep their
+                # previous (unbounded) render.
+                fn, _layouts = app.entries[pattern]
+                if inspect.isasyncgenfunction(fn):
+                    try:
+                        async with asyncio.timeout(MAX_STREAMED_STATIC_SECONDS):
+                            response = await app.render_page(pattern, None, params)
+                    except asyncio.TimeoutError as exc:
+                        raise ValueError(_config_error(
+                            f"Streamed static page for {path} exceeded the build time limit "
+                            f"({MAX_STREAMED_STATIC_SECONDS}s)",
+                            [("file", entry), ("pattern", pattern)],
+                            ["Reduce the page content or make it render faster",
+                             "Split the page into smaller pages"])) from exc
+                else:
+                    response = await app.render_page(pattern, None, params)
                 if isinstance(response, StreamingResponse):
                     body = bytearray()
                     try:
@@ -1503,31 +1522,38 @@ async def _render_static_pages(app):
                              "Split the page into smaller pages"])) from exc
                     finally:
                         await response.aclose()
+                    # Byte-level backstop for the prelude inspection in
+                    # _streaming_page_response: a page that yields nodes which
+                    # serialize to nothing (or a buffered page below that
+                    # renders to nothing) would otherwise be written out as a
+                    # file holding only the client runtime script tag. The tag
+                    # is boilerplate, not content, so it is stripped before the
+                    # emptiness test. Fail the build instead of shipping it.
+                    body_text = bytes(body).decode("utf-8", "replace")
+                    if not _strip_client_runtime(body_text):
+                        raise ValueError(_config_error(
+                            f"Static page {path} rendered an empty document",
+                            [("file", entry), ("pattern", pattern)],
+                            ["Make the page render some content",
+                             "Remove the page if it should not exist"]))
                     rendered[path] = (pattern, bytes(body))
                 else:
                     if len(response.body) > MAX_STATIC_PAGE_BYTES:
                         raise ValueError(_config_error(
                             f"Static page {path} exceeds the build size limit "
-                            f"({MAX_STATIC_PAGE_BYTES} bytes)",
+                            f"({MAX_STREAMED_STATIC_BYTES} bytes)",
                             [("file", entry), ("pattern", pattern)],
                             ["Split the page or reduce its content"]))
+                    if not _strip_client_runtime(response.body.decode("utf-8", "replace")):
+                        raise ValueError(_config_error(
+                            f"Static page {path} rendered an empty document",
+                            [("file", entry), ("pattern", pattern)],
+                            ["Make the page render some content",
+                             "Remove the page if it should not exist"]))
                     rendered[path] = (pattern, response.body)
                 rendered_params[path] = params
             except Exception as exc:
                 failures.append((path if path is not None else f"{pattern} {params}", exc))
-    if failures:
-        # A build whose every failure is a prerender bailout (dynamic
-        # access in dynamic="error" mode) fails with the bailout itself,
-        # as before staging: callers distinguish it from a page bug via
-        # is_prerender_bailout(), and the CLI still reports it cleanly
-        # (StaticGenBailoutError is a ValueError). Mixed or real page
-        # failures aggregate into one staged BuildError instead.
-        if all(is_prerender_bailout(exc) for _label, exc in failures):
-            raise failures[0][1]
-        lines = "\n".join(f"  {label}: {exc}" for label, exc in failures)
-        raise BuildError(
-            "render",
-            f"{len(failures)} static page(s) failed to render:\n{lines}") from failures[0][1]
     return rendered
 
 
