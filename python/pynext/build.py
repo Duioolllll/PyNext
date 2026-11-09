@@ -48,6 +48,7 @@ log = logging.getLogger("pynext")
 from .sortable_routes import sort_routes
 from .client import PREFIX as CLIENT_PREFIX
 from .client import discover_client, read_client_artifacts
+from .telemetry import record_build_failed
 
 MANIFEST = ".pynext/manifest.json"
 BUILD_ID_FILE = ".pynext/BUILD_ID"
@@ -718,16 +719,38 @@ def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECOND
     stages it completed in ``stages``; ``load_manifest`` refuses it
     so ``pynext start`` names the missing stage instead of serving
     a half-built app.
+
+    On failure, one anonymous ``build_failed`` telemetry event is recorded
+    locally (stage + duration only -- never paths, error messages, or user
+    code; nothing is transmitted). The original exception still propagates.
     """
     root = Path(root).resolve()
     deployment_id = resolve_deployment_id(deployment_id)
     selected = _normalize_stages(stages)
+    started = time.monotonic()
+    tracker = _BuildStage()
+    try:
+        return _write_manifest(root, deployment_id, lock_timeout, selected, tracker)
+    except Exception:
+        record_build_failed(root, tracker.stage, int((time.monotonic() - started) * 1000))
+        raise
+
+
+class _BuildStage:
+    """Mutable build-stage tracker shared by write_manifest/_write_manifest."""
+
+    def __init__(self):
+        self.stage = "discover"
+
+
+def _write_manifest(root, deployment_id, lock_timeout, selected, tracker):
     with BuildLock(root, timeout=lock_timeout):
         _preflight_checks(root)
         # Production env files are loaded before any user code runs, so static
         # rendering and island bundling both see them (Next.js loads .env
         # before loadConfig in the same way).
         loaded = load_env(root, mode="production")
+        tracker.stage = "render"
         if selected != list(STAGES):
             if selected == ["compile"]:
                 return _write_compile_only_manifest(root, deployment_id)
@@ -739,6 +762,7 @@ def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECOND
                 f"{', '.join(shadowers)} and can never match a request",
                 file=sys.stderr,
             )
+        tracker.stage = "render"
         app, rendered = _run_stage("render", _build_app_and_render, root, manifest)
         isr_static_paths = _run_stage("isr-warmup", lambda: asyncio.run(_enumerate_isr_static_paths(app)))
         _run_stage("validate", _validate_unchanged, root, manifest)
@@ -782,6 +806,7 @@ def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECOND
         manifest["stages"] = list(STAGES)
         manifest["build_id"] = generate_build_id(manifest)
         manifest["deployment_id"] = deployment_id
+        tracker.stage = "write"
         _run_stage("write-assets", _write_build_assets, root, manifest, rendered, app)
         manifest_bytes = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         _run_stage("write-manifest", _atomic_write, root / MANIFEST, manifest_bytes)

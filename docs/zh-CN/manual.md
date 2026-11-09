@@ -289,6 +289,8 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 OpenTelemetry 追踪默认关闭且为可选项：安装 `opentelemetry-api`（以及自选的 SDK/导出器），并用 `--tracing` 或 `PYNEXT_TRACING=1` 启用。启用后会创建 `pynext.request` 与 `pynext.render` span，并传播传入的 W3C `traceparent`/`tracestate` 上下文。未安装相关包时，追踪为 no-op，不会破坏任何功能。
 
+构建遥测仅在本地记录一个事件 `build_failed`：当 `pynext build` 失败时，构建阶段（`discover`、`render` 或 `write` 之一）与构建耗时会被追加到 `.pynext/telemetry.jsonl`（仅保留最近 100 条）。事件中不包含项目名、路径、错误信息或用户代码，也不会向任何外部发送数据。设置 `PYNEXT_TELEMETRY_DISABLED=1` 可关闭本地记录。
+
 可通过 CLI 标志 `--structured-logs` / `--no-structured-logs`、`--metrics` / `--no-metrics`、`--tracing` / `--no-tracing`，环境变量 `PYNEXT_STRUCTURED_LOGS`、`PYNEXT_METRICS`、`PYNEXT_TRACING`、`PYNEXT_LOG_LEVEL`，或在代码中向 `create_app(..., observability=ObservabilityConfig(...))` 传入配置来进行设置。
 
 默认可观测性设置（结构化日志 + 指标开启，追踪关闭）的实测开销已用 `benchmarks/bench.py --mode axum --requests 1000 --concurrency 10 --path / --production` 在已构建的示例上各测 2 次。由于同一 VM 上还有其他工作在并行构建与测试，绝对延迟被放大，运行间波动较大。开启：25.4 / 14.2 req/s，p50 309 / 586 ms，进程 CPU 4.79 / 5.02 秒。关闭（`PYNEXT_STRUCTURED_LOGS=0 PYNEXT_METRICS=0`）：18.7 / 18.5 req/s，p50 437 / 478 ms，CPU 5.01 / 4.69 秒。均值分别为开启 19.8 req/s、p50 447 ms，关闭 18.6 req/s、p50 457 ms，未观测到超出运行间波动的开销（开启的运行还向 stderr 写了约 1000 行 JSON 日志）。如需更严格的数值，请在空闲机器上重新测量。

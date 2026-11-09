@@ -344,6 +344,8 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 OpenTelemetry 트레이싱은 기본으로 꺼져 있으며 선택 사항입니다. `opentelemetry-api`(및 원하는 SDK/익스포터)를 설치하고 `--tracing` 또는 `PYNEXT_TRACING=1`로 켜세요. 켜면 `pynext.request`와 `pynext.render` 스팬이 생성되고 들어온 W3C `traceparent`/`tracestate` 컨텍스트가 전파됩니다. 패키지가 설치돼 있지 않으면 트레이싱은 no-op이며 아무것도 깨지지 않습니다.
 
+빌드 텔레메트리는 `build_failed` 이벤트 하나만 로컬에 기록합니다. `pynext build`가 실패하면 빌드 단계(`discover`, `render`, `write` 중 하나)와 빌드 소요 시간이 `.pynext/telemetry.jsonl`에 추가됩니다(최근 100건까지만 유지). 이벤트에는 프로젝트 이름·경로·에러 메시지·사용자 코드가 들어가지 않으며, 외부로 전송되는 것은 아무것도 없습니다. 로컬 기록을 끄려면 `PYNEXT_TELEMETRY_DISABLED=1`을 설정하세요.
+
 CLI 플래그 `--structured-logs` / `--no-structured-logs`, `--metrics` / `--no-metrics`, `--tracing` / `--no-tracing`, 환경 변수 `PYNEXT_STRUCTURED_LOGS`, `PYNEXT_METRICS`, `PYNEXT_TRACING`, `PYNEXT_LOG_LEVEL`, 또는 코드에서 `create_app(..., observability=ObservabilityConfig(...))`로 설정합니다.
 
 기본 관측성 설정(구조화 로그 + 지표 켜짐, 트레이싱 꺼짐)의 측정 오버헤드는 `benchmarks/bench.py --mode axum --requests 1000 --concurrency 10 --path / --production`으로 빌드된 예제에서 각 2회씩 측정했습니다. 다른 작업이 같은 VM에서 빌드·테스트 중이어서 절대 지연이 부풀려졌고 실행 간 편차가 큽니다. 켜짐: 25.4 / 14.2 req/s, p50 309 / 586 ms, 프로세스 CPU 4.79 / 5.02초. 꺼짐(`PYNEXT_STRUCTURED_LOGS=0 PYNEXT_METRICS=0`): 18.7 / 18.5 req/s, p50 437 / 478 ms, CPU 5.01 / 4.69초. 평균은 켜짐 19.8 req/s·p50 447 ms 대 꺼짐 18.6 req/s·p50 457 ms로, 실행 간 편차를 벗어나는 오버헤드는 없습니다(켜짐 실행은 stderr에 JSON 로그 약 1000줄도 함께 썼습니다). 더 엄밀한 수치는 조용한 머신에서 다시 측정하세요.

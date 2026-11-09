@@ -289,6 +289,10 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 OpenTelemetry トレーシングは既定で無効であり、任意です。`opentelemetry-api`（および任意の SDK/エクスポーター）をインストールし、`--tracing` または `PYNEXT_TRACING=1` で有効化してください。有効な場合、`pynext.request` と `pynext.render` スパンが作成され、受信した W3C `traceparent`/`tracestate` コンテキストが伝播します。パッケージがインストールされていない場合、トレーシングは no-op で、何も壊れません。
 
+ビルドテレメトリは `build_failed` イベントひとつのみをローカルに記録します。`pynext build` が失敗すると、ビルド段階（`discover`、`render`、`write` のいずれか）とビルド所要時間が `.pynext/telemetry.jsonl` に追加されます（直近 100 件まで保持）。イベントにプロジェクト名・パス・エラーメッセージ・ユーザーコードは含まれず、外部へ送信されるものは何もありません。ローカル記録を無効化するには `PYNEXT_TELEMETRY_DISABLED=1` を設定してください。
+
+CLI フラグ `--structured-logs` / `--no-structured-logs`、`--metrics` / `--no-metrics`、`--tracing` / `--no-tracing`、環境変数 `PYNEXT_STRUCTURED_LOGS`、`PYNEXT_METRICS`、`PYNEXT_TRACING`、`PYNEXT_LOG_LEVEL`、またはコードで `create_app(..., observability=ObservabilityConfig(...))` を使って設定します。
+
 CLI フラグ `--structured-logs` / `--no-structured-logs`、`--metrics` / `--no-metrics`、`--tracing` / `--no-tracing`、環境変数 `PYNEXT_STRUCTURED_LOGS`、`PYNEXT_METRICS`、`PYNEXT_TRACING`、`PYNEXT_LOG_LEVEL`、またはコード内で `create_app(..., observability=ObservabilityConfig(...))` により設定します。
 
 既定の可観測性設定（構造化ログ + メトリクス有効、トレーシング無効）の測定オーバーヘッドは、ビルド済みサンプルで `benchmarks/bench.py --mode axum --requests 1000 --concurrency 10 --path / --production` を各 2 回実行して測定しました。他の作業が同じ VM で並行してビルド・テスト中だったため、絶対遅延は膨らみ、実行間のばらつきが大きくなっています。有効: 25.4 / 14.2 req/s、p50 309 / 586 ms、プロセス CPU 4.79 / 5.02 秒。無効（`PYNEXT_STRUCTURED_LOGS=0 PYNEXT_METRICS=0`）: 18.7 / 18.5 req/s、p50 437 / 478 ms、CPU 5.01 / 4.69 秒。平均は有効 19.8 req/s・p50 447 ms に対して無効 18.6 req/s・p50 457 ms で、実行間のばらつきを超えるオーバーヘッドはありません（有効時の実行では stderr に JSON ログ約 1000 行も出力しています）。より厳密な値は静かなマシンで再測定してください。
