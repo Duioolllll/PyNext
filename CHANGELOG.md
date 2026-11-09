@@ -45,6 +45,9 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Escape Prometheus label values in `prometheus_text()`.
 - Add an optional `filesystem` ISR cache backend (`--cache-backend filesystem`, Next.js `FileSystemCache`-style): entries live as human-readable `.body` + `.meta` sidecar files in a shared directory, with cross-process leases, fenced writes, monotonic/wall-clock age, and oldest-first eviction (1024 entries / 512 MiB by default).
 
+- Record slow `pynext.request` / `pynext.render` spans to a local `.pynext/trace.jsonl` file when `PYNEXT_TRACE_SPAN_THRESHOLD_MS` is set (off by default, 50 MiB rotation, route patterns only, no OpenTelemetry needed; override the file with `PYNEXT_TRACE_FILE` or `configure_local_trace()`).
+- Write build diagnostics to `.pynext/diagnostics.json` on every build: stage (`discover`/`render`/`write`/`done`), framework version and (on failure) the failed route pattern, plus a local-only anonymous build-failure event history (last 50). Nothing is transmitted anywhere.
+
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.

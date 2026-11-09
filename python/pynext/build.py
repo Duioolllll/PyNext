@@ -35,6 +35,7 @@ import shutil
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import _native
@@ -59,6 +60,11 @@ BUILD_ID_LENGTH = 16
 MAX_DEPLOYMENT_ID_LENGTH = 128
 BUILD_REPORT = ".pynext/build-report.json"
 BUILD_REPORT_VERSION = 1
+DIAGNOSTICS_FILE = ".pynext/diagnostics.json"
+# Anonymous build-failure events kept in diagnostics.json (local only, no
+# transmission). Each entry is {event, stage, duration_ms, timestamp} —
+# never user code, filesystem paths or error messages.
+MAX_DIAGNOSTIC_EVENTS = 50
 VERSION = 10
 MAX_STATIC_PAGES = 10_000
 # One cap for every static page rendered at build time, streaming or
@@ -266,7 +272,7 @@ def _run_stage(stage, func, *args, **kwargs):
         raise BuildError(stage, str(exc) or exc.__class__.__name__) from exc
 
 
-def _build_app_and_render(root, manifest):
+def _build_app_and_render(root, manifest, *, _on_pattern_error=None):
     """Build the App and render static pages, incrementally.
 
     Returns ``(app, rendered, reused, reused_bytes)``: the App, freshly
@@ -278,7 +284,8 @@ def _build_app_and_render(root, manifest):
     from .app import App
     app = App(root, manifest)
     previous = _load_previous_manifest(root)
-    rendered, reused, reused_bytes = _render_incremental(app, manifest, previous)
+    rendered, reused, reused_bytes = _render_incremental(
+        app, manifest, previous, _on_pattern_error=_on_pattern_error)
     return app, rendered, reused, reused_bytes
 
 
@@ -705,6 +712,67 @@ def validate_routes(routes):
 
 
 
+def _pynext_version():
+    try:
+        from importlib.metadata import version as _distribution_version
+        return _distribution_version("pynext-framework")
+    except Exception:
+        return "unknown"
+
+
+def update_build_diagnostics(root, stage, *, failed_route=None, duration_ms=None, event=None):
+    """Merge one build-diagnostics record into ``.pynext/diagnostics.json``.
+
+    Best effort: failures to read or write the file are swallowed so a
+    diagnostics problem can never mask (or cause) a build failure. The
+    file records only the framework version, the build stage, an optional
+    failed route *pattern* and anonymous timing — never user code, file
+    system paths or error messages, and nothing is transmitted anywhere.
+    A successful build closes the record with ``stage="done"`` and clears
+    a stale ``failed_route``; the anonymous failure-event history is kept.
+    """
+    root = Path(root).resolve()
+    try:
+        _check_build_paths(root)
+    except ValueError:
+        return
+    path = root / DIAGNOSTICS_FILE
+    data = {}
+    try:
+        if path.is_file():
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+    except (OSError, ValueError, UnicodeDecodeError):
+        data = {}
+    updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    data["pynext_version"] = _pynext_version()
+    data["stage"] = stage
+    data["updated_at"] = updated_at
+    if failed_route is not None:
+        data["failed_route"] = failed_route
+    else:
+        data.pop("failed_route", None)
+    rounded = round(float(duration_ms), 3) if isinstance(duration_ms, (int, float)) else None
+    if rounded is not None:
+        data["duration_ms"] = rounded
+    if event == "build_failed":
+        events = data.get("events")
+        if not isinstance(events, list):
+            events = []
+        events.append({
+            "event": "build_failed",
+            "stage": stage,
+            "duration_ms": rounded,
+            "timestamp": updated_at,
+        })
+        data["events"] = events[-MAX_DIAGNOSTIC_EVENTS:]
+    try:
+        _atomic_write(path, (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+    except OSError:
+        pass
+
+
 def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECONDS,
                      stages=None):
     """Build the project: discover, render static pages, write assets,
@@ -735,17 +803,30 @@ def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECOND
     On failure, one anonymous ``build_failed`` telemetry event is recorded
     locally (stage + duration only -- never paths, error messages, or user
     code; nothing is transmitted). The original exception still propagates.
+    Build diagnostics (stage, failed route pattern, duration) are also
+    merged into ``.pynext/diagnostics.json``; see :func:`update_build_diagnostics`.
     """
     root = Path(root).resolve()
     deployment_id = resolve_deployment_id(deployment_id)
     selected = _normalize_stages(stages)
     started = time.monotonic()
     tracker = _BuildStage()
+    failed = {}
+
+    def _note_failed_route(pattern):
+        failed["route"] = pattern
+
     try:
-        return _write_manifest(root, deployment_id, lock_timeout, selected, tracker)
+        result = _write_manifest(root, deployment_id, lock_timeout, selected, tracker,
+                                _on_pattern_error=_note_failed_route)
     except Exception:
         record_build_failed(root, tracker.stage, int((time.monotonic() - started) * 1000))
+        update_build_diagnostics(root, tracker.stage, failed_route=failed.get("route"),
+                                 duration_ms=(time.monotonic() - started) * 1000,
+                                 event="build_failed")
         raise
+    update_build_diagnostics(root, "done", duration_ms=(time.monotonic() - started) * 1000)
+    return result
 
 
 class _BuildStage:
@@ -755,14 +836,14 @@ class _BuildStage:
         self.stage = "discover"
 
 
-def _write_manifest(root, deployment_id, lock_timeout, selected, tracker):
+def _write_manifest(root, deployment_id, lock_timeout, selected, tracker,
+                    _on_pattern_error=None):
     with BuildLock(root, timeout=lock_timeout):
         _preflight_checks(root)
         # Production env files are loaded before any user code runs, so static
         # rendering and island bundling both see them (Next.js loads .env
         # before loadConfig in the same way).
         loaded = load_env(root, mode="production")
-        tracker.stage = "render"
         if selected != list(STAGES):
             if selected == ["compile"]:
                 return _write_compile_only_manifest(root, deployment_id)
@@ -776,7 +857,9 @@ def _write_manifest(root, deployment_id, lock_timeout, selected, tracker):
             )
         tracker.stage = "render"
         build_started = time.monotonic()
-        app, rendered, reused, reused_bytes = _run_stage("render", _build_app_and_render, root, manifest)
+        app, rendered, reused, reused_bytes = _run_stage(
+            "render", _build_app_and_render, root, manifest,
+            _on_pattern_error=_on_pattern_error)
         isr_static_paths = _run_stage("isr-warmup", lambda: asyncio.run(_enumerate_isr_static_paths(app)))
         _run_stage("validate", _validate_unchanged, root, manifest)
         # Catch-all normalization over the enumerated static paths (reduced port
@@ -1060,7 +1143,7 @@ def _previous_static_pages(previous):
     return result
 
 
-def _render_incremental(app, manifest, previous):
+def _render_incremental(app, manifest, previous, *, _on_pattern_error=None):
     """Render only the static pages whose inputs changed since the last build.
 
     Returns ``(rendered, reused, reused_bytes)``: freshly rendered
@@ -1110,7 +1193,8 @@ def _render_incremental(app, manifest, previous):
     for pattern in app.static_generators:
         if not any(entry["pattern"] == pattern for entry in reused.values()):
             stale_patterns.add(pattern)
-    rendered = asyncio.run(_render_static_pages(app, patterns=stale_patterns, existing=len(reused)))
+    rendered = asyncio.run(_render_static_pages(
+        app, patterns=stale_patterns, existing=len(reused), _on_pattern_error=_on_pattern_error))
     overlap = set(rendered) & set(reused)
     if overlap:
         raise ValueError(f"Duplicate generated path: {sorted(overlap)[0]}")
@@ -1617,7 +1701,7 @@ async def _enumerate_isr_static_paths(app):
     return enumerated
 
 
-async def _render_static_pages(app, patterns=None, existing=0):
+async def _render_static_pages(app, patterns=None, existing=0, _on_pattern_error=None):
     """Render every static page, isolating failures per page.
 
     One page failing used to abort the whole build at the first error,
@@ -1767,6 +1851,8 @@ async def _render_static_pages(app, patterns=None, existing=0):
                     rendered[path] = (pattern, response.body)
                 rendered_params[path] = params
             except Exception as exc:
+                if _on_pattern_error is not None:
+                    _on_pattern_error(pattern)
                 failures.append((path if path is not None else f"{pattern} {params}", exc))
     if failures:
         # A build whose every failure is a prerender bailout (dynamic

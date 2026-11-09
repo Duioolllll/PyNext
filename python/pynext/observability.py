@@ -28,6 +28,12 @@ Design notes
 * Repeated request failures are logged in full once per callsite per
   window (``DedupedErrorLogger``); well-known transport noise
   (client disconnects, cancellations) logs at INFO instead of ERROR.
+* Slow spans can also be recorded locally without OpenTelemetry: when
+  ``PYNEXT_TRACE_SPAN_THRESHOLD_MS`` is set, ``pynext.request`` /
+  ``pynext.render`` spans slower than the threshold are appended as JSON
+  Lines to ``.pynext/trace.jsonl`` (see :func:`configure_local_trace`).
+  The file restarts from scratch at 50 MiB. Only route patterns, methods
+  and status codes are recorded — never raw URLs, headers or bodies.
 * Native (Rust) fresh ISR hits are served without entering Python, so they
   are invisible to the Python metrics below. That gap is documented in the
   manuals; only ISR outcomes that reach :meth:`App.dispatch` are counted.
@@ -75,6 +81,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .failure_policy import FAIL_CLOSED
 
@@ -87,6 +94,7 @@ __all__ = [
     "classify_request_error",
     "JsonFormatter",
     "configure_logging",
+    "configure_local_trace",
     "new_request_id",
     "get_request_id",
     "get_trace_id",
@@ -1274,6 +1282,103 @@ class RequestInsights:
                 "requests": [dict(entry) for entry in self._entries],
             }
 
+
+# -- Local trace file (Next.js trace/ light subset) -----------------------
+# Spans slower than the configured threshold are appended as JSON Lines
+# to a local file. Off by default: the threshold env var must be set.
+# Only pynext.request / pynext.render are recorded, and only with route
+# patterns / methods / status codes — never raw URLs, headers or bodies.
+# The file restarts from scratch once it reaches TRACE_FILE_MAX_BYTES
+# (50 MiB, the Next.js development cap). Recording is best effort and
+# never raises: a trace-file failure must not break request handling.
+TRACE_FILE_MAX_BYTES = 50 * 1024 * 1024
+TRACE_FILE_DEFAULT = ".pynext/trace.jsonl"
+_LOCAL_TRACE_SPAN_NAMES = frozenset({"pynext.request", "pynext.render"})
+
+_local_trace_lock = threading.Lock()
+_local_trace_configured = False
+_local_trace_threshold_ms = None  # None = off
+_local_trace_path = None
+
+
+def _parse_trace_threshold(value):
+    if value is None:
+        return None
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        return None
+    # NaN fails the >= comparison, so it is off as well.
+    return threshold if threshold >= 0 else None
+
+
+def _local_trace_settings():
+    global _local_trace_configured, _local_trace_threshold_ms, _local_trace_path
+    with _local_trace_lock:
+        if not _local_trace_configured:
+            _local_trace_threshold_ms = _parse_trace_threshold(
+                os.environ.get("PYNEXT_TRACE_SPAN_THRESHOLD_MS"))
+            _local_trace_path = os.environ.get("PYNEXT_TRACE_FILE") or TRACE_FILE_DEFAULT
+            _local_trace_configured = True
+        return _local_trace_threshold_ms, _local_trace_path
+
+
+def configure_local_trace(threshold_ms=None, *, path=None):
+    """Configure the local slow-span trace file.
+
+    ``threshold_ms`` is the minimum span duration in milliseconds to
+    record; ``None`` (the default) turns recording off. ``path`` overrides
+    the trace file location (default ``.pynext/trace.jsonl`` relative to
+    the working directory, or ``PYNEXT_TRACE_FILE`` when set in the
+    environment). Calling this replaces any environment-derived settings.
+    """
+    global _local_trace_configured, _local_trace_threshold_ms, _local_trace_path
+    threshold = _parse_trace_threshold(threshold_ms) if threshold_ms is not None else None
+    with _local_trace_lock:
+        _local_trace_threshold_ms = threshold
+        _local_trace_path = str(path) if path is not None else TRACE_FILE_DEFAULT
+        _local_trace_configured = True
+
+
+def _reset_local_trace_config():
+    """Test hook: forget any configured/env-derived local trace settings."""
+    global _local_trace_configured, _local_trace_threshold_ms, _local_trace_path
+    with _local_trace_lock:
+        _local_trace_configured = False
+        _local_trace_threshold_ms = None
+        _local_trace_path = None
+
+
+def _record_local_span(name, started_at, duration_ms, attributes, error_type):
+    threshold_ms, path = _local_trace_settings()
+    if threshold_ms is None or name not in _LOCAL_TRACE_SPAN_NAMES:
+        return
+    if duration_ms < threshold_ms:
+        return
+    try:
+        record = {
+            "timestamp": started_at,
+            "name": name,
+            "duration_ms": round(duration_ms, 3),
+            "attributes": {str(key): value for key, value in attributes.items()},
+            "error_type": error_type,
+        }
+        line = (json.dumps(record, ensure_ascii=False, default=repr) + "\n").encode("utf-8")
+    except Exception:
+        return
+    try:
+        with _local_trace_lock:
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_file() and target.stat().st_size >= TRACE_FILE_MAX_BYTES:
+                with open(target, "wb"):
+                    pass
+            with open(target, "ab") as handle:
+                handle.write(line)
+    except Exception:
+        pass
+
+
 # -- OpenTelemetry (optional) ---------------------------------------------
 _otel_trace = None
 _otel_loaded = False
@@ -1319,16 +1424,24 @@ def _extract_otel_context(headers):
 
 
 class _Span:
-    """Uniform wrapper: a real OTel span when available, else a no-op."""
+    """Uniform wrapper: a real OTel span when available, else a no-op.
 
-    def __init__(self, real=None):
+    Attributes set on the span are kept locally as well, so the local
+    trace file can record them without OpenTelemetry.
+    """
+
+    def __init__(self, real=None, name=None):
         self._real = real
+        self.name = name
         self.attributes = {}
         self.error_type = None
         self.status_error = None
 
     def set_attribute(self, key, value):
-        self.attributes[key] = value
+        try:
+            self.attributes[str(key)] = value
+        except Exception:
+            pass
         if self._real is not None:
             try:
                 self._real.set_attribute(key, value)
@@ -1391,9 +1504,13 @@ def span(name, attributes=None, *, enabled=True):
     callers never need to branch on availability. An exception leaving
     the body is recorded on the span (``error.type`` + ERROR status),
     except cancellations, which are not errors.
+
+    Independent of OpenTelemetry, spans slower than the local trace
+    threshold (see :func:`configure_local_trace`) are appended to the
+    local trace file — that recording is off by default.
     """
     trace = _load_otel() if enabled else None
-    cm = None
+    real_cm = None
     real = None
     if trace is not None:
         try:
@@ -1402,31 +1519,38 @@ def span(name, attributes=None, *, enabled=True):
             get_current = getattr(trace, "get_current_span", None)
             if name != "pynext.request" and get_current is not None and get_current().get_span_context().is_valid:
                 context = None
-            cm = tracer.start_as_current_span(name, context=context) if context is not None else tracer.start_as_current_span(name)
-            real = cm.__enter__()
+            real_cm = (tracer.start_as_current_span(name, context=context)
+                       if context is not None else tracer.start_as_current_span(name))
+            real = real_cm.__enter__()
         except Exception:
-            cm = None
+            real_cm = None
             real = None
-    wrapped = _Span(real)
+    wrapped = _Span(real, name=name)
     for key, value in (attributes or {}).items():
         wrapped.set_attribute(key, value)
+    started = time.monotonic()
+    started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    error_type = None
     try:
         yield wrapped
-    except BaseException:
+    except BaseException as exc:
         # Record the failure on the span (Next.js traceFn behaviour),
         # except cancellations: a client that went away is not an error.
-        exc = sys.exc_info()[1]
+        error_type = type(exc).__name__
         if isinstance(exc, Exception):
             wrapped.record_exception(exc)
-        if cm is not None:
+        if real_cm is not None:
             try:
-                cm.__exit__(*sys.exc_info())
+                real_cm.__exit__(*sys.exc_info())
             except Exception:
                 pass
         raise
     else:
-        if cm is not None:
+        if real_cm is not None:
             try:
-                cm.__exit__(None, None, None)
+                real_cm.__exit__(None, None, None)
             except Exception:
                 pass
+    finally:
+        _record_local_span(name, started_at, (time.monotonic() - started) * 1000,
+                           dict(wrapped.attributes), error_type)
