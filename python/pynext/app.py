@@ -42,7 +42,7 @@ from .observability import (
     span,
 )
 from .proxy import ProxyTrust
-from .ratelimit import RateLimitUnavailable, rate_limited_response
+from .ratelimit import RateLimitUnavailable, _is_exempt_path, rate_limited_response
 from .sessions import SessionMiddleware
 from .static import asset_response
 from .ws_origin import websocket_origin_allowed
@@ -1223,8 +1223,7 @@ class App:
         """
         if self.rate_limit is None:
             return None
-        exempt = getattr(self.rate_limit, "is_exempt", None)
-        if exempt and exempt(path):
+        if _is_exempt_path(self.rate_limit, path):
             return None
         client = scope.get("client")
         client_ip = client[0] if client else None
@@ -1475,8 +1474,7 @@ class App:
         # Health probes bypass rate limiting (B6): a saturated limiter
         # must never make the process look dead to a load balancer.
         is_health = scope.get("path") in ("/healthz", "/readyz")
-        exempt = getattr(self.rate_limit, "is_exempt", None)
-        if self.rate_limit is not None and not (is_health or (exempt and exempt(scope.get("path", "")))):
+        if self.rate_limit is not None and not (is_health or _is_exempt_path(self.rate_limit, scope.get("path", ""))):
             # Check before reading the body: an over-limit request is
             # rejected without handler execution or body intake.
             client = scope.get("client")

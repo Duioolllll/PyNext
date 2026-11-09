@@ -200,6 +200,65 @@ def test_native_decoded_exempt_path_is_not_charged(tmp_path):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("mode", ["asgi", "axum"])
+def test_encoded_question_mark_cannot_bypass_exempt_path(tmp_path, mode):
+    _project(tmp_path)
+    catchall = tmp_path / "app" / "[...path]"
+    catchall.mkdir()
+    (catchall / "route.py").write_text(
+        'from pynext import Response, route\n@route("GET")\n'
+        'def get(): return Response("catchall")\n', encoding="utf-8")
+    async def run():
+        limiter = RateLimiter(1, 60, exempt_paths=("/input",))
+        limiter.allow("127.0.0.1")
+        app = create_app(tmp_path, rate_limit=limiter)
+        server = None
+        if mode == "asgi":
+            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+        else:
+            server = start_native(app, asyncio.get_running_loop(), port=0)
+            client = httpx.AsyncClient(base_url=f"http://{server.address}", trust_env=False)
+        try:
+            async with client:
+                # A real query is outside the path; an encoded question
+                # mark remains part of the routed path after decoding.
+                assert (await client.get("/input?query=1")).status_code == 200
+                assert (await client.get("/input%3Fother")).status_code == 429
+                assert (await client.get("/input/child")).status_code == 200
+                assert (await client.get("/input/child%3Fvalue")).status_code == 404
+        finally:
+            if server is not None:
+                await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["asgi", "axum"])
+def test_custom_exemption_override_is_preserved(tmp_path, mode):
+    class CustomLimiter(RateLimiter):
+        def is_exempt(self, path):
+            return path == "/input"
+    async def run():
+        limiter = CustomLimiter(1, 60)
+        limiter.allow("127.0.0.1")
+        app = create_app(_project(tmp_path), rate_limit=limiter)
+        server = None
+        if mode == "asgi":
+            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+        else:
+            server = start_native(app, asyncio.get_running_loop(), port=0)
+            client = httpx.AsyncClient(base_url=f"http://{server.address}", trust_env=False)
+        try:
+            async with client:
+                assert (await client.get("/input")).status_code == 200
+                assert (await client.get("/other")).status_code == 429
+        finally:
+            if server is not None:
+                await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())
+
+
 def test_native_limiter_timeout_fails_closed_before_body(tmp_path):
     class SlowLimiter(RateLimiter):
         def allow(self, key):

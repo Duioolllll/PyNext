@@ -71,6 +71,15 @@ class RateLimitUnavailable(Exception):
     """A shared limiter could not safely decide whether to admit a request."""
 
 
+def _is_exempt_path(limiter, path):
+    """Use decoded-path matching while preserving custom exemption hooks."""
+    exempt = getattr(limiter, "is_exempt", None)
+    decoded_exempt = getattr(limiter, "is_exempt_path", None)
+    if decoded_exempt and (exempt is None or getattr(exempt, "__func__", None) is RateLimiter.is_exempt):
+        return bool(decoded_exempt(path))
+    return bool(exempt and exempt(path))
+
+
 def _parse_trusted_proxies(trusted_proxies):
     """Normalize trusted-proxy entries (kept for backward compatibility).
 
@@ -167,9 +176,15 @@ class RateLimiter:
 
     def is_exempt(self, path):
         """True when ``path`` (query string ignored) skips rate limiting."""
+        if not path:
+            return False
+        return self.is_exempt_path(str(path).split("?", 1)[0])
+
+    def is_exempt_path(self, path):
+        """Match an already decoded URL path, preserving literal ``?`` characters."""
         if not self.exempt_paths or not path:
             return False
-        path = str(path).split("?", 1)[0]
+        path = str(path)
         for prefix in self.exempt_paths:
             base = prefix.rstrip("/") or "/"
             if path == prefix or path == base or path.startswith(base + "/"):

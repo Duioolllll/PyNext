@@ -13,6 +13,7 @@ from .app import _decode_path, _invoke
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
                    WebSocketDisconnect, apply_security_headers, security_headers)
 from .observability import begin_request_context, queue_wait_var
+from .ratelimit import _is_exempt_path
 from .ws_origin import websocket_origin_allowed
 
 log = logging.getLogger("pynext")
@@ -482,8 +483,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     rate_limit_callback = None
     if limiter is not None:
         def rate_limit_callback(path, headers, peer_ip):
-            exempt = getattr(limiter, "is_exempt", None)
-            if exempt and exempt(path):
+            if _is_exempt_path(limiter, path):
                 return True, None
             key = limiter.key_for(peer_ip, headers)
             return limiter.allow(key)
