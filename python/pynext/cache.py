@@ -15,6 +15,12 @@ Every shared write atomically checks both the observed entry version and
 the live lease owner. Invalidation removes the lease with the entry, so
 an old generation cannot refill the shared cache after invalidation.
 
+Concurrent shared writes for one key coalesce (Next.js ``pendingSets``,
+``cache-handlers/default.ts``): a second write waits for the first and
+reuses its fresh entry instead of issuing a duplicate write, and a read
+that arrives while a write is landing waits (bounded) and re-reads the
+shared entry instead of serving the previous version or rendering twice.
+
 Private responses are never stored in the shared cache: a response
 with ``Set-Cookie`` or ``Cache-Control: private``/``no-store`` is served
 but not written to either layer (spec section 10.2). Requests carrying
@@ -48,6 +54,12 @@ MAX_CACHE_SECONDS = 604_800.0
 _SHARED_UNAVAILABLE = object()
 _VARIANT_GENERATION_TTL = 86400
 _MAX_LOCAL_VARIANT_PATHS = 1024
+# Bounds for waiting on an in-flight shared write (Next.js ``pendingSets``).
+# The write itself is one backend round trip, so these only bite under lock
+# contention or a stalled backend; on timeout the caller falls back to the
+# pre-existing behaviour (serve stale / write anyway).
+PENDING_SET_WAIT_TIMEOUT = 5.0
+PENDING_SET_GET_TIMEOUT = 1.0
 
 
 class CacheBusy(Exception):
@@ -457,6 +469,11 @@ class ISRCache:
         self._inflight = {}
         self._task_leases = {}
         self._tasks = set()
+        # In-flight shared writes, keyed by cache key (Next.js ``pendingSets``):
+        # a second write for the same key waits on the event instead of
+        # issuing a duplicate write, and a read waits (bounded) and re-reads
+        # the shared entry once the write lands.
+        self._pending_sets = {}
         self._variant_paths = OrderedDict()
         self._loop = None
         self._closed = False
@@ -482,6 +499,9 @@ class ISRCache:
         self._inflight.clear()
         self._task_leases.clear()
         self._tasks.clear()
+        for event in self._pending_sets.values():
+            event.set()
+        self._pending_sets.clear()
         self._variant_paths.clear()
         self._loop = None
         if self.shared is not None:
@@ -551,6 +571,87 @@ class ISRCache:
                 raise SharedCacheUnavailable("Shared cache invalidation failed") from exc
             log.warning("Shared cache remove failed for %s", key, exc_info=True)
             return False
+
+    async def _wait_pending_set(self, key, timeout):
+        """Wait for the in-flight shared write for ``key`` to finish.
+
+        Returns True when the write completed within ``timeout`` (whether
+        it stored a body or not), False on timeout or when no write was
+        pending.
+        """
+        event = self._pending_sets.get(key)
+        if event is None:
+            return False
+        try:
+            await asyncio.wait_for(event.wait(), timeout)
+            return True
+        except TimeoutError:
+            return False
+
+    def _finish_pending_set(self, key, event):
+        # Resolve waiters first, then drop the registration — but only
+        # when it is still ours, so a newer set for the same key is never
+        # unregistered by an older one finishing (the Next.js ``finally``
+        # deletes blindly).
+        event.set()
+        if self._pending_sets.get(key) is event:
+            del self._pending_sets[key]
+
+    async def _await_pending_set(self, key):
+        """If a shared write for ``key`` is in flight, wait for it (bounded)
+        and re-read the shared entry.
+
+        Returns the re-read entry, or None when no write was pending, the
+        wait timed out, or the backend failed — the caller then keeps its
+        previous entry and falls back to the pre-existing path.
+        """
+        if key not in self._pending_sets:
+            return None
+        if not await self._wait_pending_set(key, timeout=PENDING_SET_GET_TIMEOUT):
+            return None
+        entry = await self._shared_entry(key)
+        if entry is _SHARED_UNAVAILABLE:
+            return None
+        return entry
+
+    async def _store_shared(self, key, body, policy, expected_version, owner):
+        """Store ``body`` in the shared backend, coalescing concurrent sets
+        for the same key (Next.js ``pendingSets``).
+
+        Returns ``(stored, coalesced)``. When another set for ``key`` is
+        already in flight, this waits for it (bounded) and re-reads the
+        shared entry: if it is fresh the earlier set already stored a
+        usable body, so this write is skipped and the local cache is
+        populated from the shared entry instead (``coalesced=True``). When
+        no set is in flight this registers one before writing and resolves
+        it in a ``finally``, so a concurrent ``get`` waits for the write
+        instead of reading the previous version. A failed or fenced-out
+        write resolves its waiters just the same — a pending set must never
+        block readers forever.
+        """
+        deadline = time.monotonic() + PENDING_SET_WAIT_TIMEOUT
+        while True:
+            pending = self._pending_sets.get(key)
+            if pending is None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not await self._wait_pending_set(key, timeout=remaining):
+                break
+            entry = await self._shared_entry(key)
+            if entry is _SHARED_UNAVAILABLE:
+                break
+            if entry is not None and entry.status == "fresh":
+                self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                return True, True
+            # The earlier set finished without leaving a fresh entry
+            # (failed, fenced out, or private); loop and register our own
+            # set — another set may have started while we re-read.
+        event = asyncio.Event()
+        self._pending_sets[key] = event
+        try:
+            return await self._shared_store(key, body, policy, expected_version, owner), False
+        finally:
+            self._finish_pending_set(key, event)
 
     async def invalidate(self, key):
         """Remove ``key`` from the local cache and, when configured, the shared store.
@@ -694,14 +795,18 @@ class ISRCache:
                 if self._inflight.get(key) is asyncio.current_task():
                     if _is_storable(response):
                         shared_stored = True
+                        coalesced = False
                         if self.shared is not None and owner is not None:
-                            shared_stored = await self._shared_store(key, response.body, policy, expected_version, owner)
+                            shared_stored, coalesced = await self._store_shared(
+                                key, response.body, policy, expected_version, owner)
                             if not shared_stored:
                                 log.warning("Shared ISR insert for %s failed or was fenced out;"
                                             " page was served but not cached", key)
-                        # Do not populate L1 after a shared write was rejected
-                        # or after this app invalidated the running task.
-                        if shared_stored and self._inflight.get(key) is asyncio.current_task():
+                        # Do not populate L1 after a shared write was rejected,
+                        # after this app invalidated the running task, or when a
+                        # concurrent set already stored a fresh body (its body
+                        # is in L1 already).
+                        if shared_stored and not coalesced and self._inflight.get(key) is asyncio.current_task():
                             if not self.store.insert(key, response.body, policy["revalidate"], policy["stale"]):
                                 log.warning("ISR cache insert failed for %s; page was served but not cached", key)
                     else:
@@ -734,6 +839,16 @@ class ISRCache:
             # still validates each hit against the authoritative store.
             self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
             return entry.body
+        # A shared write for this key may be landing right now (Next.js
+        # ``pendingSets``): wait for it to finish (bounded) and re-read, so
+        # this request serves the new body instead of the previous version
+        # or a duplicate render.
+        refreshed = await self._await_pending_set(key)
+        if refreshed is not None:
+            entry = refreshed
+            if entry.status == "fresh":
+                self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                return entry.body
         task = self._inflight.get(key)
         if task is not None:
             owner = self._task_leases.get(task)
