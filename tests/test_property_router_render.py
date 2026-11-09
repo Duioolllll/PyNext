@@ -48,6 +48,12 @@ _ELEMENT_TAGS = [
 ]
 
 
+@pytest.mark.parametrize("tag", ["embed", "EMBED"])
+def test_embed_remains_blocked_by_renderer(tag):
+    with pytest.raises(ValueError, match="Unsupported HTML tag"):
+        _native.render(json.dumps(h(tag)))
+
+
 def _draw_route(data, allow_params=True):
     depth = data.draw(st.integers(min_value=1, max_value=3))
     segments = []

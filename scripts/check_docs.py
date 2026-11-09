@@ -124,7 +124,7 @@ def check() -> list[str]:
     # Non-goals wording must match docs/ROADMAP.md.
     roadmap = (ROOT / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
     for phrase in ("React 및 React Server Components 호환성은 현재 비목표다",
-                   "Django 통합은 ORM·폼 활용과 ASGI 서브앱 마운트 중 방향 결정을 보류한다"):
+                   "Django 통합은 DB 연동 이후로 보류한다"):
         if phrase not in roadmap:
             failures.append(f"docs/ROADMAP.md: non-goal phrase changed: {phrase!r}")
 
