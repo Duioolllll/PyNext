@@ -19,6 +19,7 @@ from .dynamic import StaticGenBailoutError, is_prerender_bailout
 from .env import load_env
 
 log = logging.getLogger("pynext")
+from .sortable_routes import sort_routes
 
 MANIFEST = ".pynext/manifest.json"
 BUILD_ID_FILE = ".pynext/BUILD_ID"
@@ -491,7 +492,13 @@ def discover(root):
     conflicts = set(public_sources).intersection(routes)
     if conflicts:
         raise ValueError(f"Public file conflicts with a page or API route: {sorted(conflicts)[0]}")
-    return {"schema_version": VERSION, "routes": {p: routes[p] for p in router.ordered_routes()},
+    # The manifest lists routes in specificity order. The trie already
+    # produces that order (Router.ordered_routes), but sorting here through
+    # the shared comparator (pynext.sortable_routes, translated from
+    # Next.js sortable-routes.ts) makes the manifest order an explicit,
+    # documented rule instead of an emergent property of the trie; the
+    # property test in tests/test_sortable_routes.py pins the two equal.
+    return {"schema_version": VERSION, "routes": {p: routes[p] for p in sort_routes(router.ordered_routes())},
             "error": global_error, "not_found": global_not_found,
             "sources": {p.relative_to(root).as_posix(): _hash(p) for p in files},
             "public_sources": public_sources, "client_sources": discover_client(root)}

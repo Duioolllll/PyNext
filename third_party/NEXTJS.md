@@ -7,6 +7,15 @@ commit `6100e81e314f7aad0c94e189bbae87820d7efb37`:
 - https://github.com/vercel/next.js/blob/6100e81e314f7aad0c94e189bbae87820d7efb37/packages/next/src/shared/lib/router/utils/sorted-routes.ts
 - https://github.com/vercel/next.js/blob/6100e81e314f7aad0c94e189bbae87820d7efb37/test/unit/page-route-sorter.test.ts
 
+The route-specificity comparator in `python/pynext/sortable_routes.py` (and
+its ported cases in `tests/test_sortable_routes.py`) is translated from
+`sortable-routes.ts` at commit `0cf37690` — the revision the Next.js/PyNext
+comparison report used; the pinned commit above could not be checked for
+this file from the shallow clone:
+
+- https://github.com/vercel/next.js/blob/0cf37690/packages/next/src/shared/lib/router/utils/sortable-routes.ts
+- https://github.com/vercel/next.js/blob/0cf37690/packages/next/src/shared/lib/router/utils/sortable-routes.test.ts
+
 The static parameter shape and path validation were also informed by the
 following source. PyNext's implementation is independent and supports a
 smaller grammar and a fixed 404 fallback for paths not generated at build time:
