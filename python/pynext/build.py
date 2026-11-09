@@ -123,6 +123,12 @@ def write_manifest(root):
 
 
 def _atomic_write(path, contents):
+    # Build outputs (manifest.json, static .html/.asset/.js) are read back
+    # by the server process, which may run as a different user than the
+    # build user, so they must be world-readable. NamedTemporaryFile
+    # creates its file 0600, which would make a build done by one user
+    # unreadable (and the app unstartable) for another; use the normal
+    # readable default 0644 instead of inheriting that restriction.
     path.parent.mkdir(parents=True, exist_ok=True)
     name = None
     try:
@@ -131,6 +137,7 @@ def _atomic_write(path, contents):
             file.write(contents)
             file.flush()
             os.fsync(file.fileno())
+        os.chmod(name, 0o644)
         os.replace(name, path)
     finally:
         if name is not None and os.path.exists(name):

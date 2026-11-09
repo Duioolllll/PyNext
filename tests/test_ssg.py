@@ -83,6 +83,20 @@ def test_ssg_in_asgi_and_axum_and_python_bypass(tmp_path):
     asyncio.run(run())
 
 
+def test_build_outputs_are_world_readable(tmp_path):
+    # _atomic_write used to leave files 0600 (NamedTemporaryFile's
+    # default); a build done by one user could then not be read by the
+    # server process running as another user.
+    make_app(tmp_path)
+    manifest = write_manifest(tmp_path)
+    outputs = [tmp_path / ".pynext" / "manifest.json"]
+    outputs += [tmp_path / ".pynext" / "static" / f"{entry['sha256']}.html"
+                for entry in manifest["static_pages"].values()]
+    assert outputs[1:]
+    for output in outputs:
+        assert output.stat().st_mode & 0o777 == 0o644, output
+
+
 def test_ssg_artifacts_integrity_and_failed_build_is_atomic(tmp_path):
     app = make_app(tmp_path)
     manifest = write_manifest(tmp_path)
