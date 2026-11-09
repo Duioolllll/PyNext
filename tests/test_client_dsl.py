@@ -239,3 +239,18 @@ def test_top_level_statements_compile_and_run():
         pytest.skip("node is required for DSL equivalence tests")
     js = compile_client_dsl("total = 0\nfor i in range(5):\n    total += i\n")
     assert json.loads(run_node(js + "\nconsole.log(JSON.stringify(total));")) == 10
+
+
+def test_non_finite_float_literals_are_rejected_and_documented():
+    from pynext.client_dsl import KNOWN_DIFFERENCES
+    assert any("non-finite" in entry for entry in KNOWN_DIFFERENCES)
+    # 1e999 overflows to float("inf") at parse time; -1e999 is a unary
+    # minus over the same constant, so constant() sees it in both cases.
+    for source in ("x = 1e999\n", "x = -1e999\n", "x = [1e999]\n",
+                   "def f(v=1e999):\n    return v\n"):
+        with pytest.raises(ClientDSLCompileError, match="non-finite float"):
+            compile_client_dsl(source)
+    # Finite floats still compile, and the emitted literal is valid JSON.
+    js = compile_client_dsl("x = 1.5\n")
+    assert "Infinity" not in js and "NaN" not in js
+    assert json.loads(run_node(js + "\nconsole.log(JSON.stringify(x));")) == 1.5
