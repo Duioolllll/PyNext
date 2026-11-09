@@ -196,6 +196,27 @@ def test_redis_rate_limiter_new_key_window_denies_only_new_keys():
         limiter.close()
 
 
+def test_redis_rate_limiter_evicted_key_is_not_denied_by_new_key_window():
+    # Review #4 #3 (Redis side): at most 2 buckets and 3 new keys per
+    # 60s window. "c" is admitted by evicting "a"; when "a" returns
+    # within the window it is an existing key, not a brand-new one, so
+    # the full new-key window must not deny it with 429. A genuinely
+    # brand-new key is still denied while the window is full.
+    namespace = "test-" + uuid.uuid4().hex
+    limiter = RedisRateLimiter(10, 60, url=URL, namespace=namespace,
+                               max_buckets=2, max_new_keys_per_window=3)
+    try:
+        assert limiter.allow("a")[0]
+        assert limiter.allow("b")[0]
+        assert limiter.allow("c")[0]
+        assert limiter.allow("a")[0]
+        allowed, retry = limiter.allow("d")
+        assert allowed is False
+        assert retry >= 1
+    finally:
+        limiter.close()
+
+
 @pytest.mark.parametrize("mode", ["asgi", "axum"])
 def test_shared_rate_limit_covers_static_and_fails_closed(tmp_path, mode):
     app_dir = tmp_path / "app"

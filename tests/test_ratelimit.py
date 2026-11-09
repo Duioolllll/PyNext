@@ -136,6 +136,28 @@ def test_global_new_key_window_denies_only_brand_new_keys():
     assert limiter.allow("c", now=1061.0)[0]
 
 
+def test_evicted_existing_key_is_not_denied_by_new_key_window():
+    # Review #4 #3: at most 2 buckets and 3 new keys per 60s window.
+    # "c" is admitted by evicting "a"; when "a" returns within the
+    # window it is an existing key, not a brand-new one, so the full
+    # new-key window must not deny it with 429.
+    limiter = RateLimiter(10, 60, max_buckets=2, max_new_keys_per_window=3)
+    assert limiter.allow("a", now=1000.0)[0]
+    assert limiter.allow("b", now=1000.0)[0]
+    assert limiter.allow("c", now=1000.0)[0]
+    # Only 2 buckets: admitting "c" evicted the stalest one, "a".
+    # (stats() is not used here: it prunes with real monotonic time,
+    # which would wipe these fake-now admissions.)
+    assert "a" not in limiter._buckets and limiter._evicted == 1
+    assert limiter.allow("a", now=1000.0)[0]
+    # A genuinely brand-new key is still denied while the window is full.
+    allowed, retry_after = limiter.allow("d", now=1000.0)
+    assert allowed is False
+    assert isinstance(retry_after, int) and retry_after >= 1
+    # And an existing key that kept its bucket is unaffected either way.
+    assert limiter.allow("b", now=1000.0)[0]
+
+
 def test_limiter_rejects_invalid_new_key_and_bucket_bounds():
     with pytest.raises(ValueError):
         RateLimiter(10, 60, max_buckets=0)

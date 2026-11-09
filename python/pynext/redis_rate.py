@@ -30,14 +30,20 @@ local row = redis.call('HMGET', KEYS[1], 'tokens', 'last')
 local tokens
 if not row[1] then
   -- New key: bound new-key churn with a global sliding window. Only
-  -- brand-new keys are denied, and only until the window slides.
-  if redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[4]) then
+  -- brand-new keys are denied, and only until the window slides. A key
+  -- that already has a :newkeys entry was admitted within this window
+  -- and lost its bucket to table-pressure eviction since: it is an
+  -- existing key, not a brand-new one, so the window must never deny it.
+  local seen = redis.call('ZSCORE', KEYS[3], KEYS[1])
+  if not seen and redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[4]) then
     local oldest = redis.call('ZRANGE', KEYS[3], 0, 0, 'WITHSCORES')
     return {0, math.max(1, math.ceil((tonumber(oldest[2]) + window - now) / 1000000))}
   end
   -- Table full: evict the stalest active bucket instead of denying the
   -- new key. Its owner gets a fresh full bucket on its next request,
-  -- so table pressure can never deny an existing key.
+  -- so table pressure can never deny an existing key. The evicted key
+  -- keeps its :newkeys entry: that entry is what marks it as an
+  -- existing key when it returns within this window.
   if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[3]) then
     local stalest = redis.call('ZRANGE', KEYS[2], 0, 0)
     if stalest[1] then
@@ -83,7 +89,9 @@ class RedisRateLimiter(RateLimiter):
     protection for the duration of the outage, so only use it where
     availability matters more than limiting. The process-local
     :class:`RateLimiter` never raises, so the policy only applies to
-    this Redis-backed limiter.
+    this Redis-backed limiter. An evicted key keeps its new-key-window
+    entry, so its return within the window is treated as an existing
+    key, never a brand-new one.
     """
 
     blocking = True

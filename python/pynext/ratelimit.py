@@ -41,7 +41,7 @@ import ipaddress
 import math
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict
 
 from .http import Response
 from .proxy import ProxyTrust, parse_trusted_proxies
@@ -134,8 +134,10 @@ class RateLimiter:
         # key -> [tokens, last_seen_monotonic], most-recently-used last.
         self._buckets = OrderedDict()
         # Monotonic timestamps of new-bucket admissions in the current
-        # window (the global sliding window for new keys).
-        self._new_keys = deque()
+        # window (the global sliding window for new keys), keyed by the
+        # admitted key: the key is what tells an evicted existing key
+        # apart from a brand-new one when its bucket is gone.
+        self._new_keys = OrderedDict()
         self._evicted = 0
 
     def _is_trusted(self, client_ip):
@@ -172,8 +174,11 @@ class RateLimiter:
     def _prune_new_keys(self, now):
         """Drop new-key admissions older than one window."""
         cutoff = now - self.window_seconds
-        while self._new_keys and self._new_keys[0] <= cutoff:
-            self._new_keys.popleft()
+        while self._new_keys:
+            oldest = next(iter(self._new_keys.values()))
+            if oldest > cutoff:
+                break
+            self._new_keys.popitem(last=False)
 
     def _evict_one(self, now):
         """Evict one bucket to make room for a new key.
@@ -213,15 +218,20 @@ class RateLimiter:
             self._prune_new_keys(now)
             bucket = self._buckets.get(key)
             if bucket is None:
-                if len(self._new_keys) >= self.max_new_keys_per_window:
-                    oldest = self._new_keys[0]
+                # Only a brand-new key is denied by the global new-key
+                # window. A key admitted within this window whose bucket
+                # was evicted under table pressure since is an existing
+                # key: it is never denied, it gets a fresh full bucket.
+                if key not in self._new_keys and len(self._new_keys) >= self.max_new_keys_per_window:
+                    oldest = next(iter(self._new_keys.values()))
                     retry_after = max(1, math.ceil(self.window_seconds - max(0.0, now - oldest)))
                     return False, retry_after
                 if len(self._buckets) >= self.max_buckets:
                     self._evict_one(now)
                 bucket = [float(self.limit), now]
                 self._buckets[key] = bucket
-                self._new_keys.append(now)
+                self._new_keys[key] = now
+                self._new_keys.move_to_end(key)
             else:
                 elapsed = max(0.0, now - bucket[1])
                 bucket[0] = min(float(self.limit), bucket[0] + elapsed * self._refill_per_second)
