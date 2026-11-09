@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Replace the L1 `PageCache` O(n) eviction scan with an O(1) doubly-linked-list + hash-map LRU (Next.js `lru-cache.ts` model): entry size is key length + body length, a single item larger than `max_bytes` is refused with a warning, zero-size entries are refused, and capacity evictions can be observed through an `on_evict` hook. Explicit removals and expired-entry drops do not fire the hook. L1 defaults (1024 entries / 32 MiB / 2 MiB body) are unchanged.
+
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.
