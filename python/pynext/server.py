@@ -11,7 +11,7 @@ import time
 from . import _native
 from .app import _decode_path, _invoke
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
-                   WebSocketDisconnect, apply_security_headers, security_headers)
+                   WebSocketDisconnect, _RequestCancellation, apply_security_headers, security_headers)
 from .observability import begin_request_context, queue_wait_var
 from .ratelimit import _is_exempt_path
 from .ws_origin import websocket_origin_allowed
@@ -397,7 +397,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
             try:
                 request = Request(method.upper(), path, bytes(query),
                                   tuple((bytes(k), bytes(v)) for k, v in headers), bytes(body), _app=app,
-                                  _cancel_event=cancel_event if cancel_event is not None else threading.Event())
+                                  _cancel_event=cancel_event if cancel_event is not None else _RequestCancellation())
                 # Trust-resolved client identity (A6, pynext.proxy), same
                 # values as on ASGI: without trusted proxies these are just
                 # the direct connection values. The native listener is plain
@@ -438,7 +438,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
 
     def _bridge_inner(method, raw_path, query, headers, body, cancellation, client_ip=None):
         submitted_at = time.monotonic()
-        cancel_event = threading.Event()
+        cancel_event = _RequestCancellation()
         try:
             future = _submit(loop, call(method, raw_path, query, headers, body, submitted_at, client_ip, cancel_event))
         except RuntimeError:
@@ -448,7 +448,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
             deadline = time.monotonic() + REQUEST_TIMEOUT
             while True:
                 if cancellation.cancelled() or not loop.is_running():
-                    cancel_event.set()
+                    cancel_event.cancel(499 if cancellation.cancelled() else 503)
                     future.cancel()
                     app.metrics.observe_worker_timeout("unavailable")
                     response = Response("Service Unavailable", status=503)
@@ -458,7 +458,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                     break
                 except concurrent.futures.TimeoutError:
                     if time.monotonic() >= deadline:
-                        cancel_event.set()
+                        cancel_event.cancel(504)
                         future.cancel()
                         app.metrics.observe_worker_timeout("timeout")
                         response = Response("Gateway Timeout", status=504)
@@ -535,7 +535,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 websocket_auth_callback=ws_auth_callback,
                                 reuse_port=reuse_port,
                                 route_patterns=app.router.ordered_routes(),
-                                middleware_enabled=bool(app.middleware) or limiter is not None or app.hot_reload,
+                                middleware_enabled=bool(app.middleware) or app.hot_reload,
                                 shared_cache_enabled=app.isr.shared is not None,
                                 websocket_protocols=app.websocket_protocols,
                                 websocket_max_message=app.websocket_max_message, listener=listener,

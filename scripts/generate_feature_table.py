@@ -105,6 +105,8 @@ def public_api() -> list[tuple[str, str]]:
                     names = _string_tuple(node.value)
                     if names is not None:
                         all_names = names
+                elif isinstance(target, ast.Name):
+                    module_of[target.id] = ""
     return [(name, module_of.get(name, "?")) for name in all_names]
 
 
@@ -233,7 +235,8 @@ def render() -> str:
         "| --- | --- |",
     ]
     for symbol, module in api:
-        lines.append(f"| `{symbol}` | `pynext.{module}` |")
+        source = f"pynext.{module}" if module else "pynext"
+        lines.append(f"| `{symbol}` | `{source}` |")
     lines += [
         "",
         "## Security defaults (`SecurityConfig`)",

@@ -1,3 +1,5 @@
+__version__: str
+
 from .app import App as App, create_app as create_app
 from .auth import require_auth as require_auth, require_permission as require_permission
 from .client_dsl import ClientDSLCompileError as ClientDSLCompileError, compile_client_dsl as compile_client_dsl

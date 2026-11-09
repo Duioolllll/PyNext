@@ -1,6 +1,8 @@
 """Timed-out synchronous handlers remain bounded and observe cancellation."""
 import asyncio
+import logging
 import threading
+import time
 
 import httpx
 import pytest
@@ -19,8 +21,76 @@ def test_request_cancellation_prevents_framework_side_effects():
         asyncio.run(request.revalidate("/"))
 
 
+def test_cooperative_worker_exit_before_awaiter_cancellation_keeps_deadline_status(tmp_path, monkeypatch, caplog):
+    from pynext.http import _RequestCancellation
+
+    caplog.set_level(logging.INFO, logger="pynext")
+    route = tmp_path / "app/slow"
+    route.mkdir(parents=True)
+    (route / "route.py").write_text(
+        'from pynext import route, Response\n@route("GET")\n'
+        'def get(request):\n'
+        '    request._cancel_event.wait(5)\n'
+        '    request.check_cancelled()\n'
+        '    return Response("unexpected")\n')
+    cancel = _RequestCancellation.cancel
+
+    def yield_after_signalling(self, status):
+        cancel(self, status)
+        # Model a legal thread switch between setting the signal and
+        # cancelling the coroutine: cooperative work can finish first.
+        time.sleep(0.1)
+
+    monkeypatch.setattr(_RequestCancellation, "cancel", yield_after_signalling)
+    monkeypatch.setattr("pynext.server.REQUEST_TIMEOUT", 0.15)
+
+    async def run():
+        app = create_app(tmp_path)
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", trust_env=False) as client:
+                assert (await client.get("/slow")).status_code == 504
+            assert await app.wait_for_inflight(2)
+            assert app.metrics.snapshot()["routes"]["/slow"]["status"] == {"504": 1}
+            assert not any(record.msg == "Request failed" for record in caplog.records)
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.shutdown()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["asgi", "axum"])
+def test_unsignalled_cancellation_exception_remains_an_application_error(tmp_path, mode):
+    route = tmp_path / "app/error"
+    route.mkdir(parents=True)
+    (route / "route.py").write_text(
+        'from pynext import route, RequestCancelled\n@route("GET")\n'
+        'def get(): raise RequestCancelled("application error without cancellation")\n')
+
+    async def run():
+        app = create_app(tmp_path)
+        server = None
+        if mode == "axum":
+            server = start_native(app, asyncio.get_running_loop(), port=0)
+            client = httpx.AsyncClient(base_url=f"http://{server.address}", trust_env=False)
+        else:
+            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost")
+        try:
+            async with client:
+                assert (await asyncio.wait_for(client.get("/error"), 2)).status_code == 500
+            assert app.metrics.snapshot()["routes"]["/error"]["status"] == {"500": 1}
+        finally:
+            if server is not None:
+                await asyncio.to_thread(server.stop)
+            await app.shutdown()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("transport", ["native-timeout", "asgi-disconnect"])
-def test_cancelled_sync_work_keeps_capacity_until_thread_finishes(tmp_path, monkeypatch, transport):
+def test_cancelled_sync_work_keeps_capacity_until_thread_finishes(tmp_path, monkeypatch, caplog, transport):
+    caplog.set_level(logging.INFO, logger="pynext")
     folder = tmp_path / "app/api/slow"
     folder.mkdir(parents=True)
     (folder / "route.py").write_text(
@@ -70,6 +140,14 @@ def test_cancelled_sync_work_keeps_capacity_until_thread_finishes(tmp_path, monk
             assert await asyncio.to_thread(state["finished"].wait, 2)
             assert await app.wait_for_inflight(2)
             assert state["writes"] == []
+            expected_status = 504 if transport == "native-timeout" else 499
+            assert app.metrics.snapshot()["routes"]["/api/slow"]["status"] == {
+                str(expected_status): 1, "503": 1,
+            }
+            statuses = [record.status for record in caplog.records
+                        if record.name == "pynext" and record.msg == "request"
+                        and getattr(record, "route", None) == "/api/slow"]
+            assert sorted(statuses) == sorted([expected_status, 503])
             # Actual completion releases capacity for a new request.
             response = await app.dispatch(Request("POST", "/api/slow", _app=app))
             assert response.status == 200

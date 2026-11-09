@@ -67,12 +67,14 @@ import math
 import threading
 import time
 from collections import OrderedDict
+from contextvars import ContextVar
 
 from .http import Response
 from .proxy import ProxyTrust, parse_trusted_proxies
 
 _MAX_BUCKETS = 10_000
 _IPV6_PREFIX_LEN = 64
+_decoded_exemption: ContextVar[bool] = ContextVar("pynext_decoded_exemption", default=False)
 
 
 class RateLimitUnavailable(Exception):
@@ -85,7 +87,16 @@ def _is_exempt_path(limiter, path):
     decoded_exempt = getattr(limiter, "is_exempt_path", None)
     if decoded_exempt and (exempt is None or getattr(exempt, "__func__", None) is RateLimiter.is_exempt):
         return bool(decoded_exempt(path))
-    return bool(exempt and exempt(path))
+    if exempt is None:
+        return False
+    # Custom hooks may delegate to the query-aware public helper. Preserve
+    # the caller's decoded-path contract even through str(path) rewrites,
+    # without changing public is_exempt() calls outside this callback.
+    token = _decoded_exemption.set(True)
+    try:
+        return bool(exempt(path))
+    finally:
+        _decoded_exemption.reset(token)
 
 
 def _parse_trusted_proxies(trusted_proxies):
@@ -183,10 +194,17 @@ class RateLimiter:
         return self._trust.is_trusted(client_ip)
 
     def is_exempt(self, path):
-        """True when ``path`` (query string ignored) skips rate limiting."""
+        """Match a raw path/query, or the decoded path inside an exemption hook.
+
+        Adapter callbacks preserve a literal ``?`` even when an override
+        delegates here. Direct public calls retain query-aware matching.
+        """
         if not path:
             return False
-        return self.is_exempt_path(str(path).split("?", 1)[0])
+        value = str(path)
+        if not _decoded_exemption.get():
+            value = value.split("?", 1)[0]
+        return self.is_exempt_path(value)
 
     def is_exempt_path(self, path):
         """Match an already decoded URL path, preserving literal ``?`` characters."""

@@ -27,7 +27,7 @@ from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
 from .client import compile_client, read_client_artifacts
 from .components import _isr_policy, _isr_query_keys, _node, bind_islands
 from .build import discover, load_manifest
-from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
+from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
@@ -970,6 +970,13 @@ class App:
             if request.method == "HEAD":
                 response.body = b""
             return response
+        except RequestCancelled:
+            if request.cancelled:
+                # A cooperative worker may observe the signal before its
+                # awaiter is cancelled. Keep that normal exit out of the
+                # transport's application-error/500 conversion.
+                raise asyncio.CancelledError from None
+            raise
         except asyncio.CancelledError:
             request._cancel_event.set()
             raise
@@ -1047,6 +1054,11 @@ class App:
                 raise
             except _SyncHandlerBusy:
                 status = 503
+                raise
+            except (asyncio.CancelledError, RequestCancelled) as exc:
+                if isinstance(exc, asyncio.CancelledError) or request.cancelled:
+                    status = getattr(request._cancel_event, "status", 499)
+                    request_span.set_attribute("pynext.cancelled", True)
                 raise
             except Exception:
                 status = 500
