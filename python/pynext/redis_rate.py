@@ -16,9 +16,22 @@ local t = redis.call('TIME')
 -- Redis breaks sorted-set ties lexicographically by member, so a tie
 -- evicted the wrong bucket (its key hash sorts first) instead of the
 -- stalest one, and the evicted owner was then denied instead of getting
--- a fresh bucket. Two scripts can never run in the same microsecond,
--- so microsecond scores order strictly by last touch. PEXPIRE still
--- takes milliseconds, so the window is kept in ms separately.
+-- a fresh bucket. Microsecond scores order by last touch; a tie is
+-- still possible in principle — TIME is gettimeofday-based with
+-- microsecond resolution, so two atomic scripts can read the same
+-- microsecond — but tied buckets are equally stale at the resolution
+-- the clock provides, and the tie is broken deterministically by
+-- member (the bucket key hash), not at random. The evicted owner is
+-- never denied: it gets a fresh full bucket on its next request, so a
+-- tie can only change which equally-stale bucket is evicted, never
+-- whether a request is admitted. PEXPIRE still takes milliseconds,
+-- so the window is kept in ms separately.
+-- Precision: scores are integer microseconds since the epoch, held in
+-- Lua doubles. At the current epoch (~1.79e15 us) and even with the
+-- maximum one-year window (~1.83e15 us), the unit in the last place
+-- is 0.25 us, so integer microsecond scores are exact; they stay exact
+-- until 2^53 us (~year 2255). Realistic windows of minutes to hours
+-- are far inside the exact range.
 local now = t[1] * 1000000 + t[2]
 local limit = tonumber(ARGV[1])
 local window_ms = tonumber(ARGV[2])
@@ -37,7 +50,10 @@ if not row[1] then
   end
   -- Table full: evict the stalest active bucket instead of denying the
   -- new key. Its owner gets a fresh full bucket on its next request,
-  -- so table pressure can never deny an existing key.
+  -- so table pressure can never deny an existing key. ZRANGE returns
+  -- the lowest score; buckets tied on that score are ordered
+  -- lexicographically by member, so the choice among equally-stale
+  -- buckets is deterministic (see the TIME comment above).
   if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[3]) then
     local stalest = redis.call('ZRANGE', KEYS[2], 0, 0)
     if stalest[1] then
@@ -84,6 +100,19 @@ class RedisRateLimiter(RateLimiter):
     availability matters more than limiting. The process-local
     :class:`RateLimiter` never raises, so the policy only applies to
     this Redis-backed limiter.
+
+    Bucket scores are integer microseconds since the epoch, taken from
+    Redis ``TIME`` and held in Lua doubles. Two scripts can read the
+    same microsecond in principle (``TIME`` is gettimeofday-based), so
+    tied buckets are possible; tied buckets are equally stale at the
+    clock's resolution and Redis orders equal scores lexicographically
+    by member, so eviction among ties is deterministic and the evicted
+    owner is never denied — it gets a fresh bucket on its next request.
+    Scores stay exact integers well beyond the maximum one-year window
+    (at the current epoch the unit in the last place is 0.25 µs, and
+    integer microseconds stay exact until 2^53 µs, ~year 2255), so
+    realistic windows of minutes to hours are unaffected by
+    double-precision limits.
     """
 
     blocking = True
