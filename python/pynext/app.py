@@ -1028,7 +1028,7 @@ class App:
                 if "query" in inspect.signature(fn).parameters and not query_keys:
                     raise ValueError(f"Page {spec['entry']} needs ISR query_keys to accept query")
                 if mode == "ssg":
-                    is_dynamic = any(segment.startswith("[") for segment in pattern.split("/"))
+                    is_dynamic = any("[" in segment for segment in pattern.split("/"))
                     generator = getattr(module, "generate_static_params", None)
                     if dynamic == "force-dynamic":
                         # Served dynamically in production, so no generator

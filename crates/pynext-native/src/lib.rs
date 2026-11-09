@@ -1767,7 +1767,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     let cache_control = state
                         .websocket_router
                         .matches(&path)
-                        .and_then(|(pattern, _)| state.isr_cache_control.get(&pattern))
+                        .and_then(|(pattern, _, _)| state.isr_cache_control.get(&pattern))
                         .cloned()
                         .unwrap_or_else(|| {
                             HeaderValue::from_static("public, max-age=0, must-revalidate")
