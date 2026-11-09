@@ -1048,6 +1048,10 @@ class App:
             except _SyncHandlerBusy:
                 status = 503
                 raise
+            except asyncio.CancelledError:
+                status = getattr(request._cancel_event, "status", 499)
+                request_span.set_attribute("pynext.cancelled", True)
+                raise
             except Exception:
                 status = 500
                 raise

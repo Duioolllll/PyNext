@@ -22,6 +22,19 @@ class RequestCancelled(RuntimeError):
     """The client disconnected or the request's execution deadline expired."""
 
 
+class _RequestCancellation(threading.Event):
+    """Cooperative signal with the transport's access-log cancellation status."""
+
+    def __init__(self):
+        super().__init__()
+        self.status = 499
+
+    def cancel(self, status):
+        # Set the reason before notifying the worker/cancelling its awaiter.
+        self.status = status
+        self.set()
+
+
 #: Methods that never change server state and are exempt from CSRF checks.
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
@@ -798,7 +811,7 @@ class Request:
     params: dict = field(default_factory=dict)
     _app: object = field(default=None, repr=False, compare=False)
     state: dict = field(default_factory=dict, compare=False)
-    _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+    _cancel_event: threading.Event = field(default_factory=_RequestCancellation, repr=False, compare=False)
 
     @property
     def cancelled(self) -> bool:

@@ -1,5 +1,6 @@
 """Timed-out synchronous handlers remain bounded and observe cancellation."""
 import asyncio
+import logging
 import threading
 
 import httpx
@@ -20,7 +21,8 @@ def test_request_cancellation_prevents_framework_side_effects():
 
 
 @pytest.mark.parametrize("transport", ["native-timeout", "asgi-disconnect"])
-def test_cancelled_sync_work_keeps_capacity_until_thread_finishes(tmp_path, monkeypatch, transport):
+def test_cancelled_sync_work_keeps_capacity_until_thread_finishes(tmp_path, monkeypatch, caplog, transport):
+    caplog.set_level(logging.INFO, logger="pynext")
     folder = tmp_path / "app/api/slow"
     folder.mkdir(parents=True)
     (folder / "route.py").write_text(
@@ -70,6 +72,14 @@ def test_cancelled_sync_work_keeps_capacity_until_thread_finishes(tmp_path, monk
             assert await asyncio.to_thread(state["finished"].wait, 2)
             assert await app.wait_for_inflight(2)
             assert state["writes"] == []
+            expected_status = 504 if transport == "native-timeout" else 499
+            assert app.metrics.snapshot()["routes"]["/api/slow"]["status"] == {
+                str(expected_status): 1, "503": 1,
+            }
+            statuses = [record.status for record in caplog.records
+                        if record.name == "pynext" and record.msg == "request"
+                        and getattr(record, "route", None) == "/api/slow"]
+            assert sorted(statuses) == sorted([expected_status, 503])
             # Actual completion releases capacity for a new request.
             response = await app.dispatch(Request("POST", "/api/slow", _app=app))
             assert response.status == 200
