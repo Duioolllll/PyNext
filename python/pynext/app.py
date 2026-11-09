@@ -26,7 +26,7 @@ from .auth import check_authorization
 from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
 from .client import compile_client, read_client_artifacts
 from .components import _isr_policy, _isr_query_keys, _node, bind_islands
-from .build import discover, load_manifest
+from .build import _config_error, _short_repr, discover, load_manifest
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
@@ -173,9 +173,17 @@ def _load(root, relative, namespace):
 def _check_signature(fn, allowed, label):
     for p in inspect.signature(fn).parameters.values():
         if p.kind in (p.POSITIONAL_ONLY, p.VAR_POSITIONAL, p.VAR_KEYWORD):
-            raise ValueError(f"{label} must use named parameters from {sorted(allowed)}")
+            raise ValueError(_config_error(
+                f"{label} must use named parameters from {sorted(allowed)}",
+                [("parameter", p.name)],
+                [f"Change {p.name!r} to a named parameter",
+                 f"Remove {p.name!r} or give it a default value"]))
         if p.name not in allowed and p.default is p.empty:
-            raise ValueError(f"Unsupported required parameter {p.name!r} in {label}")
+            raise ValueError(_config_error(
+                f"Unsupported required parameter {p.name!r} in {label}",
+                [("allowed", sorted(allowed))],
+                [f"Remove the {p.name!r} parameter from {label}",
+                 f"Give {p.name!r} a default value to make it optional"]))
 
 
 async def _invoke(fn, **values):
@@ -512,52 +520,101 @@ class App:
             if spec["kind"] == "page":
                 fn = getattr(module, "Page", None)
                 if not callable(fn) or not getattr(fn, "__pynext_page__", False):
-                    raise ValueError(f"{spec['entry']} must export a @page() Page function")
+                    raise ValueError(_config_error(
+                        f"{spec['entry']} must export a @page() Page function",
+                        [("route", pattern)],
+                        [f"Add a @page() decorated Page function to {spec['entry']}"]))
                 _check_signature(fn, {"request", "params", "query"}, spec["entry"])
                 mode = getattr(fn, "__pynext_render__", "ssr")
                 if mode not in {"ssr", "ssg", "isr"}:
-                    raise ValueError(f"Unsupported render mode in {spec['entry']}")
+                    raise ValueError(_config_error(
+                        f"Unsupported render mode {mode!r} in {spec['entry']}",
+                        [("route", pattern)],
+                        ["Change @page(render=...) to 'ssr', 'ssg', or 'isr' in "
+                         f"{spec['entry']}"]))
                 if mode in {"ssg", "isr"} and "request" in inspect.signature(fn).parameters:
-                    raise ValueError(f"{mode.upper()} page {spec['entry']} cannot accept request")
+                    raise ValueError(_config_error(
+                        f"{mode.upper()} page {spec['entry']} cannot accept request",
+                        [("route", pattern)],
+                        [f"Remove the request parameter from Page in {spec['entry']}",
+                         "SSG and ISR pages are rendered without a request"]))
                 if mode in {"ssg", "isr"} and getattr(fn, "__pynext_auth__", False):
-                    raise ValueError(f"{mode.upper()} page {spec['entry']} cannot require authentication")
+                    raise ValueError(_config_error(
+                        f"{mode.upper()} page {spec['entry']} cannot require authentication",
+                        [("route", pattern)],
+                        [f"Remove @require_auth from Page in {spec['entry']}",
+                         "Change render to 'ssr' if the page needs authentication"]))
                 self.render_modes[pattern] = mode
                 if mode == "isr":
                     policy = getattr(fn, "__pynext_cache_policy__", None)
                     if not isinstance(policy, dict) or set(policy) != {"revalidate", "stale"}:
-                        raise ValueError(f"Invalid ISR policy in {spec['entry']}")
+                        raise ValueError(_config_error(
+                            f"Invalid ISR policy in {spec['entry']}",
+                            [("route", pattern), ("got", _short_repr(policy))],
+                            ["Use @page(render='isr', revalidate=<positive seconds>, "
+                             "stale=<non-negative seconds>) in " + spec["entry"]]))
                     try:
                         policy = _isr_policy(policy["revalidate"], policy["stale"])
                     except ValueError as exc:
-                        raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
+                        raise ValueError(_config_error(
+                            f"Invalid ISR policy in {spec['entry']}: {exc}",
+                            [("route", pattern),
+                             ("got", _short_repr(getattr(fn, "__pynext_cache_policy__", None)))],
+                            ["Use @page(render='isr', revalidate=<positive seconds>, "
+                             "stale=<non-negative seconds>) in " + spec["entry"]])) from exc
                     if getattr(module, "generate_static_params", None) is not None:
-                        raise ValueError(f"ISR page {spec['entry']} cannot export generate_static_params yet")
+                        raise ValueError(_config_error(
+                            f"ISR page {spec['entry']} cannot export generate_static_params yet",
+                            [("route", pattern)],
+                            [f"Remove generate_static_params from {spec['entry']}"]))
                     self.isr_policies[pattern] = policy
                     try:
                         query_keys = _isr_query_keys(getattr(fn, "__pynext_cache_query__", ()))
                     except ValueError as exc:
-                        raise ValueError(f"Invalid ISR query keys in {spec['entry']}: {exc}") from exc
+                        raise ValueError(_config_error(
+                            f"Invalid ISR query keys in {spec['entry']}: {exc}",
+                            [("route", pattern),
+                             ("got", _short_repr(getattr(fn, "__pynext_cache_query__", ())))],
+                            ["Pass query_keys as a list of up to 16 unique names matching "
+                             "[A-Za-z][A-Za-z0-9_-]{0,63}"])) from exc
                     self.isr_queries[pattern] = query_keys
                 else:
                     query_keys = []
                 if "query" in inspect.signature(fn).parameters and not query_keys:
-                    raise ValueError(f"Page {spec['entry']} needs ISR query_keys to accept query")
+                    raise ValueError(_config_error(
+                        f"Page {spec['entry']} needs ISR query_keys to accept query",
+                        [("route", pattern)],
+                        [f"Add query_keys=(...) to @page(render='isr', ...) in {spec['entry']}",
+                         f"Remove the query parameter from Page in {spec['entry']}"]))
                 if mode == "ssg":
                     dynamic = any(segment.startswith("[") for segment in pattern.split("/"))
                     generator = getattr(module, "generate_static_params", None)
                     if dynamic and (not callable(generator) or inspect.signature(generator).parameters):
-                        raise ValueError(f"Dynamic SSG page {spec['entry']} must export generate_static_params() with no arguments")
+                        raise ValueError(_config_error(
+                            f"Dynamic SSG page {spec['entry']} must export generate_static_params() with no arguments",
+                            [("route", pattern)],
+                            [f"Define generate_static_params() with no arguments in {spec['entry']}"]))
                     if not dynamic and generator is not None:
-                        raise ValueError(f"Static SSG page {spec['entry']} cannot export generate_static_params")
+                        raise ValueError(_config_error(
+                            f"Static SSG page {spec['entry']} cannot export generate_static_params",
+                            [("route", pattern)],
+                            [f"Remove generate_static_params from {spec['entry']}",
+                             "Make the route dynamic by adding a [param] segment to its directory name"]))
                     self.static_generators[pattern] = generator
                 layouts = []
                 for relative in spec["layouts"]:
                     layout_fn = getattr(self._module(relative), "Layout", None)
                     if not callable(layout_fn) or not getattr(layout_fn, "__pynext_layout__", False):
-                        raise ValueError(f"{relative} must export a @layout Layout function")
+                        raise ValueError(_config_error(
+                            f"{relative} must export a @layout Layout function",
+                            [("route", pattern)],
+                            [f"Add a @layout decorated Layout function to {relative}"]))
                     _check_signature(layout_fn, {"children"}, relative)
                     if "children" not in inspect.signature(layout_fn).parameters:
-                        raise ValueError(f"{relative} must accept children")
+                        raise ValueError(_config_error(
+                            f"{relative} must accept children",
+                            [("route", pattern)],
+                            [f"Add a children parameter to Layout in {relative}"]))
                     layouts.append(layout_fn)
                 self.entries[pattern] = (fn, layouts)
             else:
@@ -567,32 +624,59 @@ class App:
                     method = getattr(fn, "__pynext_method__", None)
                     if method and fn.__module__ == module.__name__:
                         if method in handlers:
-                            raise ValueError(f"Duplicate {method} handler in {spec['entry']}")
+                            raise ValueError(_config_error(
+                                f"Duplicate {method} handler in {spec['entry']}",
+                                [("route", pattern)],
+                                [f"Keep only one @route({method!r}) handler in {spec['entry']}",
+                                 "Remove the duplicate handler function"]))
                         _check_signature(fn, {"request", "params"}, spec["entry"])
                         handlers[method] = fn
                     if getattr(fn, "__pynext_websocket__", False) and fn.__module__ == module.__name__:
                         if ws_handler is not None:
-                            raise ValueError(f"Duplicate WebSocket handler in {spec['entry']}")
+                            raise ValueError(_config_error(
+                                f"Duplicate WebSocket handler in {spec['entry']}",
+                                [("route", pattern)],
+                                [f"Keep only one @websocket handler in {spec['entry']}",
+                                 "Remove the duplicate handler function"]))
                         _check_signature(fn, {"websocket", "params"}, spec["entry"])
                         ws_handler = fn
                 if not handlers and ws_handler is None:
-                    raise ValueError(f"{spec['entry']} has no @route handlers")
+                    raise ValueError(_config_error(
+                        f"{spec['entry']} has no @route handlers",
+                        [("route", pattern)],
+                        [f"Add at least one @route('GET') handler to {spec['entry']}",
+                         f"Add a @websocket handler to {spec['entry']} to serve WebSocket connections"]))
                 if ws_handler is not None:
                     self.websocket_entries[pattern] = ws_handler
                 self.entries[pattern] = handlers
         if production:
             from .build import read_static_pages
             if manifest.get("render_modes") != self.render_modes:
-                raise ValueError("Render modes changed since build; run `pynext build` again")
+                raise ValueError(_config_error(
+                    "Render modes changed since build",
+                    [("manifest", ".pynext/manifest.json")],
+                    ["Run `pynext build` again"]))
             if manifest.get("isr_policies") != self.isr_policies:
-                raise ValueError("ISR policies changed since build; run `pynext build` again")
+                raise ValueError(_config_error(
+                    "ISR policies changed since build",
+                    [("manifest", ".pynext/manifest.json")],
+                    ["Run `pynext build` again"]))
             if manifest.get("isr_queries") != self.isr_queries:
-                raise ValueError("ISR query keys changed since build; run `pynext build` again")
+                raise ValueError(_config_error(
+                    "ISR query keys changed since build",
+                    [("manifest", ".pynext/manifest.json")],
+                    ["Run `pynext build` again"]))
             self.client_manifest, self.client_assets = read_client_artifacts(self.root, manifest)
             self.static_pages = read_static_pages(self.root, manifest, self.router)
             self.public_assets = read_public_artifacts(self.root, manifest)
-            if set(self.static_pages).intersection(self.public_assets):
-                raise ValueError("A public file conflicts with a generated page; rebuild the application")
+            conflicting = set(self.static_pages).intersection(self.public_assets)
+            if conflicting:
+                path = sorted(conflicting)[0]
+                raise ValueError(_config_error(
+                    f"A public file conflicts with a generated page: {path}",
+                    [("public file", f"public{path}"), ("generated page", path)],
+                    ["Rename or move the public file so its URL does not match the generated page",
+                     "Rebuild the application after changing generate_static_params"]))
         else:
             self.public_assets = read_public_sources(self.root, manifest["public_sources"])
             self.client_manifest, self.client_assets = compile_client(self.root, manifest["client_sources"])
