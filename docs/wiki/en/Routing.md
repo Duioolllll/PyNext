@@ -21,7 +21,44 @@ app/
 - `[...path]` passes a nonempty list of strings: `params["path"] == ["a", "b"]`.
 - A dynamic parameter may carry a static prefix and/or suffix: `v[version]` matches `/v2`, `[name].json` matches `/report.json`. The middle must be nonempty; catch-all parameters cannot carry a prefix or suffix. Affixed segments outrank a bare dynamic segment, and a static segment still wins over both.
 - Parameter conflicts are checked; syntactically different names may normalize to the same route slot.
-- **Unsupported:** optional catch-all (`[[...slug]]`), route groups, parallel routes, intercepting routes and client-side navigation.
+- **Unsupported:** parallel routes, intercepting routes and client-side navigation.
+
+## Reverse routing
+
+`pynext.url_for(pattern, params)` builds a URL from a route pattern (the public form of the build-internal static-path materialisation). Parameter names must match the pattern exactly; catch-all parameters take a list of segments, and an optional catch-all takes an empty list for "no segments". Every value is percent-encoded per segment, so a value can never smuggle a `/`, `?` or `#` into the URL.
+
+~~~python
+from pynext import url_for
+
+url_for("/blog/[slug]", {"slug": "a b"})            # "/blog/a%20b"
+url_for("/docs/[[...path]]", {"path": []})          # "/docs"
+url_for("/docs/[...path]", {"path": ["a", "b"]})    # "/docs/a/b"
+~~~
+
+Pass a `router` (a `pynext._native.Router` holding the pattern) to verify the generated URL matches the pattern it was built from. A missing or extra parameter, or a value containing `/`, `?`, `#`, a control character, `.` or `..`, raises `ValueError`.
+
+## Custom routes
+
+`create_app(..., custom_routes={...})` accepts minimal redirects, rewrites and headers. Sources use the same `[slug]` / `[...rest]` / `[[...rest]]` segment grammar as file routes; destinations interpolate parameters as `[name]`. Rules are compiled and validated at startup — a bad source, a destination naming an unknown parameter, or a malformed header fails `create_app()` instead of failing per request. `has` / `missing` conditions are not supported.
+
+~~~python
+app = create_app(root, custom_routes={
+    "redirects": [
+        {"source": "/old/[slug]", "destination": "/blog/[slug]", "permanent": True},
+    ],
+    "rewrites": [
+        {"source": "/legacy/[slug]", "destination": "/blog/[slug]"},
+    ],
+    "headers": [
+        {"source": "/blog/[slug]",
+         "headers": [{"key": "Cache-Control", "value": "public, max-age=3600"}]},
+    ],
+})
+~~~
+
+- **Redirects** answer 308 when `permanent` is true, 307 otherwise, and preserve the request query string when the destination has none. Destinations may be absolute `http(s)` URLs; rewrite destinations must start with `/`.
+- **Rewrites** serve the destination path as if it had been requested. A list means the `beforeFiles` phase; a `{"beforeFiles": [...], "afterFiles": [...], "fallback": [...]}` object selects phases explicitly, in Next.js order: redirect → rewrite (`beforeFiles`) → file/route check → rewrite (`afterFiles`) → rewrite (`fallback`). At most one rewrite applies per request, so rewrites cannot chain or loop.
+- **Headers** apply to every response whose requested path matches, including redirects and 404s.
 
 Example page:
 

@@ -1084,29 +1084,13 @@ def _segment_param(segment):
     """Parse one route segment.
 
     Returns (name, kind, prefix, suffix) where kind is "dynamic",
-    "catch_all" or "optional", or None for a static segment. A dynamic
-    parameter may carry a static prefix and/or suffix, as in
-    ``v[version]`` or ``[name].json`` (Next.js PARAMETER_PATTERN in
-    ``get-dynamic-param.ts``); catch-all parameters may not.
+    "catch_all" or "optional", or None for a static segment. Delegates to
+    ``pynext.routing`` so build-time parsing and public ``url_for()``
+    share one grammar.
     """
-    if "[" not in segment:
-        if "]" in segment:
-            raise ValueError(f"Invalid route segment: {segment}")
-        return None
-    match = re.fullmatch(r"([^[]*)\[(\[)?(\.\.\.)?([A-Za-z0-9_-]+)\](\])?(.*)", segment)
-    if match is None:
-        raise ValueError(f"Invalid route segment: {segment}")
-    prefix, double_open, dots, name, double_close, suffix = match.groups()
-    if bool(double_open) != bool(double_close):
-        raise ValueError(f"Invalid route segment: {segment}")
-    if double_open and not dots:
-        raise ValueError(f"Optional catch-all must use [[...name]]: {segment}")
-    if "]" in prefix or "[" in suffix or "]" in suffix:
-        raise ValueError(f"Invalid route segment: {segment}")
-    kind = "optional" if double_open else ("catch_all" if dots else "dynamic")
-    if kind != "dynamic" and (prefix or suffix):
-        raise ValueError(f"Catch-all parameters cannot have a prefix or suffix: {segment}")
-    return name, kind, prefix, suffix
+    from .routing import _segment_param as _parse_segment
+
+    return _parse_segment(segment)
 
 
 def _route_group(part):
@@ -1311,8 +1295,12 @@ def find_unreachable_routes(routes):
     return unreachable
 
 
-def _materialize(pattern, params, entry):
+def _materialize(pattern, params, entry=None):
     segments = pattern.strip("/").split("/") if pattern != "/" else []
+    # Without an entry (file) the pattern itself labels the error
+    # details: _materialize is also the 2-arg helper behind
+    # url_for() and the dev static-path check, which have no file.
+    entry = entry if entry is not None else pattern
     keys = {}
     seen = set()
     for segment in segments:
@@ -1381,7 +1369,6 @@ def _materialize(pattern, params, entry):
                     ["Return a valid UTF-8 string for the parameter"])) from exc
             output.append(prefix + part + suffix)
     return "/" + "/".join(output)
-
 
 async def _materialize_params(app, pattern, generator):
     """Call a ``generate_static_params`` generator and materialize its paths.
@@ -1579,6 +1566,19 @@ async def _render_static_pages(app):
                 rendered_params[path] = params
             except Exception as exc:
                 failures.append((path if path is not None else f"{pattern} {params}", exc))
+    if failures:
+        # A build whose every failure is a prerender bailout (dynamic
+        # access in dynamic="error" mode) fails with the bailout itself,
+        # as before staging: callers distinguish it from a page bug via
+        # is_prerender_bailout(), and the CLI still reports it cleanly
+        # (StaticGenBailoutError is a ValueError). Mixed or real page
+        # failures aggregate into one staged BuildError instead.
+        if all(is_prerender_bailout(exc) for _label, exc in failures):
+            raise failures[0][1]
+        lines = "\n".join(f"  {label}: {exc}" for label, exc in failures)
+        raise BuildError(
+            "render",
+            f"{len(failures)} static page(s) failed to render:\n{lines}") from failures[0][1]
     return rendered
 
 

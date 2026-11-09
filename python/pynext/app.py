@@ -53,6 +53,7 @@ from .fetch_cache import FetchCache, fetch_cache_scope
 from .request_memo import clear_request_memo, ensure_request_memo, request_memo_scope
 from .matcher import compile_header_rules, compile_middleware_entries
 from .middleware import MAX_MIDDLEWARE_REWRITES, MiddlewareResult, ScopedMiddleware
+from .custom_routes import compile_custom_routes
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .observability import (
     MetricsCollector,
@@ -1054,6 +1055,7 @@ class App:
                  sync_queue_limit=None, render_workers=None, session_workers=None,
                  strict_ssg=False, headers=None,
                  revalidate_secret=None, base_path="", trailing_slash="redirect", reuse_client=None,
+                 custom_routes=None,
                  body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms,
                  handler_timeout_ms=DEFAULT_CONFIG.handler_timeout_ms,
                  response_timeout_ms=DEFAULT_CONFIG.response_timeout_ms):
@@ -1124,6 +1126,9 @@ class App:
         # here so a bad deployment fails at startup.
         self.base_path = normalize_base_path(base_path)
         self.trailing_slash = validate_trailing_slash(trailing_slash)
+        # Custom routes (redirects / rewrites / headers) are compiled
+        # here so a bad rule fails startup instead of failing per request.
+        self.custom_routes = compile_custom_routes(custom_routes)
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
         if not isinstance(strict_ssg, bool):
@@ -3775,6 +3780,7 @@ class App:
                 apply_cors_headers(request, response, config=self.security)
             apply_path_headers(response, request.path, path_headers=self.path_headers)
             apply_security_headers(response, config=self.security, production=self.production)
+            self.custom_routes.apply_to_response(response, request.path)
             if request.method == "HEAD":
                 if isinstance(response, StreamingResponse):
                     await response.aclose()
@@ -3785,12 +3791,14 @@ class App:
             self._apply_path_headers(request, preflight)
             apply_path_headers(preflight, request.path, path_headers=self.path_headers)
             apply_security_headers(preflight, config=self.security, production=self.production)
+            self.custom_routes.apply_to_response(preflight, request.path)
             return preflight
         response = await self._dispatch_timed(request)
         self._apply_path_headers(request, response)
         apply_cors_headers(request, response, config=self.security)
         apply_path_headers(response, request.path, path_headers=self.path_headers)
         apply_security_headers(response, config=self.security, production=self.production)
+        self.custom_routes.apply_to_response(response, request.path)
         return response
 
     async def _dispatch_timed(self, request, handler=None):
@@ -3885,9 +3893,33 @@ class App:
                     "rate_limit": rate_limit_outcome,
                 })
 
-    async def _dispatch(self, request):
+    async def _dispatch(self, request, _rewritten=False):
         """Return a response. Streaming pages return a StreamingResponse."""
         path = request.path
+        # Custom routes, Next.js resolve-routes order: redirect ->
+        # rewrite.beforeFiles -> file/route check -> afterFiles ->
+        # fallback. The file/route check is the public-asset and
+        # router matching below; afterFiles/fallback run at the
+        # route miss at the end of this method. Only one rewrite
+        # applies per request (``_rewritten``), so rewrites cannot
+        # chain or loop.
+        if self.custom_routes and not _rewritten:
+            redirect = self.custom_routes.match_redirect(path)
+            if redirect is not None:
+                status, location = redirect
+                route_var.set("__redirect__")
+                target = location.encode("ascii")
+                if "?" not in location and request.query_string:
+                    if any(c < 32 or c == 127 for c in request.query_string):
+                        return Response("Bad Request", status=400)
+                    target += b"?" + request.query_string
+                return Response("", status=status, headers=[(b"location", target)])
+            rewritten = self.custom_routes.match_rewrite(path, "beforeFiles")
+            if rewritten is not None:
+                route_var.set("__rewrite__")
+                path = rewritten
+                request = Request(request.method, rewritten, request.query_string, request.headers,
+                                  request.body, {}, self, request.state, request._cancel_event)
         # Matching runs on the per-segment decoded form (Next.js
         # decodePathParams): static segments compare decoded, while an
         # encoded delimiter stays one segment. The encoded path is kept
@@ -4023,6 +4055,15 @@ class App:
                                   extra_headers=[(b"x-content-type-options", b"nosniff")])
         match = self.router.matches(match_path)
         if match is None:
+            if self.custom_routes and not _rewritten:
+                for phase in ("afterFiles", "fallback"):
+                    rewritten = self.custom_routes.match_rewrite(path, phase)
+                    if rewritten is not None:
+                        route_var.set("__rewrite__")
+                        rewritten_request = Request(
+                            request.method, rewritten, request.query_string, request.headers,
+                            request.body, {}, self, request.state, request._cancel_event)
+                        return await self._dispatch(rewritten_request, _rewritten=True)
             route_var.set("__not_found__")
             if _accepts_html(request):
                 return await self._not_found_page_response(request, None, {})
@@ -4836,7 +4877,7 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                trusted_proxies=None, sync_workers=32, sync_wait_timeout=ASGI_DECISION_TIMEOUT,
                sync_queue_limit=None, render_workers=None, session_workers=None,
                strict_ssg=False, headers=None,
-               revalidate_secret=None, base_path="", trailing_slash="redirect",
+               revalidate_secret=None, base_path="", trailing_slash="redirect", custom_routes=None,
                body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms,
                handler_timeout_ms=DEFAULT_CONFIG.handler_timeout_ms,
                response_timeout_ms=DEFAULT_CONFIG.response_timeout_ms):
@@ -4858,4 +4899,4 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                headers=headers, revalidate_secret=revalidate_secret,
                body_timeout_ms=body_timeout_ms, handler_timeout_ms=handler_timeout_ms,
                response_timeout_ms=response_timeout_ms, cache_handler=cache_handler,
-               base_path=base_path, trailing_slash=trailing_slash)
+               base_path=base_path, trailing_slash=trailing_slash, custom_routes=custom_routes)

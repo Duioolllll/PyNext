@@ -2,6 +2,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from os import PathLike
 from typing import Any, Literal
 from .http import PathHeaderRuleInput, PathHeaders, Request, Response, SecurityConfig
+from .custom_routes import CustomRoutes
 from .fetch_cache import FetchCache
 from .matcher import HeaderRule, Scope, ScopedMiddleware
 from .observability import MetricsCollector, ObservabilityConfig
@@ -25,6 +26,7 @@ class App:
     security: SecurityConfig
     path_headers: PathHeaders
     proxy_trust: ProxyTrust
+    custom_routes: CustomRoutes
     resources: Mapping[str, Resource]
     metrics: MetricsCollector
     middleware: tuple[Middleware, ...]
@@ -48,7 +50,8 @@ class App:
                  strict_ssg: bool = ...,
                  revalidate_secret: str | None = ..., base_path: str = ...,
                  trailing_slash: Literal["redirect", "ignore"] = ..., body_timeout_ms: int = ...,
-                 handler_timeout_ms: int = ..., response_timeout_ms: int = ...) -> None: ...
+                 handler_timeout_ms: int = ..., response_timeout_ms: int = ...,
+                 custom_routes: dict[str, Any] | None = ...) -> None: ...
     def configure_observability(self, config: ObservabilityConfig) -> App: ...
     async def startup(self) -> None: ...
     async def shutdown(self) -> None: ...
@@ -88,4 +91,5 @@ def create_app(root: str | PathLike[str] = ..., *, production: bool = ...,
                strict_ssg: bool = ...,
                revalidate_secret: str | None = ..., base_path: str = ...,
                trailing_slash: Literal["redirect", "ignore"] = ..., body_timeout_ms: int = ...,
-               handler_timeout_ms: int = ..., response_timeout_ms: int = ...) -> App: ...
+               handler_timeout_ms: int = ..., response_timeout_ms: int = ...,
+               custom_routes: dict[str, Any] | None = ...) -> App: ...
