@@ -1243,7 +1243,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         "Too Many Requests",
                         &state.security_headers,
                     );
-                    if let Ok(value) = HeaderValue::from_str(&retry_after.unwrap_or(1).max(1).to_string()) {
+                    if let Ok(value) =
+                        HeaderValue::from_str(&retry_after.unwrap_or(1).max(1).to_string())
+                    {
                         response.headers_mut().insert(header::RETRY_AFTER, value);
                     }
                     return response;
