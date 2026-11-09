@@ -13,7 +13,7 @@ from .app import _decode_path, _invoke, _split_request_path, _typed_params
 from .config import DEFAULT_CONFIG
 from .errors import SignalError, digest_for_error
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
-                   WebSocketDisconnect, _RequestCancellation, apply_path_headers,
+                   WebSocketDisconnect, _RequestCancellation, apply_path_headers, build_headers,
                    apply_security_headers, filter_internal_headers, security_headers)
 from .observability import begin_request_context, get_request_id, queue_wait_var
 from .ratelimit import _is_exempt_path
@@ -574,6 +574,13 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 security_headers=security_headers(config=app.security,
                                                                   production=app.production),
                                 path_headers=app.path_headers.for_native(),
+                                # The Rust layer serves static assets and
+                                # static HTML itself, so it needs the build
+                                # identity headers up front; bridge responses
+                                # already carry them from Python dispatch.
+                                build_headers=build_headers(
+                                    build_id=getattr(app, "build_id", None),
+                                    deployment_id=getattr(app, "deployment_id", None)),
                                 drain_timeout_secs=shutdown_timeout)
 
 
@@ -638,7 +645,19 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               header_read_timeout_ms=header_read_timeout_ms,
                               body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
                               shutdown_timeout=shutdown_timeout, max_waiting=max_waiting)
-        print(f"PyNext listening on http://{server.address}", flush=True)
+        # The build identity rides on the first log line, so an operator
+        # sees at a glance which build (and deployment) just started.
+        # It goes before the address so the address stays the last token.
+        listening = "PyNext listening"
+        build_id = getattr(app, "build_id", None)
+        if build_id is not None:
+            listening += f" (build {build_id}"
+            deployment_id = getattr(app, "deployment_id", None)
+            if deployment_id is not None:
+                listening += f", deployment {deployment_id}"
+            listening += ")"
+        listening += f" on http://{server.address}"
+        print(listening, flush=True)
         # A standalone bundle records its provenance in
         # bundle-manifest.json next to the app dir; log it (and warn on
         # a Python/PyNext version mismatch) after the listening line so

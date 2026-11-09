@@ -14,6 +14,8 @@ class App:
     hot_reload: bool
     sync_workers: int
     websocket_max_message: int
+    build_id: str | None
+    deployment_id: str | None
     security: SecurityConfig
     path_headers: PathHeaders
     proxy_trust: ProxyTrust

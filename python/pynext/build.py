@@ -22,6 +22,10 @@ log = logging.getLogger("pynext")
 MANIFEST = ".pynext/manifest.json"
 BUILD_ID_FILE = ".pynext/BUILD_ID"
 LOCK_FILE = ".pynext/.build.lock"
+# A build ID is 16 lowercase hex chars: short enough for a header value
+# and an asset URL, long enough to be unique per source set.
+BUILD_ID_LENGTH = 16
+MAX_DEPLOYMENT_ID_LENGTH = 128
 VERSION = 10
 MAX_STATIC_PAGES = 10_000
 # One cap for every static page rendered at build time, streaming or
@@ -301,6 +305,74 @@ def _hash(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def generate_build_id(manifest):
+    """Deterministic build ID from the manifest's source hashes.
+
+    SHA-256 over the canonical JSON of every source hash (app, public and
+    island sources), first 16 hex chars. Same sources give the same ID,
+    so a rebuild is reproducible; any source change gives a new ID.
+    Like Next.js's ``generateBuildId`` avoiding ``/ad/i``, an ID
+    containing ``ad`` (case-insensitive) is re-hashed with a counter
+    suffix, so an ad blocker never matches the ID inside an asset URL.
+    """
+    inputs = {key: manifest.get(key, {}) for key in ("sources", "public_sources", "client_sources")}
+    counter = 0
+    while True:
+        payload = json.dumps(inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        if counter:
+            payload += f"\0{counter}"
+        candidate = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:BUILD_ID_LENGTH]
+        if "ad" not in candidate.lower():
+            return candidate
+        counter += 1
+
+
+def _validate_deployment_id(value):
+    """True when ``value`` is a usable deployment ID.
+
+    1-128 printable ASCII characters without whitespace, so it is safe
+    in a header value, in JSON and on a log line.
+    """
+    return (isinstance(value, str) and 0 < len(value) <= MAX_DEPLOYMENT_ID_LENGTH
+            and all(33 <= ord(c) <= 126 for c in value))
+
+
+def resolve_deployment_id(explicit=None):
+    """Resolve the deployment ID: explicit value, ``PYNEXT_DEPLOYMENT_ID``, else None.
+
+    A deployment ID is an operator-chosen label (for example a rolling
+    deploy's replica-set name) that names the deployment a build belongs
+    to, separate from the build ID that names the build's sources.
+    """
+    value = explicit if explicit is not None else os.environ.get("PYNEXT_DEPLOYMENT_ID")
+    if value is None:
+        return None
+    if not _validate_deployment_id(value):
+        raise ValueError(
+            "Deployment ID must be 1-128 printable ASCII characters without whitespace")
+    return value
+
+
+def read_build_id(root):
+    """Return the build ID recorded by the last successful build, else None.
+
+    The ID lives in the build manifest (``manifest["build_id"]``); the
+    ``.pynext/BUILD_ID`` file holds the manifest-integrity seal (the
+    SHA-256 of the manifest bytes), not the build ID.
+    """
+    target = Path(root).resolve() / MANIFEST
+    try:
+        saved = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(saved, dict):
+        return None
+    value = saved.get("build_id")
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{%d}" % BUILD_ID_LENGTH, value):
+        return None
+    return value
+
+
 def _check_build_paths(root):
     build_dir = root / ".pynext"
     if build_dir.is_symlink() or (build_dir.exists() and not build_dir.is_dir()):
@@ -486,7 +558,7 @@ def validate_routes(routes):
 
 
 
-def write_manifest(root, *, lock_timeout=LOCK_TIMEOUT_SECONDS):
+def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECONDS):
     """Build the project: discover, render static pages, write assets,
     the manifest, and finally BUILD_ID — each as a separate stage.
 
@@ -498,9 +570,12 @@ def write_manifest(root, *, lock_timeout=LOCK_TIMEOUT_SECONDS):
     never look like a completed build. ``BUILD_ID`` is written last
     (Next.js records its build id last for the same reason) and holds
     the SHA-256 of the manifest bytes; ``load_manifest`` checks it, so
-    a manifest from an interrupted build is rejected at start.
+    a manifest from an interrupted build is rejected at start. The manifest
+    also records the deterministic 16-hex ``build_id`` (source-hash prefix)
+    and the optional ``deployment_id`` served as skew-protection headers.
     """
     root = Path(root).resolve()
+    deployment_id = resolve_deployment_id(deployment_id)
     with BuildLock(root, timeout=lock_timeout):
         _preflight_checks(root)
         # Production env files are loaded before any user code runs, so static
@@ -539,6 +614,14 @@ def write_manifest(root, *, lock_timeout=LOCK_TIMEOUT_SECONDS):
         # which variables were inlined into the island bundles.
         manifest["env_files"] = list(loaded.files)
         manifest["public_env_keys"] = sorted(loaded.public_values)
+        # The build ID names this build's sources (deterministic, so a
+        # rebuild of unchanged sources keeps the ID); the deployment ID
+        # names the deployment the build belongs to, when one is configured.
+        # Both are recorded after the "sources changed during build" check,
+        # so the check still compares plain discover() output — and before
+        # the manifest bytes are rendered, so the BUILD_ID seal covers them.
+        manifest["build_id"] = generate_build_id(manifest)
+        manifest["deployment_id"] = deployment_id
         _run_stage("write-assets", _write_build_assets, root, manifest, rendered, app)
         manifest_bytes = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         _run_stage("write-manifest", _atomic_write, root / MANIFEST, manifest_bytes)
@@ -771,6 +854,13 @@ def load_manifest(root):
         raise ValueError(f"Invalid build manifest {target}: expected a JSON object; rebuild the application")
     if saved.get("schema_version") != VERSION:
         raise ValueError("Incompatible manifest version; rebuild the application")
+    build_id = saved.get("build_id")
+    if build_id is not None and (not isinstance(build_id, str)
+                                 or not re.fullmatch(r"[0-9a-f]{%d}" % BUILD_ID_LENGTH, build_id)):
+        raise ValueError("Invalid build ID in manifest; rebuild the application")
+    deployment_id = saved.get("deployment_id")
+    if deployment_id is not None and not _validate_deployment_id(deployment_id):
+        raise ValueError("Invalid deployment ID in manifest; rebuild the application")
     # BUILD_ID is written last by a successful build and holds the
     # SHA-256 of the manifest bytes: a manifest left behind by a build
     # that died between writing it and finishing (or hand-edited since)

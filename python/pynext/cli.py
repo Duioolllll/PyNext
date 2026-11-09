@@ -477,6 +477,9 @@ def _build_parser():
             command.add_argument("--standalone-exclude", action="append", default=[], metavar="PACKAGE",
                                  help="omit a top-level site-packages entry from the standalone bundle "
                                       "(repeatable; recorded in bundle-manifest.json)")
+            command.add_argument("--deployment-id", default=None, metavar="ID",
+                                 help="deployment label recorded in the manifest and sent as "
+                                      "X-PyNext-Deployment-Id (also via PYNEXT_DEPLOYMENT_ID)")
         if name != "build":
             command.add_argument("--host", default=DEFAULT_CONFIG.host)
             command.add_argument("--port", type=_port, default=DEFAULT_CONFIG.port)
@@ -657,8 +660,9 @@ def main():
             # write_manifest and build_standalone each take the build
             # lock, so a second build waits (up to --lock-timeout) and a
             # standalone copy always sees one consistent, completed build.
-            manifest = write_manifest(root, lock_timeout=args.lock_timeout)
-            print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
+            manifest = write_manifest(root, deployment_id=args.deployment_id, lock_timeout=args.lock_timeout)
+            print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'} "
+              f"(build {manifest['build_id']})")
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
         coverage = manifest.get("catch_all_coverage") or {}

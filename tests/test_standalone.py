@@ -215,8 +215,8 @@ def test_standalone_runs_after_relocation_and_refuses_overwrite(tmp_path):
         # under a loaded machine that can take well over 15s.
         assert select.select([process.stdout], [], [], 60)[0], "standalone server did not start"
         line = process.stdout.readline()
-        assert "PyNext listening on http://" in line, line
-        address = line.split("http://", 1)[1].strip()
+        assert "PyNext listening" in line and "http://" in line, line
+        address = line.split("http://", 1)[1].split()[0].strip()
         with urllib.request.urlopen("http://" + address + "/", timeout=5) as response:
             assert response.status == 200 and b"bundled" in response.read()
     finally:
