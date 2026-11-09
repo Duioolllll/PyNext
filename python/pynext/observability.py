@@ -4,8 +4,9 @@ Design notes
 ------------
 * Structured logs are on by default, metrics are on by default, tracing is
   off by default and is a no-op unless the ``opentelemetry`` packages are
-  installed *and* tracing is enabled. Nothing here imports OpenTelemetry at
-  module import time.
+  installed *and* tracing is enabled. Request insights (recent slow/failed
+  request snapshots) are on in development mode only, by default. Nothing
+  here imports OpenTelemetry at module import time.
 * Sensitive values are never logged by default: the JSON formatter drops
   extra fields whose names look like credentials/headers/cookies/bodies, and
   the request log line records only the route *pattern* (never the raw URL),
@@ -67,6 +68,7 @@ from datetime import datetime, timezone
 __all__ = [
     "ObservabilityConfig",
     "MetricsCollector",
+    "RequestInsights",
     "JsonFormatter",
     "configure_logging",
     "new_request_id",
@@ -284,6 +286,41 @@ def _env_bool(name, default):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_tristate(name):
+    """Parse an env var as True/False, or None when unset/unrecognized (auto)."""
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _env_int(name, default, minimum=None):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip(), 10)
+    except ValueError:
+        return default
+    return max(minimum, value) if minimum is not None else value
+
+
+def _env_float(name):
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
 @dataclass
 class ObservabilityConfig:
     """Flags controlling structured logs, metrics and tracing.
@@ -292,12 +329,24 @@ class ObservabilityConfig:
     is installed and tracing is enabled. Environment overrides:
     ``PYNEXT_STRUCTURED_LOGS``, ``PYNEXT_METRICS``, ``PYNEXT_TRACING``,
     ``PYNEXT_LOG_LEVEL``.
+
+    Request insights (recent slow/failed request snapshots, see
+    :class:`RequestInsights`) are off unless enabled: ``request_insights``
+    forces them on (``True``) or off (``False``); ``None`` (the default)
+    means "auto" — on in development (``debug=True``) apps, off in
+    production. Environment overrides: ``PYNEXT_REQUEST_INSIGHTS``
+    (``1``/``0``), ``PYNEXT_REQUEST_INSIGHTS_MAX`` (ring-buffer size,
+    default 100), ``PYNEXT_REQUEST_INSIGHTS_SLOW_MS`` (fixed slow
+    threshold in ms; unset means the running p95 of recent latencies).
     """
 
     structured_logs: bool = True
     metrics: bool = True
     tracing: bool = False
     log_level: str = "INFO"
+    request_insights: bool | None = None
+    request_insights_max: int = 100
+    request_insights_slow_ms: float | None = None
 
     @classmethod
     def from_env(cls):
@@ -306,6 +355,9 @@ class ObservabilityConfig:
             metrics=_env_bool("PYNEXT_METRICS", True),
             tracing=_env_bool("PYNEXT_TRACING", False),
             log_level=os.environ.get("PYNEXT_LOG_LEVEL", "INFO"),
+            request_insights=_env_tristate("PYNEXT_REQUEST_INSIGHTS"),
+            request_insights_max=_env_int("PYNEXT_REQUEST_INSIGHTS_MAX", 100, minimum=1),
+            request_insights_slow_ms=_env_float("PYNEXT_REQUEST_INSIGHTS_SLOW_MS"),
         )
 
 
@@ -921,6 +973,107 @@ class MetricsCollector:
                   "# TYPE pynext_island_bundles_total_bytes gauge",
                   f'pynext_island_bundles_total_bytes {snap["island_bundles_total_bytes"]}']
         return "\n".join(lines) + "\n"
+
+
+class RequestInsights:
+    """Bounded ring buffer of recent slow / failed request snapshots.
+
+    Separate from :class:`MetricsCollector`: metrics aggregate, this keeps
+    individual request snapshots so one slow request can be inspected
+    without digging through logs. A request is kept when it is slow —
+    slower than a fixed ``slow_threshold_ms`` when set, otherwise slower
+    than the running p95 of recent latencies — or when it failed (status
+    >= 500 or an ``error_type``). The buffer is a ``deque(maxlen=...)``
+    and the p95 window is bounded too, so memory cannot grow without
+    bound no matter how long the server runs. Snapshots record only the
+    route *pattern*, never the raw URL, so no user data or credentials
+    can leak in.
+
+    In-process API only: there is deliberately no HTTP endpoint serving
+    these snapshots (routes + latencies are internal debug data). Enabled
+    in development mode by default; see :class:`ObservabilityConfig`.
+    """
+
+    DEFAULT_MAX_ENTRIES = 100
+    _P95_WINDOW = 512
+    _MIN_SAMPLES = 20
+
+    def __init__(self, enabled=True, max_entries=DEFAULT_MAX_ENTRIES,
+                 slow_threshold_ms=None):
+        if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries < 1:
+            raise ValueError("max_entries must be a positive integer")
+        if (slow_threshold_ms is not None and
+                (isinstance(slow_threshold_ms, bool) or
+                 not isinstance(slow_threshold_ms, (int, float)) or slow_threshold_ms < 0)):
+            raise ValueError("slow_threshold_ms must be a non-negative number or None")
+        self.enabled = enabled
+        self.max_entries = max_entries
+        self.slow_threshold_ms = slow_threshold_ms
+        self._lock = threading.Lock()
+        self._entries = deque(maxlen=max_entries)
+        self._latencies = deque(maxlen=self._P95_WINDOW)
+        self._observed = 0
+        self._recorded = 0
+
+    def _is_slow(self, latency_ms):
+        if self.slow_threshold_ms is not None:
+            return latency_ms >= self.slow_threshold_ms
+        if len(self._latencies) < self._MIN_SAMPLES:
+            # Not enough of a population yet to know what "slow" means;
+            # only definite failures are kept during warm-up.
+            return False
+        return latency_ms > _percentiles(list(self._latencies))["p95"]
+
+    def observe(self, *, request_id, method, route, status, latency_ms,
+                python_ms=None, rust_ms=None, queue_wait_ms=None, error_type=None):
+        """Record one finished request if it is slow or failed. No-op when disabled."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._observed += 1
+            latency = float(latency_ms)
+            self._latencies.append(latency)
+            failed = status >= 500 or error_type is not None
+            if not failed and not self._is_slow(latency):
+                return
+            self._recorded += 1
+            self._entries.append({
+                "request_id": request_id,
+                "method": method,
+                "route": route,
+                "status": int(status),
+                "latency_ms": round(latency, 3),
+                "python_ms": round(float(python_ms), 3) if python_ms is not None else None,
+                "rust_ms": round(float(rust_ms), 3) if rust_ms is not None else None,
+                "queue_wait_ms": round(float(queue_wait_ms), 3) if queue_wait_ms is not None else None,
+                "error_type": error_type,
+                "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            })
+
+    def clear(self):
+        """Drop all kept snapshots and reset the counters / p95 window."""
+        with self._lock:
+            self._entries.clear()
+            self._latencies.clear()
+            self._observed = 0
+            self._recorded = 0
+
+    def snapshot(self):
+        """Return the kept snapshots, oldest first, plus filter counters."""
+        if not self.enabled:
+            return {"enabled": False}
+        with self._lock:
+            threshold = self.slow_threshold_ms
+            if threshold is None and len(self._latencies) >= self._MIN_SAMPLES:
+                threshold = _percentiles(list(self._latencies))["p95"]
+            return {
+                "enabled": True,
+                "max_entries": self.max_entries,
+                "observed": self._observed,
+                "recorded": self._recorded,
+                "slow_threshold_ms": threshold,
+                "requests": [dict(entry) for entry in self._entries],
+            }
 
 
 # -- OpenTelemetry (optional) ---------------------------------------------

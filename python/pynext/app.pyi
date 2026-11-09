@@ -5,7 +5,7 @@ from .http import PathHeaderRuleInput, PathHeaders, Request, Response, SecurityC
 from .custom_routes import CustomRoutes
 from .fetch_cache import FetchCache
 from .matcher import HeaderRule, Scope, ScopedMiddleware
-from .observability import MetricsCollector, ObservabilityConfig
+from .observability import MetricsCollector, ObservabilityConfig, RequestInsights
 from .proxy import ProxyTrust
 from .types import ProxyEntry
 from .ratelimit import RateLimiter
@@ -29,12 +29,8 @@ class App:
     custom_routes: CustomRoutes
     resources: Mapping[str, Resource]
     metrics: MetricsCollector
-    middleware: tuple[Middleware, ...]
-    middleware_scopes: tuple[Scope | None, ...]
-    header_rules: tuple[HeaderRule, ...]
-    base_path: str
-    trailing_slash: Literal["redirect", "ignore"]
     fetch_cache: FetchCache
+    request_insights: RequestInsights
     def __init__(self, root: str | PathLike[str], manifest: dict[str, Any], *, production: bool = ...,
                  security: SecurityConfig | None = ..., cache_backend: Literal["memory", "sqlite", "redis"] = ...,
                  cache_path: str | PathLike[str] | None = ..., observability: ObservabilityConfig | None = ...,

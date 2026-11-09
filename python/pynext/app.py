@@ -58,6 +58,7 @@ from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavail
 from .observability import (
     MetricsCollector,
     ObservabilityConfig,
+    RequestInsights,
     begin_request_context,
     configure_logging,
     get_request_id,
@@ -1173,6 +1174,17 @@ class App:
         self.path_headers = compile_path_headers(_path_header_items)
         self.observability_config = observability or ObservabilityConfig.from_env()
         self.metrics = MetricsCollector(enabled=self.observability_config.metrics)
+        # Request insights are a separate, debug-only ring buffer (P2-3):
+        # on in development by default, off in production, overridable
+        # with ObservabilityConfig(request_insights=...) / PYNEXT_REQUEST_INSIGHTS.
+        insights_enabled = (self.observability_config.request_insights
+                            if self.observability_config.request_insights is not None
+                            else debug)
+        self.request_insights = RequestInsights(
+            enabled=insights_enabled,
+            max_entries=self.observability_config.request_insights_max,
+            slow_threshold_ms=self.observability_config.request_insights_slow_ms,
+        )
         configure_logging(self.observability_config)
         # Per-process token-bucket limiter (spec §11, finding #49). None
         # disables it. The Axum adapter reads the same attribute in
@@ -1601,6 +1613,9 @@ class App:
         """Apply a new observability config to this app (logging + metrics)."""
         self.observability_config = config
         self.metrics.enabled = config.metrics
+        self.request_insights.enabled = (
+            config.request_insights if config.request_insights is not None else self.debug)
+        self.request_insights.slow_threshold_ms = config.request_insights_slow_ms
         configure_logging(config)
         return self
 
@@ -3810,6 +3825,7 @@ class App:
         """
         started = time.monotonic()
         status, response = 500, None
+        error_type = None
         tracing = self.observability_config.tracing
         with span("pynext.request", {"http.method": request.method},
                   enabled=tracing) as request_span:
@@ -3836,9 +3852,11 @@ class App:
                 status = 400
                 self.metrics.observe_error(route_var.get() or "__unmatched__",
                                            type(exc).__name__)
+                error_type = "BadRequest"
                 raise
             except _SyncHandlerBusy:
                 status = 503
+                error_type = "_SyncHandlerBusy"
                 raise
             except (asyncio.CancelledError, RequestCancelled) as exc:
                 if isinstance(exc, asyncio.CancelledError) or request.cancelled:
@@ -3850,6 +3868,7 @@ class App:
                 digest, _count = digest_for_error(exc)
                 self.metrics.observe_error(route_var.get() or "__unmatched__",
                                            type(exc).__name__, digest)
+                error_type = type(exc).__name__
                 raise
             finally:
                 request_span.set_attribute("http.status_code", status)
@@ -3879,6 +3898,12 @@ class App:
                     route, request.method, status, latency_ms,
                     response_bytes=response_bytes, queue_wait_ms=queue_wait_ms,
                     python_ms=max(0.0, latency_ms - rust_ms), rust_ms=rust_ms or None,
+                )
+                self.request_insights.observe(
+                    request_id=get_request_id(), method=request.method, route=route,
+                    status=status, latency_ms=latency_ms,
+                    python_ms=max(0.0, latency_ms - rust_ms), rust_ms=rust_ms or None,
+                    queue_wait_ms=queue_wait_ms, error_type=error_type,
                 )
                 log.info("request", extra={
                     "method": request.method, "route": route, "status": status,

@@ -84,6 +84,7 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `compile_header_rules` | `pynext.matcher` |
 | `ObservabilityConfig` | `pynext.observability` |
 | `MetricsCollector` | `pynext.observability` |
+| `RequestInsights` | `pynext.observability` |
 | `WebSocket` | `pynext.http` |
 | `WebSocketDisconnect` | `pynext.http` |
 | `MAX_WS_MESSAGE` | `pynext.http` |

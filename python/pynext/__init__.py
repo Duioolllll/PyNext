@@ -34,7 +34,7 @@ from .middleware import (MAX_MIDDLEWARE_REWRITES, MiddlewareResult, MiddlewareSc
                          redirect_response, rewrite_request, scoped)
 from .matcher import (HeaderRule, Matcher, ScopedMiddleware, compile_header_rules, compile_matcher,
                       scoped_middleware)
-from .observability import MetricsCollector, ObservabilityConfig
+from .observability import MetricsCollector, ObservabilityConfig, RequestInsights
 from .proxy import ProxyTrust, ResolvedProxy, parse_trusted_proxies
 from .pubsub import PubSubOverflow, WebSocketPubSub
 from .ratelimit import RateLimiter
@@ -61,9 +61,7 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "validate_csrf", "mask_csrf_token", "unmask_csrf_token",
            "get_csrf_token", "csrf_token_response", "csrf_input",
            "content_security_policy", "security_headers", "apply_security_headers",
-           "PathHeaderRule", "PathHeaders", "apply_path_headers", "compile_path_headers",
-           "Matcher", "HeaderRule", "ScopedMiddleware", "scoped_middleware", "compile_matcher", "compile_header_rules",
-           "ObservabilityConfig", "MetricsCollector", "WebSocket", "WebSocketDisconnect", "MAX_WS_MESSAGE",
+           "ObservabilityConfig", "MetricsCollector", "RequestInsights", "WebSocket", "WebSocketDisconnect", "MAX_WS_MESSAGE",
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
            "Session", "SessionMiddleware", "SQLiteSessionStore", "RedisSessionStore", "SessionPayloadCipher", "SessionRecord", "require_auth", "require_permission",
            "require_scope", "AuthorizationPolicy", "authorization_policy", "state_changing_get", "LoginRateLimiter",
