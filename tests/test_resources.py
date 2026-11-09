@@ -73,6 +73,32 @@ def test_resource_start_failure_rolls_back_started_resources(tmp_path):
     assert events == ["start:db", "start:broken", "stop:broken", "stop:db"]
 
 
+def test_retry_after_startup_failure_restores_shared_cache_and_readiness(tmp_path):
+    project(tmp_path)
+    events = []
+    resource = Resource("db", events, fail=True)
+    app = create_app(tmp_path, resources={"db": resource}, cache_backend="sqlite",
+                     cache_path=str(tmp_path / "isr.sqlite3"))
+
+    async def run():
+        assert app.isr.shared.insert("key", b"cached", 60, 0)
+        with pytest.raises(RuntimeError, match="startup failed"):
+            await app.startup()
+        assert app.isr.shared is None
+        resource.fail = False
+        await app.startup()
+        assert app.is_ready
+        assert app.isr.shared is not None
+        assert app.isr.shared.lookup("key") == ("fresh", b"cached")
+        await app.shutdown()
+        assert not app.is_ready
+        await app.startup()
+        assert app.is_ready
+        assert app.isr.shared.lookup("key") == ("fresh", b"cached")
+        await app.shutdown()
+    asyncio.run(run())
+
+
 def test_resource_file_is_loaded_and_verified_in_production(tmp_path):
     project(tmp_path)
     source = tmp_path / "resources.py"

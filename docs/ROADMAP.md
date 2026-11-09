@@ -21,7 +21,7 @@
 | 클라이언트 | JS/TS island, load·visible·idle·interaction 활성화, 클라이언트 탐색, 제한된 공유 모델 hydration, 실험적 Python DSL | 공유 모델은 element·text·fragment와 문자열 props 중심이다. 일반 이벤트 재생과 전체 라우트 공통 IR은 완성되지 않았다. |
 | 캐시 | 프로세스별 메모리와 SQLite·Redis 공유 ISR, 빌드·쿼리별 키, lease·fencing 및 워커 간 무효화, 공유 저장소 장애 시 `fail_open`/`fail_closed` 정책(캐시 기본값 `fail_open`, 레이트리미터 기본값 `fail_closed`) | 공유 저장소 장애 시 기본 동작은 로컬 캐시로 대체하므로 즉시 일관성을 보장하지 않는다. SQLite 전체 용량 및 주기적 청소 정책은 없다. |
 | HTTP와 보안 기초 | 전역 HTTP 미들웨어, multipart 업로드, SQLite·Redis 세션과 세션 기반 CSRF, 인증·권한 검사 연결점, 선택적 공유 요청 제한 | 자격 증명 검증은 앱이 담당한다. 요청 제한은 본문 수신 후 적용되며 완성형 사용자 계정·로그인 시스템은 없다. |
-| 데이터베이스 | 개발 중인 선택적 SQLAlchemy async 리소스, SQLite·PostgreSQL 연결 풀과 명시적 세션·트랜잭션, Alembic 안내 | 공개된 0.1.0에는 미포함. 모델·마이그레이션·인증은 앱에서 관리하고, DB 연결 상태를 지속 감시하지 않는다. |
+| 데이터베이스 | 개발 중인 선택적 SQLAlchemy async 리소스와 Django ORM·폼 연동, SQLite·PostgreSQL 연결, Alembic 안내 | 공개된 0.1.0에는 미포함. 모델·마이그레이션·인증은 앱에서 관리하고, DB 연결 상태를 지속 감시하지 않는다. |
 | 실시간·워커 | WebSocket 크기·서브프로토콜 설정, 제한된 큐, 프로세스 내 pub/sub, 공유 리스너 워커와 재시작, `/healthz`·`/readyz`, SIGTERM 그레이스풀 드레인(진행 요청 완료·WebSocket 1001 종료), SIGHUP 롤링 재시작 | pub/sub은 프로세스 내부에 한정된다. Axum 연결 예산은 설정 가능하고 ASGI 서버의 연결 제한은 별도 설정한다. 드레인 타임아웃을 넘긴 요청은 중단될 수 있다. |
 | 개발과 관측 | `pynext init`, 개발 오류 페이지, 네이티브 파일 감시, JS/TS island HMR, 구조화 로그·지표·선택적 OpenTelemetry | HMR은 island 상태 보존을 보장하지 않는다. Rust 빠른 경로부터 외부 서비스까지의 전체 추적은 완성되지 않았다. |
 | 배포 | Python 3.13·3.14 패키지, 로컬 이미지 WebP 변환, Linux standalone 디렉터리 | standalone은 단일 실행 파일이 아니며 호환 시스템 라이브러리가 필요하다. 다른 OS의 standalone 패키징은 없다. |
@@ -72,4 +72,4 @@ Linux·macOS·Windows에서 Python 3.13·3.14와 Axum·Uvicorn 조합을 CI로 �
 
 ## 별도 결정이 필요한 범위
 
-Django 통합은 DB 연동 이후로 보류한다. 추후 ORM·폼 활용을 검토하며 ASGI 서브앱 마운트와 Django 템플릿은 범위에 넣지 않는다. React 및 React Server Components 호환성은 현재 비목표다. [프로덕션 로드맵](PRODUCTION_ROADMAP.md)의 관련 내용은 별도 결정이 필요한 장기 설계 후보이며 현재 지원이나 구현 약속이 아니다.
+선택적 Django ORM·폼 연동은 개발 중이며 [사용 안내](DJANGO.md)에 제약을 정리한다. Django ASGI 서브앱 마운트와 Django 템플릿은 범위 밖이다. React 및 React Server Components 호환성은 현재 비목표다. [프로덕션 로드맵](PRODUCTION_ROADMAP.md)의 관련 내용은 별도 결정이 필요한 장기 설계 후보이며 현재 지원이나 구현 약속이 아니다.

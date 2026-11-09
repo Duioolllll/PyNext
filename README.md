@@ -110,6 +110,10 @@ lifespan을 활성화해야 합니다. 저수준 `start_native()`를 직접 쓰�
 세션·트랜잭션을 제공합니다. 모델과 마이그레이션은 앱에서 관리합니다.
 [DB 연동과 Alembic 안내](docs/DATABASE.md)를 참고하세요.
 
+개발 버전의 선택적 `DjangoResource`는 Django ORM·폼을 PyNext 핸들러에서 사용할 수
+있도록 지원합니다. Django HTTP 앱과 템플릿을 제공하지 않으며 아직 공개 0.1.0에
+포함되지 않습니다. 설정과 제약은 [Django 연동 안내](docs/DJANGO.md)를 참고하세요.
+
 `SessionMiddleware(SQLiteSessionStore(path))`는 서버에 세션을 저장하고 브라우저에
 불투명 ID만 보냅니다. 기본 쿠키에는 `Secure`, `HttpOnly`, `SameSite=Lax`가
 설정됩니다. HTTPS가 아닌 로컬 개발에서만 `secure=False`를 명시하세요. 세션은

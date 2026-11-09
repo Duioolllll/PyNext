@@ -434,6 +434,14 @@ class ISRCache:
                 f"Unknown cache backend {cache_backend!r}: expected 'memory', 'sqlite' or 'redis'"
             )
         self.backend_name = cache_backend
+        self._cache_path = cache_path
+        if cache_backend == "sqlite" and cache_path is not None:
+            path = os.fspath(cache_path)
+            uri_prefix = b"file:" if isinstance(path, bytes) else "file:"
+            if path not in (":memory:", b":memory:") and not path.startswith(uri_prefix):
+                path = os.path.abspath(path)
+            self._cache_path = path
+        self._cache_url = (cache_url or os.environ.get("PYNEXT_REDIS_URL")) if cache_backend == "redis" else None
         self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_OPEN)
         # The process-local store stays the native fast path in both modes:
         # the Axum server reads it directly for fresh hits.
@@ -442,10 +450,10 @@ class ISRCache:
         if cache_backend == "sqlite":
             if cache_path is None:
                 raise ValueError("cache_path is required when cache_backend is 'sqlite'")
-            self.shared = SQLiteCacheBackend(cache_path)
+            self.shared = SQLiteCacheBackend(self._cache_path)
         elif cache_backend == "redis":
             from .redis_cache import RedisCacheBackend
-            self.shared = RedisCacheBackend(cache_url or os.environ.get("PYNEXT_REDIS_URL"))
+            self.shared = RedisCacheBackend(self._cache_url)
         self._inflight = {}
         self._task_leases = {}
         self._tasks = set()
@@ -455,6 +463,13 @@ class ISRCache:
         self.namespace = namespace
 
     def open(self):
+        # A previous shutdown or failed app startup closes the shared store.
+        # Reopening must restore it rather than silently falling back to L1.
+        if self.shared is None and self.backend_name == "sqlite":
+            self.shared = SQLiteCacheBackend(self._cache_path)
+        elif self.shared is None and self.backend_name == "redis":
+            from .redis_cache import RedisCacheBackend
+            self.shared = RedisCacheBackend(self._cache_url)
         self._closed = False
 
     async def close(self):

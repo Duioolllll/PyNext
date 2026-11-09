@@ -358,6 +358,16 @@ class App:
         try:
             _register_project(self._namespace)
             _package(self._namespace, Path(root).resolve(), load_initializer=False)
+            # Resources may initialize libraries whose models are imported by
+            # route modules. Load the declarations first, but start their
+            # connections only during the async application lifespan.
+            self.root = Path(root).resolve()
+            self.modules = {}
+            configured_resources = {}
+            if "resources.py" in manifest["sources"]:
+                configured_resources = getattr(self._module("resources.py"), "RESOURCES", None)
+                if not isinstance(configured_resources, dict):
+                    raise TypeError("resources.py must export a RESOURCES dict")
             self._initialize(root, manifest, production=production,
                              cache_backend=cache_backend, cache_path=cache_path, cache_url=cache_url,
                              cache_failure_policy=cache_failure_policy)
@@ -387,11 +397,6 @@ class App:
                     csrf_enabled=any(isinstance(item, SessionMiddleware)
                                      for item in self.middleware))
                 self.security = security
-            configured_resources = {}
-            if "resources.py" in manifest["sources"]:
-                configured_resources = getattr(self._module("resources.py"), "RESOURCES", None)
-                if not isinstance(configured_resources, dict):
-                    raise TypeError("resources.py must export a RESOURCES dict")
             if resources is None:
                 resources = {}
             if not isinstance(resources, dict):
@@ -408,6 +413,7 @@ class App:
             self.resources = MappingProxyType(combined)
             self._resources_started = []
             self._started = False
+            self._lifecycle_lock = asyncio.Lock()
             # Graceful-shutdown state (B6): set by begin_drain() when the
             # server stops accepting new traffic. In-flight requests and
             # WebSocket sessions are tracked here so serve() can wait for
@@ -438,7 +444,6 @@ class App:
         self.router = _native.Router(list(manifest["routes"]))
         self.entries = {}
         self.websocket_entries = {}
-        self.modules = {}
         self.render_modes = {}
         self.isr_policies = {}
         self.isr_queries = {}
@@ -582,8 +587,13 @@ class App:
 
     async def startup(self):
         """Start the cache and registered resources in registration order."""
+        async with self._lifecycle_lock:
+            await self._startup_locked()
+
+    async def _startup_locked(self):
         if self._started:
             return
+        self._draining = False
         self.isr.open()
         try:
             for resource in self.resources.values():
@@ -602,6 +612,11 @@ class App:
 
     async def shutdown(self):
         """Close resources in reverse order even when one shutdown fails."""
+        self._draining = True
+        async with self._lifecycle_lock:
+            await self._shutdown_locked()
+
+    async def _shutdown_locked(self):
         error = None
         self._draining = True
         for resource in reversed(self._resources_started):

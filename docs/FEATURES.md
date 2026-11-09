@@ -25,6 +25,8 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `route` | `pynext.routing` |
 | `websocket` | `pynext.routing` |
 | `Database` | `pynext.database` |
+| `DjangoBusyError` | `pynext.django` |
+| `DjangoResource` | `pynext.django` |
 | `BadRequest` | `pynext.http` |
 | `Request` | `pynext.http` |
 | `Response` | `pynext.http` |
@@ -160,4 +162,4 @@ Store classes in `pynext.sessions` implementing `load` / `save` / `delete`.
 | Item | Status |
 | --- | --- |
 | React / React Server Components | Explicit non-goal for 1.0 (see docs/ROADMAP.md). |
-| Django integration | Deferred; ORM/forms only under consideration. ASGI sub-apps and templates are out of scope. |
+| Django HTTP / templates | Out of scope; optional Django ORM/forms are supported by DjangoResource. |
