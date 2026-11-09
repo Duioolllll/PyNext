@@ -34,10 +34,11 @@ from .auth import authorization_policy, check_authorization
 from .cache import (MAX_CACHE_SECONDS, CacheBusy, ISRCache, SharedCacheUnavailable,
                     cache_control_header, dev_retention_policy, validate_cache_tag)
 from .client import compile_client, read_client_artifacts
-from .components import (_isr_policy, _isr_query_keys, _node, _partial_isr_policy, _validate_tags,
-                        bind_islands, reduce_segment_config)
+from .components import (_isr_policy, _isr_query_keys, _node, _partial_isr_policy, _ssg_fallback,
+                        _validate_tags, bind_islands, reduce_segment_config)
 from .env import load_env
-from .build import _materialize, discover, load_manifest
+from .build import (MAX_STATIC_PAGE_BYTES, MAX_STREAMED_STATIC_BYTES, MAX_STREAMED_STATIC_SECONDS,
+                    _materialize, discover, load_manifest)
 from .config import DEFAULT_CONFIG
 from .dynamic import (DYNAMIC_MODES, MAX_DYNAMIC_ACCESSES, format_dynamic_accesses,
                       suppress_dynamic_tracking, track_prerender)
@@ -1457,6 +1458,11 @@ class App:
         self.isr_queries = {}
         self.isr_tags = {}
         self.entry_layouts = {}
+        self.ssg_fallback = {}
+        self.isr_generators = {}
+        self.isr_static_paths = {}
+        self._ssg_fallback_tasks = {}
+        self._isr_warmup_task = None
         if cache_backend == "sqlite" and cache_path is None:
             cache_path = self.root / ".pynext" / "isr-cache.sqlite3"
         build_id = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"),
@@ -1586,8 +1592,19 @@ class App:
                         except ValueError as exc:
                             raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
                     self.isr_policies[pattern] = policy
-                    if getattr(module, "generate_static_params", None) is not None:
-                        raise ValueError(f"ISR page {spec['entry']} cannot export generate_static_params yet")
+                    # ISR pages may export generate_static_params: the
+                    # listed paths are warmed into the cache at startup
+                    # (see warmup_isr) instead of waiting for a first
+                    # request. The generator rules mirror SSG: a dynamic
+                    # route may export one, a static route may not.
+                    isr_dynamic = any("[" in segment for segment in pattern.split("/"))
+                    generator = getattr(module, "generate_static_params", None)
+                    if isr_dynamic and generator is not None and (
+                            not callable(generator) or inspect.signature(generator).parameters):
+                        raise ValueError(f"Dynamic ISR page {spec['entry']} must export generate_static_params() with no arguments")
+                    if not isr_dynamic and generator is not None:
+                        raise ValueError(f"Static ISR page {spec['entry']} cannot export generate_static_params")
+                    self.isr_generators[pattern] = generator
                     try:
                         query_keys = _isr_query_keys(getattr(fn, "__pynext_cache_query__", ()))
                     except ValueError as exc:
@@ -1611,6 +1628,14 @@ class App:
                 if "query" in inspect.signature(fn).parameters and not query_keys:
                     raise ValueError(f"Page {spec['entry']} needs ISR query_keys to accept query")
                 if mode == "ssg":
+                    fallback = getattr(fn, "__pynext_ssg_fallback__", None)
+                    try:
+                        fallback = _ssg_fallback(
+                            (fallback or {}).get("fallback", "not_found"),
+                            (fallback or {}).get("dynamic_params", True))
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid SSG fallback in {spec['entry']}: {exc}") from exc
+                    self.ssg_fallback[pattern] = fallback
                     is_dynamic = any("[" in segment for segment in pattern.split("/"))
                     generator = getattr(module, "generate_static_params", None)
                     if dynamic == "force-dynamic":
@@ -1707,6 +1732,16 @@ class App:
                 raise ValueError("Dynamic modes changed since build; run `pynext build` again")
             if manifest.get("isr_tags") != self.isr_tags:
                 raise ValueError("ISR tags changed since build; run `pynext build` again")
+            if manifest.get("ssg_fallback") != self.ssg_fallback:
+                raise ValueError("SSG fallback modes changed since build; run `pynext build` again")
+            isr_static_paths = manifest.get("isr_static_paths")
+            if (not isinstance(isr_static_paths, dict) or
+                    any(not isinstance(paths, list) or
+                        any(not isinstance(path, str) for path in paths)
+                        for paths in isr_static_paths.values()) or
+                    set(isr_static_paths) - {p for p, g in self.isr_generators.items() if g is not None}):
+                raise ValueError("Invalid ISR static paths in manifest; run `pynext build` again")
+            self.isr_static_paths = isr_static_paths
             self.client_manifest, self.client_assets = read_client_artifacts(self.root, manifest)
             self.static_pages = read_static_pages(self.root, manifest, self.router)
             self.public_assets = read_public_artifacts(self.root, manifest)
@@ -1998,6 +2033,48 @@ class App:
             await self.isr.close(executor=self._ensure_exit_executor())
             raise
         self._started = True
+        if self.production:
+            # ISR warmup is best-effort and must never delay readiness:
+            # it runs in the background while requests take the normal
+            # ISR path (miss -> synchronous generation) for paths that
+            # have not been warmed yet.
+            self._isr_warmup_task = asyncio.create_task(self.warmup_isr())
+
+    async def warmup_isr(self):
+        """Pre-generate ISR ``generate_static_params`` paths into the cache.
+
+        Best-effort: one path failing (slow data source, render error,
+        shared-store outage) is logged and skipped; it never fails
+        startup, and the path still renders on demand at request time.
+        Returns ``(warmed, failed)`` counts. Only runs in production:
+        development renders ISR pages on request.
+        """
+        warmed = 0
+        failed = 0
+        for pattern, paths in self.isr_static_paths.items():
+            for path in paths:
+                try:
+                    match = self.router.matches(path)
+                    if match is None or match[0] != pattern:
+                        raise ValueError(f"Warmed ISR path {path} does not match {pattern}")
+                    params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in match[1].items()}
+                    cache_key = await self._isr_cache_key(pattern, path, {})
+                    response = await self._render_isr_cached(pattern, params, {}, cache_key)
+                    if isinstance(response, StreamingResponse):
+                        try:
+                            while await response._next_chunk() is not None:
+                                pass
+                        finally:
+                            await response.aclose()
+                    warmed += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    failed += 1
+                    log.warning("ISR warmup failed for %s", path, exc_info=True)
+        if warmed or failed:
+            log.info("ISR warmup finished: %d warmed, %d failed", warmed, failed)
+        return warmed, failed
 
     async def shutdown(self):
         """Close resources in reverse order even when one shutdown fails."""
@@ -2008,6 +2085,15 @@ class App:
     async def _shutdown_locked(self):
         error = None
         self._draining = True
+        if self._isr_warmup_task is not None:
+            task, self._isr_warmup_task = self._isr_warmup_task, None
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("ISR warmup failed during shutdown")
         for resource in reversed(self._resources_started):
             try:
                 await resource.shutdown()
@@ -2684,6 +2770,21 @@ class App:
             response._pynext_loading_index = 1 if prefix else 0
         return response
 
+    async def _isr_cache_key(self, pattern, path, query):
+        """Cache key for an ISR path, including the query-variant dimension.
+
+        Paths without ``query_keys`` use the bare path, exactly as the
+        native server's fresh-hit lookup does; paths with query keys mix
+        in the variant generation and a hash of the selected query, so
+        warmup and request handling compute the same key.
+        """
+        if not self.isr_queries[pattern]:
+            return path
+        generation, _ = await self.isr.variant_generation(path)
+        encoded = json.dumps(query, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        return ("\0isr:" + hashlib.sha256(path.encode("utf-8")).hexdigest() + ":" +
+                generation + ":" + hashlib.sha256(encoded).hexdigest())
+
     def _page_query(self, pattern, request):
         keys = self.isr_queries.get(pattern, ())
         if not keys or request is None:
@@ -2752,6 +2853,106 @@ class App:
             # disconnects; other requests can still use its eventual result.
             feed.detach()
             raise
+
+    async def _generate_ssg_page(self, pattern, path, params):
+        """Render one ungenerated SSG page and store it in the runtime overlay.
+
+        The body is capped like a build-time static page, so a runaway
+        fallback generation cannot grow memory without bound. The overlay
+        lives only in this process (and is not written back to the build
+        manifest): the native server keeps the static-pages snapshot it
+        received at start, so later native requests still fall through to
+        Python dispatch, which serves the generated body from here.
+        """
+        response = await self.render_page(pattern, None, params)
+        if isinstance(response, StreamingResponse):
+            body = bytearray()
+            try:
+                async with asyncio.timeout(MAX_STREAMED_STATIC_SECONDS):
+                    while (chunk := await response._next_chunk()) is not None:
+                        if len(body) + len(chunk) > MAX_STREAMED_STATIC_BYTES:
+                            raise ValueError(f"Generated SSG page for {path} exceeds the size limit")
+                        body.extend(chunk)
+            except asyncio.TimeoutError as exc:
+                raise ValueError(
+                    f"Generated SSG page for {path} exceeded the time limit "
+                    f"({MAX_STREAMED_STATIC_SECONDS}s)") from exc
+            finally:
+                await response.aclose()
+            body = bytes(body)
+        else:
+            if len(response.body) > MAX_STATIC_PAGE_BYTES:
+                raise ValueError(f"Generated SSG page for {path} exceeds the size limit")
+            body = response.body
+        self.static_pages[path] = body
+        self.asset_etags[path] = f'"{hashlib.sha256(body).hexdigest()}"'
+        return body
+
+    async def _render_ssg_blocking(self, pattern, path, params, request):
+        """Fallback ``blocking``: generate on first request, then serve statically.
+
+        Concurrent requests for the same path share one generation
+        (single-flight); a failed generation is dropped from the task
+        table so the next request retries instead of caching the error.
+        """
+        task = self._ssg_fallback_tasks.get(path)
+        if task is None:
+            task = asyncio.create_task(self._generate_ssg_page(pattern, path, params))
+            self._ssg_fallback_tasks[path] = task
+            task.add_done_callback(lambda done: self._ssg_fallback_tasks.pop(path, None))
+        body = await task
+        return asset_response(request, body, "text/html; charset=utf-8",
+                              self.asset_etags[path], cache_control=b"public, max-age=0, must-revalidate",
+                              extra_headers=[(b"vary", b"Cookie, Authorization")])
+
+    async def _render_ssg_prerender(self, pattern, path, params):
+        """Fallback ``prerender``: stream the layout shell first, then the page.
+
+        The shell prefix flushes before the page function finishes, so
+        the first byte is fast; the generated page streams in behind it
+        in the same document. The stream is tee'd: once it is fully
+        delivered, the generated page joins the runtime static overlay
+        (see :meth:`_generate_ssg_page`) so later requests serve it
+        without rendering. A client that disconnects early stores
+        nothing.
+        """
+        fn, layouts = self.entries[pattern]
+
+        async def chunks():
+            if inspect.isasyncgenfunction(fn):
+                kwargs = {key: value for key, value in (("params", params),)
+                          if key in inspect.signature(fn).parameters}
+                async for node in fn(**kwargs):
+                    yield node
+            else:
+                yield await _invoke(fn, params=params)
+
+        response = await self._streaming_page_response(pattern, chunks(), layouts)
+        original = response._iterator
+        buffer = bytearray()
+        completed = False
+
+        async def tee():
+            nonlocal completed
+            try:
+                async for chunk in original:
+                    data = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
+                    if len(buffer) + len(data) > MAX_STATIC_PAGE_BYTES:
+                        raise ValueError(f"Generated SSG page for {path} exceeds the size limit")
+                    buffer.extend(data)
+                    yield chunk
+                completed = True
+            finally:
+                close = getattr(original, "aclose", None)
+                if close is not None:
+                    await close()
+            if completed:
+                body = bytes(buffer)
+                self.static_pages[path] = body
+                self.asset_etags[path] = f'"{hashlib.sha256(body).hexdigest()}"'
+
+        response._iterator = aiter(tee())
+        return response
 
     async def render_page(self, pattern, request, params, *, csp_nonce=True, query=None):
         """Render one page, tracking dynamic accesses for SSG/ISR pages.
@@ -3230,9 +3431,15 @@ class App:
         if (self.production and self.render_modes.get(pattern) == "ssg"
                 and self.dynamic_modes.get(pattern) != "force-dynamic"
                 and path not in self.static_pages):
-            if _accepts_html(request):
-                return await self._not_found_page_response(request, pattern, params)
-            return Response("Not Found", status=404)
+            # Only "not_found" (and dynamic_params=False, which forces it)
+            # rejects an ungenerated path outright. "blocking" and
+            # "prerender" fall through to the method checks below and are
+            # generated in the page branch.
+            fallback = self.ssg_fallback.get(pattern) or {"fallback": "not_found", "dynamic_params": True}
+            if fallback["fallback"] == "not_found" or not fallback["dynamic_params"]:
+                if _accepts_html(request):
+                    return await self._not_found_page_response(request, pattern, params)
+                return Response("Not Found", status=404)
         if (not self.production and self.render_modes.get(pattern) == "ssg"
                 and self.dynamic_modes.get(pattern) != "force-dynamic"):
             # Dev/prod consistency (§3.2 #4): development renders SSG pages
@@ -3273,9 +3480,14 @@ class App:
         if spec["kind"] == "page":
             if (self.production and self.render_modes[pattern] == "ssg"
                     and self.dynamic_modes.get(pattern) != "force-dynamic"):
-                response = asset_response(request, self.static_pages[path], "text/html; charset=utf-8",
-                                          self.asset_etags[path], cache_control=b"public, max-age=0, must-revalidate",
-                                          extra_headers=[(b"vary", b"Cookie, Authorization")])
+                if path in self.static_pages:
+                    response = asset_response(request, self.static_pages[path], "text/html; charset=utf-8",
+                                              self.asset_etags[path], cache_control=b"public, max-age=0, must-revalidate",
+                                              extra_headers=[(b"vary", b"Cookie, Authorization")])
+                elif self.ssg_fallback[pattern]["fallback"] == "blocking":
+                    response = await self._render_ssg_blocking(pattern, path, params, request)
+                else:
+                    response = await self._render_ssg_prerender(pattern, path, params)
             elif self.render_modes[pattern] == "isr" and (self.production or self.debug):
                 query = self._page_query(pattern, request)
                 private = any(name.lower() in {b"authorization", b"cookie"} for name, _ in request.headers)
@@ -3291,23 +3503,12 @@ class App:
                     # Classify the outcome before rendering: a fresh entry is
                     # a hit, a stale entry is served while one regeneration
                     # runs in the background, a miss renders synchronously.
-                    # The cache key is the routing-normalized path, not
-                    # the fully decoded one: "/files/a%2Fb" and
-                    # "/files/a/b" are different routes (different
-                    # patterns and params) and must not share an entry.
-                    # The normalized form is also what revalidate() sees
-                    # for an encoded URL, so invalidation still matches.
-                    cache_key = match_path
-                    if self.isr_queries[pattern]:
-                        try:
-                            generation, _ = await self.isr.variant_generation(match_path)
-                        except SharedCacheUnavailable:
-                            self.metrics.observe_regeneration("failure")
-                            return Response("Service Unavailable", status=503,
-                                            headers=[(b"retry-after", b"1")])
-                        encoded = json.dumps(query, ensure_ascii=True, separators=(",", ":")).encode("ascii")
-                        cache_key = ("\0isr:" + hashlib.sha256(match_path.encode("utf-8")).hexdigest() + ":" +
-                                     generation + ":" + hashlib.sha256(encoded).hexdigest())
+                    try:
+                        cache_key = await self._isr_cache_key(pattern, match_path, query)
+                    except SharedCacheUnavailable:
+                        self.metrics.observe_regeneration("failure")
+                        return Response("Service Unavailable", status=503,
+                                        headers=[(b"retry-after", b"1")])
                     cache_before, retained_body = self.isr.store.lookup(cache_key)
                     self.metrics.observe_cache(cache_before)
                     policy = self.get_isr_policy(pattern)
