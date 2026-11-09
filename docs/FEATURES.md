@@ -27,6 +27,7 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `Database` | `pynext.database` |
 | `DjangoBusyError` | `pynext.django` |
 | `DjangoResource` | `pynext.django` |
+| `CACHE_LIFE_PROFILES` | `pynext.components` |
 | `BadRequest` | `pynext.http` |
 | `Request` | `pynext.http` |
 | `RequestCancelled` | `pynext.http` |

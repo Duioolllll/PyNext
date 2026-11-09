@@ -49,7 +49,7 @@ def Page(params):
 - 익명 요청의 **쿼리 문자열은 ISR 캐시 키에 포함되지 않습니다.**
 - `Cookie` 또는 `Authorization` 헤더가 있으면 공유 캐시를 우회하며 `private, no-store`로 응답합니다.
 - ISR 공개 페이지에 비밀값·사용자별 데이터를 넣으면 안 됩니다.
-- `revalidate`는 양수, `stale`은 0 이상이며 상한도 존재합니다.
+- `revalidate`는 양수, `stale`은 0 이상이며 상한도 존재합니다. `expire`은 생성 시점부터 재는 절대 상한입니다. `revalidate`이 지난 뒤에는 `expire`까지 오래된 HTML을 제공하면서 백그라운드로 한 번 재생성하고, `expire`이 지나면 다시 제공하지 않습니다(`expire`은 `revalidate`보다 커야 하며, `float("inf")`는 1년과 같습니다). `stale`과 `expire`은 같은 구간을 다르게 쓴 것입니다(`expire == revalidate + stale`). 둘 중 하나만 주거나, 일치한다면 둘 다 줄 수 있습니다. 숫자 대신 이름 있는 프로파일도 쓸 수 있습니다. `@page(render="isr", cache_life="hours")` — `default`, `seconds`, `minutes`, `hours`, `days`, `weeks`, `max`(`pynext.CACHE_LIFE_PROFILES` 참조).
 
 ## 명시적 캐시 무효화
 

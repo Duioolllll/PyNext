@@ -3,6 +3,8 @@ import math
 import json
 import re
 
+from .cache import MAX_CACHE_SECONDS
+
 _ISLAND_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 _MAX_PROPS_BYTES = 16_384
 _MODEL_PROP_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
@@ -228,12 +230,78 @@ def bind_islands(tree, manifest, *, include_runtime=True, dev_id=None):
     return {"kind": "fragment", "children": [bound, runtime]}
 
 
-def _isr_policy(revalidate, stale):
+# Named cache-life profiles, ported from Next.js `server/config-shared.ts`
+# (`cacheLife`). Next.js profiles also carry a client-side `stale` (how
+# long the client router cache may serve without checking the server);
+# PyNext has no client router cache, so the profile's `stale` is the
+# server stale-while-revalidate window, `expire - revalidate`.
+# Semantics per profile: fresh for `revalidate`, then serve stale while
+# one background regeneration runs, and never serve past `expire` seconds
+# from generation.
+CACHE_LIFE_PROFILES = {
+    # Next.js `default`: revalidate every 15 minutes, serve stale up to 1 year.
+    "default": {"revalidate": 900, "stale": 31_535_100, "expire": 31_536_000},
+    "seconds": {"revalidate": 1, "stale": 59, "expire": 60},
+    "minutes": {"revalidate": 60, "stale": 3_540, "expire": 3_600},
+    "hours": {"revalidate": 3_600, "stale": 82_800, "expire": 86_400},
+    "days": {"revalidate": 86_400, "stale": 518_400, "expire": 604_800},
+    "weeks": {"revalidate": 604_800, "stale": 1_987_200, "expire": 2_592_000},
+    "max": {"revalidate": 2_592_000, "stale": 28_944_000, "expire": 31_536_000},
+}
+
+
+def _isr_policy(revalidate, stale=None, expire=None):
+    """Normalize an ISR lifetime to ``{"revalidate", "stale", "expire"}``.
+
+    Three axes, following Next.js `use-cache/cache-life-profile.ts`:
+
+    * ``revalidate`` — fresh window: serve as-is, no regeneration.
+    * ``stale`` — stale-while-revalidate window after the fresh window:
+      serve the old body while one background regeneration runs.
+    * ``expire`` — absolute hard cap from generation: past this, the
+      entry is never served again and the request regenerates inline.
+
+    ``stale`` and ``expire`` are two spellings of the same window, so
+    when both are given they must agree (``expire == revalidate + stale``);
+    giving only ``stale`` keeps the old meaning (``expire = revalidate +
+    stale``), and giving only ``expire`` derives ``stale`` from it.
+    ``expire=float("inf")`` means "no practical hard cap" and normalizes
+    to one year, the largest expressible value (Next.js serializes
+    Infinity as its ``INFINITE_CACHE`` sentinel the same way).
+    """
+    if stale is None:
+        stale = 60.0
+        stale_explicit = False
+    else:
+        stale_explicit = True
     for name, value, allow_zero in (("revalidate", revalidate, False), ("stale", stale, True)):
         if (isinstance(value, bool) or not isinstance(value, (int, float)) or
-                value < 0 or (not allow_zero and value == 0) or value > 604_800 or not math.isfinite(value)):
-            raise ValueError(f"{name} must be a finite {'non-negative' if allow_zero else 'positive'} number of seconds, at most 604800")
-    return {"revalidate": float(revalidate), "stale": float(stale)}
+                value < 0 or (not allow_zero and value == 0) or value > MAX_CACHE_SECONDS
+                or not math.isfinite(value)):
+            raise ValueError(f"{name} must be a finite {'non-negative' if allow_zero else 'positive'} number of seconds, at most {int(MAX_CACHE_SECONDS)}")
+    if expire is None:
+        expire = float(revalidate) + float(stale)
+    else:
+        if (isinstance(expire, bool) or not isinstance(expire, (int, float))
+                or (expire != float("inf") and (expire <= 0 or expire > MAX_CACHE_SECONDS))
+                or expire != expire):
+            raise ValueError(f"expire must be a positive number of seconds (or Infinity), at most {int(MAX_CACHE_SECONDS)}")
+        if expire == float("inf"):
+            expire = MAX_CACHE_SECONDS
+        if expire <= revalidate:
+            raise ValueError("expire must be greater than revalidate")
+        if stale_explicit and float(expire) != float(revalidate) + float(stale):
+            raise ValueError("stale and expire disagree: expire must equal revalidate + stale")
+        if not stale_explicit:
+            # Only expire was given: the SWR window is expire - revalidate.
+            stale = float(expire) - float(revalidate)
+    return {"revalidate": float(revalidate), "stale": float(stale), "expire": float(expire)}
+
+
+def _cache_life_profile(name):
+    if not isinstance(name, str) or name not in CACHE_LIFE_PROFILES:
+        raise ValueError(f"Unknown cache_life profile {name!r}: expected one of {sorted(CACHE_LIFE_PROFILES)}")
+    return dict(CACHE_LIFE_PROFILES[name])
 
 
 def _isr_query_keys(keys):
@@ -245,15 +313,25 @@ def _isr_query_keys(keys):
     return sorted(keys)
 
 
-def page(*, render="ssr", revalidate=None, stale=None, query_keys=()):
+def page(*, render="ssr", revalidate=None, stale=None, expire=None, cache_life=None, query_keys=()):
+    """Declare a page. ISR pages take a lifetime in one of two forms:
+    explicit numbers (``revalidate`` + ``stale`` and/or ``expire`` — see
+    :func:`_isr_policy`) or a named profile (``cache_life="hours"`` — see
+    :data:`CACHE_LIFE_PROFILES`). The two forms cannot be combined."""
     if render not in {"ssr", "ssg", "isr"}:
         raise ValueError("render must be 'ssr', 'ssg', or 'isr'")
     if render == "isr":
-        policy = _isr_policy(revalidate, 60.0 if stale is None else stale)
+        if cache_life is not None:
+            if revalidate is not None or stale is not None or expire is not None:
+                raise ValueError("cache_life cannot be combined with revalidate, stale, or expire")
+            profile = _cache_life_profile(cache_life)
+            policy = _isr_policy(profile["revalidate"], profile["stale"], profile["expire"])
+        else:
+            policy = _isr_policy(revalidate, stale, expire)
         query_keys = _isr_query_keys(query_keys)
     else:
-        if revalidate is not None or stale is not None or query_keys:
-            raise ValueError("revalidate, stale, and query_keys are only valid for ISR pages")
+        if revalidate is not None or stale is not None or expire is not None or cache_life is not None or query_keys:
+            raise ValueError("revalidate, stale, expire, cache_life, and query_keys are only valid for ISR pages")
         policy = None
     def decorate(fn):
         fn.__pynext_page__ = True

@@ -175,7 +175,10 @@ def test_expired_lookup_does_not_delete_concurrent_fresh_write(tmp_path):
     second = SQLiteCacheBackend(path)
     try:
         assert first.insert("k", b"old", 1, 0)
-        first._conn.execute("UPDATE entries SET generated_at = 0 WHERE key = ?", ("k",))
+        # Age the entry on both clocks: lifetimes are measured on the
+        # monotonic clock first, so zeroing only generated_at would
+        # leave the entry fresh.
+        first._conn.execute("UPDATE entries SET generated_at = 0, generated_mono = 0 WHERE key = ?", ("k",))
         first._conn.commit()
 
         class InterleavedConnection:
@@ -205,7 +208,9 @@ def test_expired_entry_keeps_version_while_live_lease_regenerates(tmp_path):
     try:
         assert backend.insert("k", b"old", 1, 0)
         assert backend.acquire_lease("k", "worker") == 1
-        backend._conn.execute("UPDATE entries SET generated_at = 0 WHERE key = ?", ("k",))
+        # Age the entry on both clocks (see above): the monotonic age
+        # is authoritative, so generated_at alone cannot expire it.
+        backend._conn.execute("UPDATE entries SET generated_at = 0, generated_mono = 0 WHERE key = ?", ("k",))
         backend._conn.commit()
         assert backend.lookup("k")[0] in {"expired", "miss"}
         assert backend.insert_fenced("k", b"new", 30, 0, 1, "worker")

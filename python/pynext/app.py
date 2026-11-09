@@ -524,10 +524,10 @@ class App:
                 self.render_modes[pattern] = mode
                 if mode == "isr":
                     policy = getattr(fn, "__pynext_cache_policy__", None)
-                    if not isinstance(policy, dict) or set(policy) != {"revalidate", "stale"}:
+                    if not isinstance(policy, dict) or set(policy) != {"revalidate", "stale", "expire"}:
                         raise ValueError(f"Invalid ISR policy in {spec['entry']}")
                     try:
-                        policy = _isr_policy(policy["revalidate"], policy["stale"])
+                        policy = _isr_policy(policy["revalidate"], policy["stale"], policy["expire"])
                     except ValueError as exc:
                         raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
                     if getattr(module, "generate_static_params", None) is not None:

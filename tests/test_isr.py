@@ -38,7 +38,7 @@ async def until(condition, timeout=5):
 def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
     make_project(tmp_path)
     manifest = write_manifest(tmp_path)
-    assert manifest["isr_policies"]["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0}
+    assert manifest["isr_policies"]["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0, "expire": 31.0}
 
     async def run():
         app = create_app(tmp_path, production=True)
@@ -262,7 +262,7 @@ def test_loaded_isr_policy_does_not_alias_page_metadata(tmp_path):
     make_project(tmp_path)
     app = create_app(tmp_path)
     app._module("app/blog/[slug]/page.py").Page.__pynext_cache_policy__["revalidate"] = 0
-    assert app.isr_policies["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0}
+    assert app.isr_policies["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0, "expire": 31.0}
 
 
 def test_isr_rejects_request_access_and_static_generator(tmp_path):

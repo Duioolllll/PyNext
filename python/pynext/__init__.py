@@ -3,7 +3,7 @@
 from .app import App, create_app
 from .auth import require_auth, require_permission
 from .client_dsl import ClientDSLCompileError, compile_client_dsl
-from .components import h, fragment, island, layout, model_prop, page
+from .components import CACHE_LIFE_PROFILES, h, fragment, island, layout, model_prop, page
 from .database import Database
 from .django import DjangoBusyError, DjangoResource
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN
@@ -21,7 +21,7 @@ from .routing import route, websocket
 from .sessions import RedisSessionStore, Session, SessionMiddleware, SQLiteSessionStore
 
 __all__ = ["App", "create_app", "h", "fragment", "island", "layout", "model_prop", "page", "route", "websocket", "Database",
-           "DjangoBusyError", "DjangoResource",
+           "DjangoBusyError", "DjangoResource", "CACHE_LIFE_PROFILES",
            "BadRequest", "Request", "RequestCancelled", "Response", "JSONResponse", "StreamingResponse", "SecurityConfig",
            "csrf_protect", "new_csrf_token", "new_csp_nonce", "set_csrf_cookie", "sign_csrf_token",
            "validate_csrf",

@@ -44,7 +44,14 @@ LEASE_TTL = GENERATION_TIMEOUT + 5.0
 LEASE_WAIT_INTERVAL = 0.05
 MAX_CACHE_KEY_BYTES = 4096
 MAX_CACHE_BODY_BYTES = 2_097_152
-MAX_CACHE_SECONDS = 604_800.0
+# One year, matching Next.js CACHE_ONE_YEAR_SECONDS / the `max` cacheLife
+# profile's expire. Every lifetime axis (revalidate, stale, expire) is
+# bounded by this; the previous 7-day bound could not express the
+# `weeks`/`max` profiles (revalidate 7d/30d, expire up to 1y).
+MAX_CACHE_SECONDS = 31_536_000.0
+# The SQLite backend keeps at most this many rows; older entries are
+# evicted on insert so an idle cache file cannot grow without bound.
+MAX_SQLITE_ENTRIES = 10_000
 _SHARED_UNAVAILABLE = object()
 _VARIANT_GENERATION_TTL = 86400
 _MAX_LOCAL_VARIANT_PATHS = 1024
@@ -90,6 +97,55 @@ def _valid_durations(fresh_seconds, stale_seconds):
             and fresh == fresh and stale == stale)
 
 
+def normalize_isr_policy(policy):
+    """Return a 3-axis policy ``{"revalidate", "stale", "expire"}``.
+
+    ``expire`` is the absolute hard cap measured from generation: after
+    ``revalidate`` the entry is served stale while one regeneration runs,
+    and after ``expire`` it is never served again. Policies written before
+    ``expire`` existed (``{"revalidate", "stale"}`` only) keep their old
+    meaning with ``expire = revalidate + stale``. The effective
+    stale-while-revalidate window handed to backends is therefore
+    ``expire - revalidate`` (see :func:`policy_windows`).
+    """
+    if not isinstance(policy, dict):
+        raise ValueError("ISR policy must be a dict")
+    revalidate = policy.get("revalidate")
+    stale = policy.get("stale")
+    expire = policy.get("expire", None)
+    for name, value, allow_zero in (("revalidate", revalidate, False), ("stale", stale, True)):
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or value != value or value < 0 or (not allow_zero and value == 0)
+                or value > MAX_CACHE_SECONDS):
+            raise ValueError(
+                f"{name} must be a finite {'non-negative' if allow_zero else 'positive'}"
+                f" number of seconds, at most {int(MAX_CACHE_SECONDS)}")
+    if expire is None:
+        expire = float(revalidate) + float(stale)
+    elif (isinstance(expire, bool) or not isinstance(expire, (int, float)) or expire != expire
+          or expire <= 0 or (expire != float("inf") and expire > MAX_CACHE_SECONDS)):
+        raise ValueError(
+            f"expire must be a positive number of seconds (or Infinity), at most {int(MAX_CACHE_SECONDS)}")
+    elif expire == float("inf"):
+        # Next.js serializes Infinity as the INFINITE_CACHE sentinel; here
+        # the 1-year bound is the largest expressible hard cap.
+        expire = MAX_CACHE_SECONDS
+    if expire <= float(revalidate):
+        raise ValueError("expire must be greater than revalidate")
+    return {"revalidate": float(revalidate), "stale": float(stale), "expire": float(expire)}
+
+
+def policy_windows(policy):
+    """Map a 3-axis policy to the ``(fresh_for, stale_for)`` backend windows.
+
+    ``fresh_for`` is ``revalidate``; ``stale_for`` is ``expire - revalidate``,
+    so the SWR window runs right up to the hard cap and the backend schema
+    (fresh/stale durations) needs no third column.
+    """
+    normalized = normalize_isr_policy(policy)
+    return normalized["revalidate"], normalized["expire"] - normalized["revalidate"]
+
+
 class MemoryCacheBackend(CacheBackend):
     """The original process-local backend, backed by the Rust PageCache."""
 
@@ -130,9 +186,21 @@ class SQLiteCacheBackend(CacheBackend):
     can share a cache with only the standard library. All statements run
     under one connection guarded by a lock, with ``BEGIN IMMEDIATE`` for
     lease and fenced-write transactions so two processes cannot both win
-    the same lease or the same version check. Timestamps use wall-clock
-    seconds; a clock jump may age entries early or late, but versions
-    still fence every write.
+    the same lease or the same version check.
+
+    Entry lifetimes are measured on the monotonic clock
+    (``time.monotonic()``, system-wide since boot, so it is shared by all
+    processes on the machine and immune to NTP/wall-clock jumps). The
+    wall-clock ``generated_at`` is kept alongside as a fallback: after a
+    reboot the monotonic epoch restarts, so a stored monotonic timestamp
+    from before the reboot is meaningless and the lookup falls back to
+    the wall-clock age. A monotonic age is only trusted when it is
+    non-negative; a negative one (reboot, or a database file copied from
+    another machine) means "fall back". Leases are live only while *both*
+    clocks say so, so a wall-clock jump in either direction can only
+    shorten a lease, never extend it past its monotonic TTL. The table
+    is bounded: expired rows are purged on insert and the oldest rows go
+    once ``MAX_SQLITE_ENTRIES`` is exceeded.
     """
 
     def __init__(self, path):
@@ -162,38 +230,78 @@ class SQLiteCacheBackend(CacheBackend):
                 "CREATE TABLE IF NOT EXISTS variant_generations ("
                 "  key TEXT PRIMARY KEY, token TEXT NOT NULL, expires_at REAL NOT NULL);"
             )
+            # Monotonic-clock columns, added to databases created before
+            # them (CREATE TABLE IF NOT EXISTS leaves old files untouched).
+            self._ensure_column("entries", "generated_mono", "REAL")
+            self._ensure_column("leases", "expires_mono", "REAL")
             self._conn.commit()
         except sqlite3.Error as exc:
             raise ValueError(f"Cannot open SQLite cache at {path}: {exc}") from exc
 
-    def _read_entry(self, key, now):
+    def _ensure_column(self, table, column, definition):
+        columns = [row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")]
+        if column not in columns:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    @staticmethod
+    def _age(generated_at, generated_mono, now_wall, now_mono):
+        """Age of an entry in seconds, monotonic-first with wall fallback.
+
+        A non-negative monotonic age is authoritative (immune to clock
+        jumps). A negative one means the monotonic epoch restarted (reboot)
+        or the file came from another machine, so the wall-clock age —
+        clamped at zero, since a backwards jump must not resurrect an
+        expired entry as fresh — is used instead.
+        """
+        if generated_mono is not None:
+            age_mono = now_mono - generated_mono
+            if age_mono >= 0:
+                return age_mono
+        return max(0.0, now_wall - generated_at)
+
+    @staticmethod
+    def _lease_is_live(expires_at, expires_mono, now_wall, now_mono):
+        """A lease is live only while both clocks say so.
+
+        Either clock expiring the lease ends it: a wall jump forward ends
+        it (wall), a wall jump backward cannot extend it past its
+        monotonic TTL (mono), and a reboot makes the stored monotonic
+        expiry look far-future, so the wall clock ends it.
+        """
+        if expires_at <= now_wall:
+            return False
+        return expires_mono is None or expires_mono > now_mono
+
+    def _read_entry(self, key, now_wall, now_mono):
         for _ in range(3):
             row = self._conn.execute(
-                "SELECT body, generated_at, fresh_for, stale_for, version"
+                "SELECT body, generated_at, generated_mono, fresh_for, stale_for, version"
                 " FROM entries WHERE key = ?", (key,)
             ).fetchone()
             if row is None:
                 return None
-            body, generated_at, fresh_for, stale_for, version = row
-            age = now - generated_at
+            body, generated_at, generated_mono, fresh_for, stale_for, version = row
+            age = self._age(generated_at, generated_mono, now_wall, now_mono)
             if age >= fresh_for + stale_for:
                 lease = self._conn.execute(
-                    "SELECT 1 FROM leases WHERE key = ? AND expires_at > ?", (key, now)
+                    "SELECT expires_at, expires_mono FROM leases WHERE key = ?", (key,)
                 ).fetchone()
-                if lease is not None:
+                if lease is not None and self._lease_is_live(lease[0], lease[1], now_wall, now_mono):
                     return SharedEntry("expired", None, version, 0.0, 0.0)
                 # Another connection can replace the row between the read
                 # and delete, or take a lease. Delete only the exact expired
                 # version seen, and only if no live generation owns it.
                 deleted = self._conn.execute(
                     "DELETE FROM entries WHERE key = ? AND version = ? AND generated_at = ?"
-                    " AND NOT EXISTS (SELECT 1 FROM leases WHERE key = ? AND expires_at > ?)",
-                    (key, version, generated_at, key, now),
+                    " AND NOT EXISTS (SELECT 1 FROM leases WHERE key = ?"
+                    "   AND expires_at > ? AND (expires_mono IS NULL OR expires_mono > ?))",
+                    (key, version, generated_at, key, now_wall, now_mono),
                 ).rowcount
                 self._conn.commit()
                 if deleted:
                     return SharedEntry("expired", None, version, 0.0, 0.0)
-                now = time.time()
+                now_wall = time.time()
+                now_mono = time.monotonic()
                 continue
             if age < fresh_for:
                 return SharedEntry("fresh", body, version, fresh_for - age, stale_for)
@@ -204,7 +312,7 @@ class SQLiteCacheBackend(CacheBackend):
     def lookup(self, key):
         with self._lock:
             try:
-                entry = self._read_entry(key, time.time())
+                entry = self._read_entry(key, time.time(), time.monotonic())
             except sqlite3.Error:
                 log.warning("Shared cache lookup failed for %s", key, exc_info=True)
                 return ("miss", None)
@@ -218,7 +326,7 @@ class SQLiteCacheBackend(CacheBackend):
         for repopulating the process-local cache."""
         with self._lock:
             try:
-                return self._read_entry(key, time.time())
+                return self._read_entry(key, time.time(), time.monotonic())
             except sqlite3.Error as exc:
                 raise SharedCacheUnavailable("Shared cache lookup failed") from exc
 
@@ -239,11 +347,13 @@ class SQLiteCacheBackend(CacheBackend):
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
                     now = time.time()
+                    now_mono = time.monotonic()
                     if owner is not None:
                         lease = self._conn.execute(
-                            "SELECT owner, expires_at FROM leases WHERE key = ?", (key,)
+                            "SELECT owner, expires_at, expires_mono FROM leases WHERE key = ?", (key,)
                         ).fetchone()
-                        if lease is None or lease[0] != owner or lease[1] <= now:
+                        if (lease is None or lease[0] != owner
+                                or not self._lease_is_live(lease[1], lease[2], now, now_mono)):
                             self._conn.execute("ROLLBACK")
                             return False
                     row = self._conn.execute(
@@ -262,22 +372,60 @@ class SQLiteCacheBackend(CacheBackend):
                     else:
                         version = row[0] + 1
                     self._conn.execute(
-                        "INSERT INTO entries (key, body, generated_at, fresh_for, stale_for, version)"
-                        " VALUES (?, ?, ?, ?, ?, ?)"
+                        "INSERT INTO entries (key, body, generated_at, generated_mono,"
+                        " fresh_for, stale_for, version)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?)"
                         " ON CONFLICT(key) DO UPDATE SET body=excluded.body,"
-                        " generated_at=excluded.generated_at, fresh_for=excluded.fresh_for,"
+                        " generated_at=excluded.generated_at, generated_mono=excluded.generated_mono,"
+                        " fresh_for=excluded.fresh_for,"
                         " stale_for=excluded.stale_for, version=excluded.version",
-                        (key, bytes(body), now, float(fresh_seconds), float(stale_seconds), version),
+                        (key, bytes(body), now, now_mono, float(fresh_seconds), float(stale_seconds), version),
                     )
                     self._conn.execute("COMMIT")
                 except BaseException:
                     if self._conn.in_transaction:
                         self._conn.execute("ROLLBACK")
                     raise
+                self._prune(exclude=key)
                 return True
             except sqlite3.Error:
                 log.warning("Shared cache insert failed for %s", key, exc_info=True)
                 return False
+
+    def _prune(self, exclude=None):
+        """Best-effort bounded cleanup after an insert: drop rows both
+        clocks agree are expired, then evict the oldest rows past the
+        row cap. A row is only purged as expired when the wall clock and
+        (when present) the monotonic clock both place it past its
+        lifetime, so a clock jump cannot purge live entries. The key
+        this insert just wrote is excluded: with a very short TTL a
+        scheduling stall between the insert's timestamp and this prune
+        could otherwise make the prune delete the row it just wrote,
+        so a lookup right after a successful insert would see a miss
+        instead of the entry (fresh, or expired once its TTL elapsed)."""
+        try:
+            now_wall = time.time()
+            now_mono = time.monotonic()
+            self._conn.execute(
+                "DELETE FROM entries WHERE key IN (SELECT key FROM entries"
+                " WHERE generated_at + fresh_for + stale_for <= ?"
+                " AND (generated_mono IS NULL OR generated_mono + fresh_for + stale_for <= ?)"
+                " AND (? IS NULL OR key != ?)"
+                " LIMIT 512)", (now_wall, now_mono, exclude, exclude))
+            count = self._conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+            if count > MAX_SQLITE_ENTRIES:
+                self._conn.execute(
+                    "DELETE FROM entries WHERE key IN (SELECT key FROM entries"
+                    " WHERE (? IS NULL OR key != ?)"
+                    " ORDER BY generated_at ASC LIMIT ?)", (exclude, exclude, count - MAX_SQLITE_ENTRIES))
+            self._conn.commit()
+        except sqlite3.Error:
+            log.warning("Shared cache prune failed", exc_info=True)
+            if self._conn.in_transaction:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
 
     def remove(self, key):
         with self._lock:
@@ -345,10 +493,11 @@ class SQLiteCacheBackend(CacheBackend):
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
                     now = time.time()
+                    now_mono = time.monotonic()
                     row = self._conn.execute(
-                        "SELECT owner, expires_at FROM leases WHERE key = ?", (key,)
+                        "SELECT owner, expires_at, expires_mono FROM leases WHERE key = ?", (key,)
                     ).fetchone()
-                    if row is not None and row[1] > now:
+                    if row is not None and self._lease_is_live(row[1], row[2], now, now_mono):
                         self._conn.execute("ROLLBACK")
                         return None
                     version_row = self._conn.execute(
@@ -356,10 +505,11 @@ class SQLiteCacheBackend(CacheBackend):
                     ).fetchone()
                     version = version_row[0] if version_row else 0
                     self._conn.execute(
-                        "INSERT INTO leases (key, owner, expires_at, version) VALUES (?, ?, ?, ?)"
+                        "INSERT INTO leases (key, owner, expires_at, expires_mono, version) VALUES (?, ?, ?, ?, ?)"
                         " ON CONFLICT(key) DO UPDATE SET owner=excluded.owner,"
-                        " expires_at=excluded.expires_at, version=excluded.version",
-                        (key, owner, now + ttl, version),
+                        " expires_at=excluded.expires_at, expires_mono=excluded.expires_mono,"
+                        " version=excluded.version",
+                        (key, owner, now + ttl, now_mono + ttl, version),
                     )
                     self._conn.execute("COMMIT")
                 except BaseException:
@@ -386,9 +536,11 @@ class SQLiteCacheBackend(CacheBackend):
     def owns_lease(self, key, owner):
         with self._lock:
             try:
-                row = self._conn.execute("SELECT 1 FROM leases WHERE key=? AND owner=? AND expires_at>?",
-                                         (key, owner, time.time())).fetchone()
-                return row is not None
+                row = self._conn.execute(
+                    "SELECT expires_at, expires_mono FROM leases WHERE key=? AND owner=?",
+                    (key, owner)).fetchone()
+                return row is not None and self._lease_is_live(
+                    row[0], row[1], time.time(), time.monotonic())
             except sqlite3.Error as exc:
                 raise SharedCacheUnavailable("Shared cache lease lookup failed") from exc
 
@@ -658,6 +810,13 @@ class ISRCache:
             self._loop = loop
         elif self._loop is not loop:
             raise RuntimeError("An ISR app instance must use a single event loop")
+        # Normalize to the 3-axis policy, then hand the backends the two
+        # windows they store: fresh_for = revalidate, stale_for =
+        # expire - revalidate, so the SWR window runs up to the hard cap.
+        # A pre-expire 2-key policy keeps its old meaning
+        # (expire = revalidate + stale).
+        fresh_for, stale_for = policy_windows(policy)
+        policy = {"revalidate": fresh_for, "stale": stale_for}
         status, body = self.store.lookup(key)
         if status == "fresh" and self.shared is None:
             return body
