@@ -245,6 +245,10 @@ async def _render_static_pages(app):
                             if len(body) + len(chunk) > MAX_STREAMED_STATIC_BYTES:
                                 raise ValueError("Streamed static page exceeds build size limit")
                             body.extend(chunk)
+                except asyncio.TimeoutError as exc:
+                    raise ValueError(
+                        f"Streamed static page for {path} exceeded the build time limit "
+                        f"({MAX_STREAMED_STATIC_SECONDS}s)") from exc
                 finally:
                     await response.aclose()
                 rendered[path] = (pattern, bytes(body))

@@ -133,6 +133,22 @@ def test_ssg_artifacts_integrity_and_failed_build_is_atomic(tmp_path):
         create_app(tmp_path, production=True)
 
 
+def test_streamed_ssg_timeout_fails_with_a_clear_build_error(tmp_path, monkeypatch):
+    from pynext import build as build_module
+
+    app_dir = make_app(tmp_path)
+    (app_dir / "page.py").write_text(
+        'from pynext import page, h\nimport asyncio\n@page(render="ssg")\n'
+        'async def Page():\n'
+        '    await asyncio.sleep(5)\n'
+        '    yield h("p", {}, "slow")\n', encoding="utf-8")
+    # The real limit is 30s; shrink it for the test — the timeout path
+    # (asyncio.timeout -> ValueError) is the same either way.
+    monkeypatch.setattr(build_module, "MAX_STREAMED_STATIC_SECONDS", 0.05)
+    with pytest.raises(ValueError, match="exceeded the build time limit"):
+        write_manifest(tmp_path)
+
+
 def test_streamed_ssg_is_rendered_at_build_and_served_as_static(tmp_path):
     app_dir = make_app(tmp_path)
     (app_dir / "page.py").write_text(
