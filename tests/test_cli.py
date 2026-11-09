@@ -21,15 +21,15 @@ def test_cli_rejects_invalid_port_before_starting(value, monkeypatch, capsys):
 @pytest.mark.parametrize("flag,value,message", [
     ("--max-concurrent", "-1", "--max-concurrent must be an integer >= 1"),
     ("--max-concurrent", "0", "--max-concurrent must be an integer >= 1"),
-    ("--max-concurrent", "not-a-number", "--max-concurrent must be an integer >= 1"),
+    ("--max-concurrent", "not-a-number", "--max-concurrent must be an integer in [1, 1000000]"),
     ("--body-capacity", "-1", "--body-capacity must be an integer >= 1"),
     ("--body-capacity", "0", "--body-capacity must be an integer >= 1"),
     ("--acquire-timeout-ms", "-1", "--acquire-timeout-ms must be an integer >= 0"),
-    ("--acquire-timeout-ms", "not-a-number", "--acquire-timeout-ms must be an integer >= 0"),
+    ("--acquire-timeout-ms", "not-a-number", "--acquire-timeout-ms must be an integer in [0, 86400000]"),
     ("--body-timeout-ms", "-1", "--body-timeout-ms must be an integer >= 0"),
-    ("--body-timeout-ms", "not-a-number", "--body-timeout-ms must be an integer >= 0"),
+    ("--body-timeout-ms", "not-a-number", "--body-timeout-ms must be an integer in [0, 86400000]"),
     ("--max-waiting", "-1", "--max-waiting must be an integer >= 0"),
-    ("--max-waiting", "not-a-number", "--max-waiting must be an integer >= 0"),
+    ("--max-waiting", "not-a-number", "--max-waiting must be an integer in [0, 1000000]"),
 ])
 def test_cli_rejects_out_of_range_limits_before_starting(flag, value, message, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["pynext", "dev", flag, value])
@@ -241,6 +241,33 @@ def test_cli_build_reports_manifest_errors_instead_of_traceback(tmp_path, monkey
         cli.main()
     assert error.value.code == 2
     assert "Application sources changed during build" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("option", "bounds"), [("--workers", "[1, 64]"),
+                                                ("--max-concurrent", "[1, 1000000]")])
+def test_cli_non_integer_count_reports_full_range(monkeypatch, capsys, option, bounds):
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", option, "many"])
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    message = capsys.readouterr().err
+    assert option in message and bounds in message
+
+
+def test_cli_start_reports_non_object_manifest(tmp_path, monkeypatch, capsys):
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "page.py").write_text(
+        'from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "ok")\n', encoding="utf-8")
+    cli.write_manifest(tmp_path)
+    (tmp_path / ".pynext" / "manifest.json").write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path)])
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    message = capsys.readouterr().err
+    assert "expected a JSON object" in message and "rebuild" in message
+    assert "Traceback" not in message
 
 
 def test_cli_security_flags_reach_app(tmp_path, monkeypatch):

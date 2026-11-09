@@ -122,6 +122,8 @@ Skipping rotation leaves the session open to fixation: a session id fixed by an 
 
 A `RedisSessionStore` follows a failure policy when Redis is unreachable (see `failure_policy`): the default is `fail_closed`, which raises `SessionUnavailable` and the request is answered 503 instead of silently losing session state. Pass `failure_policy="fail_open"` to start a fresh ephemeral session instead — reads keep working, but nothing is persisted, and a login cannot complete during the outage: the CSRF token issued for it is never stored, so the login request fails CSRF (403). A rotation during the outage may also leave the old session id usable until it expires. Only use `fail_open` where availability matters more than session continuity.
 
+Under `fail_open`, session deletion on logout is also best-effort. The browser cookie can be cleared while the server-side session and a previously copied token remain valid until the TTL expires or deletion succeeds after recovery. Such a logout does not confirm server-side revocation.
+
 Cross-origin requests are denied by default (spec v0.2 §11): no `Access-Control-Allow-Origin` header is sent unless the origin is configured. Pass the policy to `create_app` with `SecurityConfig`:
 
 ~~~python
@@ -178,6 +180,10 @@ In the development version, the handshake accepts only a same-origin `Origin` by
 
 For PyNext to identify a trusted proxy on ASGI, the server must preserve the original peer in `scope["client"]`. Disable upstream proxy-header rewriting (for Uvicorn, use `--no-proxy-headers`) when PyNext is responsible for interpreting forwarded headers.
 
+Do not create, rotate or invalidate sessions in WebSocket authorization middleware. The pre-flight response is discarded, including `Set-Cookie`, so a new token will not reach the browser and a rotated old token may already have been removed. Perform login and session changes through ordinary HTTP endpoints before connecting.
+
+For authorization pre-flight denials, ASGI sends `websocket.close` with code 1008 before acceptance; an ASGI server normally answers the handshake with HTTP 403. Axum maps pre-flight 401/403 responses to HTTP 403 and all other pre-flight responses or failures to 503. This mapping is separate from the built-in handshake rate limiter, which can return 429.
+
 ~~~python
 # app/ws/echo/route.py
 from pynext import WebSocket, WebSocketDisconnect, websocket
@@ -220,7 +226,7 @@ SSG and ISR pages cannot accept `request` and must contain public content. ISR i
 
 A build produces at most 10,000 SSG pages. Development mode renders SSG pages for each request. ISR pages cannot export `generate_static_params()` and permit at most 128 concurrent generation tasks per process.
 
-An authorized API handler can call `await request.revalidate("/news/example")`; code holding an app instance can call `await app.revalidate(path)`. Pass a decoded ISR path without a query string. The result is `True` if a local cached entry or in-flight generation was invalidated. With a shared backend the shared entry is removed too while the store is reachable; in `fail_open` mode a `True` result does not guarantee the shared entry is gone when the shared store is unreachable (shared removal is best-effort there), so other workers may keep serving the stale entry until it expires — use `fail_closed` if an unapplied invalidation must raise instead of reporting success. Existing requests may still receive an older in-flight result, but that result cannot repopulate the cache. With the memory backend, invalidation is process-local and is not sent to other workers; with the SQLite backend it removes the shared entry and other workers observe that on their next lookup while the store is available. Authenticate and authorize any endpoint that exposes it.
+An authorized API handler can call `await request.revalidate("/news/example")`; code holding an app instance can call `await app.revalidate(path)`. Pass a decoded ISR path without a query string. The result is `True` if a local or shared cached entry was removed, or an in-flight generation was retired. With a shared backend the shared entry is removed too while the store is reachable; in `fail_open` mode a `True` result does not guarantee the shared entry is gone when the shared store is unreachable (shared removal is best-effort there), so other workers may keep serving the stale entry until it expires — use `fail_closed` if an unapplied invalidation must raise instead of reporting success. Existing requests may still receive an older in-flight result, but that result cannot repopulate the cache. With the memory backend, invalidation is process-local and is not sent to other workers; with the SQLite backend it removes the shared entry and other workers observe that on their next lookup while the store is available. Authenticate and authorize any endpoint that exposes it.
 
 ## Public files and islands
 
@@ -259,6 +265,8 @@ All pages load the client runtime. Same-origin links use partial navigation when
 
 `pynext.client_dsl.compile_client_dsl(source)` compiles a small, fixed subset of Python to JavaScript (spec §7.3). Supported: literals (int within the JavaScript safe-integer range, float, str, bool, None, list, tuple, dict), arithmetic (`+ - * / // % **`), comparisons, `and`/`or`/`not`, `if`/`else`, `for` over `range()` or a list, `while`, function definitions, `len`, `str`, `int`, `float`, `bool`, `abs`, `min`, `max`, `list`, `print`, `.append()`, indexing, slices and one-clause list comprehensions. Everything else raises `ClientDSLCompileError`: imports, reflection, file I/O, classes, lambdas, `try`, f-strings and server-only names such as `open`, `os`, `Request` or `h` are rejected at compile time so server code cannot leak into a browser bundle. See `pynext.client_dsl.SUPPORTED` and `KNOWN_DIFFERENCES` for the exact list and the known semantic differences (for example `str(1.0)` drops the trailing `.0`). See the [example](../../examples/basic/client_dsl_example.py). The DSL is a standalone compiler: it does not bundle code into islands automatically.
 
+Rejecting non-finite literals does not guarantee finite runtime results. `float("Infinity")`, `float("nan")` and arithmetic overflow such as `1e308 * 1e308` can still produce Infinity or NaN; runtime finiteness is not enforced. See `KNOWN_DIFFERENCES`.
+
 ## ASGI, timeouts and safety
 
 To use the included development ASGI app with Uvicorn:
@@ -271,7 +279,7 @@ For a built app, create the ASGI app with `create_app(project_path, production=T
 
 Distributed rate limiting is implemented with `--rate-limit-backend redis` (shared Redis token buckets). Production hardening remains a roadmap item. SQLite invalidation is observed on the next lookup while the shared store is available. OpenTelemetry spans are emitted when the optional packages are installed and tracing is enabled (see Observability). ASGI conformance is verified by `tests/test_asgi_conformance.py` (HTTP event order, chunked bodies, disconnects, lifespan including failure paths). See [production roadmap](../PRODUCTION_ROADMAP.md) for proposed work and its acceptance criteria.
 
-Both adapters limit request bodies to 1 MiB and return 413 when exceeded. By default Axum permits 16 simultaneous body reads with a 10-second body deadline (408), 64 Python handlers, and at most the smaller of the handler limit and 64 waiting requests; full queues return 503. The execution and body settings can be changed with the CLI. HTTP/1.1 header reads have a 10-second deadline, but total connections remain unlimited. External ASGI servers manage their own timeouts. Non-root paths ending in a slash redirect with 308. Each compiled island is limited to 2 MiB, with 32 MiB total.
+Both adapters limit request bodies to 1 MiB and return 413 when exceeded. By default Axum permits 16 simultaneous body reads with a 10-second body deadline (408), 64 Python handlers, and at most the smaller of the handler limit and 64 waiting requests; full queues return 503. The execution and body settings can be changed with the CLI. HTTP/1.1 header reads have a 10-second deadline. Axum defaults to 1,024 total connections and 128 per IP per worker, configurable with `--max-connections` and `--max-connections-per-ip`. External ASGI servers manage their own timeouts. Non-root paths ending in a slash redirect with 308. Each compiled island is limited to 2 MiB, with 32 MiB total.
 
 ## Observability
 

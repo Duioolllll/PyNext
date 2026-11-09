@@ -248,7 +248,7 @@ def test_cli_rejects_invalid_workers(monkeypatch, capsys):
 
     for argv, message in [
         (["pynext", "start", "--workers", "0"], "--workers must be an integer >= 1"),
-        (["pynext", "start", "--workers", "not-a-number"], "--workers must be an integer >= 1"),
+        (["pynext", "start", "--workers", "not-a-number"], "--workers must be an integer in [1, 64]"),
     ]:
         monkeypatch.setattr(sys, "argv", argv)
         monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: pytest.fail("unexpected startup"))

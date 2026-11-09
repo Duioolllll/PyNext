@@ -69,3 +69,22 @@ def test_init_failure_keeps_pre_existing_root_but_removes_created_app_dir(tmp_pa
     assert (project / "keep.txt").read_text() == "keep"
     assert not (project / "app").exists()
     assert not (project / "README.md").exists()
+
+
+@pytest.mark.parametrize("keep_parent", [False, True])
+def test_init_failure_cleans_created_ancestors_only(tmp_path, monkeypatch, keep_parent):
+    from pynext.scaffold import init_project
+
+    parent = tmp_path / "a"
+    if keep_parent:
+        parent.mkdir()
+        (parent / "keep.txt").write_text("keep", encoding="utf-8")
+    project = parent / "b" / "project"
+    _fail_readme_open(monkeypatch)
+    with pytest.raises(OSError, match="simulated disk failure"):
+        init_project(project)
+    assert not (parent / "b").exists()
+    if keep_parent:
+        assert (parent / "keep.txt").read_text() == "keep"
+    else:
+        assert not parent.exists()

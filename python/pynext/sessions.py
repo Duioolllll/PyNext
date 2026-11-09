@@ -182,7 +182,10 @@ class RedisSessionStore:
     working, but a login cannot complete during the outage: the CSRF
     token issued for it is never stored, so the login request fails
     CSRF (403). A rotation during the outage may also leave the old
-    session id usable until it expires. Fencing conflicts
+    session id usable until it expires. A failed delete under ``fail_open``
+    can clear the browser cookie without revoking the server session;
+    its old token can remain usable until the TTL expires or a later
+    successful delete. Fencing conflicts
     (:class:`SessionConflict`) and corrupt data (``ValueError``) are
     not outages and are never absorbed by either policy.
     """

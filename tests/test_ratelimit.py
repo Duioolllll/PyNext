@@ -457,7 +457,7 @@ def test_cli_rejects_invalid_rate_limit_flags(monkeypatch, capsys):
         (["pynext", "start", "--rate-limit", "10", "--rate-limit-ipv6-prefix-len", "129"],
          "--rate-limit-ipv6-prefix-len must be an integer <= 128"),
         (["pynext", "start", "--rate-limit", "10", "--rate-limit-ipv6-prefix-len", "not-a-number"],
-         "--rate-limit-ipv6-prefix-len must be an integer >= 0"),
+         "--rate-limit-ipv6-prefix-len must be an integer in [0, 128]"),
     ]:
         monkeypatch.setattr(sys, "argv", argv)
         monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: pytest.fail("unexpected startup"))

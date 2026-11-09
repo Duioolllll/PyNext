@@ -98,6 +98,18 @@ def test_corrupt_manifest_fails_with_a_clear_build_error(tmp_path):
         load_manifest(tmp_path)
 
 
+@pytest.mark.parametrize("payload", ["[]", "null", '"manifest"', "1", "true"])
+def test_non_object_manifest_fails_with_a_clear_build_error(tmp_path, payload):
+    from pynext.build import load_manifest
+
+    make_app(tmp_path)
+    write_manifest(tmp_path)
+    manifest = tmp_path / ".pynext" / "manifest.json"
+    manifest.write_text(payload, encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid build manifest.*expected a JSON object"):
+        load_manifest(tmp_path)
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="Unix permission bits are not meaningful on Windows",
