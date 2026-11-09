@@ -555,10 +555,11 @@ class ISRCache:
     async def invalidate(self, key):
         """Remove ``key`` from the local cache and, when configured, the shared store.
 
-        Returns ``True`` when a local entry or an in-flight generation
-        was removed. In ``fail_open`` mode a ``True`` return means
-        local removal succeeded; shared removal is best-effort, so
-        ``True`` does not guarantee the shared entry is gone — when the
+        Returns ``True`` when a local or shared entry was removed, or an
+        in-flight generation was retired. In ``fail_open`` mode shared
+        removal is best-effort: local removal or retirement can return
+        ``True`` even when the shared store is unavailable, so ``True``
+        does not guarantee the shared entry is gone — when the
         shared store is unreachable the removal is skipped (and logged)
         and other workers may keep serving the stale entry until it
         expires or the store recovers. In ``fail_closed`` mode a

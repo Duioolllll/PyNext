@@ -33,18 +33,23 @@ Defaults are chosen per component for the safer side of its own risk:
   (the CSRF token issued for it is never stored, so the login
   request fails CSRF with 403).
 
-The policy governs the *read/decision* path only. Best-effort writes
-stay best-effort in both modes: a shared-cache insert that fails after
+Best-effort cache writes stay best-effort in both modes: a shared-cache
+insert that fails after
 a page was rendered correctly does not fail the request (the page is
 fresh and safe to serve once; only its caching is lost), and a lease
 release failure does not fail the request either (leases expire on
 their own). An explicit invalidation that cannot reach the shared
 store is different: under ``fail_closed`` it raises instead of
 reporting success, so callers never mistake an unapplied invalidation
-for a completed one. For Redis sessions, a ``fail_open`` save likewise
+for a completed one. Redis sessions apply the policy to load, save and
+delete: ``fail_closed`` propagates storage failures; a ``fail_open`` save
 reports success without persisting anything (the session is ephemeral),
 and a rotation during the outage may leave the old session id usable
-until it expires. A ``fail_open`` session outage also breaks
+until it expires. A ``fail_open`` delete is also best-effort: logout
+can clear the browser cookie while the server-side session remains
+usable with the old token until its TTL expires or it is explicitly
+deleted after recovery. Do not treat such a logout as confirmed
+server-side revocation. A ``fail_open`` session outage also breaks
 session-bound CSRF: the token issued for a login is never stored, so
 the login request fails CSRF (403) even though reads keep working.
 """

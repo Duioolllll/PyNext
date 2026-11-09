@@ -110,9 +110,11 @@ def build_standalone(root, output):
     try:
         _populate_standalone(root, output, built, purelib, package)
     except BaseException:
-        # Never leave a partial bundle behind: a failed build must not
-        # block the retry, and a half-copied output must not look usable.
+        # Preserve the build exception and make an incomplete cleanup
+        # visible so a partial bundle cannot be mistaken for usable output.
         shutil.rmtree(output, ignore_errors=True)
+        if output.exists() or output.is_symlink():
+            log.warning("Incomplete standalone bundle remains at %s; remove it before retrying", output)
         raise
     return output
 
