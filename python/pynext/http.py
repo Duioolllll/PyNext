@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote_to_bytes
 
 from .forms import parse_form
+from .ws_origin import canonical_origin
 
 
 class BadRequest(Exception):
@@ -82,6 +83,11 @@ class SecurityConfig:
     ``Secure`` by default: over plain ``http://`` (local development)
     pass ``csrf_cookie_secure=False`` to the app config and to
     :func:`set_csrf_cookie` (or use ``pynext dev``, which does that).
+
+    WebSocket handshakes require a same-origin ``Origin`` by default.
+    Additional origins can be listed in ``websocket_allowed_origins``;
+    ``websocket_allow_missing_origin`` opts non-browser clients without
+    the header in. Origin checking does not replace authentication.
     """
 
     csrf_enabled: bool | None = None
@@ -109,6 +115,8 @@ class SecurityConfig:
     csp_frame_ancestors: str = "'none'"
     csp_base_uri: str = "'self'"
     csp_form_action: str = "'self'"
+    websocket_allowed_origins: tuple = ()
+    websocket_allow_missing_origin: bool = False
 
     def __post_init__(self):
         if self.csrf_enabled is not None and not isinstance(self.csrf_enabled, bool):
@@ -123,6 +131,14 @@ class SecurityConfig:
             raise TypeError("csrf_cookie_secure must be a bool")
         if not isinstance(self.csrf_origin_check, bool):
             raise TypeError("csrf_origin_check must be a bool")
+        if not isinstance(self.websocket_allow_missing_origin, bool):
+            raise TypeError("websocket_allow_missing_origin must be a bool")
+        if isinstance(self.websocket_allowed_origins, (str, bytes)):
+            raise TypeError("websocket_allowed_origins must be a sequence of origins")
+        self.websocket_allowed_origins = tuple(self.websocket_allowed_origins)
+        origin_keys = [canonical_origin(origin) for origin in self.websocket_allowed_origins]
+        if any(origin is None for origin in origin_keys):
+            raise ValueError("websocket_allowed_origins must contain valid HTTP(S) origins")
         key = self.csrf_signing_key
         if key is None:
             env_key = os.environ.get("PYNEXT_CSRF_SIGNING_KEY")

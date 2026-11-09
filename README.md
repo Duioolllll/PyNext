@@ -258,6 +258,10 @@ async def Page():
 
 `route.py`는 `@websocket` 핸들러를 하나 내보낼 수 있습니다. 핸들러는 `WebSocket`을 받아 `await websocket.accept()` 후 텍스트·바이너리 메시지를 주고받습니다. 상대가 끊으면 `receive()`에서 `WebSocketDisconnect`가 발생합니다. 메시지는 기본 64 KiB이며 `create_app(..., websocket_max_message=...)` 또는 `--ws-max-message-bytes`로 최대 16 MiB까지 조정합니다. `@websocket(protocols=("chat.v1", "chat.v2"))`는 서버가 지정한 순서로 서브프로토콜을 선택하며, 결과는 `websocket.subprotocol`에서 확인합니다. [echo 예제](examples/basic/app/ws/echo/route.py)를 참고하세요.
 
+개발 버전은 WebSocket 연결 시 기본적으로 같은 출처의 `Origin`만 허용합니다. 다른 출처는 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`를 `create_app(..., security=...)`에 전달하거나 `--ws-allowed-origin https://client.example`을 반복 지정하세요. 출처에는 스킴과 필요한 포트를 포함하며 `*`와 `null`은 허용하지 않습니다. 기존 비브라우저 클라이언트가 `Origin`을 보내지 않는다면 `websocket_allow_missing_origin=True` 또는 `--ws-allow-missing-origin`을 명시해야 합니다. 이 검사는 인증을 대체하지 않으며, 헤더를 생략하거나 위조할 수 있는 클라이언트는 앱에서 인증·인가해야 합니다. 프록시 뒤에서는 실제 프록시만 `--trusted-proxy`로 지정하고 프록시가 클라이언트의 전달 헤더를 덮어써야 합니다. 이 정책은 공개된 0.1.0 패키지에는 포함되지 않았습니다.
+
+ASGI 서버가 프록시 헤더를 먼저 해석해 `scope["client"]`를 바꾸면 PyNext가 실제 프록시를 식별할 수 없습니다. PyNext에서 신뢰 프록시를 판정할 때는 ASGI 서버가 원래 피어 주소를 전달하도록 설정하세요(Uvicorn은 `--no-proxy-headers`).
+
 `WebSocketPubSub`은 한 프로세스의 이벤트 루프에서 연결 간 메시지를 전달합니다. 예를 들어 `async with broker.subscribe("news") as sub:` 안에서 `await sub.receive()`로 받고, 같은 브로커에 `await broker.publish("news", "hello")`로 보냅니다. 느린 구독자의 큐가 차면 해당 구독을 제거하고 `PubSubOverflow`를 발생시킵니다. 워커 간 메시지를 공유하거나 메시지의 영속성을 보장하지 않습니다.
 
 경로는 정적 경로, `[slug]`, 마지막 위치의 `[...path]`, 0개 이상의 세그먼트를 매칭하는 `[[...path]]`를 지원합니다. 우선순위는 정적 > 단일 동적 > catch-all > 선택적 catch-all입니다. catch-all 파라미터는 문자열 리스트이고 단일 동적 파라미터는 문자열입니다. 필수 catch-all과 선택적 catch-all을 같은 레벨에 함께 쓸 수 없습니다. 괄호 디렉터리 `app/(marketing)/` 같은 라우트 그룹은 URL에 나타나지 않고, 그룹 안의 레이아웃은 그대로 적용됩니다. 병렬·인터셉트 라우트는 아직 지원하지 않습니다. 빌드 시 경로 충돌과 잘못된 핸들러를 검사하고 `.pynext/manifest.json`에 소스 해시를 기록합니다. `start`는 빌드 후 소스가 바뀌면 재빌드를 요구합니다.

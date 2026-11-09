@@ -9,7 +9,7 @@ TLS 종료는 리버스 프록시에서 수행한다. PyNext 자체는 TLS를 �
 ## 현재 근거와 제약
 
 - Axum은 HTTP/1.1·h2c를 제공한다. TLS 종료는 리버스 프록시에서 수행한다(ADR-0001). HSTS·X-Frame-Options·Referrer-Policy·Permissions-Policy·확장 CSP를 포함한 보안 헤더가 모든 응답 종류(SSR·SSG·ISR·API·정적·오류)에 적용되며, Rust 빠른 경로에도 적용된다.
-- CSRF는 세션 미들웨어 사용 시 상태 변경 API에 자동 적용되며 `csrf_cookie_secure` 기본값은 true다. 세션 없는 double-submit 쿠키는 HMAC으로 서명하고 Origin·Sec-Fetch-Site를 검증한다. WebSocket Origin 검증은 아직 없으며, 인증 정보 검증은 앱의 책임이다.
+- CSRF는 세션 미들웨어 사용 시 상태 변경 API에 자동 적용되며 `csrf_cookie_secure` 기본값은 true다. 세션 없는 double-submit 쿠키는 HMAC으로 서명하고 Origin·Sec-Fetch-Site를 검증한다. 개발 버전의 WebSocket은 기본적으로 같은 Origin만 허용하고, 추가 출처와 Origin 없는 클라이언트는 명시적으로 설정한다. 공개된 0.1.0에는 이 검사가 없으며, 인증 정보 검증은 앱의 책임이다.
 - 요청 제한은 IPv6 /64 묶음과 바운드 리더보드·전역 슬라이딩 창으로 키 고갈을 방어한다. 전체 연결 수(기본 1024)·IP별 연결 수(기본 128) 상한과 헤더 읽기 타임아웃·최소 본문 수신 속도가 있다. 동기 핸들러는 시간 초과 뒤에도 계속 실행될 수 있다.
 - SQLite·Redis 세션과 SQLite·Redis 공유 ISR이 있다. 세션 만료 정리는 백그라운드에서 자동으로 수행되며 충돌 시 409가 발생한다. 공유 저장소 장애 시 동작은 `fail_open`/`fail_closed` 정책으로 정한다(캐시 기본값 `fail_open`으로 로컬 대체, 레이트리미터 기본값 `fail_closed`로 503). 단일 Redis 재시작·TCP 단절은 시험했지만 클러스터 분할 일관성은 미검증이다.
 - 0.1.0의 Linux x86-64 manylinux 2.34+, macOS ARM64, Windows x86-64 휠이 Python 3.13·3.14용으로 PyPI에 게시돼 있다. 해당 휠 설치에는 Rust가 필요 없지만 소스 빌드에는 필요하다. Linux standalone은 호환 라이브러리가 필요한 디렉터리다. Windows 공유 리스너 워커 실행·재시작은 CI에서 검증했고, 신호 기반 수퍼바이저 검사는 Linux·macOS에서 수행한다.

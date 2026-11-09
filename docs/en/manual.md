@@ -152,6 +152,10 @@ async def stream():
 
 A `route.py` may export one `@websocket` handler alongside its HTTP handlers. The handler receives a `WebSocket` and must call `await websocket.accept()` before sending or receiving. Text and binary messages round-trip; the peer closing the connection raises `WebSocketDisconnect` in `receive()`, so per-connection cleanup belongs in a `finally` block.
 
+In the development version, the handshake accepts only a same-origin `Origin` by default, before ASGI or Axum accepts the connection. Configure additional exact HTTP(S) origins with `SecurityConfig(websocket_allowed_origins=("https://client.example",))` passed to `create_app(..., security=...)`, or repeat `--ws-allowed-origin https://client.example` on the CLI. Include the scheme and any non-default port; wildcard and `null` are rejected. Existing non-browser clients that omit `Origin` must explicitly opt in using `websocket_allow_missing_origin=True` or `--ws-allow-missing-origin`. The published 0.1.0 package does not have this check. Origin is not authentication: clients can forge or omit it, so the app must authenticate and authorize connections. When behind a proxy, configure only actual trusted peers with `--trusted-proxy` and make the proxy overwrite client-supplied forwarded headers.
+
+For PyNext to identify a trusted proxy on ASGI, the server must preserve the original peer in `scope["client"]`. Disable upstream proxy-header rewriting (for Uvicorn, use `--no-proxy-headers`) when PyNext is responsible for interpreting forwarded headers.
+
 ~~~python
 # app/ws/echo/route.py
 from pynext import WebSocket, WebSocketDisconnect, websocket

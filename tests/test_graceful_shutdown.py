@@ -194,7 +194,7 @@ class _RawWSClient:
         self.sock.settimeout(5)
         self.key = base64.b64encode(os.urandom(16)).decode("ascii")
         request = (
-            f"GET {path} HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\n"
+            f"GET {path} HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nUpgrade: websocket\r\n"
             f"Connection: Upgrade\r\nSec-WebSocket-Key: {self.key}\r\n"
             "Sec-WebSocket-Version: 13\r\n\r\n"
         )
