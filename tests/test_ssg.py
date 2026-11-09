@@ -1,6 +1,7 @@
 from conftest import page_html
 import asyncio
 import json
+import sys
 
 import httpx
 import pytest
@@ -97,6 +98,10 @@ def test_corrupt_manifest_fails_with_a_clear_build_error(tmp_path):
         load_manifest(tmp_path)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Unix permission bits are not meaningful on Windows",
+)
 def test_build_outputs_are_world_readable(tmp_path):
     # _atomic_write used to leave files 0600 (NamedTemporaryFile's
     # default); a build done by one user could then not be read by the
