@@ -21,7 +21,7 @@ from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingRespo
                    filter_internal_headers, security_headers)
 from .mgmtplane import ManagementPlaneConfig
 from .observability import begin_request_context, get_request_id, queue_wait_var
-from .ratelimit import _is_exempt_path
+from .ratelimit import RateLimitUnavailable, _is_exempt_path
 from .standalone import log_bundle_info
 from .ws_origin import websocket_origin_allowed
 
@@ -677,11 +677,11 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_
                 if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
                     response.headers.append((b"x-request-id", request_id.encode("ascii")))
             except BadRequest as exc:
-                log.info("Bad request: %s", exc)
+                log.info("Bad request", extra={"error_type": type(exc).__name__})
                 response = Response("Bad Request", status=400)
             except Exception as exc:
                 digest, _count = digest_for_error(exc)
-                log.exception("Request failed", extra={"error_digest": digest})
+                app.log_request_error(exc)
                 response = app.error_response(exc, digest=digest)
                 # error_response results bypass dispatch, so path headers
                 # are applied here; routed responses already have them.
@@ -827,15 +827,23 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_
             # App._rate_limit_denied on ASGI. This runs on a Rust thread
             # before dispatch, so only the counter is recorded here — the
             # per-request log line / span cannot see it.
+            # The metrics endpoint bypasses the limiter when enabled, so
+            # a scraper is never throttled (same rule as the ASGI path).
+            if path == "/metrics" and app.observability_config.metrics_endpoint:
+                return True, None
             if _is_exempt_path(limiter, path):
                 app.metrics.observe_rate_limit("exempt")
                 return True, None
             key = limiter.key_for(peer_ip, headers)
             try:
                 allowed, retry_after = limiter.allow(key)
+            except RateLimitUnavailable:
+                app._report_rate_limit(limiter, refused=True)
+                raise
             except Exception:
                 app.metrics.observe_rate_limit("error")
                 raise
+            app._report_rate_limit(limiter)
             app.metrics.observe_rate_limit("allowed" if allowed else "denied")
             return allowed, retry_after
 

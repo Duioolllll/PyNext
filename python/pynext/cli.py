@@ -701,6 +701,9 @@ def _build_parser():
             command.add_argument("--metrics", dest="metrics",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="collect in-memory request/cache/queue metrics (default: on)")
+            command.add_argument("--metrics-endpoint", dest="metrics_endpoint",
+                                 action=argparse.BooleanOptionalAction, default=None,
+                                 help="serve Prometheus text at the reserved /metrics path (default: off)")
             command.add_argument("--tracing", dest="tracing",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="emit OpenTelemetry spans when the opentelemetry packages are installed (default: off)")
@@ -938,7 +941,7 @@ def main():
     values = resolved.values if resolved is not None else DEFAULT_CONFIG
     obs_config = _observability_from_config(resolved) if resolved is not None else None
     if (args.structured_logs is not None or args.metrics is not None
-            or args.tracing is not None):
+            or args.metrics_endpoint is not None or args.tracing is not None):
         # CLI flags override the config: create_app() already reads the
         # same PYNEXT_* variables, so the default path stays exactly the
         # old call shape.
@@ -948,6 +951,8 @@ def main():
             obs_config.structured_logs = args.structured_logs
         if args.metrics is not None:
             obs_config.metrics = args.metrics
+        if args.metrics_endpoint is not None:
+            obs_config.metrics_endpoint = args.metrics_endpoint
         if args.tracing is not None:
             obs_config.tracing = args.tracing
     try:

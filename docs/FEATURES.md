@@ -234,15 +234,17 @@ CLI defaults of `None` defer to server defaults; see the manual for scope and un
 | `--max-connections` | `None` |
 | `--max-connections-per-ip` | `None` |
 | `--max-waiting` | `None` |
+| `--metrics-endpoint` | `None` |
 | `--shutdown-timeout` | `30.0` |
 
 ## Health endpoints
 
-Reserved GET/HEAD paths; readiness reflects startup and draining, not upstream health.
+Reserved GET/HEAD paths; readiness reflects startup, draining, and fail_closed backend health.
 
 | Path |
 | --- |
 | `/healthz` |
+| `/metrics` |
 | `/readyz` |
 
 ## Island activation strategies

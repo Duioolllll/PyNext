@@ -5,7 +5,7 @@ from .http import PathHeaderRuleInput, PathHeaders, Request, Response, SecurityC
 from .custom_routes import CustomRoutes
 from .fetch_cache import FetchCache
 from .matcher import HeaderRule, Scope, ScopedMiddleware
-from .observability import MetricsCollector, ObservabilityConfig, RequestInsights
+from .observability import BackendHealth, MetricsCollector, ObservabilityConfig, RequestInsights
 from .proxy import ProxyTrust
 from .types import ProxyEntry
 from .ratelimit import RateLimiter
@@ -31,6 +31,7 @@ class App:
     metrics: MetricsCollector
     fetch_cache: FetchCache
     request_insights: RequestInsights
+    backend_health: BackendHealth
     def __init__(self, root: str | PathLike[str], manifest: dict[str, Any], *, production: bool = ...,
                  security: SecurityConfig | None = ..., cache_backend: Literal["memory", "sqlite", "redis"] = ...,
                  cache_path: str | PathLike[str] | None = ..., observability: ObservabilityConfig | None = ...,
@@ -62,6 +63,7 @@ class App:
     async def warm_isr_cache(self, *, timeout: float | None = ...) -> dict[str, Any]: ...
     async def dispatch(self, request: Request) -> Response: ...
     def update_dev_client(self, manifest: dict[str, Any], assets: dict[str, bytes]) -> None: ...
+    def log_request_error(self, exc: BaseException) -> None: ...
     def error_response(self, exc: Exception, digest: str | None = ...) -> Response: ...
     def note_dev_bind_host(self, host: str | None) -> None: ...
     async def render_page(self, pattern: str, request: Request, params: Params, *, csp_nonce: bool = ...,

@@ -2391,7 +2391,8 @@ register_cache_handler("redis", _redis_handler_factory)
 
 class ISRCache:
     def __init__(self, cache_backend="memory", cache_path=None, namespace="", cache_url=None,
-                 failure_policy=None, sqlite_max_entries=None, sqlite_max_bytes=None, cache_handler=None):
+                 failure_policy=None, sqlite_max_entries=None, sqlite_max_bytes=None, cache_handler=None,
+                 health=None, metrics=None):
         """Create an ISR cache.
 
         ``failure_policy`` (roadmap item B4) decides what happens when
@@ -2419,6 +2420,16 @@ class ISRCache:
         wrapped so reads/writes go through it while generation is
         coordinated only within this process. When ``cache_handler``
         is given, ``cache_backend`` is ignored.
+
+        ``health`` is an optional :class:`observability.BackendHealth`
+        that the read/decision path reports to whenever it actually
+        touches the shared backend (success or failure), so ``/readyz``
+        can reflect backend health from last-seen state without
+        probing. Best-effort writes do not report.
+
+        ``metrics`` is an optional :class:`observability.MetricsCollector`
+        that counts failure-policy activations (``"refused"`` under
+        ``fail_closed``, ``"degraded"`` under ``fail_open``).
         """
         self.handler = None
         self._shared_builder = None
@@ -2493,6 +2504,8 @@ class ISRCache:
             self._cache_path = path
         self._cache_url = (cache_url or os.environ.get("PYNEXT_REDIS_URL")) if cache_backend == "redis" else None
         self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_OPEN)
+        self._health = health
+        self._metrics = metrics
         # The process-local store stays the native fast path in both modes:
         # the Axum server reads it directly for fresh hits.
         self.store = _native.PageCache()
@@ -2642,6 +2655,17 @@ class ISRCache:
             raise RuntimeError("An ISR app instance must use a single event loop")
         return loop
 
+    def _report_backend(self, healthy):
+        """Record a shared-backend touch for ``/readyz`` (no-op without one)."""
+        if self._health is not None and self.shared is not None:
+            self._health.report("isr-cache", healthy=healthy, policy=self.failure_policy)
+
+    def _report_degraded(self):
+        """Count one failure-policy activation (refused vs degraded)."""
+        if self._metrics is not None and self.shared is not None:
+            outcome = "refused" if self.failure_policy == FAIL_CLOSED else "degraded"
+            self._metrics.observe_degraded("isr-cache", self.failure_policy, outcome)
+
     async def _shared_entry(self, key):
         """Return an entry, a miss, or a distinct backend-failure sentinel.
 
@@ -2650,12 +2674,16 @@ class ISRCache:
         sentinel, so the request fails rather than falling back.
         """
         try:
-            return await asyncio.to_thread(self.shared.lookup_entry, self.namespace + key)
+            entry = await asyncio.to_thread(self.shared.lookup_entry, self.namespace + key)
         except Exception as exc:
+            self._report_backend(False)
+            self._report_degraded()
             if self.failure_policy == FAIL_CLOSED:
                 raise SharedCacheUnavailable("Shared cache lookup failed") from exc
             log.warning("Shared cache lookup failed for %s", key, exc_info=True)
             return _SHARED_UNAVAILABLE
+        self._report_backend(True)
+        return entry
 
     async def _shared_store(self, key, body, policy, expected_version, owner, tags=(),
                             generated_at=None, generated_mono=None):
@@ -2685,12 +2713,16 @@ class ISRCache:
 
     async def _shared_acquire(self, key, owner):
         try:
-            return await asyncio.to_thread(self.shared.acquire_lease, self.namespace + key, owner)
+            acquired = await asyncio.to_thread(self.shared.acquire_lease, self.namespace + key, owner)
         except Exception as exc:
+            self._report_backend(False)
+            self._report_degraded()
             if self.failure_policy == FAIL_CLOSED:
                 raise SharedCacheUnavailable("Shared cache lease failed") from exc
             log.warning("Shared cache lease failed for %s", key, exc_info=True)
             return _SHARED_UNAVAILABLE
+        self._report_backend(True)
+        return acquired
 
     async def _shared_release(self, key, owner):
         # Best-effort in both policies: leases expire on their own, and
@@ -2702,14 +2734,18 @@ class ISRCache:
 
     async def _shared_remove(self, key):
         try:
-            return await asyncio.to_thread(self.shared.remove, self.namespace + key)
+            removed = await asyncio.to_thread(self.shared.remove, self.namespace + key)
         except Exception as exc:
+            self._report_backend(False)
+            self._report_degraded()
             if self.failure_policy == FAIL_CLOSED:
                 # An explicit invalidation must not report success when
                 # the shared store never saw it.
                 raise SharedCacheUnavailable("Shared cache invalidation failed") from exc
             log.warning("Shared cache remove failed for %s", key, exc_info=True)
             return False
+        self._report_backend(True)
+        return removed
 
 
     def _store_insert(self, key, body, fresh_seconds, stale_seconds):
@@ -3160,9 +3196,12 @@ class ISRCache:
             try:
                 token, existed = await asyncio.to_thread(
                     self.shared.variant_generation, self.namespace + path, invalidate=invalidate)
+                self._report_backend(True)
                 self._remember_variant_generation(path, token)
                 return token, existed or had_local
             except Exception as exc:
+                self._report_backend(False)
+                self._report_degraded()
                 if self.failure_policy == FAIL_CLOSED:
                     raise SharedCacheUnavailable("Shared cache generation failed") from exc
                 log.warning("Shared cache generation failed for %s", path, exc_info=True)

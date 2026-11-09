@@ -56,10 +56,13 @@ from .middleware import MAX_MIDDLEWARE_REWRITES, MiddlewareResult, ScopedMiddlew
 from .custom_routes import compile_custom_routes
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .observability import (
+    BackendHealth,
+    DedupedErrorLogger,
     MetricsCollector,
     ObservabilityConfig,
     RequestInsights,
     begin_request_context,
+    classify_request_error,
     configure_logging,
     get_request_id,
     middleware_actor_var,
@@ -72,7 +75,7 @@ from .observability import (
     span,
 )
 from .proxy import ProxyTrust
-from .ratelimit import _is_exempt_path, rate_limited_response
+from .ratelimit import RateLimitUnavailable, _is_exempt_path, rate_limited_response
 from .routing import normalize_base_path, preprocess_pathname, validate_trailing_slash
 from .sessions import SessionMiddleware, SQLiteSessionStore, WS_PREFLIGHT_STATE_KEY
 from .sync_dispatch import (
@@ -1185,6 +1188,10 @@ class App:
             max_entries=self.observability_config.request_insights_max,
             slow_threshold_ms=self.observability_config.request_insights_slow_ms,
         )
+        # Last-seen shared-backend health, for /readyz (no probing: the
+        # backends report here when they are actually touched).
+        self.backend_health = BackendHealth(ttl_s=self.observability_config.backend_health_ttl_s)
+        self._error_log_dedup = DedupedErrorLogger(window_s=self.observability_config.log_dedup_window_s)
         configure_logging(self.observability_config)
         # Per-process token-bucket limiter (spec §11, finding #49). None
         # disables it. The Axum adapter reads the same attribute in
@@ -1616,6 +1623,8 @@ class App:
         self.request_insights.enabled = (
             config.request_insights if config.request_insights is not None else self.debug)
         self.request_insights.slow_threshold_ms = config.request_insights_slow_ms
+        self.backend_health.set_ttl(config.backend_health_ttl_s)
+        self._error_log_dedup.set_window(config.log_dedup_window_s)
         configure_logging(config)
         return self
 
@@ -1677,7 +1686,8 @@ class App:
                             namespace=(build_id + ":") if cache_backend in {"sqlite", "redis"}
                             or cache_handler is not None else "",
                             cache_url=cache_url, failure_policy=cache_failure_policy,
-                            cache_handler=cache_handler)
+                            cache_handler=cache_handler,
+                            health=self.backend_health, metrics=self.metrics)
         # Fetch/data cache over the same backends (track C P1-1); page
         # handlers reach it as ``request.app.fetch_cache`` or via
         # ``pynext.fetch_cache`` helpers, and the request memo
@@ -2266,6 +2276,24 @@ class App:
             if response is not None:
                 return response
         return Response("Not Found", status=404)
+
+    def log_request_error(self, exc):
+        """Log one request failure at the transport boundary.
+
+        Well-known transport noise (client disconnects, cancellations)
+        logs once at INFO with the error type and route only — never the
+        exception message, which can carry request data. Real failures
+        log in full, deduped by callsite (exception class + innermost
+        user-code frame + route pattern) so one broken page cannot flood
+        the log.
+        """
+        route = route_var.get()
+        if classify_request_error(exc) == "known":
+            log.info("Request failed (known error)", extra={
+                "error_type": type(exc).__name__, "route": route,
+            })
+            return
+        self._error_log_dedup.log_exception(exc, route=route)
 
     def error_response(self, exc, digest=None):
         """Render a 500 for an unexpected failure.
@@ -3849,19 +3877,47 @@ class App:
         # rate limiting and static serving for these paths; see
         # server.start_native and crates/pynext-native/src/lib.rs.
         # /healthz is liveness (the process answers at all); /readyz is
-        # readiness (startup finished and not draining).
-        if request.path in ("/healthz", "/readyz"):
-            route_var.set("__health__")
+        # readiness (startup finished, not draining, and no fail_closed
+        # backend is currently down); /metrics serves Prometheus text
+        # when the metrics endpoint is enabled, and is an ordinary path
+        # otherwise (an app route may serve it, or it 404s).
+        if request.path == "/metrics" and not self.observability_config.metrics_endpoint:
+            pass
+        elif request.path in ("/healthz", "/readyz", "/metrics"):
             if request.method not in {"GET", "HEAD"}:
                 response = Response("Method Not Allowed", status=405,
                                     headers=[(b"allow", b"GET, HEAD")])
             elif request.path == "/healthz":
+                route_var.set("__health__")
                 body = b"" if request.method == "HEAD" else b"ok"
                 response = Response(body, media_type="text/plain; charset=utf-8")
+            elif request.path == "/metrics":
+                route_var.set("__metrics__")
+                body = b"" if request.method == "HEAD" else self.metrics.prometheus_text().encode("utf-8")
+                response = Response(body, media_type="text/plain; version=0.0.4; charset=utf-8")
             elif self.is_ready:
-                body = b"" if request.method == "HEAD" else b"ready"
-                response = Response(body, media_type="text/plain; charset=utf-8")
+                route_var.set("__health__")
+                # Backend health is last-seen state only: a fail_closed
+                # backend that is currently down makes the process unready
+                # so the load balancer stops sending traffic, while a
+                # fail_open backend only degrades the answer.
+                unhealthy = self.backend_health.unhealthy_fail_closed()
+                if unhealthy:
+                    detail = ", ".join(unhealthy)
+                    body = b"" if request.method == "HEAD" else f"not ready (unhealthy: {detail})".encode("ascii")
+                    response = Response(body, status=503, media_type="text/plain; charset=utf-8",
+                                    headers=[(b"retry-after", b"1")])
+                else:
+                    degraded = self.backend_health.degraded()
+                    if degraded:
+                        detail = ", ".join(degraded)
+                        body = b"" if request.method == "HEAD" else f"ready (degraded: {detail})".encode("ascii")
+                        response = Response(body, media_type="text/plain; charset=utf-8")
+                    else:
+                        body = b"" if request.method == "HEAD" else b"ready"
+                        response = Response(body, media_type="text/plain; charset=utf-8")
             else:
+                route_var.set("__health__")
                 response = Response(b"" if request.method == "HEAD" else b"not ready", status=503,
                                     media_type="text/plain; charset=utf-8",
                                     headers=[(b"retry-after", b"1")])
@@ -4382,6 +4438,25 @@ class App:
         return {path: list(getattr(handler, "__pynext_websocket_protocols__", ()))
                 for path, handler in self.websocket_entries.items()}
 
+    def _report_rate_limit(self, limiter, *, refused=False):
+        """Report a shared (Redis) limiter decision to ``/readyz`` health.
+
+        In-process limiters have no shared backend and are skipped. Under
+        ``fail_closed`` an outage raises before returning, so the caller
+        reports it with ``refused=True``; under ``fail_open`` the outage
+        is absorbed inside ``allow()``, and the limiter's
+        ``last_unavailable_at`` marker is what reveals it.
+        """
+        policy = getattr(limiter, "failure_policy", None)
+        if policy is None:
+            return
+        if refused or getattr(limiter, "last_unavailable_at", None) is not None:
+            self.backend_health.report("rate-limit", healthy=False, policy=policy)
+            self.metrics.observe_degraded(
+                "rate-limit", policy, "refused" if refused else "admitted")
+        else:
+            self.backend_health.report("rate-limit", healthy=True, policy=policy)
+
     async def _rate_limit_denied(self, scope, path):
         """One bounded admission check for both ASGI HTTP and WebSocket."""
         limiter = self.rate_limit
@@ -4398,7 +4473,12 @@ class App:
             if _is_exempt_path(limiter, path):
                 return True, None, "exempt"
             key = limiter.key_for(client_ip, headers)
-            allowed, retry_after = limiter.allow(key)
+            try:
+                allowed, retry_after = limiter.allow(key)
+            except RateLimitUnavailable:
+                self._report_rate_limit(limiter, refused=True)
+                raise
+            self._report_rate_limit(limiter)
             if type(allowed) is not bool or (retry_after is not None and (
                     not isinstance(retry_after, int) or not 0 <= retry_after <= 2**64 - 1)):
                 raise ValueError("Invalid rate-limit decision")
@@ -4827,7 +4907,8 @@ class App:
             response = Response("Bad Request", status=400)
         else:
             # Liveness/readiness remain available when decision slots are full.
-            denied = (None if match_path in ("/healthz", "/readyz") else
+            denied = (None if match_path in ("/healthz", "/readyz") or
+                      (match_path == "/metrics" and self.observability_config.metrics_endpoint) else
                       await self._rate_limit_denied(scope, match_path))
             if denied is not None:
                 if scope["method"].upper() == "HEAD":
@@ -4904,12 +4985,13 @@ class App:
                                           raw_path=encoded_path)
                         break
             except BadRequest as exc:
-                log.info("Bad request: %s", exc)
+                # Log the type only: the message can carry request data.
+                log.info("Bad request", extra={"error_type": type(exc).__name__})
                 response = Response("Bad Request", status=400)
             except Exception as exc:
                 digest, _count = digest_for_error(exc)
                 self.metrics.observe_error("__unmatched__", type(exc).__name__, digest)
-                log.exception("Request failed", extra={"error_digest": digest})
+                self.log_request_error(exc)
                 response = self.error_response(exc, digest=digest)
         if request is not None:
             # Trust-resolved client identity (A6, pynext.proxy): the peer
@@ -4942,11 +5024,11 @@ class App:
                     if request_id and not any(k == b"x-request-id" for k, _ in result.headers):
                         result.headers.append((b"x-request-id", request_id.encode("ascii")))
                 except BadRequest as exc:
-                    log.info("Bad request: %s", exc)
+                    log.info("Bad request", extra={"error_type": type(exc).__name__})
                     result = Response("Bad Request", status=400)
                 except Exception as exc:
                     digest, _count = digest_for_error(exc)
-                    log.exception("Request failed", extra={"error_digest": digest})
+                    self.log_request_error(exc)
                     result = self.error_response(exc, digest=digest)
                     request_id = get_request_id()
                     if request_id and not any(k == b"x-request-id" for k, _ in result.headers):

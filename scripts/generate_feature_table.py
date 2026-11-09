@@ -195,7 +195,8 @@ def _config_defaults() -> dict[str, str]:
 
 def server_controls() -> list[tuple[str, str]]:
     """Extract selected operational CLI controls and their declared defaults."""
-    wanted = {"--max-waiting", "--max-connections", "--max-connections-per-ip", "--shutdown-timeout"}
+    wanted = {"--max-waiting", "--max-connections", "--max-connections-per-ip", "--shutdown-timeout",
+              "--metrics-endpoint"}
     rows = {}
     config_defaults = _config_defaults()
     for node in ast.walk(_parse(ROOT / "python" / "pynext" / "cli.py")):
@@ -303,7 +304,7 @@ def render() -> str:
         "",
         "## Health endpoints",
         "",
-        "Reserved GET/HEAD paths; readiness reflects startup and draining, not upstream health.",
+        "Reserved GET/HEAD paths; readiness reflects startup, draining, and fail_closed backend health.",
         "",
         "| Path |",
         "| --- |",
