@@ -83,6 +83,20 @@ def test_ssg_in_asgi_and_axum_and_python_bypass(tmp_path):
     asyncio.run(run())
 
 
+def test_corrupt_manifest_fails_with_a_clear_build_error(tmp_path):
+    make_app(tmp_path)
+    write_manifest(tmp_path)
+    manifest = tmp_path / ".pynext" / "manifest.json"
+    manifest.write_text("{not valid json")
+    from pynext.build import load_manifest
+
+    with pytest.raises(ValueError, match="Invalid build manifest"):
+        load_manifest(tmp_path)
+    manifest.write_bytes(b"\xff\xfe invalid utf-8 \x80\x81")
+    with pytest.raises(ValueError, match="Invalid build manifest"):
+        load_manifest(tmp_path)
+
+
 def test_build_outputs_are_world_readable(tmp_path):
     # _atomic_write used to leave files 0600 (NamedTemporaryFile's
     # default); a build done by one user could then not be read by the

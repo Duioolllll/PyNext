@@ -294,7 +294,10 @@ def load_manifest(root):
     target = root / MANIFEST
     if not target.is_file():
         raise ValueError("No build manifest found; run `pynext build` first")
-    saved = json.loads(target.read_text(encoding="utf-8"))
+    try:
+        saved = json.loads(target.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Invalid build manifest {target}: {exc}; rebuild the application") from exc
     if saved.get("schema_version") != VERSION:
         raise ValueError("Incompatible manifest version; rebuild the application")
     expected = discover(root)
