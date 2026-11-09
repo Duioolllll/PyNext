@@ -1,8 +1,9 @@
 """Failure policies for shared backends (roadmap item B4).
 
-A shared backend (the SQLite/Redis ISR cache, the Redis rate limiter)
-can become unavailable while the process itself is healthy. Each
-component exposes one policy that decides what a request does then:
+A shared backend (the SQLite/Redis ISR cache, the Redis rate limiter,
+the Redis session store) can become unavailable while the process
+itself is healthy. Each component exposes one policy that decides what
+a request does then:
 
 * ``fail_open`` — degrade: serve the request from process-local state
   (the ISR cache falls back to its local L1 and renders locally; the
@@ -24,6 +25,13 @@ Defaults are chosen per component for the safer side of its own risk:
 * Rate limiter: ``fail_closed``. Failing open would admit unlimited
   traffic exactly when the shared limiter is down, which is when abuse
   protection is most needed. This is also the historical behaviour.
+* Redis sessions: ``fail_closed``. Failing open would silently drop
+  session state, so the store raises ``SessionUnavailable`` and
+  the middleware answers 503 instead. Under ``fail_open`` the request
+  proceeds with a fresh ephemeral session and nothing is persisted:
+  reads keep working, but a login cannot complete during the outage
+  (the CSRF token issued for it is never stored, so the login
+  request fails CSRF with 403).
 
 The policy governs the *read/decision* path only. Best-effort writes
 stay best-effort in both modes: a shared-cache insert that fails after
@@ -33,7 +41,12 @@ release failure does not fail the request either (leases expire on
 their own). An explicit invalidation that cannot reach the shared
 store is different: under ``fail_closed`` it raises instead of
 reporting success, so callers never mistake an unapplied invalidation
-for a completed one.
+for a completed one. For Redis sessions, a ``fail_open`` save likewise
+reports success without persisting anything (the session is ephemeral),
+and a rotation during the outage may leave the old session id usable
+until it expires. A ``fail_open`` session outage also breaks
+session-bound CSRF: the token issued for a login is never stored, so
+the login request fails CSRF (403) even though reads keep working.
 """
 
 FAIL_OPEN = "fail_open"

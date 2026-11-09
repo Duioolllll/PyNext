@@ -12,6 +12,7 @@ import time
 from collections.abc import MutableMapping
 from pathlib import Path
 
+from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
 from .http import Response, StreamingResponse, _add_vary, _header_values
 
 log = logging.getLogger("pynext")
@@ -40,6 +41,17 @@ def _check_json_serializable(key, value):
 
 class SessionConflict(Exception):
     """The session was changed or revoked while this request was running."""
+
+
+class SessionUnavailable(Exception):
+    """The session store could not be reached (Redis outage, fail_closed).
+
+    Raised by :class:`RedisSessionStore` under the default
+    ``"fail_closed"`` failure policy instead of leaking the raw Redis
+    client error, so callers can distinguish "the store is down" from a
+    fencing conflict (:class:`SessionConflict`) or corrupt data
+    (``ValueError``). The session middleware answers 503 for it.
+    """
 
 
 def _key(token):
@@ -161,12 +173,26 @@ class RedisSessionStore:
     store. Pass a ``client`` (a ``redis.Redis`` or compatible object) to
     share a connection or to inject a fake in tests; otherwise a client is
     built from ``url`` or the ``PYNEXT_REDIS_URL`` environment variable.
+
+    ``failure_policy`` decides what happens when Redis is unreachable:
+    the default ``"fail_closed"`` raises :class:`SessionUnavailable`
+    (the middleware answers 503) instead of silently losing session
+    state, while ``"fail_open"`` starts a fresh ephemeral session —
+    the request proceeds, but nothing is read or persisted. Reads keep
+    working, but a login cannot complete during the outage: the CSRF
+    token issued for it is never stored, so the login request fails
+    CSRF (403). A rotation during the outage may also leave the old
+    session id usable until it expires. Fencing conflicts
+    (:class:`SessionConflict`) and corrupt data (``ValueError``) are
+    not outages and are never absorbed by either policy.
     """
 
-    def __init__(self, url=None, *, client=None, key_prefix="pynext:session"):
+    def __init__(self, url=None, *, client=None, key_prefix="pynext:session",
+                 failure_policy=None):
         if not isinstance(key_prefix, str) or not key_prefix or len(key_prefix.encode("utf-8")) > 256:
             raise ValueError("session key prefix must be a nonempty string up to 256 bytes")
         self.key_prefix = key_prefix
+        self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_CLOSED)
         self._owns_client = client is None
         if client is not None:
             if not all(callable(getattr(client, name, None))
@@ -187,6 +213,20 @@ class RedisSessionStore:
     def _redis_key(self, token):
         return f"{self.key_prefix}:{_key(token)}"
 
+    def _handle_redis_error(self, operation, exc):
+        """Apply the failure policy to a Redis transport error.
+
+        Returns ``True`` when ``fail_open`` absorbs the error (the
+        caller then degrades: load reports a miss, save reports the
+        version that would have been stored, delete is a no-op).
+        Raises :class:`SessionUnavailable` under ``fail_closed``.
+        """
+        if self.failure_policy == FAIL_OPEN:
+            log.warning("Redis session %s failed; continuing without stored state (fail_open)",
+                        operation, exc_info=True)
+            return True
+        raise SessionUnavailable(f"Redis session {operation} failed: {exc}") from exc
+
     def close(self):
         """Close the Redis client this store created (a no-op for injected clients)."""
         if self._owns_client:
@@ -199,7 +239,14 @@ class RedisSessionStore:
                 return None
             payload = _decode_session(raw)
             return payload["data"], payload.get("csrf"), payload["version"]
-        return await asyncio.to_thread(read)
+        try:
+            return await asyncio.to_thread(read)
+        except ValueError:
+            # Corrupt stored data is not an outage; never absorb it.
+            raise
+        except Exception as exc:
+            self._handle_redis_error("load", exc)
+            return None
 
     async def save(self, token, data, csrf, version, expires, *, previous_token=None):
         for key, value in data.items():
@@ -209,11 +256,21 @@ class RedisSessionStore:
         if len(payload.encode("utf-8")) > _MAX_SESSION_BYTES:
             raise ValueError("session data exceeds 16384 bytes")
         ttl_ms = max(0, int((expires - time.time()) * 1000))
-        if previous_token is not None:
-            return await asyncio.to_thread(self._rotate, previous_token, token, data, csrf, version, ttl_ms)
-        if version is None:
-            return await asyncio.to_thread(self._insert, token, data, csrf, ttl_ms)
-        return await asyncio.to_thread(self._update, token, data, csrf, version, ttl_ms)
+        try:
+            if previous_token is not None:
+                return await asyncio.to_thread(self._rotate, previous_token, token, data, csrf, version, ttl_ms)
+            if version is None:
+                return await asyncio.to_thread(self._insert, token, data, csrf, ttl_ms)
+            return await asyncio.to_thread(self._update, token, data, csrf, version, ttl_ms)
+        except (SessionConflict, ValueError):
+            # Fencing and corrupt-data errors are not outages.
+            raise
+        except Exception as exc:
+            self._handle_redis_error("save", exc)
+            # fail_open: the session is ephemeral — nothing was stored —
+            # but report the version that would have been stored so the
+            # request proceeds exactly as if the save had succeeded.
+            return 1 if version is None or previous_token is not None else version + 1
 
     def _insert(self, token, data, csrf, ttl_ms):
         if ttl_ms <= 0:
@@ -277,7 +334,11 @@ class RedisSessionStore:
             pipe.reset()
 
     async def delete(self, token):
-        await asyncio.to_thread(self.client.delete, self._redis_key(token))
+        try:
+            await asyncio.to_thread(self.client.delete, self._redis_key(token))
+        except Exception as exc:
+            # fail_open: logout is best-effort; fail_closed raises.
+            self._handle_redis_error("delete", exc)
 
     async def purge_expired(self):
         """No-op: Redis expires session keys with their TTL automatically."""
@@ -472,14 +533,25 @@ class SessionMiddleware:
     async def __call__(self, request, call_next):
         self._ensure_purge_task()
         token = self._cookie(request)
-        loaded = await self.store.load(token) if token is not None else None
+        try:
+            loaded = await self.store.load(token) if token is not None else None
+        except SessionUnavailable:
+            # A fail_closed store reports the outage instead of serving
+            # a request with no session state; fail_open stores never
+            # raise here (they report a miss instead).
+            return Response("Session unavailable", status=503,
+                            headers=[(b"retry-after", b"1"), (b"cache-control", b"no-store")])
         session = Session(*(loaded[:2]), token=token, version=loaded[2]) if loaded else Session()
         request.state["session"] = session
         response = await call_next(request)
         changed = session._changed() if not session._invalidated else False
         if session._invalidated:
             if session._token:
-                await self.store.delete(session._token)
+                try:
+                    await self.store.delete(session._token)
+                except SessionUnavailable:
+                    return Response("Session unavailable", status=503,
+                                    headers=[(b"retry-after", b"1"), (b"cache-control", b"no-store")])
             self._set_cookie(response, "", 0)
         elif changed:
             old_token = session._token
@@ -493,6 +565,11 @@ class SessionMiddleware:
                     await response.aclose()
                 return Response("Session changed; retry the request", status=409,
                                 headers=[(b"cache-control", b"no-store")])
+            except SessionUnavailable:
+                if isinstance(response, StreamingResponse):
+                    await response.aclose()
+                return Response("Session unavailable", status=503,
+                                headers=[(b"retry-after", b"1"), (b"cache-control", b"no-store")])
             self._set_cookie(response, new_token, self.max_age)
         if loaded or changed or session._invalidated:
             response.headers = [(name, value) for name, value in response.headers if name != b"cache-control"]
