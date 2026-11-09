@@ -94,7 +94,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-启用会话中间件后，无需另传安全配置即可自动开启 CSRF。若没有会话，又想保护全部状态变更类 API 路由，可向 `create_app` 传入 `security=SecurityConfig(csrf_enabled=True)`。令牌仅证明请求来自能够读取该 Cookie 的页面。与其他 double-submit 方案一样，能够通过 XSS 读取 Cookie 的页面可以绕过它。Cookie 默认使用 `SameSite=Lax`，且不设 `HttpOnly`（JavaScript 需要读取它）；CSRF Cookie 默认带 `Secure`，在明文 `http://` 本地开发时，请同时向应用配置和 `set_csrf_cookie()` 调用传入 `csrf_cookie_secure=False`（`pynext dev` 会自动这样做）。多 worker 部署时，所有 worker 必须使用相同的 `csrf_signing_key`（或 `PYNEXT_CSRF_SIGNING_KEY` 环境变量），这样一个 worker 签发的 Cookie 才能在其他 worker 上通过验证。
+启用会话中间件后，无需另传安全配置即可自动开启 CSRF。若没有会话，又想保护全部状态变更类 API 路由，可向 `create_app` 传入 `security=SecurityConfig(csrf_enabled=True)`。令牌仅证明请求来自能够读取该 Cookie 的页面。与其他 double-submit 方案一样，能够通过 XSS 读取 Cookie 的页面可以绕过它。Cookie 默认使用 `SameSite=Lax`，且不设 `HttpOnly`（JavaScript 需要读取它）；CSRF Cookie 默认带 `Secure`，在明文 `http://` 本地开发时，请同时向应用配置和 `set_csrf_cookie()` 调用传入 `csrf_cookie_secure=False`（`pynext dev` 会自动这样做）。多 worker 部署时，所有 worker 共享同一个签名密钥。使用 `--workers N` 启动时，supervisor 会生成一个 32 字节密钥（若指定了 `--csrf-signing-key` / `PYNEXT_CSRF_SIGNING_KEY`，则使用该密钥），并与所有 worker 共享，包括崩溃或滚动重启后新启动的 worker，因此一个 worker 签发的 Cookie 可以在其他 worker 上通过验证。密钥可以是至少 16 字节的字符串、`hex:<hex>` 或 `base64:<base64>`；为空、过短或无法解码的密钥不会静默回退到随机密钥，而是在启动时直接失败。不使用 worker 的单进程服务器继续使用每个进程的回退密钥，因为全部配置都在同一个进程内，所以没有问题。
 
 跨源请求默认一律拒绝（规范 v0.2 §11）：未配置来源时，不会发送 `Access-Control-Allow-Origin` 请求头。请通过 `SecurityConfig` 将策略传给 `create_app`：
 

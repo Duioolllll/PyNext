@@ -94,7 +94,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-セッションミドルウェアがある場合、セキュリティ設定を別途渡さなくても CSRF が自動的に有効になります。セッションがなく、すべての状態変更 API ルートを保護するには、`create_app` に `security=SecurityConfig(csrf_enabled=True)` を渡してください。トークンが証明するのは、Cookie を読めたページからのリクエストであることだけです。XSS で Cookie を読めるページは、他の double-submit 方式と同様にこれを回避できます。Cookie は既定で `SameSite=Lax` であり、`HttpOnly` ではありません（JavaScript が読む必要があります）。CSRF Cookie は既定で `Secure` のため、平文 `http://` でのローカル開発では `csrf_cookie_secure=False` をアプリ設定と `set_csrf_cookie()` の呼び出しの両方に渡してください（`pynext dev` は自動的にそう動作します）。マルチワーカーで運用する場合は、すべてのワーカーで同じ `csrf_signing_key`（または `PYNEXT_CSRF_SIGNING_KEY` 環境変数）を使い、あるワーカーが発行した Cookie を他のワーカーでも検証できるようにしてください。
+セッションミドルウェアがある場合、セキュリティ設定を別途渡さなくても CSRF が自動的に有効になります。セッションがなく、すべての状態変更 API ルートを保護するには、`create_app` に `security=SecurityConfig(csrf_enabled=True)` を渡してください。トークンが証明するのは、Cookie を読めたページからのリクエストであることだけです。XSS で Cookie を読めるページは、他の double-submit 方式と同様にこれを回避できます。Cookie は既定で `SameSite=Lax` であり、`HttpOnly` ではありません（JavaScript が読む必要があります）。CSRF Cookie は既定で `Secure` のため、平文 `http://` でのローカル開発では `csrf_cookie_secure=False` をアプリ設定と `set_csrf_cookie()` の呼び出しの両方に渡してください（`pynext dev` は自動的にそう動作します）。マルチワーカーで運用する場合は、すべてのワーカーで同じ署名鍵を共有します。`--workers N` で起動すると、スーパーバイザーが 32 バイトの鍵を 1 つ生成するか（`--csrf-signing-key` / `PYNEXT_CSRF_SIGNING_KEY` が指定されていればそれを使い）、すべてのワーカーと共有するため、クラッシュやローリング再起動後に起動したワーカーでも、あるワーカーが発行した Cookie を検証できます。鍵は 16 バイト以上の文字列、`hex:<hex>`、`base64:<base64>` のいずれかで指定でき、空・短すぎる・復号できない鍵はランダムな鍵に黙ってフォールバックせず、起動時に失敗します。ワーカーを使わない単一プロセスのサーバーはプロセスごとのフォールバック鍵をそのまま使い、すべての設定が同一プロセス内にあるため問題ありません。
 
 クロスオリジンリクエストは既定で拒否されます（仕様 v0.2 §11）。オリジンを設定しない限り、`Access-Control-Allow-Origin` ヘッダーは送信されません。ポリシーは `SecurityConfig` で `create_app` に渡します。
 
