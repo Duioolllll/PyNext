@@ -10,9 +10,10 @@ import time
 
 from . import _native
 from .app import _decode_path, _invoke
+from .errors import SignalError, digest_for_error
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
                    WebSocketDisconnect, apply_security_headers, security_headers)
-from .observability import begin_request_context, queue_wait_var
+from .observability import begin_request_context, get_request_id, queue_wait_var
 from .ratelimit import _is_exempt_path
 from .ws_origin import websocket_origin_allowed
 
@@ -411,12 +412,20 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                 request.state["client_scheme"] = info.scheme
                 request.state["client_host"] = info.host
                 response = await app.dispatch(request)
+            except SignalError as exc:
+                # Defensive: the timed dispatcher converts signals first.
+                # A signal escaping dispatch still answers without an error log.
+                response = exc.to_response()
+                request_id = get_request_id()
+                if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
+                    response.headers.append((b"x-request-id", request_id.encode("ascii")))
             except BadRequest as exc:
                 log.info("Bad request: %s", exc)
                 response = Response("Bad Request", status=400)
             except Exception as exc:
-                log.exception("Request failed")
-                response = app.error_response(exc)
+                digest, _count = digest_for_error(exc)
+                log.exception("Request failed", extra={"error_digest": digest})
+                response = app.error_response(exc, digest=digest)
         if method.upper() == "HEAD":
             response.body = b""
         if isinstance(response, StreamingResponse) and not response._head_only:

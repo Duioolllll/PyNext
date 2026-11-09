@@ -27,6 +27,7 @@ from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
 from .client import compile_client, read_client_artifacts
 from .components import _isr_policy, _isr_query_keys, _node, bind_islands
 from .build import discover, load_manifest
+from .errors import SignalError, digest_for_error, error_count
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
@@ -624,12 +625,47 @@ class App:
             self.modules[key] = _load(self.root, path, self._namespace)
         return self.modules[key]
 
-    def error_response(self, exc):
+    def error_response(self, exc, digest=None):
+        """Render a 500 for an unexpected failure.
+
+        The production body never leaks the exception — it carries the
+        ``request_id`` and the error ``digest`` instead, so a user reporting
+        "500" can be matched to the log line (which records the same
+        digest) and the registry entry :func:`errors.lookup_error` restores.
+        The ``x-request-id`` response header carries the same id. In
+        development the page also shows the digest, how many times this
+        error has been seen, and whether the traceback was truncated.
+        Signal errors never reach this method: the dispatcher converts them
+        to their response before an error log is written.
+        """
+        if digest is None:
+            digest, count = digest_for_error(exc)
+        else:
+            count = error_count(digest)
+        request_id = get_request_id()
         if not self.debug:
-            return Response("Internal Server Error", status=500)
-        details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-16384:]
+            detail = "Internal Server Error"
+            parts = []
+            if request_id:
+                parts.append(f"request_id: {request_id}")
+            if digest:
+                parts.append(f"digest: {digest}")
+            if parts:
+                detail += " (" + ", ".join(parts) + ")"
+            return Response(detail, status=500)
+        full = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        truncated = len(full) > 16384
+        details = full[-16384:]
+        header = "<h1>Development error</h1>"
+        if request_id:
+            header += f"<p>request_id: {html.escape(request_id)}</p>"
+        if digest:
+            header += (f"<p>digest: {html.escape(digest)}"
+                       f" (seen {count} time{'s' if count != 1 else ''})</p>")
+        if truncated:
+            header += "<p>traceback truncated to last 16384 characters</p>"
         body = ("<!DOCTYPE html><html><head><title>PyNext development error</title></head>"
-                "<body><h1>Development error</h1><pre>" + html.escape(details) + "</pre></body></html>")
+                "<body>" + header + "<pre>" + html.escape(details) + "</pre></body></html>")
         return Response(body, status=500, media_type="text/html; charset=utf-8",
                         headers=[(b"cache-control", b"no-store")])
 
@@ -1042,14 +1078,31 @@ class App:
                 if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
                     response.headers.append((b"x-request-id", request_id.encode("ascii")))
                 return response
-            except BadRequest:
+            except SignalError as exc:
+                # Control-flow signal (notFound/forbidden/redirect): answer
+                # with its response and count it, but write no error log.
+                # The access log line in the finally block still records it.
+                status = exc.status
+                response = exc.to_response()
+                self.metrics.observe_error(route_var.get() or "__unmatched__",
+                                           type(exc).__name__, exc.label_digest)
+                request_id = get_request_id()
+                if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
+                    response.headers.append((b"x-request-id", request_id.encode("ascii")))
+                return response
+            except BadRequest as exc:
                 status = 400
+                self.metrics.observe_error(route_var.get() or "__unmatched__",
+                                           type(exc).__name__)
                 raise
             except _SyncHandlerBusy:
                 status = 503
                 raise
-            except Exception:
+            except Exception as exc:
                 status = 500
+                digest, _count = digest_for_error(exc)
+                self.metrics.observe_error(route_var.get() or "__unmatched__",
+                                           type(exc).__name__, digest)
                 raise
             finally:
                 request_span.set_attribute("http.status_code", status)
@@ -1585,8 +1638,10 @@ class App:
                 log.info("Bad request: %s", exc)
                 response = Response("Bad Request", status=400)
             except Exception as exc:
-                log.exception("Request failed")
-                response = self.error_response(exc)
+                digest, _count = digest_for_error(exc)
+                self.metrics.observe_error("__unmatched__", type(exc).__name__, digest)
+                log.exception("Request failed", extra={"error_digest": digest})
+                response = self.error_response(exc, digest=digest)
         if request is not None:
             # Trust-resolved client identity (A6, pynext.proxy): the peer
             # address, scheme and Host header, unless a trusted proxy
@@ -1609,12 +1664,24 @@ class App:
             async def dispatch_and_send():
                 try:
                     result = await self.dispatch(request)
+                except SignalError as exc:
+                    # A signal that escaped dispatch (defensive: the timed
+                    # dispatcher converts these first) still answers without
+                    # an error log.
+                    result = exc.to_response()
+                    request_id = get_request_id()
+                    if request_id and not any(k == b"x-request-id" for k, _ in result.headers):
+                        result.headers.append((b"x-request-id", request_id.encode("ascii")))
                 except BadRequest as exc:
                     log.info("Bad request: %s", exc)
                     result = Response("Bad Request", status=400)
                 except Exception as exc:
-                    log.exception("Request failed")
-                    result = self.error_response(exc)
+                    digest, _count = digest_for_error(exc)
+                    log.exception("Request failed", extra={"error_digest": digest})
+                    result = self.error_response(exc, digest=digest)
+                    request_id = get_request_id()
+                    if request_id and not any(k == b"x-request-id" for k, _ in result.headers):
+                        result.headers.append((b"x-request-id", request_id.encode("ascii")))
                 if scope["method"].upper() == "HEAD":
                     result.body = b""
                 try:

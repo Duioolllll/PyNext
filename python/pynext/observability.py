@@ -13,6 +13,12 @@ Design notes
   ``Authorization`` values to the logger.
 * Metric labels use route patterns (``/blog/[slug]``), never raw URLs or
   user IDs, so cardinality stays bounded by the application's route table.
+  The same rule applies to error digests: only the fixed well-known
+  digests (``PYNEXT_HTTP_ERROR_FALLBACK;404`` and friends, ``PYNEXT_REDIRECT``)
+  become Prometheus label values. Computed digests (a hash of message +
+  stack) are aggregated in the in-process snapshot only, capped at 256
+  distinct digests with the rest folded into an ``__overflow__`` bucket,
+  and are emitted in Prometheus under an empty ``digest`` label.
 * Native (Rust) fresh ISR hits are served without entering Python, so they
   are invisible to the Python metrics below. That gap is documented in the
   manuals; only ISR outcomes that reach :meth:`App.dispatch` are counted.
@@ -289,6 +295,37 @@ class MetricsCollector:
         self._regeneration = {"success": 0, "failure": 0, "started": 0}
         self._workers = {"starts": 0, "timeouts": 0, "unavailable": 0}
         self._bundles = {}  # client asset path -> size in bytes
+        # Error counts, joint key (route, error_type, digest); digest is ""
+        # when the error has none. Computed digests are capped (see
+        # observe_error) so a distinct traceback per request cannot grow
+        # this dict without bound.
+        self._errors = {}
+        self._error_digests = set()
+
+    # -- errors -----------------------------------------------------------
+    def observe_error(self, route, error_type, digest=None):
+        """Count one error, by exception type and (when known) digest.
+
+        ``digest`` is the well-known signal digest for control-flow errors
+        (``PYNEXT_HTTP_ERROR_FALLBACK;404`` ...) or the computed digest of a
+        real failure. Signal errors are counted too — they are error
+        responses, just not failures — and their distinct ``error_type``
+        label keeps them separable from 500s. Computed digests are capped
+        at 256 distinct values; further distinct digests fold into the
+        ``__overflow__`` bucket. A digest is never a raw URL or message.
+        """
+        if not self.enabled:
+            return
+        digest = digest or ""
+        with self._lock:
+            if (digest and not digest.startswith("PYNEXT_")
+                    and digest not in self._error_digests):
+                if len(self._error_digests) >= 256:
+                    digest = "__overflow__"
+                else:
+                    self._error_digests.add(digest)
+            key = (route, error_type, digest)
+            self._errors[key] = self._errors.get(key, 0) + 1
 
     # -- requests ---------------------------------------------------------
     def observe_request(self, route, method, status, latency_ms,
@@ -393,11 +430,20 @@ class MetricsCollector:
                 total_requests += entry["count"]
                 total_bytes += entry["bytes"]
             bundle_sizes = dict(sorted(self._bundles.items()))
+            errors_by_type = {}
+            errors_by_digest = {}
+            for (route, error_type, digest), count in sorted(self._errors.items()):
+                errors_by_type.setdefault(route, {})[error_type] = (
+                    errors_by_type.setdefault(route, {}).get(error_type, 0) + count)
+                if digest:
+                    errors_by_digest.setdefault(route, {})[digest] = (
+                        errors_by_digest.setdefault(route, {}).get(digest, 0) + count)
             return {
                 "enabled": True,
                 "requests_total": total_requests,
                 "response_bytes_total": total_bytes,
                 "routes": routes,
+                "errors": {"by_type": errors_by_type, "by_digest": errors_by_digest},
                 "queue": {
                     "current": self._queue_current,
                     "max": self._queue_max,
@@ -453,6 +499,28 @@ class MetricsCollector:
                   "# TYPE pynext_worker_total counter"]
         for outcome, count in snap["workers"].items():
             lines.append(f'pynext_worker_total{{outcome="{outcome}"}} {count}')
+        lines += ["# HELP pynext_errors_total Errors, by route, exception type and digest.",
+                  "# TYPE pynext_errors_total counter"]
+        # Emit from the joint (route, error_type, digest) counts, not the
+        # snapshot marginals: a digest belongs to the error type that raised
+        # it. Well-known signal digests get their own series; computed
+        # digests are folded into digest="" so one traceback per request
+        # cannot mint a new series (see module docstring).
+        with self._lock:
+            joint = sorted(self._errors.items())
+        folded = {}
+        for (route, error_type, digest), count in joint:
+            if digest.startswith("PYNEXT_"):
+                lines.append(
+                    f'pynext_errors_total{{route="{route}",error_type="{error_type}",'
+                    f'digest="{digest}"}} {count}')
+            else:
+                key = (route, error_type)
+                folded[key] = folded.get(key, 0) + count
+        for (route, error_type), count in sorted(folded.items()):
+            lines.append(
+                f'pynext_errors_total{{route="{route}",error_type="{error_type}",'
+                f'digest=""}} {count}')
         lines += ["# HELP pynext_python_execution_queue_length Current Python execution queue depth.",
                   "# TYPE pynext_python_execution_queue_length gauge",
                   f'pynext_python_execution_queue_length {snap["queue"]["current"]}',

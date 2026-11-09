@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Add signal errors for pages (`not_found()`/`forbidden()`/`unauthorized()`/`redirect()` and the `NotFoundError`/`ForbiddenError`/`UnauthorizedError`/`RedirectError` classes): the dispatcher answers with the signal's response and counts it, but writes no error log. Real failures get a stable `sha256(type + message + stack)` digest; the 500 body and the error log line carry the same `request_id` and digest, and `lookup_error(digest)` restores the original error record (type, truncated message, sighting count) from a bounded in-process registry. `pynext_errors_total{route,error_type,digest}` counts errors by type and digest (well-known signal digests as labels; computed digests folded to `digest=""` in Prometheus and kept in the snapshot).
+
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.
