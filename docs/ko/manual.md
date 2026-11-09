@@ -94,7 +94,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-세션 미들웨어가 있으면 `create_app`에 보안 설정을 따로 전달하지 않아도 CSRF가 자동으로 켜집니다. 세션이 없는데 모든 상태 변경 API 라우트를 보호하려면 `create_app`에 `security=SecurityConfig(csrf_enabled=True)`를 전달하세요. 토큰은 쿠키를 읽을 수 있는 페이지에서 요청이 왔다는 것만 증명합니다. XSS로 쿠키를 읽을 수 있는 페이지는 다른 double-submit 방식과 마찬가지로 이를 우회할 수 있습니다. 쿠키는 기본적으로 `SameSite=Lax`이며 `HttpOnly`가 아닙니다(JavaScript가 읽어야 합니다). CSRF 쿠키는 기본적으로 `Secure`이므로 평문 `http://` 로컬 개발에서는 `csrf_cookie_secure=False`를 앱 설정과 `set_csrf_cookie()` 호출에 함께 전달하세요(`pynext dev`는 자동으로 이렇게 동작합니다). 다중 워커로 배포할 때는 모든 워커가 같은 `csrf_signing_key`(또는 `PYNEXT_CSRF_SIGNING_KEY` 환경 변수)를 써야 한 워커가 발급한 쿠키를 다른 워커도 검증할 수 있습니다.
+세션 미들웨어가 있으면 `create_app`에 보안 설정을 따로 전달하지 않아도 CSRF가 자동으로 켜집니다. 세션이 없는데 모든 상태 변경 API 라우트를 보호하려면 `create_app`에 `security=SecurityConfig(csrf_enabled=True)`를 전달하세요. 토큰은 쿠키를 읽을 수 있는 페이지에서 요청이 왔다는 것만 증명합니다. XSS로 쿠키를 읽을 수 있는 페이지는 다른 double-submit 방식과 마찬가지로 이를 우회할 수 있습니다. 쿠키는 기본적으로 `SameSite=Lax`이며 `HttpOnly`가 아닙니다(JavaScript가 읽어야 합니다). CSRF 쿠키는 기본적으로 `Secure`이므로 평문 `http://` 로컬 개발에서는 `csrf_cookie_secure=False`를 앱 설정과 `set_csrf_cookie()` 호출에 함께 전달하세요(`pynext dev`는 자동으로 이렇게 동작합니다). 다중 워커로 배포할 때는 모든 워커가 서명 키 하나를 공유합니다. `--workers N`으로 시작하면 supervisor가 32바이트 키 하나를 만들거나(`--csrf-signing-key` / `PYNEXT_CSRF_SIGNING_KEY`가 주어지면 그 키를 쓰고) 모든 워커와 공유하므로, 충돌이나 롤링 재시작 뒤에 새로 뜬 워커에서도 한 워커가 발급한 쿠키를 검증할 수 있습니다. 키는 16바이트 이상의 문자열, `hex:<hex>`, `base64:<base64>` 중 하나로 줄 수 있으며, 비어 있거나 너무 짧거나 해독할 수 없는 키는 조용히 임의 키로 대체되지 않고 시작 시점에 실패합니다. 워커를 쓰지 않는 단일 프로세스 서버는 프로세스별 폴백 키를 그대로 쓰며, 모든 설정이 한 프로세스 안에 있으므로 문제가 없습니다.
 
 교차 출처 요청은 기본적으로 허용하지 않습니다(명세 v0.2 §11). 출처를 설정하지 않으면 `Access-Control-Allow-Origin` 헤더를 보내지 않습니다. `SecurityConfig`로 정책을 `create_app`에 전달하세요.
 

@@ -267,6 +267,12 @@ def main():
             command.add_argument("--csrf", action=argparse.BooleanOptionalAction, default=None,
                                  help="protect state-changing API requests (default: auto — on when a "
                                       "session middleware is installed; --no-csrf opts out)")
+            command.add_argument("--csrf-signing-key", default=None, metavar="KEY",
+                                 help="HMAC key signing double-submit CSRF cookies: a string of at "
+                                      "least 16 bytes, 'hex:<hex>' or 'base64:<base64>' (also via "
+                                      "PYNEXT_CSRF_SIGNING_KEY); with --workers N the supervisor "
+                                      "shares this key with every worker instead of generating one; "
+                                      "an invalid key fails at startup")
             command.add_argument("--csrf-cookie-secure", action=argparse.BooleanOptionalAction, default=None,
                                  help="send the double-submit CSRF cookie only over HTTPS "
                                       "(default: on for start, off for dev over plain http)")
@@ -331,6 +337,7 @@ def main():
                                 exempt_paths=tuple(args.rate_limit_exempt_path), **options)
                    if args.rate_limit >= 1 else None)
         security = (SecurityConfig(csrf_enabled=args.csrf,
+                                   csrf_signing_key=args.csrf_signing_key,
                                    csrf_cookie_secure=(args.csrf_cookie_secure
                                                       if args.csrf_cookie_secure is not None
                                                       else args.command == "start"),
@@ -339,7 +346,8 @@ def main():
                                    websocket_allowed_origins=tuple(args.ws_allowed_origin),
                                    websocket_allow_missing_origin=args.ws_allow_missing_origin,
                                    csp_nonce_enabled=args.csp_nonce)
-                    if (args.csrf is not None or args.csrf_cookie_secure is not None or args.cors_origin or
+                    if (args.csrf is not None or args.csrf_signing_key is not None or
+                        args.csrf_cookie_secure is not None or args.cors_origin or
                         args.cors_credentials or args.csp_nonce or args.ws_allowed_origin or
                         args.ws_allow_missing_origin) else None)
     except ValueError as exc:
