@@ -17,7 +17,7 @@ import uuid
 import weakref
 from pathlib import Path
 from types import MappingProxyType
-from urllib.parse import quote, unquote_to_bytes
+from urllib.parse import quote, unquote, unquote_to_bytes
 
 from . import _native
 from .admission import DecisionGate
@@ -307,16 +307,101 @@ async def _run_while_connected(work, receive):
         await asyncio.gather(task, disconnect, return_exceptions=True)
 
 
-def _decode_path(path, raw_path=None):
-    if raw_path is not None:
-        if re.search(br"%(?![0-9a-fA-F]{2})|%(?:2[fF]|5[cC]|00)", raw_path):
-            raise ValueError("Invalid or encoded path separator")
-        path = unquote_to_bytes(raw_path).decode("utf-8", errors="strict")
+# Matches Next.js `escapePathDelimiters(segment, true)`: re-encode any path
+# delimiter a decoded value produced, plus encoded delimiters that were
+# already present, so a decoded value can never be mistaken for a
+# separator or decoded a second time.
+_DELIMITER_RE = re.compile(r"([/#?\\]|%(?:2f|23|3f|5c))", re.IGNORECASE)
+
+
+def _escape_path_delimiters(segment):
+    """Re-encode path delimiters in a decoded parameter value."""
+    return _DELIMITER_RE.sub(lambda match: quote(match.group(0), safe=""), segment)
+
+
+def _validate_path(path):
+    """Reject a path that is not a normalized absolute path."""
     if (not path.startswith("/") or "//" in path or "\\" in path or
             any(ord(c) < 32 or ord(c) == 127 for c in path) or
             any(part in (".", "..") for part in path.split("/"))):
         raise ValueError("Invalid request path")
-    return path
+
+
+def _validate_encoded_path(raw):
+    """Validate a still-encoded request path; return it as a string.
+
+    Only the encoded form is checked here: ``%00`` and malformed ``%``
+    sequences are rejected, as are literal ``//``, backslashes, control
+    characters and ``.``/``..`` segments. Encoded delimiters (``%2F``,
+    ``%5C``, ``%23``, ``%3F``) are allowed through — they are decoded
+    per segment before matching, with delimiters re-encoded, so they
+    never act as separators.
+    """
+    if isinstance(raw, str):
+        raw = raw.encode("ascii")
+    if re.search(br"%(?![0-9a-fA-F]{2})|%00", raw):
+        raise ValueError("Invalid or NUL-encoded path")
+    encoded = raw.decode("ascii")
+    _validate_path(encoded)
+    return encoded
+
+
+def _split_request_path(path, raw_path=None):
+    """Return ``(decoded_path, encoded_path)`` for a request.
+
+    Route matching runs on the per-segment decoded form produced by
+    :func:`_normalize_path_for_matching` (``/files/a%2Fb`` matches
+    ``[name]`` with the value ``a%2Fb``; ``/in%70ut`` matches the
+    static segment ``input``). The decoded path is kept for
+    asset/static/ISR lookups and handler visibility. When no raw path
+    is available (for example ``revalidate()``), both are the validated
+    path. The decoded form is validated too, so a ``%2F`` that would
+    create an empty segment (``/%2finput`` → ``//input``) or a ``..``
+    segment is still rejected before any rate-limit charge.
+    """
+    if raw_path is None:
+        _validate_path(path)
+        return path, path
+    encoded = _validate_encoded_path(raw_path)
+    decoded = unquote_to_bytes(encoded).decode("utf-8", errors="strict")
+    _validate_path(decoded)
+    return decoded, encoded
+
+
+def _decode_path(path, raw_path=None):
+    """Return the decoded request path (see :func:`_split_request_path`)."""
+    return _split_request_path(path, raw_path)[0]
+
+
+def _decode_param(name, raw):
+    """Decode one matched parameter value (Next.js ``decodePathParams``).
+
+    Raises :class:`BadRequest` naming the parameter when the value
+    cannot be decoded. Delimiters produced by decoding are re-encoded
+    so the value cannot be mistaken for a separator.
+    """
+    try:
+        value = unquote(raw, errors="strict")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise BadRequest(f"Failed to decode path param '{name}'") from exc
+    return _escape_path_delimiters(value)
+
+
+def _normalize_path_for_matching(encoded_path):
+    """Decode each segment and re-escape delimiters (Next.js ``decodePathParams``).
+
+    Matching runs on this form: a static segment compares decoded (so
+    ``/in%70ut`` matches ``/input``), while an encoded delimiter stays
+    one segment (so ``/files/a%2Fb`` matches ``[name]`` with the value
+    ``a%2Fb``). The values the router returns are already the decoded,
+    delimiter-safe values the handler receives, so no second decode is
+    needed. Raises :class:`BadRequest` naming the offending segment when
+    a value cannot be decoded.
+    """
+    segments = encoded_path.split("/")
+    return "/".join(
+        _decode_param(segment, segment) for segment in segments
+    )
 
 
 def _module_key(root, relative):
@@ -1077,6 +1162,12 @@ class App:
     async def _dispatch(self, request):
         """Return a response. Streaming pages return a StreamingResponse."""
         path = request.path
+        # Matching runs on the per-segment decoded form (Next.js
+        # decodePathParams): static segments compare decoded, while an
+        # encoded delimiter stays one segment. The encoded path is kept
+        # for the trailing-slash redirect so the encoding is preserved.
+        encoded_path = request.raw_path or request.path
+        match_path = _normalize_path_for_matching(encoded_path)
         if self.hot_reload and path == "/_pynext/dev/client":
             route_var.set("__dev__")
             if request.method not in {"GET", "HEAD"}:
@@ -1086,9 +1177,14 @@ class App:
             if request.method == "HEAD":
                 response.body = b""
             return response
-        if path != "/" and path.endswith("/"):
+        if match_path != "/" and match_path.endswith("/"):
             route_var.set("__redirect__")
-            location = quote(path.rstrip("/"), safe="/!$&'()*+,;=:@-._~").encode("ascii")
+            # Redirect to the encoded form so an encoded delimiter in a
+            # parameter value is preserved instead of becoming a separator.
+            if request.raw_path:
+                location = encoded_path.rstrip("/").encode("ascii")
+            else:
+                location = quote(encoded_path.rstrip("/"), safe="/!$&'()*+,;=:@-._~").encode("ascii")
             if request.query_string:
                 if any(c < 32 or c == 127 for c in request.query_string):
                     return Response("Bad Request", status=400)
@@ -1146,15 +1242,17 @@ class App:
             return asset_response(request, body, media_type, self.asset_etags[path],
                                   cache_control=b"public, max-age=0, must-revalidate",
                                   extra_headers=[(b"x-content-type-options", b"nosniff")])
-        match = self.router.matches(path)
+        match = self.router.matches(match_path)
         if match is None:
             route_var.set("__not_found__")
             return Response("Not Found", status=404)
         pattern, raw_params = match
         route_var.set(pattern)
+        # The matched values are already decoded and delimiter-safe
+        # (see _normalize_path_for_matching), so they are used as-is.
         params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
         request = Request(request.method, request.path, request.query_string, request.headers, request.body,
-                          params, self, request.state, request._cancel_event)
+                          params, self, request.state, request._cancel_event, raw_path=request.raw_path)
         spec = self.manifest["routes"][pattern]
         entry = self.entries[pattern]
         if self.production and self.render_modes.get(pattern) == "ssg" and path not in self.static_pages:
@@ -1315,7 +1413,7 @@ class App:
         """
         return await self._rate_limit_denied(scope, path)
 
-    async def _authorize_websocket(self, path, query_string=b"", headers=()):
+    async def _authorize_websocket(self, path, query_string=b"", headers=(), raw_path=None):
         """Pre-handshake authorization for a WebSocket upgrade.
 
         Returns ``None`` when the upgrade may proceed, else a ``Response``
@@ -1342,17 +1440,27 @@ class App:
         token's ``set-cookie`` would never reach the client while the
         old token is already gone from the store.
         """
-        match = self.router.matches(path)
+        # Match on the per-segment decoded form (Next.js
+        # decodePathParams) so the pre-flight checks the same route the
+        # handler will run; when no encoded path is available (native
+        # transport, where Rust already decoded it) the decoded path
+        # normalizes to the same form.
+        try:
+            match_path = _normalize_path_for_matching(raw_path or path)
+        except BadRequest:
+            return Response("Bad Request", status=400)
+        match = self.router.matches(match_path)
         if match is None:
             return Response("Not Found", status=404)
         pattern, raw_params = match
         handler = self.websocket_entries.get(pattern)
         if handler is None:
             return Response("Not Found", status=404)
+        # The matched values are already decoded and delimiter-safe.
         params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
         request = Request("GET", path, bytes(query_string),
                           tuple((bytes(name), bytes(value)) for name, value in headers),
-                          b"", params, self, {})
+                          b"", params, self, {}, raw_path=raw_path or "")
         terminal_reached = False
         seen = {}
 
@@ -1379,17 +1487,23 @@ class App:
 
     async def _handle_websocket(self, scope, receive, send):
         try:
-            path = _decode_path(scope["path"], scope.get("raw_path"))
+            path, encoded_path = _split_request_path(scope["path"], scope.get("raw_path"))
         except (ValueError, UnicodeError):
             await send({"type": "websocket.close", "code": 1008})
             return
-        match = self.router.matches(path)
+        try:
+            match_path = _normalize_path_for_matching(encoded_path)
+        except BadRequest:
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        match = self.router.matches(match_path)
         handler = None
         params = {}
         if match is not None:
             pattern, raw_params = match
             handler = self.websocket_entries.get(pattern)
             if handler is not None:
+                # The matched values are already decoded and delimiter-safe.
                 params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
         if handler is None:
             # No route, or a route with no WebSocket handler: refuse the
@@ -1430,7 +1544,7 @@ class App:
         # upgrade is refused with a close instead of an accept, so the
         # handler never runs and no data is sent.
         denied = await self._authorize_websocket(path, scope.get("query_string", b""),
-                                                 scope.get("headers", []))
+                                                 scope.get("headers", []), raw_path=encoded_path)
         if denied is not None:
             await send({"type": "websocket.close", "code": 1008})
             return
@@ -1551,7 +1665,7 @@ class App:
         # paths never consume a token, even when the client's bucket is empty.
         request = None
         try:
-            path = _decode_path(scope["path"], scope.get("raw_path"))
+            path, encoded_path = _split_request_path(scope["path"], scope.get("raw_path"))
         except (ValueError, UnicodeError):
             response = Response("Bad Request", status=400)
         else:
@@ -1579,7 +1693,8 @@ class App:
                     chunks.append(chunk)
                     if not message.get("more_body", False):
                         request = Request(scope["method"].upper(), path, scope.get("query_string", b""),
-                                          tuple(scope.get("headers", [])), b"".join(chunks), _app=self)
+                                          tuple(scope.get("headers", [])), b"".join(chunks), _app=self,
+                                          raw_path=encoded_path)
                         break
             except BadRequest as exc:
                 log.info("Bad request: %s", exc)

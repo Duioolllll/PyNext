@@ -799,6 +799,15 @@ class Request:
     _app: object = field(default=None, repr=False, compare=False)
     state: dict = field(default_factory=dict, compare=False)
     _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+    # Still-encoded request path, when the transport supplied one. Route
+    # matching normalizes this form per segment (Next.js
+    # decodePathParams) so an encoded delimiter inside a parameter value
+    # stays one segment while static segments compare decoded; ``path``
+    # is the decoded form used for asset/static/ISR lookups and handler
+    # visibility. Empty when the request was built without a raw path
+    # (for example in tests), in which case matching falls back to
+    # ``path``.
+    raw_path: str = ""
 
     @property
     def cancelled(self) -> bool:

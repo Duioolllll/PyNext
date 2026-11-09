@@ -42,7 +42,9 @@ async def check_static_responses(client):
     assert (await client.get("/docs/a/b")).text == page_html("<p>a/b</p>")
     assert (await client.get("/blog/not-generated")).status_code == 404
     assert (await client.get("/docs")).status_code == 404
-    assert (await client.get("/blog/a%2Fb")).status_code == 400
+    # The encoded slash still matches the SSG route, but the page was not
+    # pre-generated, so production serves 404 instead of rendering.
+    assert (await client.get("/blog/a%2Fb")).status_code == 404
     head = await client.head("/")
     assert head.status_code == 200 and head.content == b""
     assert int(head.headers["content-length"]) == len(page_html("<p>built</p>").encode())
