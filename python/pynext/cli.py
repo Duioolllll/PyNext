@@ -10,6 +10,7 @@ from pathlib import Path
 from .app import create_app
 from .build import write_manifest
 from .client import compile_client, discover_client
+from .env import load_env
 from .http import MAX_WS_MESSAGE, SecurityConfig
 from .observability import ObservabilityConfig
 from .ratelimit import RateLimiter
@@ -362,6 +363,13 @@ def main():
         return
     if args.ws_max_message_bytes > 16 * 1024 * 1024:
         parser.error("--ws-max-message-bytes must be at most 16777216")
+    # Load .env before anything reads PYNEXT_* from the environment
+    # (rate limiter, CSRF key, Redis URL): create_app() loads it again
+    # on every (re)start, which also refreshes edited files in dev.
+    try:
+        load_env(root, mode="production" if args.command == "start" else "development")
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     obs_config = None
     if (args.structured_logs is not None or args.metrics is not None
             or args.tracing is not None):

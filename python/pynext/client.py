@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .assets import _read_public, _validate_component
 from .components import _ISLAND_NAME
+from .env import public_env_defines
 
 PREFIX = "/_pynext/static/"
 MAX_SOURCE_BYTES = 1 * 1024 * 1024
@@ -138,8 +139,12 @@ def compile_client(root, sources):
         output = Path(temp) / "bundle.js"
         metadata = Path(temp) / "meta.json"
         for name, entry in entries.items():
+            # Only PYNEXT_PUBLIC_* variables are defined into the bundle;
+            # any other variable stays server-only and can never leak
+            # through an island (Next.js NEXT_PUBLIC_ rule).
             command = [*executable, entry, "--bundle", "--format=esm", "--platform=browser", "--target=es2020",
                        "--charset=utf8", "--log-level=error", "--log-override:unsupported-dynamic-import=error",
+                       *public_env_defines(),
                        f"--outfile={output}", f"--metafile={metadata}"]
             try:
                 subprocess.run(command, cwd=directory, check=True, encoding="utf-8", errors="replace",

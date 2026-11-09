@@ -7,6 +7,8 @@ import sysconfig
 from functools import partial
 from pathlib import Path
 
+from .env import STANDALONE_ENV_FILES
+
 log = logging.getLogger("pynext")
 
 
@@ -152,6 +154,14 @@ def _populate_standalone(root, output, built, purelib, package):
     project.mkdir()
     names = {"app", "public", "islands", *(path.name for path in root.glob("*.py"))}
     for name in sorted(names):
+        source = root / name
+        if source.exists() or source.is_symlink():
+            _project_copy(source, project / name)
+    # Only .env and .env.production ship in the bundle: .env*.local files
+    # hold local secrets and are never copied (Next.js standalone rule).
+    # The bundle's `run` launcher starts `pynext start` in this directory,
+    # which loads these files again at runtime.
+    for name in STANDALONE_ENV_FILES:
         source = root / name
         if source.exists() or source.is_symlink():
             _project_copy(source, project / name)

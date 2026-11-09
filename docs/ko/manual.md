@@ -299,6 +299,12 @@ CLI 플래그 `--structured-logs` / `--no-structured-logs`, `--metrics` / `--no-
 
 여러 워커: `pynext start --workers 4`는 하나의 리스너를 공유하는 워커 수퍼바이저를 실행합니다. `--port 0`으로 시작하면 할당된 포트를 워커 재시작 시에도 유지합니다. 워커의 인터프리터와 이벤트 루프는 독립적이며 메모리 캐시와 기본 요청 제한은 워커별입니다. SQLite·Redis ISR과 Redis 요청 제한은 공유할 수 있습니다. 수퍼바이저가 실패한 워커를 재시작하고 종료를 조정합니다. 처리 중 중단된 요청은 실패하므로 재시도해야 합니다. 공유 리스너 워커의 실행과 재시작은 Linux·macOS·Windows CI에서 검사하며, 신호 기반 수퍼바이저 검사는 Linux·macOS에서 수행합니다.
 
+## 환경 파일(`.env`)
+
+`pynext dev`, `pynext build`, `pynext start`는 사용자 코드가 실행되기 전에 프로젝트 루트의 `.env` 파일을 읽습니다. 우선순위는 높은 것부터 `.env.{mode}.local`, `.env.local`, `.env.{mode}`, `.env`이며, 모드는 `dev`에서 `development`, `build`/`start`에서 `production`입니다. `test` 모드에서는 `.env.local`을 읽지 않습니다(`.env.test.local`은 읽습니다). 프로세스 환경에 이미 있는 변수가 파일보다 항상 우선합니다. `.env` 파일을 고치면 개발 서버가 재시작되고 값이 다시 읽힙니다.
+
+`PYNEXT_PUBLIC_` 접두사가 붙은 변수만 island 번들에 인라인됩니다(esbuild `--define`으로 `process.env.PYNEXT_PUBLIC_<이름>` 형태). 그 외 변수는 서버 전용이라 비밀값이 클라이언트 자바스크립트로 새는 일이 없습니다. `PYNEXT_REDIS_URL`, `PYNEXT_CSRF_SIGNING_KEY` 같은 비밀은 `.env.local` / `.env.production.local`에만 두세요. standalone 번들은 `.env`와 `.env.production`만 복사하고 `.env*.local` 파일은 절대 복사하지 않습니다. 읽은 파일 이름과 공개 변수 키(값은 기록하지 않음)는 `.pynext/manifest.json`의 `env_files`, `public_env_keys`에 기록됩니다. 코드에서는 `pynext.env`의 `load_env(root, mode="production")`을 쓰세요.
+
 ## 테스트와 문제 해결
 
 ~~~bash

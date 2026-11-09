@@ -66,6 +66,11 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `parse_trusted_proxies` | `pynext.proxy` |
 | `FAIL_OPEN` | `pynext.failure_policy` |
 | `FAIL_CLOSED` | `pynext.failure_policy` |
+| `LoadedEnv` | `pynext.env` |
+| `env_file_names` | `pynext.env` |
+| `load_env` | `pynext.env` |
+| `public_env_defines` | `pynext.env` |
+| `public_env_vars` | `pynext.env` |
 
 ## Security defaults (`SecurityConfig`)
 
