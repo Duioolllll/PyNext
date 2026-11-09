@@ -426,3 +426,210 @@ def test_redis_sessions_two_nodes_login_rotation_logout(tmp_path, mode):
     finally:
         store1.close()
         store2.close()
+
+
+# ----------------------------------------------------------------------
+# Review #4 #19: Redis session failure policy (mocked outage — no server).
+# ----------------------------------------------------------------------
+from pynext.sessions import SessionUnavailable  # noqa: E402
+
+
+class _FailingRedis:
+    """redis-py-shaped client whose every operation raises ConnectionError."""
+
+    def get(self, *args, **kwargs):
+        raise ConnectionError("redis down (mock)")
+
+    def set(self, *args, **kwargs):
+        raise ConnectionError("redis down (mock)")
+
+    def delete(self, *args, **kwargs):
+        raise ConnectionError("redis down (mock)")
+
+    def pipeline(self, *args, **kwargs):
+        raise ConnectionError("redis down (mock)")
+
+    def close(self):
+        pass
+
+
+class _CorruptRedis(_FakeRedis):
+    """Returns bytes that are not a valid session payload."""
+
+    def get(self, key):
+        return b"not a session payload"
+
+
+class _WatchErrorRedis(_FakeRedis):
+    """A store whose optimistic-lock execute always reports a conflict."""
+
+    def pipeline(self):
+        pipe = _FakePipeline(self)
+
+        def failing_execute():
+            raise WatchError("watched key changed")
+
+        pipe.execute = failing_execute
+        return pipe
+
+
+def _outage_token():
+    return secrets.token_urlsafe(32)
+
+
+def test_redis_session_store_default_policy_is_fail_closed():
+    """Review #4 #19: no policy was defined; outages raised raw errors.
+
+    The default is now fail_closed: a Redis outage raises the specific
+    SessionUnavailable (chaining the Redis error) instead of leaking a
+    raw ConnectionError, and the request is answered 503, not 500.
+    """
+    store = RedisSessionStore(client=_FailingRedis())
+    assert store.failure_policy == "fail_closed"
+
+    async def run():
+        with pytest.raises(SessionUnavailable) as excinfo:
+            await store.load(_outage_token())
+        assert isinstance(excinfo.value.__cause__, ConnectionError)
+        with pytest.raises(SessionUnavailable):
+            await store.save(_outage_token(), {"user_id": "alice"}, None, None,
+                             time.time() + 60)
+        with pytest.raises(SessionUnavailable):
+            await store.delete(_outage_token())
+    asyncio.run(run())
+
+
+def test_redis_session_store_fail_open_starts_ephemeral_session():
+    """fail_open degrades to a fresh ephemeral session: nothing persists."""
+    store = RedisSessionStore(client=_FailingRedis(), failure_policy="fail_open")
+    assert store.failure_policy == "fail_open"
+
+    async def run():
+        token = _outage_token()
+        assert await store.load(token) is None
+        # Save reports the version that would have been stored, but the
+        # session is ephemeral: a later load still finds nothing.
+        assert await store.save(token, {"user_id": "alice"}, None, None,
+                                time.time() + 60) == 1
+        assert await store.load(token) is None
+        assert await store.save(token, {"user_id": "alice"}, None, 2,
+                                time.time() + 60) == 3
+        new_token = _outage_token()
+        assert await store.save(new_token, {"user_id": "alice"}, None, 2,
+                                time.time() + 60, previous_token=token) == 1
+        assert await store.delete(token) is None
+    asyncio.run(run())
+
+
+def test_redis_session_store_rejects_invalid_failure_policy():
+    with pytest.raises(ValueError, match="failure policy"):
+        RedisSessionStore(client=_FailingRedis(), failure_policy="sometimes")
+
+
+def test_redis_session_outage_never_absorbs_conflict_or_corrupt_data():
+    """Fencing conflicts and corrupt data are not outages (either policy)."""
+    for policy in ("fail_closed", "fail_open"):
+        store = RedisSessionStore(client=_WatchErrorRedis(), failure_policy=policy)
+
+        async def run_conflict(store=store):
+            token = _outage_token()
+            assert await store.save(token, {"value": 1}, None, None, time.time() + 60) == 1
+            with pytest.raises(SessionConflict):
+                await store.save(token, {"value": 2}, None, 1, time.time() + 60)
+        asyncio.run(run_conflict())
+
+        corrupt = RedisSessionStore(client=_CorruptRedis(), failure_policy=policy)
+
+        async def run_corrupt(corrupt=corrupt):
+            with pytest.raises(ValueError, match="invalid session data"):
+                await corrupt.load(_outage_token())
+        asyncio.run(run_corrupt())
+
+
+def test_redis_session_outage_middleware_answers_503_by_default(tmp_path):
+    """fail_closed (default): a request during an outage gets 503, not 500.
+
+    A request that presents a session cookie fails at load (503), and a
+    request that would store session data fails at save (503). A request
+    that never touches the store — no cookie, no session change, like
+    the unauthenticated /api/private probe below — is unaffected and
+    still answers 401 from @require_auth.
+    """
+    _build_session_api(tmp_path)
+    app = _make_app(tmp_path, RedisSessionStore(client=_FailingRedis()))
+
+    async def run():
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://test") as client:
+                # No cookie, but the handler stores a CSRF token, so the
+                # save fails: 503 (before the fix this was a raw 500).
+                assert (await client.get("/api/token")).status_code == 503
+                assert (await client.get("/api/private")).status_code == 401
+                # A presented cookie fails at load: 503.
+                cookie = secrets.token_urlsafe(32)
+                assert (await client.get(
+                    "/api/private",
+                    headers={"Cookie": f"pynext_session={cookie}"})).status_code == 503
+        finally:
+            await app.isr.close()
+    asyncio.run(run())
+
+
+class _FailingWriteRedis(_FakeRedis):
+    """Loads miss, but every write fails — isolates the save path."""
+
+    def set(self, *args, **kwargs):
+        raise ConnectionError("redis down on write (mock)")
+
+    def delete(self, *args, **kwargs):
+        raise ConnectionError("redis down on write (mock)")
+
+    def pipeline(self, *args, **kwargs):
+        raise ConnectionError("redis down on write (mock)")
+
+
+def test_redis_session_save_outage_answers_503_even_when_load_succeeds(tmp_path):
+    """A save failure alone (load healthy) is also a 503, not a 500."""
+    _build_session_api(tmp_path)
+    app = _make_app(tmp_path, RedisSessionStore(client=_FailingWriteRedis()))
+
+    async def run():
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://test") as client:
+                assert (await client.get("/api/token")).status_code == 503
+        finally:
+            await app.isr.close()
+    asyncio.run(run())
+
+
+def test_redis_session_outage_fail_open_keeps_reads_but_login_cannot_complete(tmp_path):
+    """fail_open: reads proceed on an ephemeral session; login cannot finish.
+
+    The CSRF token issued by GET /api/token is never stored, so the
+    login POST fails CSRF (403) — session-bound CSRF cannot be
+    established while the store is down — and /api/private stays 401.
+    """
+    _build_session_api(tmp_path)
+    app = _make_app(tmp_path, RedisSessionStore(client=_FailingRedis(),
+                                                failure_policy="fail_open"))
+
+    async def run():
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://test") as client:
+                token_response = await client.get("/api/token")
+                assert token_response.status_code == 200
+                token = token_response.json()["token"]
+                assert (await client.post("/api/login",
+                                          headers={"x-csrf-token": token})).status_code == 403
+                assert (await client.get("/api/private")).status_code == 401
+                # Logout is best-effort under fail_open, but it is still a
+                # state-changing request, so it fails CSRF the same way:
+                # no stored session means no stored CSRF token to match.
+                assert (await client.post("/api/logout",
+                                          headers={"x-csrf-token": token})).status_code == 403
+        finally:
+            await app.isr.close()
+    asyncio.run(run())

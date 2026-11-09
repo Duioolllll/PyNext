@@ -22,7 +22,7 @@ PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust�
 
 기능 목록은 코드에서 자동 생성됩니다: [FEATURES](docs/FEATURES.md). 요약하면 파일 기반 라우팅과 중첩 레이아웃, Python 페이지·API, SSR·SSG·ISR, Axum·ASGI 실행, JS/TS island와 클라이언트 탐색, SQLite·Redis 공유 ISR, 전역 HTTP 미들웨어, SQLite 세션과 CSRF, WebSocket, 다중 워커, `pynext init`과 Linux standalone 디렉터리를 제공합니다.
 
-공유 island 모델은 문자열 props 등을 사용하는 제한된 부분집합이며 HMR 중 island 상태가 초기화될 수 있습니다. 인증 정보 검증은 앱의 책임이고 WebSocket pub/sub은 프로세스 내부로 한정됩니다. 현재 버전은 실험 단계이므로 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하는 데 사용하지 마세요.
+공유 island 모델은 문자열 props 등을 사용하는 제한된 부분집합이며 HMR 중 island 상태가 초기화될 수 있습니다. 신원 확립(자격 증명 검증)은 앱의 책임이고, WebSocket 업그레이드에는 전역 미들웨어와 `@require_auth`가 핸드셰이크 전에 적용되며, WebSocket pub/sub은 프로세스 내부로 한정됩니다. 현재 버전은 실험 단계이므로 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하는 데 사용하지 마세요.
 
 ## 실행
 
@@ -121,6 +121,7 @@ lifespan을 활성화해야 합니다. 저수준 `start_native()`를 직접 쓰�
 로그아웃 시 `invalidate()`를 호출합니다. 앱은 자격 증명을 직접 검증한 뒤
 `session["user_id"]`와 선택적 `session["permissions"]`를 설정합니다.
 `@require_auth`와 `@require_permission("name")`은 해당 서버 세션을 확인합니다.
+HTTP 핸들러와 WebSocket 핸들러 모두에 적용되며, WebSocket은 핸드셰이크 전에 검사합니다.
 인증이 필요한 페이지는 SSR이어야 합니다.
 
 ```python
@@ -258,7 +259,7 @@ async def Page():
 
 `route.py`는 `@websocket` 핸들러를 하나 내보낼 수 있습니다. 핸들러는 `WebSocket`을 받아 `await websocket.accept()` 후 텍스트·바이너리 메시지를 주고받습니다. 상대가 끊으면 `receive()`에서 `WebSocketDisconnect`가 발생합니다. 메시지는 기본 64 KiB이며 `create_app(..., websocket_max_message=...)` 또는 `--ws-max-message-bytes`로 최대 16 MiB까지 조정합니다. `@websocket(protocols=("chat.v1", "chat.v2"))`는 서버가 지정한 순서로 서브프로토콜을 선택하며, 결과는 `websocket.subprotocol`에서 확인합니다. [echo 예제](examples/basic/app/ws/echo/route.py)를 참고하세요.
 
-개발 버전은 WebSocket 연결 시 기본적으로 같은 출처의 `Origin`만 허용합니다. 다른 출처는 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`를 `create_app(..., security=...)`에 전달하거나 `--ws-allowed-origin https://client.example`을 반복 지정하세요. 출처에는 스킴과 필요한 포트를 포함하며 `*`와 `null`은 허용하지 않습니다. 기존 비브라우저 클라이언트가 `Origin`을 보내지 않는다면 `websocket_allow_missing_origin=True` 또는 `--ws-allow-missing-origin`을 명시해야 합니다. 이 검사는 인증을 대체하지 않으며, 헤더를 생략하거나 위조할 수 있는 클라이언트는 앱에서 인증·인가해야 합니다. 프록시 뒤에서는 실제 프록시만 `--trusted-proxy`로 지정하고 프록시가 클라이언트의 전달 헤더를 덮어써야 합니다. 이 정책은 공개된 0.1.0 패키지에는 포함되지 않았습니다.
+개발 버전은 WebSocket 연결 시 기본적으로 같은 출처의 `Origin`만 허용합니다. 다른 출처는 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`를 `create_app(..., security=...)`에 전달하거나 `--ws-allowed-origin https://client.example`을 반복 지정하세요. 출처에는 스킴과 필요한 포트를 포함하며 `*`와 `null`은 허용하지 않습니다. 기존 비브라우저 클라이언트가 `Origin`을 보내지 않는다면 `websocket_allow_missing_origin=True` 또는 `--ws-allow-missing-origin`을 명시해야 합니다. 이 검사는 인증을 대체하지 않지만, 핸드셰이크 전에는 업그레이드 요청에 전역 미들웨어 체인(세션 미들웨어 포함)과 핸들러의 `@require_auth`/`@require_permission` 정책이 적용되며, 거부된 업그레이드는 101 응답 전에 차단됩니다(Axum은 HTTP 403, ASGI는 close 1008). 신원 확립(예: 로그인에서 `session["user_id"]` 설정)은 여전히 앱의 책임이며, 세션 외의 자격 증명 방식은 미들웨어에서 검증해야 합니다. 프록시 뒤에서는 실제 프록시만 `--trusted-proxy`로 지정하고 프록시가 클라이언트의 전달 헤더를 덮어써야 합니다. 이 정책은 공개된 0.1.0 패키지에는 포함되지 않았습니다.
 
 ASGI 서버가 프록시 헤더를 먼저 해석해 `scope["client"]`를 바꾸면 PyNext가 실제 프록시를 식별할 수 없습니다. PyNext에서 신뢰 프록시를 판정할 때는 ASGI 서버가 원래 피어 주소를 전달하도록 설정하세요(Uvicorn은 `--no-proxy-headers`).
 

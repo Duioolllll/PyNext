@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import gc
+import math
 import os
 import sys
 import traceback
@@ -14,8 +15,10 @@ from .observability import ObservabilityConfig
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
 from .scaffold import init_project
-from .server import serve
-from .supervisor import WorkerConfig, run_supervisor
+from .server import (MAX_BODY_CAPACITY, MAX_BODY_MIN_RATE_BYTES_PER_SEC,
+                     MAX_CONCURRENT, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP,
+                     MAX_SHUTDOWN_TIMEOUT, MAX_TIMEOUT_MS, MAX_WAITING, serve)
+from .supervisor import MAX_WORKERS, WorkerConfig, run_supervisor
 from .standalone import build_standalone
 from .watch import Watcher
 
@@ -47,6 +50,29 @@ def _at_least(minimum, label):
             raise argparse.ArgumentTypeError(f"{label} must be an integer >= {minimum}") from exc
         if number < minimum:
             raise argparse.ArgumentTypeError(f"{label} must be an integer >= {minimum}")
+        return number
+    return convert
+
+
+def _bounded(minimum, maximum, label):
+    """argparse type for an integer that must be within [``minimum``, ``maximum``].
+
+    Same lower-bound story as :func:`_at_least`, plus an upper bound: a
+    value past the native usize/u64/f64 conversion range dies with an
+    OverflowError traceback instead of a CLI error, and an absurd but
+    fitting value (--workers 100000, --max-concurrent in the billions)
+    exhausts resources before serving anything. Both ends are rejected
+    here, at parse time, with a clear ``parser.error`` message.
+    """
+    def convert(value):
+        try:
+            number = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer >= {minimum}") from exc
+        if number < minimum:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer >= {minimum}")
+        if number > maximum:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer <= {maximum}")
         return number
     return convert
 
@@ -180,7 +206,11 @@ def _positive_float(value):
         number = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("--rate-limit-window must be a number > 0") from exc
-    if number <= 0:
+    # float("nan") and float("inf") parse fine but are not usable windows:
+    # nan passes the <= 0 check (comparisons are False) and only survived
+    # because RateLimiter.__init__ rejects non-finite windows downstream.
+    # Reject them here so the CLI reports the bad flag instead.
+    if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError("--rate-limit-window must be a number > 0")
     return number
 
@@ -198,30 +228,38 @@ def main():
         if name != "build":
             command.add_argument("--host", default="127.0.0.1")
             command.add_argument("--port", type=_port, default=3000)
-            command.add_argument("--max-concurrent", type=_at_least(1, "--max-concurrent"), default=64,
-                                 help="in-flight requests before new ones wait for a slot")
-            command.add_argument("--acquire-timeout-ms", type=_at_least(0, "--acquire-timeout-ms"), default=1000,
-                                 help="how long a request waits for a slot before getting a 503")
-            command.add_argument("--max-waiting", type=_at_least(0, "--max-waiting"), default=None,
+            command.add_argument("--max-concurrent", type=_bounded(1, MAX_CONCURRENT, "--max-concurrent"),
+                                 default=64,
+                                 help="in-flight requests before new ones wait for a slot (1-1000000)")
+            command.add_argument("--acquire-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--acquire-timeout-ms"),
+                                 default=1000,
+                                 help="how long a request waits for a slot before getting a 503 (0-86400000)")
+            command.add_argument("--max-waiting", type=_bounded(0, MAX_WAITING, "--max-waiting"), default=None,
                                  help="requests waiting for an execution slot before new ones get a 503"
-                                      " (default: min(--max-concurrent, 64); 0 waits for nobody)")
-            command.add_argument("--body-capacity", type=_at_least(1, "--body-capacity"), default=16,
-                                 help="concurrent request bodies being read before new ones get a 503")
-            command.add_argument("--body-timeout-ms", type=_at_least(0, "--body-timeout-ms"), default=10000,
-                                 help="how long a request body may take to arrive before a 408")
-            command.add_argument("--max-connections", type=_at_least(1, "--max-connections"), default=None,
-                                 help="concurrent TCP connections before new ones are dropped at accept")
-            command.add_argument("--max-connections-per-ip", type=_at_least(1, "--max-connections-per-ip"),
+                                      " (default: min(--max-concurrent, 64); 0 waits for nobody; max 1000000)")
+            command.add_argument("--body-capacity", type=_bounded(1, MAX_BODY_CAPACITY, "--body-capacity"),
+                                 default=16,
+                                 help="concurrent request bodies being read before new ones get a 503 (1-1000000)")
+            command.add_argument("--body-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--body-timeout-ms"),
+                                 default=10000,
+                                 help="how long a request body may take to arrive before a 408 (0-86400000)")
+            command.add_argument("--max-connections", type=_bounded(1, MAX_CONNECTIONS, "--max-connections"),
                                  default=None,
-                                 help="concurrent TCP connections allowed from one client IP")
-            command.add_argument("--header-read-timeout-ms", type=_at_least(0, "--header-read-timeout-ms"),
+                                 help="concurrent TCP connections before new ones are dropped at accept (1-1000000)")
+            command.add_argument("--max-connections-per-ip",
+                                 type=_bounded(1, MAX_CONNECTIONS_PER_IP, "--max-connections-per-ip"),
+                                 default=None,
+                                 help="concurrent TCP connections allowed from one client IP (1-1000000)")
+            command.add_argument("--header-read-timeout-ms",
+                                 type=_bounded(0, MAX_TIMEOUT_MS, "--header-read-timeout-ms"),
                                  default=None,
                                  help="how long request headers (and idle keep-alive) may take before the "
-                                      "connection is closed")
+                                      "connection is closed (0-86400000)")
             command.add_argument("--body-min-rate-bytes-per-sec",
-                                 type=_at_least(0, "--body-min-rate-bytes-per-sec"), default=None,
+                                 type=_bounded(0, MAX_BODY_MIN_RATE_BYTES_PER_SEC,
+                                               "--body-min-rate-bytes-per-sec"), default=None,
                                  help="minimum average body receive rate in bytes/second after a 2s grace "
-                                      "window; slower bodies get a 408 (0 disables)")
+                                      "window; slower bodies get a 408 (0 disables; max 1000000000)")
             command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis"), default="memory",
                                  help="ISR page cache backend: process-local memory (default) or a"
                                       " shared SQLite file or Redis via PYNEXT_REDIS_URL")
@@ -242,13 +280,19 @@ def main():
             command.add_argument("--tracing", dest="tracing",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="emit OpenTelemetry spans when the opentelemetry packages are installed (default: off)")
-            command.add_argument("--workers", type=_at_least(1, "--workers"), default=1,
-                                 help="worker processes sharing the port (default 1: single process); "
+            command.add_argument("--workers", type=_bounded(1, MAX_WORKERS, "--workers"), default=1,
+                                 help="worker processes sharing the port (default 1: single process; max 64); "
                                       "a supervisor restarts crashed workers")
             command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"), default=0,
                                  help="requests allowed per client per --rate-limit-window (0 disables)")
             command.add_argument("--rate-limit-window", type=_positive_float, default=60.0,
                                  help="rate limit window in seconds")
+            command.add_argument("--rate-limit-ipv6-prefix-len",
+                                 type=_bounded(0, 128, "--rate-limit-ipv6-prefix-len"), default=64,
+                                 help="IPv6 prefix length sharing one rate-limit bucket (default 64;"
+                                      " 48 groups a whole /48 into one bucket, which stops a /48"
+                                      " holder minting fresh buckets, but also throttles every host"
+                                      " sharing that prefix together)")
             command.add_argument("--rate-limit-backend", choices=("memory", "redis"), default="memory",
                                  help="per-process memory (default) or Redis via PYNEXT_REDIS_URL")
             command.add_argument("--rate-limit-failure-policy", choices=("fail_open", "fail_closed"),
@@ -267,6 +311,12 @@ def main():
             command.add_argument("--csrf", action=argparse.BooleanOptionalAction, default=None,
                                  help="protect state-changing API requests (default: auto — on when a "
                                       "session middleware is installed; --no-csrf opts out)")
+            command.add_argument("--csrf-signing-key", default=None, metavar="KEY",
+                                 help="HMAC key signing double-submit CSRF cookies: a string of at "
+                                      "least 16 bytes, 'hex:<hex>' or 'base64:<base64>' (also via "
+                                      "PYNEXT_CSRF_SIGNING_KEY); with --workers N the supervisor "
+                                      "shares this key with every worker instead of generating one; "
+                                      "an invalid key fails at startup")
             command.add_argument("--csrf-cookie-secure", action=argparse.BooleanOptionalAction, default=None,
                                  help="send the double-submit CSRF cookie only over HTTPS "
                                       "(default: on for start, off for dev over plain http)")
@@ -281,9 +331,10 @@ def main():
                                  help="allow an additional WebSocket origin (repeatable)")
             command.add_argument("--ws-allow-missing-origin", action="store_true",
                                  help="allow WebSocket clients that omit Origin")
-            command.add_argument("--shutdown-timeout", type=_at_least(0, "--shutdown-timeout"), default=30,
+            command.add_argument("--shutdown-timeout", type=_bounded(0, MAX_SHUTDOWN_TIMEOUT, "--shutdown-timeout"),
+                                 default=30,
                                  help="seconds to let in-flight requests finish and WebSockets close "
-                                      "after SIGTERM before the server stops anyway (default 30)")
+                                      "after SIGTERM before the server stops anyway (default 30; max 3600)")
     args = parser.parse_args()
     root = Path(args.dir).resolve()
     if args.command == "init":
@@ -296,7 +347,10 @@ def main():
     if args.command == "build":
         if args.standalone_dir and not args.standalone:
             parser.error("--standalone-dir requires --standalone")
-        manifest = write_manifest(root)
+        try:
+            manifest = write_manifest(root)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
         print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
@@ -328,9 +382,11 @@ def main():
                    if args.rate_limit_backend == "redis" else {})
         limiter = (limiter_type(args.rate_limit, args.rate_limit_window,
                                 trusted_proxies=args.trusted_proxy,
-                                exempt_paths=tuple(args.rate_limit_exempt_path), **options)
+                                exempt_paths=tuple(args.rate_limit_exempt_path),
+                                ipv6_prefix_len=args.rate_limit_ipv6_prefix_len, **options)
                    if args.rate_limit >= 1 else None)
         security = (SecurityConfig(csrf_enabled=args.csrf,
+                                   csrf_signing_key=args.csrf_signing_key,
                                    csrf_cookie_secure=(args.csrf_cookie_secure
                                                       if args.csrf_cookie_secure is not None
                                                       else args.command == "start"),
@@ -339,7 +395,8 @@ def main():
                                    websocket_allowed_origins=tuple(args.ws_allowed_origin),
                                    websocket_allow_missing_origin=args.ws_allow_missing_origin,
                                    csp_nonce_enabled=args.csp_nonce)
-                    if (args.csrf is not None or args.csrf_cookie_secure is not None or args.cors_origin or
+                    if (args.csrf is not None or args.csrf_signing_key is not None or
+                        args.csrf_cookie_secure is not None or args.cors_origin or
                         args.cors_credentials or args.csp_nonce or args.ws_allowed_origin or
                         args.ws_allow_missing_origin) else None)
     except ValueError as exc:
@@ -371,6 +428,7 @@ def main():
                               rate_limit_window=args.rate_limit_window,
                               rate_limit_backend=args.rate_limit_backend,
                               rate_limit_exempt_paths=tuple(args.rate_limit_exempt_path),
+                              rate_limit_ipv6_prefix_len=args.rate_limit_ipv6_prefix_len,
                               rate_limit_failure_policy=args.rate_limit_failure_policy,
                               trusted_proxies=tuple(args.trusted_proxy),
                               cache_backend=args.cache_backend, cache_path=args.cache_path,

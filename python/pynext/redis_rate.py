@@ -5,7 +5,7 @@ import math
 import os
 
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
-from .ratelimit import RateLimiter, RateLimitUnavailable, _MAX_BUCKETS
+from .ratelimit import RateLimiter, RateLimitUnavailable, _IPV6_PREFIX_LEN, _MAX_BUCKETS
 
 log = logging.getLogger("pynext")
 
@@ -16,9 +16,22 @@ local t = redis.call('TIME')
 -- Redis breaks sorted-set ties lexicographically by member, so a tie
 -- evicted the wrong bucket (its key hash sorts first) instead of the
 -- stalest one, and the evicted owner was then denied instead of getting
--- a fresh bucket. Two scripts can never run in the same microsecond,
--- so microsecond scores order strictly by last touch. PEXPIRE still
--- takes milliseconds, so the window is kept in ms separately.
+-- a fresh bucket. Microsecond scores order by last touch; a tie is
+-- still possible in principle — TIME is gettimeofday-based with
+-- microsecond resolution, so two atomic scripts can read the same
+-- microsecond — but tied buckets are equally stale at the resolution
+-- the clock provides, and the tie is broken deterministically by
+-- member (the bucket key hash), not at random. The evicted owner is
+-- never denied: it gets a fresh full bucket on its next request, so a
+-- tie can only change which equally-stale bucket is evicted, never
+-- whether a request is admitted. PEXPIRE still takes milliseconds,
+-- so the window is kept in ms separately.
+-- Precision: scores are integer microseconds since the epoch, held in
+-- Lua doubles. At the current epoch (~1.79e15 us) and even with the
+-- maximum one-year window (~1.83e15 us), the unit in the last place
+-- is 0.25 us, so integer microsecond scores are exact; they stay exact
+-- until 2^53 us (~year 2255). Realistic windows of minutes to hours
+-- are far inside the exact range.
 local now = t[1] * 1000000 + t[2]
 local limit = tonumber(ARGV[1])
 local window_ms = tonumber(ARGV[2])
@@ -30,14 +43,23 @@ local row = redis.call('HMGET', KEYS[1], 'tokens', 'last')
 local tokens
 if not row[1] then
   -- New key: bound new-key churn with a global sliding window. Only
-  -- brand-new keys are denied, and only until the window slides.
-  if redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[4]) then
+  -- brand-new keys are denied, and only until the window slides. A key
+  -- that already has a :newkeys entry was admitted within this window
+  -- and lost its bucket to table-pressure eviction since: it is an
+  -- existing key, not a brand-new one, so the window must never deny it.
+  local seen = redis.call('ZSCORE', KEYS[3], KEYS[1])
+  if not seen and redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[4]) then
     local oldest = redis.call('ZRANGE', KEYS[3], 0, 0, 'WITHSCORES')
     return {0, math.max(1, math.ceil((tonumber(oldest[2]) + window - now) / 1000000))}
   end
   -- Table full: evict the stalest active bucket instead of denying the
   -- new key. Its owner gets a fresh full bucket on its next request,
-  -- so table pressure can never deny an existing key.
+  -- so table pressure can never deny an existing key. The evicted key
+  -- keeps its :newkeys entry: that entry is what marks it as an
+  -- existing key when it returns within this window. ZRANGE returns
+  -- the lowest score; buckets tied on that score are ordered
+  -- lexicographically by member, so the choice among equally-stale
+  -- buckets is deterministic (see the TIME comment above).
   if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[3]) then
     local stalest = redis.call('ZRANGE', KEYS[2], 0, 0)
     if stalest[1] then
@@ -83,17 +105,33 @@ class RedisRateLimiter(RateLimiter):
     protection for the duration of the outage, so only use it where
     availability matters more than limiting. The process-local
     :class:`RateLimiter` never raises, so the policy only applies to
-    this Redis-backed limiter.
+    this Redis-backed limiter. An evicted key keeps its new-key-window
+    entry, so its return within the window is treated as an existing
+    key, never a brand-new one.
+
+    Bucket scores are integer microseconds since the epoch, taken from
+    Redis ``TIME`` and held in Lua doubles. Two scripts can read the
+    same microsecond in principle (``TIME`` is gettimeofday-based), so
+    tied buckets are possible; tied buckets are equally stale at the
+    clock's resolution and Redis orders equal scores lexicographically
+    by member, so eviction among ties is deterministic and the evicted
+    owner is never denied — it gets a fresh bucket on its next request.
+    Scores stay exact integers well beyond the maximum one-year window
+    (at the current epoch the unit in the last place is 0.25 µs, and
+    integer microseconds stay exact until 2^53 µs, ~year 2255), so
+    realistic windows of minutes to hours are unaffected by
+    double-precision limits.
     """
 
     blocking = True
 
     def __init__(self, limit, window_seconds, *, url=None, namespace="default", trusted_proxies=(),
                  exempt_paths=(), max_buckets=None, max_new_keys_per_window=None,
-                 failure_policy=None):
+                 ipv6_prefix_len=_IPV6_PREFIX_LEN, failure_policy=None):
         super().__init__(limit, window_seconds, trusted_proxies=trusted_proxies,
                          exempt_paths=exempt_paths, max_buckets=max_buckets,
-                         max_new_keys_per_window=max_new_keys_per_window)
+                         max_new_keys_per_window=max_new_keys_per_window,
+                         ipv6_prefix_len=ipv6_prefix_len)
         self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_CLOSED)
         if limit > 1_000_000 or not 0.001 <= self.window_seconds <= 31_536_000:
             raise ValueError("Redis rate limits require at most 1000000 tokens and a window from 0.001 to 31536000 seconds")

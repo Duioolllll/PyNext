@@ -94,7 +94,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-启用会话中间件后，无需另传安全配置即可自动开启 CSRF。若没有会话，又想保护全部状态变更类 API 路由，可向 `create_app` 传入 `security=SecurityConfig(csrf_enabled=True)`。令牌仅证明请求来自能够读取该 Cookie 的页面。与其他 double-submit 方案一样，能够通过 XSS 读取 Cookie 的页面可以绕过它。Cookie 默认使用 `SameSite=Lax`，且不设 `HttpOnly`（JavaScript 需要读取它）；CSRF Cookie 默认带 `Secure`，在明文 `http://` 本地开发时，请同时向应用配置和 `set_csrf_cookie()` 调用传入 `csrf_cookie_secure=False`（`pynext dev` 会自动这样做）。多 worker 部署时，所有 worker 必须使用相同的 `csrf_signing_key`（或 `PYNEXT_CSRF_SIGNING_KEY` 环境变量），这样一个 worker 签发的 Cookie 才能在其他 worker 上通过验证。
+启用会话中间件后，无需另传安全配置即可自动开启 CSRF。若没有会话，又想保护全部状态变更类 API 路由，可向 `create_app` 传入 `security=SecurityConfig(csrf_enabled=True)`。令牌仅证明请求来自能够读取该 Cookie 的页面。与其他 double-submit 方案一样，能够通过 XSS 读取 Cookie 的页面可以绕过它。Cookie 默认使用 `SameSite=Lax`，且不设 `HttpOnly`（JavaScript 需要读取它）；CSRF Cookie 默认带 `Secure`，在明文 `http://` 本地开发时，请同时向应用配置和 `set_csrf_cookie()` 调用传入 `csrf_cookie_secure=False`（`pynext dev` 会自动这样做）。多 worker 部署时，所有 worker 共享同一个签名密钥。使用 `--workers N` 启动时，supervisor 会生成一个 32 字节密钥（若指定了 `--csrf-signing-key` / `PYNEXT_CSRF_SIGNING_KEY`，则使用该密钥），并与所有 worker 共享，包括崩溃或滚动重启后新启动的 worker，因此一个 worker 签发的 Cookie 可以在其他 worker 上通过验证。密钥可以是至少 16 字节的字符串、`hex:<hex>` 或 `base64:<base64>`；为空、过短或无法解码的密钥不会静默回退到随机密钥，而是在启动时直接失败。不使用 worker 的单进程服务器继续使用每个进程的回退密钥，因为全部配置都在同一个进程内，所以没有问题。
 
 跨源请求默认一律拒绝（规范 v0.2 §11）：未配置来源时，不会发送 `Access-Control-Allow-Origin` 请求头。请通过 `SecurityConfig` 将策略传给 `create_app`：
 
@@ -116,13 +116,35 @@ app = create_app(".", security=SecurityConfig(
 
 默认 CSP 为 `script-src 'self'; object-src 'none'`。设置 `SecurityConfig(csp_nonce_enabled=True)` 后，每个动态渲染页面都会获得一个新的按请求生成的 nonce：响应头变为 `script-src 'self' 'nonce-<值>'; object-src 'none'`，同一个 nonce 也会添加到 island 运行时 `<script>` 标签上。nonce 每次响应都不同，请勿自行缓存带有 nonce 的页面。预渲染的 SSG 页面、已缓存的 ISR 响应和静态文件保持不带 nonce 的静态策略：嵌入共享 HTML 的 nonce 会在多个响应中被重复使用，从而失去 nonce 的意义。携带 Cookie 或 Authorization 请求头的 ISR 请求会按请求重新渲染，因此会获得 nonce。
 
+## 会话
+
+安装 `SessionMiddleware` 后，服务器端会话位于 `request.state["session"]` 中（`SQLiteSessionStore` 用于工作进程共享的单个文件，`RedisSessionStore` 用于 Redis）。会话 Cookie 中只有不透明令牌，且为 `HttpOnly`，默认 `Secure`、`SameSite=Lax`。会话数据必须是 JSON 可序列化的：为不可序列化的值（例如任意对象或集合）赋值时，会在赋值时抛出指明键名的 `TypeError`，而不是等到保存会话时才失败。存储数据上限为 16 KiB。多次出示同一会话 Cookie 名的请求会被视为完全没有会话（fail-closed）。
+
+登录时请轮换会话 id——这是必需的，不是可选的。验证凭据并存储已认证身份后，在返回登录响应之前调用 `session.rotate_on_login()`：
+
+~~~python
+from pynext import JSONResponse, route
+
+@route("POST")
+def login(request):
+    user = authenticate(request)  # 验证凭据；失败时返回/抛出 401
+    session = request.state["session"]
+    session["user_id"] = user.id
+    session.rotate_on_login()  # 新的会话 id + 新的 CSRF 令牌；旧 id 不再可用
+    return JSONResponse({"ok": True})
+~~~
+
+跳过轮换会使会话面临固定攻击：攻击者在登录前固定的会话 id 在登录后仍然有效。权限变更时（例如修改密码后）也请再次轮换。退出登录时调用 `session.invalidate()` 以删除服务器端会话并清除 Cookie。
+
+`RedisSessionStore` 在 Redis 不可达时遵循故障策略（见 `failure_policy`）：默认是 `fail_closed`，即抛出 `SessionUnavailable`，请求以 503 响应，而不是悄悄丢失会话状态。传入 `failure_policy="fail_open"` 则改为以一个全新的临时会话开始——读取可以继续，但不会持久化任何内容，并且故障期间无法完成登录：为其签发的 CSRF 令牌从未被存储，因此登录请求会在 CSRF（403）上失败。故障期间的轮换还可能让旧会话 id 在过期前继续可用。仅在可用性比会话连续性更重要时使用 `fail_open`。
+
 ## API 响应流
 
 向 `StreamingResponse` 传入产生字符串或字节的异步 iterable。ASGI 和 Axum 会依次发送数据块，并在完成、断开或出错时关闭迭代器。单块最多 1 MiB；不要手动设置 `Content-Length` 或 `Transfer-Encoding`，协议帧由服务器管理。Axum 最多排队一个数据块，下一块生成与发送等待分别有 30 秒超时。响应头发出后出错会中断流，无法更改状态码。HEAD 不会消费流。尚不支持 React/RSC 流式渲染。
 
 ## 流式 SSR
 
-页面函数可以返回 UI 节点的异步 iterable。SSR 按生成顺序发送布局和各块；SSG 在构建时合并并提供静态文件。公开 ISR 的首次请求接收流，其他并发请求等待完整结果或立即收到 stale 内容，只有完整结果才会缓存。SSG 和 ISR 流限制为 8 MiB、30 秒；ISR 最多缓存 2 MiB 的正文。首次客户端断开后生成仍可能继续。布局必须恰好渲染一次 children。[示例](../../examples/basic/app/stream/page.py)。
+页面函数可以返回 UI 节点的异步 iterable。SSR 按生成顺序发送布局和各块；SSG 在构建时合并并提供静态文件。公开 ISR 的首次请求接收流，其他并发请求等待完整结果或立即收到 stale 内容，只有完整结果才会缓存。SSG 页面限制为 8 MiB；SSG 和 ISR 流还限制为 30 秒；ISR 最多缓存 2 MiB 的正文。首次客户端断开后生成仍可能继续。布局必须恰好渲染一次 children。[示例](../../examples/basic/app/stream/page.py)。
 
 ~~~python
 from pynext import h, page
@@ -148,7 +170,7 @@ async def stream():
 
 `route.py` 可以在 HTTP 处理函数之外再导出一个 `@websocket` 处理函数。处理函数接收一个 `WebSocket`，在收发消息之前必须调用 `await websocket.accept()`。支持文本和二进制消息往返；对方断开连接时 `receive()` 会抛出 `WebSocketDisconnect`，因此每个连接的清理工作应放在 `finally` 块中。
 
-开发版本在 ASGI 和 Axum 接受连接前检查 `Origin`，默认只允许同源。通过向 `create_app(..., security=...)` 传入 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`，或重复指定 `--ws-allowed-origin https://client.example`，可以添加 HTTP(S) 来源。来源须包含协议及非默认端口；不接受 `*` 和 `null`。不发送 `Origin` 的现有非浏览器客户端必须通过 `websocket_allow_missing_origin=True` 或 `--ws-allow-missing-origin` 显式允许。已发布的 0.1.0 不包含此检查。客户端可以伪造或省略 `Origin`，所以应用仍须对连接进行身份验证和授权。使用代理时，只通过 `--trusted-proxy` 指定实际的代理，并配置代理覆盖客户端提供的转发头。
+开发版本在 ASGI 和 Axum 接受连接前检查 `Origin`，默认只允许同源。通过向 `create_app(..., security=...)` 传入 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`，或重复指定 `--ws-allowed-origin https://client.example`，可以添加 HTTP(S) 来源。来源须包含协议及非默认端口；不接受 `*` 和 `null`。不发送 `Origin` 的现有非浏览器客户端必须通过 `websocket_allow_missing_origin=True` 或 `--ws-allow-missing-origin` 显式允许。已发布的 0.1.0 不包含此检查。客户端可以伪造或省略 `Origin`。在握手完成之前，升级请求还会经过全局中间件链（包括会话中间件）和处理函数的 `@require_auth`/`@require_permission` 策略（ASGI 和 Axum 均适用）；被拒绝的升级会在 101 响应之前被拦截（Axum 返回 HTTP 403，ASGI 返回 close 1008），处理函数不会执行。应用仍须负责建立身份（例如登录路由设置 `session["user_id"]`），会话之外的凭证方式（如令牌）须在中间件中验证。使用代理时，只通过 `--trusted-proxy` 指定实际的代理，并配置代理覆盖客户端提供的转发头。
 
 为了让 PyNext 在 ASGI 下识别可信代理，服务器须在 `scope["client"]` 中保留原始对端地址。如果由 PyNext 解释转发头，请关闭 ASGI 服务器提前处理代理头的功能（Uvicorn 使用 `--no-proxy-headers`）。
 
@@ -194,7 +216,7 @@ SSG 和 ISR 页面不能接收 `request`，仅用于公开内容。ISR 默认忽
 
 SSG 构建最多生成 10,000 个页面；开发模式下每次请求都会渲染 SSG 页面。ISR 页面不能导出 `generate_static_params()`，每个进程最多并发执行 128 个生成任务。
 
-已授权的 API 处理函数可调用 `await request.revalidate("/news/example")`；持有应用实例的代码可调用 `await app.revalidate(path)`。请传入不含查询字符串、已解码的 ISR 路径。如果移除了缓存或使进行中的生成失效，返回 `True`。已有请求仍可能收到旧生成结果，但该结果不会重新覆盖缓存。内存后端下失效只作用于当前进程，不会传播到其他工作进程；SQLite 后端下也会删除共享条目，共享存储正常时其他工作进程的下次查询会看到失效。对外提供此操作的端点需要认证和授权。
+已授权的 API 处理函数可调用 `await request.revalidate("/news/example")`；持有应用实例的代码可调用 `await app.revalidate(path)`。请传入不含查询字符串、已解码的 ISR 路径。如果移除了本地缓存条目或使进行中的生成失效，返回 `True`。使用共享后端时，存储可达则同时删除共享条目；但在 `fail_open` 模式下，共享存储不可达时即使返回 `True` 也不保证共享条目已被删除（共享删除仅为尽力而为，其他工作进程可能继续提供旧条目直至其过期）——如需让未生效的失效报错而非报告成功，请使用 `fail_closed`。已有请求仍可能收到旧生成结果，但该结果不会重新覆盖缓存。内存后端下失效只作用于当前进程，不会传播到其他工作进程；SQLite 后端下也会删除共享条目，共享存储正常时其他工作进程的下次查询会看到失效。对外提供此操作的端点需要认证和授权。
 
 ## 公共文件与 islands
 
@@ -243,7 +265,7 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 已构建的应用需使用 `create_app(project_path, production=True)`。ASGI 请求超时由所使用的服务器管理。Axum 适配器等待 Python 最多 30 秒，之后请求取消并返回 504。已经在线程中运行的同步函数可能在 504 之后继续执行并产生写入等副作用。请确保写入操作幂等，并为数据库与外部服务设置单独超时。进程隔离可通过 `--workers`（见下文）获得；单进程没有该能力。ISR 取消也有相同限制。
 
-分布式限流和生产环境加固尚未实现。共享存储正常时 SQLite 失效会在下次查询时生效。安装可选包并启用追踪后会生成 OpenTelemetry span（见可观测性一节）。ASGI 一致性由 `tests/test_asgi_conformance.py` 验证（HTTP 事件顺序、分块请求体、断开连接、包含失败路径的 lifespan）。请参阅[生产路线图](. 请参阅[生产路线图](../PRODUCTION_ROADMAP.md)中的计划与验收条件。
+分布式限流已通过 `--rate-limit-backend redis` 实现（共享 Redis 令牌桶）。生产环境加固仍是路线图项目。共享存储正常时 SQLite 失效会在下次查询时生效。安装可选包并启用追踪后会生成 OpenTelemetry span（见可观测性一节）。ASGI 一致性由 `tests/test_asgi_conformance.py` 验证（HTTP 事件顺序、分块请求体、断开连接、包含失败路径的 lifespan）。请参阅[生产路线图](. 请参阅[生产路线图](../PRODUCTION_ROADMAP.md)中的计划与验收条件。
 
 两个适配器的请求体上限均为 1 MiB，超出返回 413。Axum 默认同时接收 16 个请求体、接收期限 10 秒（408），Python 执行槽为 64 个，等待队列上限是执行槽数与 64 中较小的值；队列满返回 503。执行和请求体设置可通过 CLI 调整。HTTP/1.1 请求头读取期限为 10 秒，但连接总数没有限制。外部 ASGI 服务器的超时由其自身管理。非根路径末尾的 `/` 会以 308 重定向。编译后的 island 单个上限为 2 MiB，总计 32 MiB。
 
@@ -261,9 +283,9 @@ OpenTelemetry 追踪默认关闭且为可选项：安装 `opentelemetry-api`（�
 
 ## 限流
 
-限流是可选项，采用按进程的令牌桶：`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的动态请求返回 429，并带有以秒为单位的 `Retry-After` 头。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失。使用 `--rate-limit-backend redis` 时桶在进程间共享；Redis 不可达时遵循故障策略：默认（`fail_closed`，`--rate-limit-failure-policy fail_closed`）返回 503，`fail_open` 则放行请求。静态文件和新鲜的 ISR 页面在到达 Python 桥接之前已由 Rust 层返回，因此不受限流。
+限流是可选项，采用按进程的令牌桶：`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的动态请求返回 429，并带有以秒为单位的 `Retry-After` 头。WebSocket 握手也以同样方式限流：每次握手从同一个按 IP 划分的桶中消耗一个令牌，超限的握手返回 429 并带有 `Retry-After`。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失。使用 `--rate-limit-backend redis` 时桶在进程间共享；Redis 不可达时遵循故障策略：默认（`fail_closed`，`--rate-limit-failure-policy fail_closed`）返回 503，`fail_open` 则放行请求。静态文件和新鲜的 ISR 页面在到达 Python 桥接之前已由 Rust 层返回，因此不受限流。
 
-转发链从右向左遍历受信任的代理，使用最近的不受信任地址。必须准确配置所有中间代理。每个进程最多保留 10,000 个桶；全部处于活跃状态时，新键会逐出最旧的桶而不是收到 429，新键的创建受全局滑动窗口限制（每个窗口最多 10,000 个新键）。IPv6 地址按 /64 前缀共享桶。用 `--rate-limit-exempt-path`（例如 `/healthz`）指定的路径跳过速率限制。
+转发链从右向左遍历受信任的代理，使用最近的不受信任地址。必须准确配置所有中间代理。每个进程最多保留 10,000 个桶；全部处于活跃状态时，新键会逐出最旧的桶而不是收到 429，新键的创建受全局滑动窗口限制（每个窗口最多 10,000 个新键）。桶的分数是取自 Redis `TIME` 的整数微秒；两个脚本可能读到同一微秒，此时分数相同的桶同样陈旧，按桶键确定性地选择要逐出的桶——被逐出的所有者不会被拒绝，下次请求会获得一个新的桶。分数在远超最长一年窗口的范围内仍保持为精确整数（当前纪元下最后一位的单位是 0.25 µs），因此数分钟到数小时的实际窗口不受双精度限制的影响。IPv6 地址按 /64 前缀共享桶。这种分组是一种权衡：持有整个 /48 的攻击者可以生成 65,536 个不同的 /64，填满桶表和新键窗口，在窗口滑动之前真正的新键仍会被拒绝（被逐出的已有键不会被拒绝）。`--rate-limit-ipv6-prefix-len 48` 将整个 /48 归入一个桶，可以阻止这种攻击，但共享该前缀的所有主机也将共享一个桶，繁忙的 /48 会连带限制无辜用户；默认值保持为 64。用 `--rate-limit-exempt-path`（例如 `/healthz`）指定的路径跳过速率限制。
 
 多工作进程：`pynext start --workers 4` 启动共享监听套接字的监管器。使用 `--port 0` 时，动态分配的端口在 worker 重启后保持不变。各 worker 的解释器、内存缓存和默认限流独立；SQLite/Redis ISR 与 Redis 限流可以共享。监管器会重启故障 worker；中断的请求需要重试。CI 在 Linux、macOS 和 Windows 上检查共享监听套接字的 worker 启动和重启，并在 Linux 和 macOS 上运行基于信号的监管器测试。
 

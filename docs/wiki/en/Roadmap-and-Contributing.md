@@ -22,7 +22,7 @@ The full capability list is generated from code: [FEATURES](../../FEATURES.md).
 ## Planned / not yet implemented
 
 - React/RSC compatibility is a separate significant design effort and an explicit non-goal for 1.0
-- Global connection limits and security-default hardening (see [roadmap](../../ROADMAP.md))
+- Security-default hardening (see [roadmap](../../ROADMAP.md))
 - DB and authentication reference apps (credential verification stays the application's responsibility)
 - Better Rust/Python data transfer and systematic profiling
 - **Exploratory Django integration** (such as ORM, auth, and admin interoperability) has been discussed as a potential direction, **but no integration exists or is promised**.

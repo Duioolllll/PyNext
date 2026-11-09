@@ -435,7 +435,16 @@ struct ServerState {
     websocket_max_message: usize,
     ws_callback: Option<Py<PyAny>>,
     ws_origin_callback: Option<Py<PyAny>>,
+    // Rate-limit check for WebSocket handshakes (review #4 #21): the
+    // HTTP bridge checks the limiter before dispatch, but the upgrade
+    // branch never reached it. The Python callback mirrors bridge():
+    // it returns (allowed, retry_after_seconds) and raises
+    // RateLimitUnavailable when the limiter cannot decide, which the
+    // upgrade branch answers with 503 like the bridge does.
+    ws_rate_limit_callback: Option<Py<PyAny>>,
     ws_origin_capacity: Arc<Semaphore>,
+    ws_auth_callback: Option<Py<PyAny>>,
+    ws_auth_capacity: Arc<Semaphore>,
 }
 
 #[pyclass(name = "_RequestCancellation")]
@@ -1184,6 +1193,74 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         if !state.websocket_paths.contains(&pattern) {
             return plain_response(StatusCode::NOT_FOUND, "Not Found", &state.security_headers);
         }
+        // Rate limiting runs before the origin check and the 101: the
+        // HTTP bridge applies the same limiter before dispatch, but the
+        // upgrade branch never reached it, so handshakes were unmetered.
+        // A denied handshake gets 429 with Retry-After, exactly like an
+        // over-limit HTTP request; a callback failure or timeout fails
+        // closed with 503, like the bridge does. The check shares the
+        // bounded Python-check capacity with the origin check, so stalled
+        // callbacks cannot queue without bound.
+        if state.ws_rate_limit_callback.is_some() {
+            let Ok(permit) = Arc::clone(&state.ws_origin_capacity).try_acquire_owned() else {
+                return plain_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service Unavailable",
+                    &state.security_headers,
+                );
+            };
+            let rate_path = path.clone();
+            let rate_headers: Vec<(Vec<u8>, Vec<u8>)> = parts
+                .headers
+                .iter()
+                .map(|(name, value)| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
+                .collect();
+            let rate_peer = parts
+                .extensions
+                .get::<PeerAddr>()
+                .map(|addr| addr.0.ip().to_string());
+            let rate_state = Arc::clone(&state);
+            let decision = tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || {
+                    // The permit stays with the task even if the timeout expires.
+                    let _permit = permit;
+                    Python::with_gil(|py| -> PyResult<(bool, Option<u64>)> {
+                        rate_state
+                            .ws_rate_limit_callback
+                            .as_ref()
+                            .expect("callback checked above")
+                            .bind(py)
+                            .call1((rate_path, rate_headers, rate_peer))?
+                            .extract()
+                    })
+                }),
+            )
+            .await;
+            match decision {
+                Ok(Ok(Ok((true, _)))) => {}
+                Ok(Ok(Ok((false, retry_after)))) => {
+                    let mut response = plain_response(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Too Many Requests",
+                        &state.security_headers,
+                    );
+                    if let Ok(value) =
+                        HeaderValue::from_str(&retry_after.unwrap_or(1).max(1).to_string())
+                    {
+                        response.headers_mut().insert(header::RETRY_AFTER, value);
+                    }
+                    return response;
+                }
+                _ => {
+                    return plain_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Service Unavailable",
+                        &state.security_headers,
+                    );
+                }
+            }
+        }
         // Origin policy must run before the HTTP 101 response. Limit the
         // Python checks separately so stalled callbacks cannot queue without
         // bound or consume the ordinary HTTP execution budget.
@@ -1235,6 +1312,72 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         match decision {
             Ok(Ok(Ok(true))) => {}
             Ok(Ok(Ok(false))) => {
+                return plain_response(StatusCode::FORBIDDEN, "Forbidden", &state.security_headers);
+            }
+            _ => {
+                return plain_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service Unavailable",
+                    &state.security_headers,
+                );
+            }
+        }
+        // Authorization (global middleware chain + the handler's
+        // @require_auth/@require_permission policy) must run before the
+        // HTTP 101 response, like the Origin policy above. The Python
+        // callback returns true (allow), false (deny -> 403), or None
+        // (pre-flight error -> 503, fail closed). The handshake must
+        // never complete before this decision.
+        let Ok(auth_permit) = Arc::clone(&state.ws_auth_capacity).try_acquire_owned() else {
+            return plain_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+                &state.security_headers,
+            );
+        };
+        if state.ws_auth_callback.is_none() {
+            return plain_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+                &state.security_headers,
+            );
+        }
+        let auth_path = path.clone();
+        let auth_query = parts.uri.query().unwrap_or("").as_bytes().to_vec();
+        let auth_headers: Vec<(Vec<u8>, Vec<u8>)> = parts
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
+            .collect();
+        let auth_peer = parts
+            .extensions
+            .get::<PeerAddr>()
+            .map(|addr| addr.0.ip().to_string());
+        let auth_state = Arc::clone(&state);
+        let auth_decision = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                // The permit stays with the task even if the timeout expires.
+                let _permit = auth_permit;
+                Python::with_gil(|py| -> PyResult<Option<bool>> {
+                    let headers = PyList::empty(py);
+                    for (name, value) in &auth_headers {
+                        headers.append((PyBytes::new(py, name), PyBytes::new(py, value)))?;
+                    }
+                    auth_state
+                        .ws_auth_callback
+                        .as_ref()
+                        .expect("callback checked above")
+                        .bind(py)
+                        .call1((auth_path, PyBytes::new(py, &auth_query), headers, auth_peer))?
+                        .extract()
+                })
+            }),
+        )
+        .await;
+        match auth_decision {
+            Ok(Ok(Ok(Some(true)))) => {}
+            Ok(Ok(Ok(Some(false)))) => {
                 return plain_response(StatusCode::FORBIDDEN, "Forbidden", &state.security_headers);
             }
             _ => {
@@ -1700,7 +1843,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1733,6 +1876,8 @@ impl NativeServer {
         security_headers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
         drain_timeout_secs: f64,
         websocket_origin_callback: Option<Py<PyAny>>,
+        websocket_rate_limit_callback: Option<Py<PyAny>>,
+        websocket_auth_callback: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -1906,7 +2051,10 @@ impl NativeServer {
                     websocket_max_message,
                     ws_callback: websocket_callback,
                     ws_origin_callback: websocket_origin_callback,
+                    ws_rate_limit_callback: websocket_rate_limit_callback,
                     ws_origin_capacity: Arc::new(Semaphore::new(64)),
+                    ws_auth_callback: websocket_auth_callback,
+                    ws_auth_capacity: Arc::new(Semaphore::new(64)),
                 });
                 // The accept loop below enforces the connection budget from
                 // this handle; the router takes its own clone via with_state.

@@ -29,7 +29,7 @@ from .build import discover, load_manifest
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
-from .images import ImageBusy, ImageUnavailable, optimize_image
+from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .observability import (
     MetricsCollector,
     ObservabilityConfig,
@@ -882,6 +882,35 @@ class App:
             html = "<!DOCTYPE html>" + html
         return Response(html, media_type="text/html; charset=utf-8", csp_nonce=nonce)
 
+    async def _run_middleware(self, request, terminal):
+        """Run the global middleware chain around ``terminal(request)``.
+
+        ``terminal`` is the final step (the HTTP dispatcher, or the
+        WebSocket pre-flight sentinel): it only runs when every middleware
+        called ``call_next``. A middleware that returns its own response
+        short-circuits the chain, and that response is the result.
+        """
+        async def invoke(index, current):
+            if not isinstance(current, Request):
+                raise TypeError("call_next requires a Request")
+            if index == len(self.middleware):
+                return await terminal(current)
+            called = False
+
+            async def call_next(next_request):
+                nonlocal called
+                if called:
+                    raise RuntimeError("call_next may be called only once")
+                called = True
+                return await invoke(index + 1, next_request)
+
+            result = await self.middleware[index](current, call_next)
+            if not isinstance(result, Response):
+                raise TypeError("middleware must return a Response")
+            return result
+
+        return await invoke(0, request)
+
     async def dispatch(self, request):
         """Return a response. Exceptions are converted at the transport boundary."""
         # Health probes are reserved framework paths (B6): they bypass
@@ -914,26 +943,7 @@ class App:
                     return preflight
                 return await self._dispatch(current)
 
-            async def invoke(index, current):
-                if not isinstance(current, Request):
-                    raise TypeError("call_next requires a Request")
-                if index == len(self.middleware):
-                    return await terminal(current)
-                called = False
-
-                async def call_next(next_request):
-                    nonlocal called
-                    if called:
-                        raise RuntimeError("call_next may be called only once")
-                    called = True
-                    return await invoke(index + 1, next_request)
-
-                result = await self.middleware[index](current, call_next)
-                if not isinstance(result, Response):
-                    raise TypeError("middleware must return a Response")
-                return result
-
-            response = await self._dispatch_timed(request, lambda: invoke(0, request))
+            response = await self._dispatch_timed(request, lambda: self._run_middleware(request, terminal))
             if preflight is None:
                 apply_cors_headers(request, response, config=self.security)
             apply_security_headers(response, config=self.security, production=self.production)
@@ -1032,8 +1042,8 @@ class App:
             source = query["src"][0]
             width, quality = query["w"][0], query.get("q", ["75"])[0]
             if (not width.isascii() or not width.isdecimal() or not quality.isascii() or not quality.isdecimal() or
-                    len(width) > 4 or len(quality) > 2 or not 1 <= int(width) <= 2048 or
-                    not 1 <= int(quality) <= 95):
+                    len(width) > 4 or len(quality) > 2 or not 1 <= int(width) <= MAX_IMAGE_WIDTH or
+                    not 1 <= int(quality) <= MAX_IMAGE_QUALITY):
                 raise BadRequest("Invalid image dimensions or quality")
             asset = self.public_assets.get(source)
             if asset is None:
@@ -1189,13 +1199,110 @@ class App:
         return {path: list(getattr(handler, "__pynext_websocket_protocols__", ()))
                 for path, handler in self.websocket_entries.items()}
 
-    async def _handle_websocket(self, scope, receive, send):
+    async def _websocket_rate_limit_denied(self, scope, path):
+        """Return the denial response for an over-limit WS handshake, else ``None``.
+
+        Mirrors the native upgrade branch (review #4 #21): WebSocket
+        handshakes share the HTTP limiter's bucket per client IP, so one
+        token is charged per handshake attempt, exempt paths skip the
+        check, no configured limiter means no change, and a limiter that
+        cannot decide fails closed with 503, like ``_handle_http``. The
+        caller answers with the returned response before the accept, so a
+        denied handshake is an HTTP 429 with ``Retry-After``, never an
+        accepted socket closed afterwards.
+
+        Composition with ``_authorize_websocket`` (Track A, separate
+        branch): the pre-flight runs a synthetic GET through the
+        middleware chain only — it never passes through ``_handle_http``,
+        where the HTTP limiter lives — so it consumes no token. This
+        check is therefore the single charge per handshake attempt. Do
+        not add a second limiter call inside ``_authorize_websocket`` or
+        the pre-flight, or each handshake would cost two tokens; if a
+        middleware-based limiter is ever introduced, the pre-flight must
+        be exempted from it instead.
+        """
+        if self.rate_limit is None:
+            return None
+        exempt = getattr(self.rate_limit, "is_exempt", None)
+        if exempt and exempt(path):
+            return None
         client = scope.get("client")
-        peer_ip = client[0] if client else None
-        if not websocket_origin_allowed(scope.get("headers", []), peer_ip, scope.get("scheme") or "ws",
-                                        self.proxy_trust, self.security):
-            await send({"type": "websocket.close", "code": 1008})
-            return
+        client_ip = client[0] if client else None
+        key = self.rate_limit.key_for(client_ip, scope.get("headers", []))
+        try:
+            if getattr(self.rate_limit, "blocking", False):
+                allowed, retry_after = await asyncio.to_thread(self.rate_limit.allow, key)
+            else:
+                allowed, retry_after = self.rate_limit.allow(key)
+        except RateLimitUnavailable:
+            return Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
+        if not allowed:
+            return rate_limited_response(retry_after)
+        return None
+
+    async def _authorize_websocket(self, path, query_string=b"", headers=()):
+        """Pre-handshake authorization for a WebSocket upgrade.
+
+        Returns ``None`` when the upgrade may proceed, else a ``Response``
+        describing the denial. Runs the global middleware chain (including
+        ``SessionMiddleware``, which loads the session into
+        ``request.state``) around a synthetic ``GET`` for the upgrade path,
+        then the handler's ``@require_auth``/``@require_permission`` policy
+        — all before the handshake completes, so a denial is a rejected
+        upgrade, never an accepted socket closed afterwards.
+
+        The upgrade is allowed only when the chain reaches the terminal:
+        a middleware that short-circuits with its own response (even a
+        200) denies the upgrade, because the request never reached the
+        handler. A middleware failure fails closed with 503. The
+        authorization state is not passed to the WebSocket handler: the
+        handler receives a ``WebSocket``, not a ``Request``, and the native
+        transport cannot carry the pre-flight ``request.state`` through
+        the Rust upgrade — so handlers that need the identity must re-derive
+        it from the socket (for example from a session cookie the
+        middleware already validated, or from a token checked in
+        middleware). The check itself is identical on ASGI and native.
+        Middleware must not rotate or invalidate the session during this
+        pre-flight: the pre-flight response is discarded, so a rotated
+        token's ``set-cookie`` would never reach the client while the
+        old token is already gone from the store.
+        """
+        match = self.router.matches(path)
+        if match is None:
+            return Response("Not Found", status=404)
+        pattern, raw_params = match
+        handler = self.websocket_entries.get(pattern)
+        if handler is None:
+            return Response("Not Found", status=404)
+        params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
+        request = Request("GET", path, bytes(query_string),
+                          tuple((bytes(name), bytes(value)) for name, value in headers),
+                          b"", params, self, {})
+        terminal_reached = False
+        seen = {}
+
+        async def terminal(current):
+            nonlocal terminal_reached
+            terminal_reached = True
+            seen["request"] = current
+            return Response(b"", status=200)
+
+        try:
+            response = await (self._run_middleware(request, terminal) if self.middleware
+                              else terminal(request))
+        except Exception:
+            log.exception("WebSocket authorization failed")
+            return Response("Service Unavailable", status=503)
+        if not terminal_reached:
+            # A middleware answered the upgrade itself: its response is
+            # the denial (for example 403 from an auth middleware).
+            return response
+        denied = check_authorization(seen.get("request", request), handler)
+        if denied is not None:
+            return denied
+        return None
+
+    async def _handle_websocket(self, scope, receive, send):
         try:
             path = _decode_path(scope["path"], scope.get("raw_path"))
         except (ValueError, UnicodeError):
@@ -1212,6 +1319,27 @@ class App:
         if handler is None:
             # No route, or a route with no WebSocket handler: refuse the
             # handshake with a policy-violation close instead of hanging.
+            # Unknown paths consume no token: the native upgrade branch
+            # answers 404 before its rate-limit check, and this mirrors it.
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        # Rate limiting runs before the origin check and the accept, in
+        # the same relative order as the native upgrade branch (route
+        # lookup, then rate limit, then origin, then 101): a denied
+        # handshake is answered as an HTTP 429 with Retry-After via
+        # websocket.http.response.start, before any websocket.connect is
+        # read, so the socket is never accepted and then closed.
+        denied = await self._websocket_rate_limit_denied(scope, path)
+        if denied is not None:
+            apply_security_headers(denied, config=self.security, production=self.production)
+            await send({"type": "websocket.http.response.start", "status": denied.status,
+                        "headers": denied.headers})
+            await send({"type": "websocket.http.response.body", "body": denied.body})
+            return
+        client = scope.get("client")
+        peer_ip = client[0] if client else None
+        if not websocket_origin_allowed(scope.get("headers", []), peer_ip, scope.get("scheme") or "ws",
+                                        self.proxy_trust, self.security):
             await send({"type": "websocket.close", "code": 1008})
             return
         offered = scope.get("subprotocols", [])
@@ -1221,6 +1349,14 @@ class App:
         supported = getattr(handler, "__pynext_websocket_protocols__", ())
         chosen = next((protocol for protocol in supported if protocol in offered), None)
         if supported and offered and chosen is None:
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        # Authorization runs before the handshake completes: a denied
+        # upgrade is refused with a close instead of an accept, so the
+        # handler never runs and no data is sent.
+        denied = await self._authorize_websocket(path, scope.get("query_string", b""),
+                                                 scope.get("headers", []))
+        if denied is not None:
             await send({"type": "websocket.close", "code": 1008})
             return
         try:

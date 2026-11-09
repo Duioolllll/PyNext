@@ -14,7 +14,11 @@ from .client import discover_client
 MANIFEST = ".pynext/manifest.json"
 VERSION = 9
 MAX_STATIC_PAGES = 10_000
-MAX_STREAMED_STATIC_BYTES = 8 * 1024 * 1024
+# One cap for every static page rendered at build time, streaming or
+# not: a non-streaming page used to have no size limit at all while a
+# streaming page was capped at 8 MiB.
+MAX_STATIC_PAGE_BYTES = 8 * 1024 * 1024
+MAX_STREAMED_STATIC_BYTES = MAX_STATIC_PAGE_BYTES
 MAX_STREAMED_STATIC_SECONDS = 30
 
 
@@ -36,14 +40,27 @@ def _check_build_paths(root):
 def discover(root):
     root = Path(root).resolve()
     app_dir = root / "app"
+    if app_dir.is_symlink():
+        raise ValueError(f"App directory must not be a symbolic link: {app_dir}")
     if not app_dir.is_dir():
         raise ValueError(f"App directory not found: {app_dir}")
+    # rglob does not descend into symlinked directories, so a symlinked
+    # directory was silently skipped (its page.py never became a route)
+    # while a symlinked file pointing outside was rejected: reject every
+    # symlink under app/ instead, like discover_public does for public/.
+    for current, dirs, files in os.walk(app_dir, followlinks=False):
+        dirs[:] = [name for name in dirs if name != "__pycache__"]
+        for name in dirs + files:
+            if (Path(current) / name).is_symlink():
+                raise ValueError(f"App symlink is not allowed: {Path(current) / name}")
     files = sorted(p for p in app_dir.rglob("*.py") if "__pycache__" not in p.parts)
     for path in files:
         if not path.resolve().is_relative_to(app_dir.resolve()):
             raise ValueError(f"Python file escapes app directory: {path}")
     for name in ("middleware.py", "resources.py"):
         extra = root / name
+        if extra.is_symlink():
+            raise ValueError(f"{name} must not be a symbolic link")
         if extra.is_file():
             if not extra.resolve().is_relative_to(root):
                 raise ValueError(f"{name} escapes project root")
@@ -123,6 +140,12 @@ def write_manifest(root):
 
 
 def _atomic_write(path, contents):
+    # Build outputs (manifest.json, static .html/.asset/.js) are read back
+    # by the server process, which may run as a different user than the
+    # build user, so they must be world-readable. NamedTemporaryFile
+    # creates its file 0600, which would make a build done by one user
+    # unreadable (and the app unstartable) for another; use the normal
+    # readable default 0644 instead of inheriting that restriction.
     path.parent.mkdir(parents=True, exist_ok=True)
     name = None
     try:
@@ -131,6 +154,7 @@ def _atomic_write(path, contents):
             file.write(contents)
             file.flush()
             os.fsync(file.fileno())
+        os.chmod(name, 0o644)
         os.replace(name, path)
     finally:
         if name is not None and os.path.exists(name):
@@ -238,10 +262,16 @@ async def _render_static_pages(app):
                             if len(body) + len(chunk) > MAX_STREAMED_STATIC_BYTES:
                                 raise ValueError("Streamed static page exceeds build size limit")
                             body.extend(chunk)
+                except asyncio.TimeoutError as exc:
+                    raise ValueError(
+                        f"Streamed static page for {path} exceeded the build time limit "
+                        f"({MAX_STREAMED_STATIC_SECONDS}s)") from exc
                 finally:
                     await response.aclose()
                 rendered[path] = (pattern, bytes(body))
             else:
+                if len(response.body) > MAX_STATIC_PAGE_BYTES:
+                    raise ValueError("Static page exceeds build size limit")
                 rendered[path] = (pattern, response.body)
     return rendered
 
@@ -287,7 +317,10 @@ def load_manifest(root):
     target = root / MANIFEST
     if not target.is_file():
         raise ValueError("No build manifest found; run `pynext build` first")
-    saved = json.loads(target.read_text(encoding="utf-8"))
+    try:
+        saved = json.loads(target.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Invalid build manifest {target}: {exc}; rebuild the application") from exc
     if saved.get("schema_version") != VERSION:
         raise ValueError("Incompatible manifest version; rebuild the application")
     expected = discover(root)

@@ -1,3 +1,5 @@
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -23,9 +25,86 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 #: share it, so a cookie issued with the framework default config
 #: verifies against an app's own default config. Explicit keys and the
 #: environment variable still override it per config. Workers are
-#: separate processes, so each has its own fallback key — multi-worker
-#: deployments must share one key explicitly.
+#: separate processes, so each has its own fallback key — a lone worker
+#: (or a single-process server) is unaffected, but a multi-worker
+#: supervisor must share one key explicitly: see
+#: :func:`ensure_shared_csrf_signing_key`, which the supervisor calls
+#: before spawning workers so every worker signs with the same key.
 _FALLBACK_CSRF_SIGNING_KEY = secrets.token_bytes(32)
+
+
+def parse_csrf_signing_key(value, *, source="csrf_signing_key"):
+    """Parse a CSRF signing key supplied as bytes or text.
+
+    Accepted forms (``source`` names the setting in error messages,
+    e.g. ``"csrf_signing_key"``, ``"PYNEXT_CSRF_SIGNING_KEY"`` or
+    ``"--csrf-signing-key"``):
+
+    - ``bytes`` / ``bytearray`` of at least 16 bytes, used as-is;
+    - ``"hex:<hex>"`` — hex-decoded, at least 16 bytes after decoding;
+    - ``"base64:<base64>"`` — standard base64-decoded, at least 16
+      bytes after decoding;
+    - any other ``str`` — UTF-8 encoded, at least 16 bytes.
+
+    Surrounding whitespace is ignored. A key that is empty, too short,
+    or has undecodable hex/base64 raises :class:`ValueError` (a value of
+    the wrong type raises :class:`TypeError`): it never silently falls
+    back to a random key, so a misconfigured deployment fails loudly at
+    startup instead of issuing cookies no other worker can verify.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        key = bytes(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError(f"{source} must not be empty")
+        if text.startswith("hex:"):
+            try:
+                key = bytes.fromhex(text[4:].strip())
+            except ValueError as exc:
+                raise ValueError(f"{source} is not valid hex after 'hex:'") from exc
+        elif text.startswith("base64:"):
+            try:
+                key = base64.b64decode(text[7:].strip(), validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError(f"{source} is not valid base64 after 'base64:'") from exc
+        else:
+            key = text.encode("utf-8")
+    else:
+        raise TypeError(f"{source} must be str, bytes or None")
+    if len(key) < 16:
+        raise ValueError(f"{source} must be at least 16 bytes")
+    return key
+
+
+def ensure_shared_csrf_signing_key(explicit_key=None):
+    """Return the one CSRF signing key every worker must share (finding #23).
+
+    Precedence: an explicit key wins, then a set
+    ``PYNEXT_CSRF_SIGNING_KEY`` (validated — an invalid value raises
+    instead of falling back), and otherwise a fresh 32-byte key from
+    :mod:`secrets`. The winning key is published back into the
+    environment as ``PYNEXT_CSRF_SIGNING_KEY=hex:<hex>`` so workers
+    spawned afterwards (``multiprocessing`` ``"spawn"`` re-imports this
+    module per worker) inherit exactly the same key, and so every
+    default :class:`SecurityConfig` built inside a worker agrees with
+    the app's config. The key itself is never logged; only the fact
+    that one key is shared is observable to callers.
+
+    The supervisor calls this once before spawning workers; single-
+    process servers do not call it, so their per-process fallback
+    behaviour is unchanged.
+    """
+    if explicit_key is not None:
+        key = parse_csrf_signing_key(explicit_key, source="csrf_signing_key")
+    else:
+        env_key = os.environ.get("PYNEXT_CSRF_SIGNING_KEY")
+        if env_key is not None:
+            key = parse_csrf_signing_key(env_key, source="PYNEXT_CSRF_SIGNING_KEY")
+        else:
+            key = secrets.token_bytes(32)
+    os.environ["PYNEXT_CSRF_SIGNING_KEY"] = f"hex:{key.hex()}"
+    return key
 
 _KNOWN_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
 _TOKEN_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
@@ -62,10 +141,18 @@ class SecurityConfig:
     inject its own token: an unsigned or foreign-signed cookie is
     rejected even when the submitted token matches it. The key defaults
     to ``PYNEXT_CSRF_SIGNING_KEY`` when set, and otherwise to a fresh
-    per-process key — so multi-worker deployments must set the same
-    key (or signing secret) on every worker, or a cookie issued by one
-    worker is rejected by the others. With sessions the token is bound
-    to the server-side session instead and the signing key is unused.
+    per-process key. A key may be given as bytes, as a string of at
+    least 16 bytes, or as ``"hex:<hex>"`` / ``"base64:<base64>"`` (see
+    :func:`parse_csrf_signing_key`); an empty, too-short or undecodable
+    key raises instead of silently falling back to a random key.
+    Multi-worker deployments must share one key on every worker, or a
+    cookie issued by one worker is rejected by the others — when the
+    app is started with ``--workers N`` the supervisor generates one
+    key (or adopts ``--csrf-signing-key`` / ``PYNEXT_CSRF_SIGNING_KEY``)
+    and shares it with every worker, including replacements started
+    after a crash or a rolling restart. With sessions the token is
+    bound to the server-side session instead and the signing key is
+    unused.
 
     The A1 default security headers (HSTS, ``X-Content-Type-Options``,
     ``X-Frame-Options``, ``Referrer-Policy``, ``Permissions-Policy`` and the
@@ -142,22 +229,23 @@ class SecurityConfig:
         key = self.csrf_signing_key
         if key is None:
             env_key = os.environ.get("PYNEXT_CSRF_SIGNING_KEY")
-            if env_key:
-                key = env_key
-        if key is None:
-            # Shared process-wide fallback key (see _FALLBACK_CSRF_SIGNING_KEY):
-            # a cookie issued with the framework default config must verify
-            # against an app's own default config. Multi-worker deployments
-            # must share one key explicitly (see the class docstring).
-            key = _FALLBACK_CSRF_SIGNING_KEY
-        elif isinstance(key, str):
-            key = key.encode("utf-8")
-        elif isinstance(key, (bytes, bytearray)):
-            key = bytes(key)
+            if env_key is not None:
+                # Invalid env values fail here (see
+                # parse_csrf_signing_key): an empty, too-short or
+                # undecodable key must never silently fall back to a
+                # random key that no other worker shares.
+                key = parse_csrf_signing_key(env_key, source="PYNEXT_CSRF_SIGNING_KEY")
+            else:
+                # Shared process-wide fallback key (see
+                # _FALLBACK_CSRF_SIGNING_KEY): a cookie issued with the
+                # framework default config must verify against an app's
+                # own default config. Multi-worker deployments share one
+                # key via ensure_shared_csrf_signing_key (see the class
+                # docstring); this fallback is only for single-process
+                # servers, where every config lives in one process.
+                key = _FALLBACK_CSRF_SIGNING_KEY
         else:
-            raise TypeError("csrf_signing_key must be str, bytes or None")
-        if len(key) < 16:
-            raise ValueError("csrf_signing_key must be at least 16 bytes")
+            key = parse_csrf_signing_key(key, source="csrf_signing_key")
         self.csrf_signing_key = key
         self.cors_allowed_origins = tuple(self.cors_allowed_origins)
         self.cors_allowed_methods = tuple(self.cors_allowed_methods)

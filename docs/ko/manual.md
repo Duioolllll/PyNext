@@ -94,7 +94,7 @@ async def update(request):
     return JSONResponse({"ok": True})
 ~~~
 
-세션 미들웨어가 있으면 `create_app`에 보안 설정을 따로 전달하지 않아도 CSRF가 자동으로 켜집니다. 세션이 없는데 모든 상태 변경 API 라우트를 보호하려면 `create_app`에 `security=SecurityConfig(csrf_enabled=True)`를 전달하세요. 토큰은 쿠키를 읽을 수 있는 페이지에서 요청이 왔다는 것만 증명합니다. XSS로 쿠키를 읽을 수 있는 페이지는 다른 double-submit 방식과 마찬가지로 이를 우회할 수 있습니다. 쿠키는 기본적으로 `SameSite=Lax`이며 `HttpOnly`가 아닙니다(JavaScript가 읽어야 합니다). CSRF 쿠키는 기본적으로 `Secure`이므로 평문 `http://` 로컬 개발에서는 `csrf_cookie_secure=False`를 앱 설정과 `set_csrf_cookie()` 호출에 함께 전달하세요(`pynext dev`는 자동으로 이렇게 동작합니다). 다중 워커로 배포할 때는 모든 워커가 같은 `csrf_signing_key`(또는 `PYNEXT_CSRF_SIGNING_KEY` 환경 변수)를 써야 한 워커가 발급한 쿠키를 다른 워커도 검증할 수 있습니다.
+세션 미들웨어가 있으면 `create_app`에 보안 설정을 따로 전달하지 않아도 CSRF가 자동으로 켜집니다. 세션이 없는데 모든 상태 변경 API 라우트를 보호하려면 `create_app`에 `security=SecurityConfig(csrf_enabled=True)`를 전달하세요. 토큰은 쿠키를 읽을 수 있는 페이지에서 요청이 왔다는 것만 증명합니다. XSS로 쿠키를 읽을 수 있는 페이지는 다른 double-submit 방식과 마찬가지로 이를 우회할 수 있습니다. 쿠키는 기본적으로 `SameSite=Lax`이며 `HttpOnly`가 아닙니다(JavaScript가 읽어야 합니다). CSRF 쿠키는 기본적으로 `Secure`이므로 평문 `http://` 로컬 개발에서는 `csrf_cookie_secure=False`를 앱 설정과 `set_csrf_cookie()` 호출에 함께 전달하세요(`pynext dev`는 자동으로 이렇게 동작합니다). 다중 워커로 배포할 때는 모든 워커가 서명 키 하나를 공유합니다. `--workers N`으로 시작하면 supervisor가 32바이트 키 하나를 만들거나(`--csrf-signing-key` / `PYNEXT_CSRF_SIGNING_KEY`가 주어지면 그 키를 쓰고) 모든 워커와 공유하므로, 충돌이나 롤링 재시작 뒤에 새로 뜬 워커에서도 한 워커가 발급한 쿠키를 검증할 수 있습니다. 키는 16바이트 이상의 문자열, `hex:<hex>`, `base64:<base64>` 중 하나로 줄 수 있으며, 비어 있거나 너무 짧거나 해독할 수 없는 키는 조용히 임의 키로 대체되지 않고 시작 시점에 실패합니다. 워커를 쓰지 않는 단일 프로세스 서버는 프로세스별 폴백 키를 그대로 쓰며, 모든 설정이 한 프로세스 안에 있으므로 문제가 없습니다.
 
 교차 출처 요청은 기본적으로 허용하지 않습니다(명세 v0.2 §11). 출처를 설정하지 않으면 `Access-Control-Allow-Origin` 헤더를 보내지 않습니다. `SecurityConfig`로 정책을 `create_app`에 전달하세요.
 
@@ -116,13 +116,35 @@ app = create_app(".", security=SecurityConfig(
 
 기본 CSP는 `script-src 'self'; object-src 'none'`입니다. `SecurityConfig(csp_nonce_enabled=True)`로 설정하면 동적 렌더링 페이지마다 요청별 새 nonce가 발급됩니다. 헤더는 `script-src 'self' 'nonce-<값>'; object-src 'none'`이 되고, 같은 nonce가 island 런타임 `<script>` 태그에도 들어갑니다. nonce는 응답마다 다르므로 nonce가 포함된 페이지를 직접 캐시하지 마세요. 미리 렌더링된 SSG 페이지, 캐시된 ISR 응답, 정적 파일은 nonce 없는 정적 정책을 유지합니다. 공유 HTML에 박힌 nonce는 여러 응답에서 재사용돼 nonce의 의미가 사라지기 때문입니다. 쿠키나 Authorization 헤더가 있는 ISR 요청은 요청마다 새로 렌더링하므로 nonce가 적용됩니다.
 
+## 세션
+
+서버 측 세션은 `SessionMiddleware`를 설치하면 `request.state["session"]`에 들어갑니다(`SQLiteSessionStore`는 워커가 공유하는 단일 파일용, `RedisSessionStore`는 Redis용). 세션 쿠키에는 불투명한 토큰만 들어 있으며 `HttpOnly`이고 기본적으로 `Secure`, `SameSite=Lax`입니다. 세션 데이터는 JSON 직렬화 가능해야 합니다. 직렬화할 수 없는 값(임의의 객체나 집합 등)을 할당하면 저장 시점에 실패하는 대신 할당 시점에 키를 명시한 `TypeError`가 발생합니다. 저장 데이터는 최대 16 KiB입니다. 세션 쿠키 이름을 두 번 이상 제시한 요청은 세션이 없는 것으로 취급합니다(fail-closed).
+
+로그인 시 세션 id를 교체하세요 — 선택이 아니라 필수입니다. 자격 증명을 확인하고 인증된 정체성을 저장한 뒤, 로그인 응답을 반환하기 전에 `session.rotate_on_login()`을 호출하세요:
+
+~~~python
+from pynext import JSONResponse, route
+
+@route("POST")
+def login(request):
+    user = authenticate(request)  # 자격 증명을 검증합니다. 실패 시 401을 반환/발생시키세요
+    session = request.state["session"]
+    session["user_id"] = user.id
+    session.rotate_on_login()  # 새 세션 id + 새 CSRF 토큰. 이전 id는 사용할 수 없습니다
+    return JSONResponse({"ok": True})
+~~~
+
+교체를 건너뛰면 세션이 고정 공격에 열립니다. 공격자가 로그인 전에 고정해 둔 세션 id가 로그인 후에도 계속 유효해집니다. 권한이 바뀔 때(예: 비밀번호 변경 후)도 다시 교체하세요. 로그아웃 시에는 `session.invalidate()`를 호출해 서버 측 세션을 삭제하고 쿠키를 지우세요.
+
+`RedisSessionStore`는 Redis에 닿지 않을 때 장애 정책(`failure_policy` 참고)을 따릅니다. 기본값은 `fail_closed`로, `SessionUnavailable`을 발생시켜 세션 상태를 조용히 잃는 대신 요청에 503으로 응답합니다. `failure_policy="fail_open"`을 전달하면 대신 새로 만든 휘발성 세션으로 시작합니다. 읽기는 계속되지만 저장되는 것은 없고, 장애 중에는 로그인을 완료할 수 없습니다. 발급된 CSRF 토큰이 저장되지 않으므로 로그인 요청은 CSRF(403)에서 실패합니다. 장애 중 교체가 일어나면 이전 세션 id가 만료될 때까지 계속 사용될 수 있습니다. `fail_open`은 세션 연속성보다 가용성이 중요한 경우에만 사용하세요.
+
 ## API 응답 스트리밍
 
 `StreamingResponse`에 문자열 또는 바이트를 내보내는 비동기 iterable을 전달합니다. ASGI와 Axum이 청크를 순서대로 전송하며 완료·연결 해제·오류 시 반복자를 닫습니다. 청크당 최대 1 MiB이며 `Content-Length`와 `Transfer-Encoding`은 직접 지정하지 않습니다. Axum은 청크 하나를 대기시키고 다음 청크 생성과 송신 대기에 각각 30초 제한을 적용합니다. 헤더 전송 후 오류는 상태 코드를 바꾸지 못하고 스트림을 중단합니다. HEAD 요청은 스트림을 소비하지 않습니다. React/RSC 스트리밍은 미구현입니다.
 
 ## 스트리밍 SSR
 
-페이지 함수는 UI 노드의 비동기 iterable을 반환할 수 있습니다. SSR은 레이아웃 셸과 청크를 생성되는 대로 보내고, SSG는 빌드 중 청크를 합쳐 정적 파일로 제공합니다. 공개 ISR 최초 요청은 스트리밍하고 동시 요청은 완성된 결과를 기다리며 stale 결과가 있으면 즉시 받습니다. 완성된 결과만 캐시합니다. SSG·ISR 스트림은 8 MiB와 30초로 제한하며 ISR 캐시는 최대 2 MiB의 본문을 저장합니다. ISR 최초 요청이 끊겨도 다른 요청을 위해 생성이 계속될 수 있습니다. 레이아웃은 자식을 한 번 렌더링해야 하며 헤더 전송 후 오류는 스트림을 중단합니다. [예제 페이지](../../examples/basic/app/stream/page.py)를 참고하세요.
+페이지 함수는 UI 노드의 비동기 iterable을 반환할 수 있습니다. SSR은 레이아웃 셸과 청크를 생성되는 대로 보내고, SSG는 빌드 중 청크를 합쳐 정적 파일로 제공합니다. 공개 ISR 최초 요청은 스트리밍하고 동시 요청은 완성된 결과를 기다리며 stale 결과가 있으면 즉시 받습니다. 완성된 결과만 캐시합니다. SSG 페이지는 8 MiB로 제한하고, SSG·ISR 스트림은 추가로 30초로 제한하며, ISR 캐시는 최대 2 MiB의 본문을 저장합니다. ISR 최초 요청이 끊겨도 다른 요청을 위해 생성이 계속될 수 있습니다. 레이아웃은 자식을 한 번 렌더링해야 하며 헤더 전송 후 오류는 스트림을 중단합니다. [예제 페이지](../../examples/basic/app/stream/page.py)를 참고하세요.
 
 ~~~python
 from pynext import h, page
@@ -148,7 +170,7 @@ async def stream():
 
 `route.py`는 HTTP 핸들러와 함께 `@websocket` 핸들러를 하나 내보낼 수 있습니다. 핸들러는 `WebSocket`을 받아 보내거나 받기 전에 `await websocket.accept()`를 호출해야 합니다. 텍스트와 바이너리 메시지를 주고받을 수 있으며, 상대가 연결을 끊으면 `receive()`에서 `WebSocketDisconnect`가 발생하므로 연결별 정리는 `finally` 블록에 둡니다.
 
-개발 버전은 ASGI·Axum에서 연결을 수락하기 전에 `Origin`을 검사하며, 기본적으로 같은 출처만 허용합니다. 다른 HTTP(S) 출처는 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`를 `create_app(..., security=...)`에 전달하거나 `--ws-allowed-origin https://client.example`을 반복 지정하세요. 스킴과 기본값이 아닌 포트를 포함하며 `*`와 `null`은 허용하지 않습니다. `Origin`을 생략하는 기존 비브라우저 클라이언트는 `websocket_allow_missing_origin=True` 또는 `--ws-allow-missing-origin`으로 명시적으로 허용해야 합니다. 공개된 0.1.0 패키지에는 이 검사가 없습니다. 클라이언트는 `Origin`을 위조하거나 생략할 수 있으므로 앱에서 연결을 인증·인가해야 합니다. 프록시 뒤에서는 실제 프록시만 `--trusted-proxy`로 지정하고 클라이언트가 보낸 전달 헤더를 프록시가 덮어쓰도록 설정하세요.
+개발 버전은 ASGI·Axum에서 연결을 수락하기 전에 `Origin`을 검사하며, 기본적으로 같은 출처만 허용합니다. 다른 HTTP(S) 출처는 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`를 `create_app(..., security=...)`에 전달하거나 `--ws-allowed-origin https://client.example`을 반복 지정하세요. 스킴과 기본값이 아닌 포트를 포함하며 `*`와 `null`은 허용하지 않습니다. `Origin`을 생략하는 기존 비브라우저 클라이언트는 `websocket_allow_missing_origin=True` 또는 `--ws-allow-missing-origin`으로 명시적으로 허용해야 합니다. 공개된 0.1.0 패키지에는 이 검사가 없습니다. 클라이언트는 `Origin`을 위조하거나 생략할 수 있습니다. 핸드셰이크 전에는 업그레이드 요청에 전역 미들웨어 체인(세션 미들웨어 포함)과 핸들러의 `@require_auth`/`@require_permission` 정책이 ASGI·Axum 모두에서 적용되며, 거부된 업그레이드는 101 응답 전에 차단됩니다(Axum은 HTTP 403, ASGI는 close 1008). 따라서 핸들러는 실행되지 않습니다. 신원 확립(예: 로그인 라우트에서 `session["user_id"]` 설정)은 여전히 앱의 책임이며, 세션 외의 자격 증명 방식(예: 토큰)은 미들웨어에서 검증해야 합니다. 프록시 뒤에서는 실제 프록시만 `--trusted-proxy`로 지정하고 클라이언트가 보낸 전달 헤더를 프록시가 덮어쓰도록 설정하세요.
 
 ASGI에서 PyNext가 신뢰 프록시를 판정하려면 서버가 `scope["client"]`에 원래 피어 주소를 보존해야 합니다. PyNext가 전달 헤더를 해석할 때는 ASGI 서버의 선행 프록시 헤더 처리를 끄세요(Uvicorn은 `--no-proxy-headers`).
 
@@ -194,7 +216,7 @@ SSG와 ISR 페이지는 `request`를 받을 수 없고 공개 콘텐츠에 사�
 
 SSG 빌드는 최대 10,000페이지를 생성하며 개발 모드에서는 요청마다 SSG 페이지를 렌더링합니다. ISR 페이지는 `generate_static_params()`를 내보낼 수 없고 프로세스별 동시 생성 작업은 최대 128개입니다.
 
-권한을 확인한 API 핸들러에서는 `await request.revalidate("/news/example")`, 앱 인스턴스를 가진 코드에서는 `await app.revalidate(path)`를 사용할 수 있습니다. 쿼리 문자열이 없는 디코딩된 ISR 경로를 전달합니다. 캐시나 진행 중인 생성을 무효화했다면 `True`를 반환합니다. 기존 요청은 이전 생성 결과를 받을 수 있지만 그 결과가 캐시를 다시 덮어쓰지는 않습니다. 메모리 백엔드에서는 무효화가 프로세스별이며 다른 워커에 전파되지 않고, SQLite 백엔드에서는 공유 항목도 제거되며 정상 상태의 다른 워커는 다음 조회에서 이를 확인합니다. 외부에 노출하는 엔드포인트는 인증·권한 검사가 필요합니다.
+권한을 확인한 API 핸들러에서는 `await request.revalidate("/news/example")`, 앱 인스턴스를 가진 코드에서는 `await app.revalidate(path)`를 사용할 수 있습니다. 쿼리 문자열이 없는 디코딩된 ISR 경로를 전달합니다. 로컬 캐시 항목이나 진행 중인 생성을 무효화했다면 `True`를 반환합니다. 공유 백엔드가 있는 경우 저장소에 닿을 수 있을 때는 공유 항목도 함께 제거되지만, `fail_open` 모드에서는 공유 저장소에 닿지 않을 때 `True`여도 공유 항목이 제거됐다고 보장하지 않습니다(공유 제거는 최선 노력 방식이라 다른 워커는 만료될 때까지 오래된 항목을 계속 제공할 수 있습니다) — 적용되지 않은 무효화를 성공으로 보고하지 않으려면 `fail_closed`를 사용하세요. 기존 요청은 이전 생성 결과를 받을 수 있지만 그 결과가 캐시를 다시 덮어쓰지는 않습니다. 메모리 백엔드에서는 무효화가 프로세스별이며 다른 워커에 전파되지 않고, SQLite 백엔드에서는 공유 항목도 제거되며 정상 상태의 다른 워커는 다음 조회에서 이를 확인합니다. 외부에 노출하는 엔드포인트는 인증·권한 검사가 필요합니다.
 
 ## 공개 파일과 islands
 
@@ -243,7 +265,7 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 빌드된 앱은 `create_app(project_path, production=True)`로 만듭니다. ASGI 서버의 시간 제한은 해당 서버가 관리합니다. Axum 어댑터는 Python 응답을 최대 30초 기다린 뒤 취소를 요청하고 504를 반환합니다. 이미 스레드에서 실행 중인 동기 함수는 504 이후에도 계속 실행되어 쓰기 등의 부작용을 일으킬 수 있습니다. 쓰기 작업의 멱등성과 데이터베이스·외부 서비스의 별도 시간 제한을 확보하세요. 강제 프로세스 격리는 `--workers`(아래)로 제공하며, 단일 프로세스에는 없습니다. ISR 취소에도 같은 제한이 있습니다.
 
-분산 요청 제한과 운영 환경 보안 강화는 미구현입니다. SQLite 무효화는 공유 저장소가 정상일 때 다음 조회에 반영됩니다. OpenTelemetry 스팬은 선택 패키지를 설치하고 트레이싱을 켰을 때 생성됩니다(관측성 참고). ASGI 적합성은 `tests/test_asgi_conformance.py`로 검증합니다(HTTP 이벤트 순서, 청크 분할 본문, 연결 해제, 실패 경로를 포함한 lifespan). 계획과 완료 기준은 [프로덕션 로드맵](../PRODUCTION_ROADMAP.md)을 참고하세요.
+분산 요청 제한은 `--rate-limit-backend redis`로 구현됐습니다(공유 Redis 토큰 버킷). 운영 환경 보안 강화는 아직 로드맵 항목입니다. SQLite 무효화는 공유 저장소가 정상일 때 다음 조회에 반영됩니다. OpenTelemetry 스팬은 선택 패키지를 설치하고 트레이싱을 켰을 때 생성됩니다(관측성 참고). ASGI 적합성은 `tests/test_asgi_conformance.py`로 검증합니다(HTTP 이벤트 순서, 청크 분할 본문, 연결 해제, 실패 경로를 포함한 lifespan). 계획과 완료 기준은 [프로덕션 로드맵](../PRODUCTION_ROADMAP.md)을 참고하세요.
 
 두 어댑터의 요청 본문은 최대 1 MiB이며 초과 시 413입니다. Axum의 기본 본문 수신 슬롯은 16개, 본문 수신 제한은 10초(408), Python 실행 슬롯은 64개입니다. 대기열은 실행 슬롯 수와 64 중 작은 값으로 제한하며 가득 차면 503입니다. 실행 및 본문 설정은 CLI에서 조정할 수 있습니다. HTTP/1.1 헤더 수신은 10초로 제한하지만 전체 연결 수는 제한하지 않습니다. 외부 ASGI 서버의 시간 제한은 해당 서버가 관리합니다. 루트가 아닌 경로의 마지막 `/`는 308로 리디렉션됩니다. 컴파일된 island는 개당 2 MiB, 전체 32 MiB 이하입니다.
 
@@ -261,9 +283,9 @@ CLI 플래그 `--structured-logs` / `--no-structured-logs`, `--metrics` / `--no-
 
 ## 요청 속도 제한
 
-요청 속도 제한은 선택 사항이며 프로세스별 토큰 버킷입니다. `pynext start --rate-limit 100 --rate-limit-window 60`은 클라이언트 IP당 60초에 100요청을 허용합니다(버스트가 곧 제한). 제한을 초과한 동적 요청은 초 단위 `Retry-After` 헤더와 함께 429를 받습니다. 키는 클라이언트 IP이며, `X-Forwarded-For`는 `--trusted-proxy`(IP 또는 CIDR, 반복 가능)로 지정한 피어에서만 신뢰합니다. 신뢰하지 않는 프록시의 헤더는 위조가 가능하므로 무시합니다. 코드에서는 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`처럼 사용합니다. 버킷은 프로세스별이며 재시작 시 사라집니다. `--rate-limit-backend redis`를 쓰면 버킷이 공유되며, Redis에 닿지 않을 때는 장애 정책에 따릅니다. 기본값(`fail_closed`, `--rate-limit-failure-policy fail_closed`)은 503으로 응답하고, `fail_open`은 요청을 허용합니다. 정적 파일과 신선한 ISR 페이지는 Python 브리지에 도달하기 전에 Rust 계층에서 제공되므로 속도 제한이 적용되지 않습니다.
+요청 속도 제한은 선택 사항이며 프로세스별 토큰 버킷입니다. `pynext start --rate-limit 100 --rate-limit-window 60`은 클라이언트 IP당 60초에 100요청을 허용합니다(버스트가 곧 제한). 제한을 초과한 동적 요청은 초 단위 `Retry-After` 헤더와 함께 429를 받습니다. WebSocket 핸드셰이크도 같은 방식으로 속도 제한을 받습니다. 핸드셰이크마다 같은 IP별 버킷에서 토큰 하나가 소모되고, 제한을 초과한 핸드셰이크는 `Retry-After`와 함께 429를 받습니다. 키는 클라이언트 IP이며, `X-Forwarded-For`는 `--trusted-proxy`(IP 또는 CIDR, 반복 가능)로 지정한 피어에서만 신뢰합니다. 신뢰하지 않는 프록시의 헤더는 위조가 가능하므로 무시합니다. 코드에서는 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`처럼 사용합니다. 버킷은 프로세스별이며 재시작 시 사라집니다. `--rate-limit-backend redis`를 쓰면 버킷이 공유되며, Redis에 닿지 않을 때는 장애 정책에 따릅니다. 기본값(`fail_closed`, `--rate-limit-failure-policy fail_closed`)은 503으로 응답하고, `fail_open`은 요청을 허용합니다. 정적 파일과 신선한 ISR 페이지는 Python 브리지에 도달하기 전에 Rust 계층에서 제공되므로 속도 제한이 적용되지 않습니다.
 
-전달된 주소는 오른쪽부터 신뢰하는 프록시를 거슬러 가장 가까운 비신뢰 주소를 사용합니다. 모든 중간 프록시를 정확히 등록해야 합니다. 프로세스당 버킷은 최대 10,000개이며, 모두 사용 중이면 새 주소가 가장 오래된 버킷을 내보내고 들어갑니다(기존 주소가 429를 받지는 않습니다). 신규 주소 생성은 윈도우당 최대 10,000개까지의 전역 슬라이딩 윈도우로 제한합니다. IPv6 주소는 /64 접두사별로 버킷을 공유합니다. `--rate-limit-exempt-path`(예: `/healthz`)로 지정한 경로는 속도 제한을 건너뜁니다.
+전달된 주소는 오른쪽부터 신뢰하는 프록시를 거슬러 가장 가까운 비신뢰 주소를 사용합니다. 모든 중간 프록시를 정확히 등록해야 합니다. 프로세스당 버킷은 최대 10,000개이며, 모두 사용 중이면 새 주소가 가장 오래된 버킷을 내보내고 들어갑니다(기존 주소가 429를 받지는 않습니다). 신규 주소 생성은 윈도우당 최대 10,000개까지의 전역 슬라이딩 윈도우로 제한합니다. 버킷 점수는 Redis `TIME`에서 가져온 정수 마이크로초입니다. 두 스크립트가 같은 마이크로초를 읽을 수 있는데, 그 경우 동점인 버킷은 똑같이 오래된 것이므로 버킷 키 기준으로 결정적으로 내보낼 버킷을 정합니다. 내보내진 소유자는 거부되지 않고 다음 요청에서 새 버킷을 받습니다. 점수는 최대 1년 윈도우를 훨씬 넘어서도 정확한 정수로 유지됩니다(현재 epoch 기준 마지막 자리 단위는 0.25 µs). 따라서 수 분에서 수 시간의 현실적인 윈도우는 배정밀도 한계의 영향을 받지 않습니다. IPv6 주소는 /64 접두사별로 버킷을 공유합니다. 이 묶음은 트레이드오프입니다. /48 전체를 가진 공격자는 서로 다른 /64를 65,536개 만들어 테이블과 신규 주소 윈도우를 채울 수 있고, 그러면 진짜 신규 주소는 윈도우가 지날 때까지 거부됩니다(내보내진 기존 주소는 거부되지 않습니다). `--rate-limit-ipv6-prefix-len 48`은 /48 전체를 하나의 버킷으로 묶어 이 공격을 막지만, 해당 접두사를 공유하는 모든 호스트가 하나의 버킷을 공유하므로 붐비는 /48에서는 무고한 사용자까지 함께 제한됩니다. 기본값은 64로 유지됩니다. `--rate-limit-exempt-path`(예: `/healthz`)로 지정한 경로는 속도 제한을 건너뜁니다.
 
 여러 워커: `pynext start --workers 4`는 하나의 리스너를 공유하는 워커 수퍼바이저를 실행합니다. `--port 0`으로 시작하면 할당된 포트를 워커 재시작 시에도 유지합니다. 워커의 인터프리터와 이벤트 루프는 독립적이며 메모리 캐시와 기본 요청 제한은 워커별입니다. SQLite·Redis ISR과 Redis 요청 제한은 공유할 수 있습니다. 수퍼바이저가 실패한 워커를 재시작하고 종료를 조정합니다. 처리 중 중단된 요청은 실패하므로 재시도해야 합니다. 공유 리스너 워커의 실행과 재시작은 Linux·macOS·Windows CI에서 검사하며, 신호 기반 수퍼바이저 검사는 Linux·macOS에서 수행합니다.
 

@@ -1,6 +1,7 @@
 from conftest import page_html
 import asyncio
 import json
+import sys
 
 import httpx
 import pytest
@@ -83,6 +84,38 @@ def test_ssg_in_asgi_and_axum_and_python_bypass(tmp_path):
     asyncio.run(run())
 
 
+def test_corrupt_manifest_fails_with_a_clear_build_error(tmp_path):
+    make_app(tmp_path)
+    write_manifest(tmp_path)
+    manifest = tmp_path / ".pynext" / "manifest.json"
+    manifest.write_text("{not valid json")
+    from pynext.build import load_manifest
+
+    with pytest.raises(ValueError, match="Invalid build manifest"):
+        load_manifest(tmp_path)
+    manifest.write_bytes(b"\xff\xfe invalid utf-8 \x80\x81")
+    with pytest.raises(ValueError, match="Invalid build manifest"):
+        load_manifest(tmp_path)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Unix permission bits are not meaningful on Windows",
+)
+def test_build_outputs_are_world_readable(tmp_path):
+    # _atomic_write used to leave files 0600 (NamedTemporaryFile's
+    # default); a build done by one user could then not be read by the
+    # server process running as another user.
+    make_app(tmp_path)
+    manifest = write_manifest(tmp_path)
+    outputs = [tmp_path / ".pynext" / "manifest.json"]
+    outputs += [tmp_path / ".pynext" / "static" / f"{entry['sha256']}.html"
+                for entry in manifest["static_pages"].values()]
+    assert outputs[1:]
+    for output in outputs:
+        assert output.stat().st_mode & 0o777 == 0o644, output
+
+
 def test_ssg_artifacts_integrity_and_failed_build_is_atomic(tmp_path):
     app = make_app(tmp_path)
     manifest = write_manifest(tmp_path)
@@ -103,6 +136,36 @@ def test_ssg_artifacts_integrity_and_failed_build_is_atomic(tmp_path):
     (tmp_path / ".pynext" / "static" / (digest + ".html")).write_text("corrupted")
     with pytest.raises(ValueError, match="integrity check"):
         create_app(tmp_path, production=True)
+
+
+def test_non_streaming_static_page_size_cap(tmp_path, monkeypatch):
+    from pynext import build as build_module
+
+    app_dir = make_app(tmp_path)
+    (app_dir / "page.py").write_text(
+        'from pynext import page, h\n@page(render="ssg")\n'
+        'def Page(): return h("p", {}, "x" * 200)\n', encoding="utf-8")
+    # The real cap is 8 MiB; shrink it for the test — the check itself
+    # is the same. A 200-char page is over a 100-byte cap.
+    monkeypatch.setattr(build_module, "MAX_STATIC_PAGE_BYTES", 100)
+    with pytest.raises(ValueError, match="exceeds build size limit"):
+        write_manifest(tmp_path)
+
+
+def test_streamed_ssg_timeout_fails_with_a_clear_build_error(tmp_path, monkeypatch):
+    from pynext import build as build_module
+
+    app_dir = make_app(tmp_path)
+    (app_dir / "page.py").write_text(
+        'from pynext import page, h\nimport asyncio\n@page(render="ssg")\n'
+        'async def Page():\n'
+        '    await asyncio.sleep(5)\n'
+        '    yield h("p", {}, "slow")\n', encoding="utf-8")
+    # The real limit is 30s; shrink it for the test — the timeout path
+    # (asyncio.timeout -> ValueError) is the same either way.
+    monkeypatch.setattr(build_module, "MAX_STREAMED_STATIC_SECONDS", 0.05)
+    with pytest.raises(ValueError, match="exceeded the build time limit"):
+        write_manifest(tmp_path)
 
 
 def test_streamed_ssg_is_rendered_at_build_and_served_as_static(tmp_path):

@@ -30,7 +30,12 @@ Scope and limits, stated plainly:
   event loop and rate-limit buckets. The ISR cache is per-process with
   the memory backend, but shared across workers with
   ``--cache-backend sqlite``. State other than shared ISR entries is
-  not shared between workers (see the manual).
+  not shared between workers (see the manual) — with one exception:
+  the CSRF signing key. The supervisor creates one key before spawning
+  (finding #23) and shares it with every worker, via the environment
+  and via the pickled worker config, so a double-submit CSRF cookie
+  issued by one worker verifies on every other worker, including
+  replacements started after a crash or a rolling restart.
 - The supervisor does not proxy or route requests: if a worker dies
   mid-request, that request fails (the connection drops) and the client
   must retry. Only the *server* survives, not the in-flight request.
@@ -47,6 +52,8 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, replace
+
+from .http import SecurityConfig, ensure_shared_csrf_signing_key
 
 log = logging.getLogger("pynext.supervisor")
 
@@ -82,6 +89,7 @@ class WorkerConfig:
     rate_limit_window: float = 60.0
     rate_limit_backend: str = "memory"
     rate_limit_exempt_paths: tuple = ()
+    rate_limit_ipv6_prefix_len: int = 64  # IPv6 bucket grouping (see ratelimit.py)
     trusted_proxies: tuple = ()
     # Shared-cache / observability settings, forwarded to each worker's
     # create_app so multi-worker mode honours them (finding #42/#45).
@@ -122,7 +130,8 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                    if config.rate_limit_backend == "redis" else {})
         limiter = limiter_type(config.rate_limit, config.rate_limit_window,
                                trusted_proxies=config.trusted_proxies,
-                               exempt_paths=config.rate_limit_exempt_paths, **options)
+                               exempt_paths=config.rate_limit_exempt_paths,
+                               ipv6_prefix_len=config.rate_limit_ipv6_prefix_len, **options)
     app = create_app(config.root, production=config.production, rate_limit=limiter,
                      cache_backend=config.cache_backend, cache_path=config.cache_path,
                      cache_failure_policy=config.cache_failure_policy,
@@ -289,13 +298,40 @@ def _rolling_restart(pool, config, context, listener):
     return True
 
 
+MAX_WORKERS = 64
+"""Most worker processes worth running: beyond this the supervisor spends
+more time spawning and watching children than serving (review #4 #5:
+--workers 100000 attempted tens of thousands of processes). The CLI
+rejects larger values at parse time; run_supervisor enforces the same
+bound for direct callers."""
+
+
 def run_supervisor(config, *, workers):
     """Spawn and supervise ``workers`` processes. Returns an exit code.
 
     Blocks until SIGINT/SIGTERM, then shuts every worker down gracefully.
     """
-    if workers < 1:
-        raise ValueError("workers must be >= 1")
+    if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= MAX_WORKERS:
+        raise ValueError(f"workers must be an integer between 1 and {MAX_WORKERS}")
+    # Finding #23: one CSRF signing key for every worker. Each worker
+    # re-imports the framework (spawn), so a per-process fallback key
+    # would differ per worker and a cookie issued by one worker would
+    # fail HMAC verification on the others (intermittent 403). Resolve
+    # the shared key first — an invalid configured key raises here,
+    # before any socket is bound or worker spawned — then publish it
+    # both ways workers can read it: the environment (inherited by
+    # spawn children, so their default configs agree) and the pickled
+    # worker config (so the app's own config carries it even if the
+    # environment were not inherited). The same ``config`` is reused
+    # for crash restarts and rolling restarts, so replacements keep
+    # the key. The key itself is never logged.
+    existing_key = getattr(config.security, "csrf_signing_key", None)
+    shared_key = ensure_shared_csrf_signing_key(existing_key)
+    if config.security is None:
+        config = replace(config, security=SecurityConfig(csrf_signing_key=shared_key))
+    else:
+        config = replace(config, security=replace(config.security, csrf_signing_key=shared_key))
+    log.info("Sharing one CSRF signing key across %d workers", workers)
     addresses = socket.getaddrinfo(config.host, config.port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
     family, kind, proto, _, address = addresses[0]
     listener = socket.socket(family, kind, proto)

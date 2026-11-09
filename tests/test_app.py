@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from pynext import _native, Response, create_app, h
-from pynext.build import write_manifest
+from pynext.build import discover, write_manifest
 from pynext.server import serve, start_native
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "basic"
@@ -175,6 +175,51 @@ def test_response_rejects_control_characters_in_media_type():
 
     with pytest.raises(ValueError, match="response header"):
         Response("ok", headers=[(b"x-test", b"bad\x01value")])
+
+
+def test_build_rejects_symlinked_app_directory(tmp_path):
+    # Review #4 #6: rglob does not descend into symlinked directories,
+    # so app/linked -> external was silently skipped (only "/" built).
+    # Every symlink under app/ is now rejected, like public symlinks.
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "page.py").write_text('from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "linked")\n')
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "page.py").write_text('from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "home")\n')
+    (app / "linked").symlink_to(external, target_is_directory=True)
+    with pytest.raises(ValueError, match="App symlink is not allowed"):
+        discover(tmp_path)
+
+
+@pytest.mark.parametrize("kind", ["file", "dir", "app"])
+def test_build_rejects_all_app_symlinks(tmp_path, kind):
+    # Same rule for the neighbouring cases: a symlinked file pointing
+    # inside app/ used to slip through (only outside targets tripped
+    # the escape check), and app/ itself could be a symlink to a
+    # directory outside the project.
+    app = tmp_path / "app"
+    app.mkdir()
+    if kind == "app":
+        real = tmp_path / "real-app"
+        real.mkdir()
+        (real / "page.py").write_text('from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "x")\n')
+        app.rmdir()
+        app.symlink_to(real, target_is_directory=True)
+        with pytest.raises(ValueError, match="symbolic link|symlink"):
+            discover(tmp_path)
+        return
+    (app / "page.py").write_text('from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "home")\n')
+    if kind == "file":
+        (app / "real.py").write_text("x = 1\n")
+        (app / "linked.py").symlink_to(app / "real.py")
+    elif kind == "dir":
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "page.py").write_text('from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "x")\n')
+        (app / "linked").symlink_to(external, target_is_directory=True)
+    with pytest.raises(ValueError, match="symbolic link|symlink"):
+        discover(tmp_path)
 
 
 def test_build_rejects_stale_sources(tmp_path):

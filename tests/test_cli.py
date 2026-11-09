@@ -1,9 +1,11 @@
+import asyncio
 import sys
 from pathlib import Path
 
 import pytest
 
-from pynext import cli
+from pynext import cli, create_app
+from pynext.server import start_native
 
 
 @pytest.mark.parametrize("value", ["-1", "65536", "not-a-port"])
@@ -36,6 +38,104 @@ def test_cli_rejects_out_of_range_limits_before_starting(flag, value, message, m
         cli.main()
     assert error.value.code == 2
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flag,value,message", [
+    ("--max-concurrent", "1000001", "--max-concurrent must be an integer <= 1000000"),
+    ("--max-concurrent", "99999999999999999999999999", "--max-concurrent must be an integer <= 1000000"),
+    ("--max-waiting", "1000001", "--max-waiting must be an integer <= 1000000"),
+    ("--body-capacity", "1000001", "--body-capacity must be an integer <= 1000000"),
+    ("--max-connections", "1000001", "--max-connections must be an integer <= 1000000"),
+    ("--max-connections-per-ip", "1000001", "--max-connections-per-ip must be an integer <= 1000000"),
+    ("--shutdown-timeout", "3601", "--shutdown-timeout must be an integer <= 3600"),
+    ("--shutdown-timeout", "99999999999999999999999999", "--shutdown-timeout must be an integer <= 3600"),
+    ("--workers", "65", "--workers must be an integer <= 64"),
+    ("--workers", "100000", "--workers must be an integer <= 64"),
+    ("--acquire-timeout-ms", "86400001", "--acquire-timeout-ms must be an integer <= 86400000"),
+    ("--body-timeout-ms", "86400001", "--body-timeout-ms must be an integer <= 86400000"),
+    ("--header-read-timeout-ms", "86400001", "--header-read-timeout-ms must be an integer <= 86400000"),
+    ("--body-min-rate-bytes-per-sec", "1000000001",
+     "--body-min-rate-bytes-per-sec must be an integer <= 1000000000"),
+])
+def test_cli_rejects_above_maximum_limits_before_starting(flag, value, message, monkeypatch, capsys):
+    # Review #4 #5: huge counts used to die with an OverflowError
+    # traceback (or, for --workers, attempt a resource-exhausting spawn);
+    # now argparse rejects them with exit code 2 and a clear message.
+    monkeypatch.setattr(sys, "argv", ["pynext", "dev", flag, value])
+    monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: pytest.fail("unexpected startup"))
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_cli_accepts_maximum_limits(tmp_path, monkeypatch):
+    # Boundary values (not just the small ones) must still reach serve()
+    # unchanged.
+    root = tmp_path.resolve()
+    seen = []
+    app = object()
+    monkeypatch.setattr(cli, "create_app", lambda path, production, cache_backend="memory", cache_path=None,
+                        rate_limit=None, **kwargs:
+                        seen.append(("app", path, production, cache_backend, cache_path)) or app)
+
+    async def serve(*args, **kwargs):
+        seen.append(("serve", args, kwargs))
+
+    monkeypatch.setattr(cli, "serve", serve)
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root),
+                                      "--max-concurrent", "1000000", "--acquire-timeout-ms", "86400000",
+                                      "--max-waiting", "1000000", "--body-capacity", "1000000",
+                                      "--body-timeout-ms", "86400000", "--max-connections", "1000000",
+                                      "--max-connections-per-ip", "1000000",
+                                      "--header-read-timeout-ms", "86400000",
+                                      "--body-min-rate-bytes-per-sec", "1000000000",
+                                      "--shutdown-timeout", "3600"])
+    cli.main()
+    assert seen[0][0] == "app"
+    args, kwargs = seen[1][1], seen[1][2]
+    assert args[1:] == ("127.0.0.1", 3000, 1000000, 86400000, 1000000, 86400000)
+    assert kwargs["shutdown_timeout"] == 3600
+    assert kwargs["max_waiting"] == 1000000
+    assert kwargs["max_connections"] == 1000000
+    assert kwargs["max_connections_per_ip"] == 1000000
+    assert kwargs["header_read_timeout_ms"] == 86400000
+    assert kwargs["body_min_rate_bytes_per_sec"] == 1000000000
+
+
+def test_cli_workers_boundary_reaches_supervisor(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(cli, "run_supervisor", lambda config, workers: seen.append(workers) or 0)
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path), "--workers", "64"])
+    assert cli.main() == 0
+    assert seen == [64]
+
+
+def test_server_limits_rejected_directly_without_overflow(tmp_path):
+    # Review #4 #5: a direct serve()/start_native() caller bypasses the
+    # CLI, so the same bounds are enforced there with a clear ValueError
+    # instead of the PyO3 OverflowError traceback.
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "page.py").write_text('from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "ok")\n')
+    app = create_app(tmp_path)
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        with pytest.raises(ValueError, match="max_concurrent must be an integer between 1 and 1000000"):
+            start_native(app, loop, port=0, max_concurrent=99999999999999999999999999)
+        with pytest.raises(ValueError, match="shutdown_timeout must be a number between 0 and 3600"):
+            start_native(app, loop, port=0, shutdown_timeout=99999999999999999999999999)
+        with pytest.raises(ValueError, match="max_waiting must be an integer between 0 and 1000000"):
+            start_native(app, loop, port=0, max_waiting=1000001)
+        from pynext.supervisor import WorkerConfig, run_supervisor
+        config = WorkerConfig(root=str(tmp_path), host="127.0.0.1", port=0, production=True,
+                              max_concurrent=64, acquire_timeout_ms=1000, body_capacity=16,
+                              body_timeout_ms=10000)
+        with pytest.raises(ValueError, match="workers must be an integer between 1 and 64"):
+            run_supervisor(config, workers=100000)
+
+    asyncio.run(run())
 
 
 def test_cli_accepts_boundary_limits(tmp_path, monkeypatch):
@@ -129,6 +229,18 @@ def test_cli_shutdown_timeout_reaches_serve(tmp_path, monkeypatch):
                                       "--shutdown-timeout", "-1"])
     with pytest.raises(SystemExit):
         cli.main()
+
+
+def test_cli_build_reports_manifest_errors_instead_of_traceback(tmp_path, monkeypatch, capsys):
+    def failing_manifest(path):
+        raise ValueError("Application sources changed during build; retry the build")
+
+    monkeypatch.setattr(cli, "write_manifest", failing_manifest)
+    monkeypatch.setattr(sys, "argv", ["pynext", "build", "--dir", str(tmp_path)])
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert "Application sources changed during build" in capsys.readouterr().err
 
 
 def test_cli_security_flags_reach_app(tmp_path, monkeypatch):
