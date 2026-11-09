@@ -5,7 +5,7 @@ from pynext import (
     App, Database, DjangoResource, JSONResponse, RateLimiter, Request, Response, SecurityConfig,
     Session, SessionMiddleware, SQLiteSessionStore, StreamingResponse, WebSocket,
     WebSocketPubSub, create_app, csrf_protect, fragment, h, island, page,
-    require_auth, route, websocket,
+    __version__, require_auth, route, websocket,
 )
 from pynext.types import RenderNode
 
@@ -55,6 +55,7 @@ async def resources(django: DjangoResource, broker: WebSocketPubSub) -> None:
 app = create_app(".", security=SecurityConfig(cors_allowed_origins=("https://client.example",)),
                  resources={"db": Database()}, middleware=[SessionMiddleware(SQLiteSessionStore("session.db"))])
 assert_type(app, App)
+assert_type(__version__, str)
 handler: Callable[[Request], Awaitable[Response]] = post
 stream: Response = StreamingResponse(chunks())
 assert_type(RateLimiter(10, 60, exempt_paths=("/public",)).is_exempt_path("/public?literal"), bool)

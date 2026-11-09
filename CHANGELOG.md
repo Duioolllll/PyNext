@@ -2,12 +2,14 @@
 
 All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
 
-## Unreleased
-
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.
 - Validate ASGI HTTP paths before rate limiting so malformed paths return 400 without consuming tokens, matching native admission. Add the public `is_exempt_path()` type signature and real Redis/shared-capacity regression coverage.
+- Fix a rate-limit exemption bypass in custom `is_exempt()` hooks delegating to `super()`: a decoded literal `?` stays part of the path, so `/input%3Fother` cannot inherit `/input`'s exemption. Preserve query-aware direct calls and isolate the decoded contract across concurrent callbacks (review #7 B-1).
+- Reserve decoded health-probe paths before native static serving, including percent-encoded `/healthz` and `/readyz` aliases, so same-name public assets cannot shadow liveness or readiness (review #7 B-2).
+- Record cancelled handlers as 499 for connection/task cancellation and 504 for a native handler deadline, preserving cancellation propagation and synchronous work capacity instead of counting these as internal errors (review #7 B-3).
+- Expose typed `pynext.__version__` from installed distribution metadata, expose the compiled native version, align all workspace crates and Cargo.lock with 0.1.2, and verify version consistency in every isolated wheel smoke check (review #7 A-1/A-2). Remove the empty Unreleased heading (A-3).
 
 ## 0.1.1 (2026-11-09)
 
@@ -67,7 +69,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
   `docs/WHEEL_RELEASE.md`. CI still does not upload anything to PyPI;
   publishing stays a manual maintainer step.
 
-The current release is **0.1.1** (top section). The `v0.7.0a1` section below is a release plan superseded by the 0.1.0 decision; its items were merged to `main` and are included in 0.1.0. The `v0.1.0` section at the bottom is the early reconstructed snapshot, not the current release.
+The current release is **0.1.2** (top section). The `v0.7.0a1` section below is a release plan superseded by the 0.1.0 decision; its items were merged to `main` and are included in 0.1.0. The `v0.1.0` section at the bottom is the early reconstructed snapshot, not the current release.
 
 ## 0.1.0
 

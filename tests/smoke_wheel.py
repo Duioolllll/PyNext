@@ -75,9 +75,10 @@ with tempfile.TemporaryDirectory(prefix="pynext-wheel-check-") as directory:
                    cwd=ROOT, check=True)
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
-    check = ("from pathlib import Path; import pynext, sys; "
-             "assert Path(pynext.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve())")
-    subprocess.run([str(wheel_python), "-c", check, str(venv)], cwd=ROOT, env=env, check=True)
+    check = ("from pathlib import Path; from importlib.metadata import version; import pynext, sys; "
+             "assert Path(pynext.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()); "
+             "assert pynext.__version__ == pynext._native.__version__ == version('pynext-framework') == sys.argv[2]")
+    subprocess.run([str(wheel_python), "-c", check, str(venv), parts[1]], cwd=ROOT, env=env, check=True)
     subprocess.run([str(wheel_python), "-m", "pynext.cli", "build", "--dir", str(ROOT / "examples/basic")],
                    cwd=ROOT, env=env, check=True)
     # Serve the example from the installed wheel as well as building it. Reuse

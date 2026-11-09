@@ -1,5 +1,9 @@
 """Public API for the experimental PyNext framework."""
 
+from importlib.metadata import version as _distribution_version
+
+__version__ = _distribution_version("pynext-framework")
+
 from .app import App, create_app
 from .auth import require_auth, require_permission
 from .client_dsl import ClientDSLCompileError, compile_client_dsl
@@ -20,7 +24,7 @@ from .redis_rate import RedisRateLimiter
 from .routing import route, websocket
 from .sessions import RedisSessionStore, Session, SessionMiddleware, SQLiteSessionStore
 
-__all__ = ["App", "create_app", "h", "fragment", "island", "layout", "model_prop", "page", "route", "websocket", "Database",
+__all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layout", "model_prop", "page", "route", "websocket", "Database",
            "DjangoBusyError", "DjangoResource",
            "BadRequest", "Request", "RequestCancelled", "Response", "JSONResponse", "StreamingResponse", "SecurityConfig",
            "csrf_protect", "new_csrf_token", "new_csp_nonce", "set_csrf_cookie", "sign_csrf_token",

@@ -14,6 +14,7 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 
 | Symbol | Module |
 | --- | --- |
+| `__version__` | `pynext` |
 | `App` | `pynext.app` |
 | `create_app` | `pynext.app` |
 | `h` | `pynext.components` |

@@ -1,3 +1,6 @@
 [workspace]
 members = ["crates/pynext-router", "crates/pynext-cache", "crates/pynext-native"]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.2"
