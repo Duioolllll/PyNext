@@ -399,7 +399,9 @@ def test_cli_rejects_invalid_rate_limit_flags(monkeypatch, capsys):
         (["pynext", "start", "--rate-limit-window", "not-a-number"], "--rate-limit-window must be a number > 0"),
         (["pynext", "start", "--rate-limit-window", "nan"], "--rate-limit-window must be a number > 0"),
         (["pynext", "start", "--rate-limit-window", "inf"], "--rate-limit-window must be a number > 0"),
-        (["pynext", "start", "--rate-limit-window", "-inf"], "--rate-limit-window must be a number > 0"),
+        # "-inf" as a separate argv word looks like an option to argparse,
+        # so pass it in --flag=value form to reach the type check.
+        (["pynext", "start", "--rate-limit-window=-inf"], "--rate-limit-window must be a number > 0"),
         (["pynext", "start", "--rate-limit", "10", "--trusted-proxy", "not-an-ip"],
          "Invalid trusted proxy"),
         (["pynext", "start", "--rate-limit", "10", "--rate-limit-exempt-path", "healthz"],

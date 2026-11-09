@@ -85,11 +85,15 @@ def test_standalone_bundle_is_deterministic_and_drops_stale_pynext_files(tmp_pat
     # The installed pynext copy carries a file the source tree no longer
     # has; overlaying the source used to leave it in the bundle.
     _fake_purelib(monkeypatch, tmp_path, pynext_extra={"stale_ghost.py": "# deleted from source\n"})
+    # Bundles are ~126MB each: hash and drop the first before building
+    # the second so only one is on disk at a time.
     build_standalone(project, tmp_path / "bundle-a")
+    assert not (_site_packages(tmp_path / "bundle-a") / "pynext" / "stale_ghost.py").exists()
+    hashes_a = _tree_hashes(tmp_path / "bundle-a")
+    shutil.rmtree(tmp_path / "bundle-a")
     build_standalone(project, tmp_path / "bundle-b")
-    for bundle in (tmp_path / "bundle-a", tmp_path / "bundle-b"):
-        assert not (_site_packages(bundle) / "pynext" / "stale_ghost.py").exists()
-    assert _tree_hashes(tmp_path / "bundle-a") == _tree_hashes(tmp_path / "bundle-b")
+    assert not (_site_packages(tmp_path / "bundle-b") / "pynext" / "stale_ghost.py").exists()
+    assert _tree_hashes(tmp_path / "bundle-b") == hashes_a
 
 
 def test_standalone_runs_after_relocation_and_refuses_overwrite(tmp_path):
