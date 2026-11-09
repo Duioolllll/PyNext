@@ -66,6 +66,9 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `parse_trusted_proxies` | `pynext.proxy` |
 | `FAIL_OPEN` | `pynext.failure_policy` |
 | `FAIL_CLOSED` | `pynext.failure_policy` |
+| `url_for` | `pynext.routing` |
+| `preprocess_pathname` | `pynext.routing` |
+| `add_base_path` | `pynext.routing` |
 
 ## Security defaults (`SecurityConfig`)
 

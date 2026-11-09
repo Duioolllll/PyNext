@@ -44,6 +44,7 @@ from .observability import (
 )
 from .proxy import ProxyTrust
 from .ratelimit import _is_exempt_path, rate_limited_response
+from .routing import normalize_base_path, preprocess_pathname, validate_trailing_slash
 from .sessions import SessionMiddleware
 from .static import asset_response
 from .ws_origin import websocket_origin_allowed
@@ -331,10 +332,17 @@ class App:
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
                  resources=None, cache_url=None, cache_failure_policy=None,
                  websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
-                 trusted_proxies=None, sync_workers=32):
+                 trusted_proxies=None, sync_workers=32, base_path="", trailing_slash="redirect"):
         if isinstance(sync_workers, bool) or not isinstance(sync_workers, int) or not 1 <= sync_workers <= 1024:
             raise ValueError("sync_workers must be an integer from 1 to 1024")
         self.sync_workers = sync_workers
+        # Path preprocessing (REPORT.md §2.3 P2, track A §2.8): the base
+        # path is stripped before route matching and re-added by
+        # url_for(); the trailing-slash policy names the 308 behaviour
+        # that used to be hardcoded in _dispatch. Both are validated
+        # here so a bad deployment fails at startup.
+        self.base_path = normalize_base_path(base_path)
+        self.trailing_slash = validate_trailing_slash(trailing_slash)
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
         if production and debug:
@@ -766,10 +774,18 @@ class App:
             await asyncio.sleep(0.05)
 
     async def revalidate(self, path):
-        """Invalidate one decoded ISR path for this app instance."""
+        """Invalidate one decoded ISR path for this app instance.
+
+        A base-path-prefixed path is accepted and stripped first, so
+        operators can pass the public URL; the trailing-slash rule
+        still applies to the app-relative path.
+        """
         if not isinstance(path, str):
             raise TypeError("ISR path must be a string")
         path = _decode_path(path)
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash="redirect")
+        if path is None:
+            raise ValueError("Path does not match an ISR page")
         if path != "/" and path.endswith("/"):
             raise ValueError("ISR path must not have a trailing slash")
         match = self.router.matches(path)
@@ -1086,9 +1102,20 @@ class App:
             if request.method == "HEAD":
                 response.body = b""
             return response
+        # Path preprocessing (track A §2.8): strip the base path before
+        # matching, then apply the trailing-slash policy. Everything
+        # below — route matching, `/_pynext/` assets, public files,
+        # SSG/ISR lookups — sees the app-relative path. The raw path
+        # is kept for the 308 Location, so the prefix survives the
+        # redirect. A path outside the base path is a plain 404.
+        raw_path = path
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
+        if path is None:
+            route_var.set("__not_found__")
+            return Response("Not Found", status=404)
         if path != "/" and path.endswith("/"):
             route_var.set("__redirect__")
-            location = quote(path.rstrip("/"), safe="/!$&'()*+,;=:@-._~").encode("ascii")
+            location = quote(raw_path.rstrip("/"), safe="/!$&'()*+,;=:@-._~").encode("ascii")
             if request.query_string:
                 if any(c < 32 or c == 127 for c in request.query_string):
                     return Response("Bad Request", status=400)
@@ -1342,6 +1369,11 @@ class App:
         token's ``set-cookie`` would never reach the client while the
         old token is already gone from the store.
         """
+        # Same path preprocessing as _dispatch: the pre-flight matches
+        # the app-relative path, so a prefixed upgrade finds its route.
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
+        if path is None:
+            return Response("Not Found", status=404)
         match = self.router.matches(path)
         if match is None:
             return Response("Not Found", status=404)
@@ -1381,6 +1413,16 @@ class App:
         try:
             path = _decode_path(scope["path"], scope.get("raw_path"))
         except (ValueError, UnicodeError):
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        # Same path preprocessing as _dispatch: a prefixed handshake
+        # matches the app-relative path; outside the base path the
+        # upgrade is refused like an unknown route. The raw path is
+        # kept for _authorize_websocket below, which preprocesses it
+        # itself — passing the stripped path twice would 404.
+        raw_path = path
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
+        if path is None:
             await send({"type": "websocket.close", "code": 1008})
             return
         match = self.router.matches(path)
@@ -1429,7 +1471,7 @@ class App:
         # Authorization runs before the handshake completes: a denied
         # upgrade is refused with a close instead of an accept, so the
         # handler never runs and no data is sent.
-        denied = await self._authorize_websocket(path, scope.get("query_string", b""),
+        denied = await self._authorize_websocket(raw_path, scope.get("query_string", b""),
                                                  scope.get("headers", []))
         if denied is not None:
             await send({"type": "websocket.close", "code": 1008})
@@ -1636,11 +1678,12 @@ class App:
 def create_app(root=".", *, production=False, security=None, cache_backend="memory", cache_path=None,
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
                cache_failure_policy=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
-               trusted_proxies=None, sync_workers=32):
+               trusted_proxies=None, sync_workers=32, base_path="", trailing_slash="redirect"):
     root = Path(root).resolve()
     return App(root, load_manifest(root) if production else discover(root), production=production,
                security=security, cache_backend=cache_backend, cache_path=cache_path,
                observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
                resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
                websocket_max_message=websocket_max_message, hot_reload=hot_reload,
-               trusted_proxies=trusted_proxies, sync_workers=sync_workers)
+               trusted_proxies=trusted_proxies, sync_workers=sync_workers,
+               base_path=base_path, trailing_slash=trailing_slash)

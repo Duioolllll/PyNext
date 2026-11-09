@@ -18,6 +18,8 @@ class App:
     proxy_trust: ProxyTrust
     resources: Mapping[str, Resource]
     metrics: MetricsCollector
+    base_path: str
+    trailing_slash: Literal["redirect", "ignore"]
     def __init__(self, root: str | PathLike[str], manifest: dict[str, Any], *, production: bool = ...,
                  security: SecurityConfig | None = ..., cache_backend: Literal["memory", "sqlite", "redis"] = ...,
                  cache_path: str | PathLike[str] | None = ..., observability: ObservabilityConfig | None = ...,
@@ -25,7 +27,8 @@ class App:
                  debug: bool = ..., resources: dict[str, Resource] | None = ..., cache_url: str | None = ...,
                  cache_failure_policy: Literal["fail_open", "fail_closed"] | None = ...,
                  websocket_max_message: int = ..., hot_reload: bool = ...,
-                 trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...) -> None: ...
+                 trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...,
+                 base_path: str = ..., trailing_slash: Literal["redirect", "ignore"] = ...) -> None: ...
     def configure_observability(self, config: ObservabilityConfig) -> App: ...
     async def startup(self) -> None: ...
     async def shutdown(self) -> None: ...
@@ -54,4 +57,5 @@ def create_app(root: str | PathLike[str] = ..., *, production: bool = ...,
                debug: bool = ..., resources: dict[str, Resource] | None = ..., cache_url: str | None = ...,
                cache_failure_policy: Literal["fail_open", "fail_closed"] | None = ...,
                websocket_max_message: int = ..., hot_reload: bool = ...,
-               trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...) -> App: ...
+               trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...,
+               base_path: str = ..., trailing_slash: Literal["redirect", "ignore"] = ...) -> App: ...

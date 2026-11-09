@@ -17,7 +17,7 @@ from .proxy import ProxyTrust, ResolvedProxy, parse_trusted_proxies
 from .pubsub import PubSubOverflow, WebSocketPubSub
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
-from .routing import route, websocket
+from .routing import add_base_path, preprocess_pathname, route, url_for, websocket
 from .sessions import RedisSessionStore, Session, SessionMiddleware, SQLiteSessionStore
 
 __all__ = ["App", "create_app", "h", "fragment", "island", "layout", "model_prop", "page", "route", "websocket", "Database",
@@ -30,4 +30,5 @@ __all__ = ["App", "create_app", "h", "fragment", "island", "layout", "model_prop
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
            "Session", "SessionMiddleware", "SQLiteSessionStore", "RedisSessionStore", "require_auth", "require_permission",
            "RedisRateLimiter", "WebSocketPubSub", "PubSubOverflow",
-           "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies", "FAIL_OPEN", "FAIL_CLOSED"]
+           "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies", "FAIL_OPEN", "FAIL_CLOSED",
+           "url_for", "preprocess_pathname", "add_base_path"]
