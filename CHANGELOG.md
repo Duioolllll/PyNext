@@ -4,6 +4,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Require a same-origin WebSocket `Origin` by default on ASGI and Axum before accepting the handshake. This changes behavior for non-browser clients that omit `Origin`: opt in with `SecurityConfig(websocket_allow_missing_origin=True)` or `--ws-allow-missing-origin`. Additional exact HTTP(S) origins can be configured with `websocket_allowed_origins` or repeatable `--ws-allowed-origin`; wildcard, `null`, malformed and duplicate origins are rejected. Forwarded host and scheme are honored only for configured trusted proxies. Origin checks do not replace application authentication.
 - Add an optional, bounded Django ORM/form resource with lifecycle-managed worker cleanup; Django HTTP apps and templates remain out of scope.
 - Serialize overlapping SQLite memory-database sessions and application/database lifecycle transitions, and reopen shared ISR stores after startup failure or shutdown.
 - Add an optional SQLAlchemy async `Database` resource for SQLite and PostgreSQL, with lifespan-managed connection pools and explicit session and transaction contexts. Include PostgreSQL integration CI and an Alembic guide.

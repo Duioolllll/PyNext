@@ -1,8 +1,9 @@
 """Minimal WebSocket echo endpoint: text and binary messages are sent back unchanged.
 
-Connect from a browser with::
+Connect from a page served by this app using the browser console::
 
-    const ws = new WebSocket("ws://127.0.0.1:3000/ws/echo");
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${scheme}://${location.host}/ws/echo`);
     ws.onmessage = (event) => console.log(event.data);
     ws.onopen = () => ws.send("hello");
 

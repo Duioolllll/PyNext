@@ -148,6 +148,10 @@ async def stream():
 
 `route.py` は HTTP ハンドラとあわせて `@websocket` ハンドラを 1 つエクスポートできます。ハンドラは `WebSocket` を受け取り、送受信の前に `await websocket.accept()` を呼ぶ必要があります。テキストとバイナリのメッセージをやり取りでき、相手が切断すると `receive()` で `WebSocketDisconnect` が発生するため、接続ごとのクリーンアップは `finally` ブロックに書きます。
 
+開発版は ASGI・Axum で接続前に `Origin` を検査し、既定では同一オリジンのみを許可します。追加する HTTP(S) オリジンは `SecurityConfig(websocket_allowed_origins=("https://client.example",))` を `create_app(..., security=...)` に渡すか、`--ws-allowed-origin https://client.example` を繰り返し指定します。スキームと既定以外のポートを含め、`*` と `null` は使えません。`Origin` を送らない既存の非ブラウザークライアントには `websocket_allow_missing_origin=True` または `--ws-allow-missing-origin` が必要です。公開済み 0.1.0 にはこの検査はありません。`Origin` は偽装・省略できるため、接続の認証・認可はアプリで行ってください。プロキシ利用時は実際のプロキシだけを `--trusted-proxy` で指定し、クライアント由来の転送ヘッダーをプロキシが上書きするよう設定してください。
+
+ASGI で PyNext が信頼プロキシを識別するには、サーバーが `scope["client"]` に元の接続元を保持する必要があります。PyNext で転送ヘッダーを解釈する場合は、ASGI サーバー側での先行処理を無効にしてください（Uvicorn は `--no-proxy-headers`）。
+
 ~~~python
 # app/ws/echo/route.py
 from pynext import WebSocket, WebSocketDisconnect, websocket

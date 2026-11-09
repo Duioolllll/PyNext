@@ -17,7 +17,7 @@ use pynext_cache::{CacheResult, PageCache};
 use pynext_router::Router;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyList};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -434,6 +434,8 @@ struct ServerState {
     websocket_protocols: HashMap<String, Vec<String>>,
     websocket_max_message: usize,
     ws_callback: Option<Py<PyAny>>,
+    ws_origin_callback: Option<Py<PyAny>>,
+    ws_origin_capacity: Arc<Semaphore>,
 }
 
 #[pyclass(name = "_RequestCancellation")]
@@ -1182,6 +1184,67 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         if !state.websocket_paths.contains(&pattern) {
             return plain_response(StatusCode::NOT_FOUND, "Not Found", &state.security_headers);
         }
+        // Origin policy must run before the HTTP 101 response. Limit the
+        // Python checks separately so stalled callbacks cannot queue without
+        // bound or consume the ordinary HTTP execution budget.
+        let Ok(permit) = Arc::clone(&state.ws_origin_capacity).try_acquire_owned() else {
+            return plain_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+                &state.security_headers,
+            );
+        };
+        if state.ws_origin_callback.is_none() {
+            return plain_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+                &state.security_headers,
+            );
+        }
+        let origin_headers: Vec<(Vec<u8>, Vec<u8>)> = parts
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
+            .collect();
+        let peer = parts
+            .extensions
+            .get::<PeerAddr>()
+            .map(|addr| addr.0.ip().to_string());
+        let origin_state = Arc::clone(&state);
+        let decision = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                // The permit stays with the task even if the timeout expires.
+                let _permit = permit;
+                Python::with_gil(|py| -> PyResult<bool> {
+                    let headers = PyList::empty(py);
+                    for (name, value) in &origin_headers {
+                        headers.append((PyBytes::new(py, name), PyBytes::new(py, value)))?;
+                    }
+                    origin_state
+                        .ws_origin_callback
+                        .as_ref()
+                        .expect("callback checked above")
+                        .bind(py)
+                        .call1((headers, peer))?
+                        .extract()
+                })
+            }),
+        )
+        .await;
+        match decision {
+            Ok(Ok(Ok(true))) => {}
+            Ok(Ok(Ok(false))) => {
+                return plain_response(StatusCode::FORBIDDEN, "Forbidden", &state.security_headers);
+            }
+            _ => {
+                return plain_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service Unavailable",
+                    &state.security_headers,
+                );
+            }
+        }
         let mut parts = parts;
         let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
             Ok(upgrade) => upgrade,
@@ -1637,7 +1700,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1669,6 +1732,7 @@ impl NativeServer {
         body_min_rate_bytes_per_sec: usize,
         security_headers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
         drain_timeout_secs: f64,
+        websocket_origin_callback: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -1841,6 +1905,8 @@ impl NativeServer {
                     websocket_protocols: websocket_protocols.unwrap_or_default(),
                     websocket_max_message,
                     ws_callback: websocket_callback,
+                    ws_origin_callback: websocket_origin_callback,
+                    ws_origin_capacity: Arc::new(Semaphore::new(64)),
                 });
                 // The accept loop below enforces the connection budget from
                 // this handle; the router takes its own clone via with_state.

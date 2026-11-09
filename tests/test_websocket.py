@@ -18,6 +18,7 @@ from pynext import MAX_WS_MESSAGE, create_app
 from pynext.server import start_native
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "basic"
+SAME_ORIGIN_HEADERS = [(b"host", b"localhost"), (b"origin", b"http://localhost")]
 
 
 class _ScriptedConnection:
@@ -45,7 +46,7 @@ def test_asgi_echo_text_and_binary_round_trip():
             {"type": "websocket.receive", "bytes": b"\x00\x01\x02"},
             {"type": "websocket.disconnect", "code": 1000},
         ])
-        await app({"type": "websocket", "path": "/ws/echo", "headers": [],
+        await app({"type": "websocket", "path": "/ws/echo", "headers": SAME_ORIGIN_HEADERS,
                    "query_string": b""}, conn.receive, conn.send)
         assert conn.sent == [
             {"type": "websocket.accept"},
@@ -67,7 +68,7 @@ def test_asgi_peer_close_ends_handler_and_oversized_message():
         ])
         # The echo handler never closes on its own, so the peer closing must
         # end the handler without the server sending anything more.
-        await app({"type": "websocket", "path": "/ws/echo", "headers": [],
+        await app({"type": "websocket", "path": "/ws/echo", "headers": SAME_ORIGIN_HEADERS,
                    "query_string": b""}, conn.receive, conn.send)
         assert conn.sent == [
             {"type": "websocket.accept"},
@@ -83,7 +84,7 @@ def test_asgi_peer_close_ends_handler_and_oversized_message():
             {"type": "websocket.connect"},
             {"type": "websocket.receive", "text": "x" * (MAX_WS_MESSAGE + 1)},
         ])
-        await app({"type": "websocket", "path": "/ws/echo", "headers": [],
+        await app({"type": "websocket", "path": "/ws/echo", "headers": SAME_ORIGIN_HEADERS,
                    "query_string": b""}, conn.receive, conn.send)
         assert conn.sent == [
             {"type": "websocket.accept"},
@@ -122,7 +123,7 @@ def test_asgi_disconnect_runs_handler_cleanup(tmp_path):
             {"type": "websocket.connect"},
             {"type": "websocket.disconnect", "code": 1000},
         ])
-        await app({"type": "websocket", "path": "/ws", "headers": [],
+        await app({"type": "websocket", "path": "/ws", "headers": SAME_ORIGIN_HEADERS,
                    "query_string": b""}, conn.receive, conn.send)
         assert module.cleanup_log == ["disconnected", "cleaned-up"]
         assert conn.sent == [{"type": "websocket.accept"}]
@@ -141,7 +142,7 @@ def test_asgi_handler_returning_without_accept_closes(tmp_path):
         )
         app = _tmp_ws_app(tmp_path, source)
         conn = _ScriptedConnection([{"type": "websocket.connect"}])
-        await app({"type": "websocket", "path": "/ws", "headers": [],
+        await app({"type": "websocket", "path": "/ws", "headers": SAME_ORIGIN_HEADERS,
                    "query_string": b""}, conn.receive, conn.send)
         assert conn.sent == [{"type": "websocket.close", "code": 1000}]
         await app.isr.close()
@@ -174,7 +175,7 @@ class _RawWSClient:
         self.key = base64.b64encode(os.urandom(16)).decode("ascii")
         protocol_header = f"Sec-WebSocket-Protocol: {', '.join(protocols)}\r\n" if protocols else ""
         request = (
-            f"GET {path} HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\n"
+            f"GET {path} HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nUpgrade: websocket\r\n"
             f"Connection: Upgrade\r\nSec-WebSocket-Key: {self.key}\r\n"
             f"Sec-WebSocket-Version: 13\r\n{protocol_header}\r\n"
         )
@@ -328,13 +329,13 @@ def test_websocket_subprotocol_and_configured_message_limit(tmp_path):
         app = create_app(tmp_path, websocket_max_message=4)
         conn = _ScriptedConnection([{"type": "websocket.connect"},
                                     {"type": "websocket.receive", "text": "12345"}])
-        await app({"type": "websocket", "path": "/ws", "headers": [], "query_string": b"",
+        await app({"type": "websocket", "path": "/ws", "headers": SAME_ORIGIN_HEADERS, "query_string": b"",
                    "subprotocols": ["slow", "fast"]}, conn.receive, conn.send)
         assert conn.sent == [{"type": "websocket.accept", "subprotocol": "fast"},
                              {"type": "websocket.send", "text": "fast"},
                              {"type": "websocket.close", "code": 1009, "reason": "message too large"}]
         denied = _ScriptedConnection([{"type": "websocket.connect"}])
-        await app({"type": "websocket", "path": "/ws", "headers": [], "query_string": b"",
+        await app({"type": "websocket", "path": "/ws", "headers": SAME_ORIGIN_HEADERS, "query_string": b"",
                    "subprotocols": ["unsupported"]}, denied.receive, denied.send)
         assert denied.sent == [{"type": "websocket.close", "code": 1008}]
         server = start_native(app, asyncio.get_running_loop(), port=0)
@@ -466,18 +467,18 @@ def test_dynamic_websocket_route_matches_asgi_and_native(tmp_path):
     async def run():
         app = create_app(tmp_path)
         conn = _ScriptedConnection([{"type": "websocket.connect"}])
-        await app({"type": "websocket", "path": "/ws/abc", "headers": [],
+        await app({"type": "websocket", "path": "/ws/abc", "headers": SAME_ORIGIN_HEADERS,
                    "query_string": b""}, conn.receive, conn.send)
         assert conn.sent[:2] == [{"type": "websocket.accept"},
                                  {"type": "websocket.send", "text": "abc"}]
         for path, expected in (("/events", ""), ("/events/one/two", "one/two")):
             catch_conn = _ScriptedConnection([{"type": "websocket.connect"}])
-            await app({"type": "websocket", "path": path, "headers": [],
+            await app({"type": "websocket", "path": path, "headers": SAME_ORIGIN_HEADERS,
                        "query_string": b""}, catch_conn.receive, catch_conn.send)
             assert catch_conn.sent[:2] == [{"type": "websocket.accept"},
                                            {"type": "websocket.send", "text": expected}]
         reserved = _ScriptedConnection([{"type": "websocket.connect"}])
-        await app({"type": "websocket", "path": "/ws/reserved", "headers": [],
+        await app({"type": "websocket", "path": "/ws/reserved", "headers": SAME_ORIGIN_HEADERS,
                    "query_string": b""}, reserved.receive, reserved.send)
         assert reserved.sent == [{"type": "websocket.close", "code": 1008}]
         server = start_native(app, asyncio.get_running_loop(), port=0)

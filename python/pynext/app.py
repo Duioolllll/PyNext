@@ -45,6 +45,7 @@ from .proxy import ProxyTrust
 from .ratelimit import RateLimitUnavailable, rate_limited_response
 from .sessions import SessionMiddleware
 from .static import asset_response
+from .ws_origin import websocket_origin_allowed
 
 log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
@@ -1189,6 +1190,12 @@ class App:
                 for path, handler in self.websocket_entries.items()}
 
     async def _handle_websocket(self, scope, receive, send):
+        client = scope.get("client")
+        peer_ip = client[0] if client else None
+        if not websocket_origin_allowed(scope.get("headers", []), peer_ip, scope.get("scheme") or "ws",
+                                        self.proxy_trust, self.security):
+            await send({"type": "websocket.close", "code": 1008})
+            return
         try:
             path = _decode_path(scope["path"], scope.get("raw_path"))
         except (ValueError, UnicodeError):

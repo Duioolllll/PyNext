@@ -13,6 +13,7 @@ from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingRespo
                    WebSocketDisconnect, apply_security_headers, security_headers)
 from .observability import begin_request_context, queue_wait_var
 from .ratelimit import RateLimitUnavailable, rate_limited_response
+from .ws_origin import websocket_origin_allowed
 
 log = logging.getLogger("pynext")
 REQUEST_TIMEOUT = 30
@@ -443,6 +444,9 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     def ws_callback(path, query, headers, subprotocol):
         return _websocket_callback(app, loop, path, query, headers, subprotocol)
 
+    def ws_origin_callback(headers, peer_ip):
+        return websocket_origin_allowed(headers, peer_ip, "http", app.proxy_trust, app.security)
+
     return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store, app.asset_etags,
                                 max_concurrent=max_concurrent, acquire_timeout_ms=acquire_timeout_ms,
                                 max_waiting=max_waiting,
@@ -453,6 +457,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
                                 websocket_paths=sorted(app.websocket_routes),
                                 websocket_callback=ws_callback,
+                                websocket_origin_callback=ws_origin_callback,
                                 reuse_port=reuse_port,
                                 route_patterns=app.router.ordered_routes(),
                                 middleware_enabled=bool(app.middleware) or limiter is not None or app.hot_reload,

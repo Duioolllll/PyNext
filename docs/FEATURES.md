@@ -97,6 +97,8 @@ Fields of `pynext.http.SecurityConfig` with their defaults.
 | `csp_frame_ancestors` | `"'none'"` |
 | `csp_base_uri` | `"'self'"` |
 | `csp_form_action` | `"'self'"` |
+| `websocket_allowed_origins` | `()` |
+| `websocket_allow_missing_origin` | `False` |
 
 ## ISR cache backends
 

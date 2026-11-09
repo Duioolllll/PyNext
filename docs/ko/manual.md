@@ -148,6 +148,10 @@ async def stream():
 
 `route.py`는 HTTP 핸들러와 함께 `@websocket` 핸들러를 하나 내보낼 수 있습니다. 핸들러는 `WebSocket`을 받아 보내거나 받기 전에 `await websocket.accept()`를 호출해야 합니다. 텍스트와 바이너리 메시지를 주고받을 수 있으며, 상대가 연결을 끊으면 `receive()`에서 `WebSocketDisconnect`가 발생하므로 연결별 정리는 `finally` 블록에 둡니다.
 
+개발 버전은 ASGI·Axum에서 연결을 수락하기 전에 `Origin`을 검사하며, 기본적으로 같은 출처만 허용합니다. 다른 HTTP(S) 출처는 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`를 `create_app(..., security=...)`에 전달하거나 `--ws-allowed-origin https://client.example`을 반복 지정하세요. 스킴과 기본값이 아닌 포트를 포함하며 `*`와 `null`은 허용하지 않습니다. `Origin`을 생략하는 기존 비브라우저 클라이언트는 `websocket_allow_missing_origin=True` 또는 `--ws-allow-missing-origin`으로 명시적으로 허용해야 합니다. 공개된 0.1.0 패키지에는 이 검사가 없습니다. 클라이언트는 `Origin`을 위조하거나 생략할 수 있으므로 앱에서 연결을 인증·인가해야 합니다. 프록시 뒤에서는 실제 프록시만 `--trusted-proxy`로 지정하고 클라이언트가 보낸 전달 헤더를 프록시가 덮어쓰도록 설정하세요.
+
+ASGI에서 PyNext가 신뢰 프록시를 판정하려면 서버가 `scope["client"]`에 원래 피어 주소를 보존해야 합니다. PyNext가 전달 헤더를 해석할 때는 ASGI 서버의 선행 프록시 헤더 처리를 끄세요(Uvicorn은 `--no-proxy-headers`).
+
 ~~~python
 # app/ws/echo/route.py
 from pynext import WebSocket, WebSocketDisconnect, websocket

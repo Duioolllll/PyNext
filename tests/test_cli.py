@@ -142,8 +142,17 @@ def test_cli_security_flags_reach_app(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "serve", serve)
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path), "--csrf",
                                       "--csrf-cookie-secure", "--cors-origin", "https://example.com",
-                                      "--cors-credentials", "--csp-nonce"])
+                                      "--cors-credentials", "--csp-nonce",
+                                      "--ws-allowed-origin", "https://example.com",
+                                      "--ws-allowed-origin", "https://client.example.com",
+                                      "--ws-allow-missing-origin"])
     cli.main()
     security = seen["security"]
     assert security.csrf_enabled and security.csrf_cookie_secure and security.csp_nonce_enabled
     assert security.cors_allowed_origins == ("https://example.com",) and security.cors_allow_credentials
+    assert security.websocket_allowed_origins == ("https://example.com", "https://client.example.com")
+    assert security.websocket_allow_missing_origin
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path),
+                                      "--ws-allowed-origin", "*"])
+    with pytest.raises(SystemExit):
+        cli.main()

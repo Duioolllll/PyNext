@@ -277,6 +277,10 @@ def main():
             command.add_argument("--csp-nonce", action="store_true", help="enable CSP nonces on dynamic pages")
             command.add_argument("--ws-max-message-bytes", type=_at_least(1, "--ws-max-message-bytes"),
                                  default=MAX_WS_MESSAGE, help="WebSocket message limit in bytes (max 16777216)")
+            command.add_argument("--ws-allowed-origin", action="append", default=[], metavar="ORIGIN",
+                                 help="allow an additional WebSocket origin (repeatable)")
+            command.add_argument("--ws-allow-missing-origin", action="store_true",
+                                 help="allow WebSocket clients that omit Origin")
             command.add_argument("--shutdown-timeout", type=_at_least(0, "--shutdown-timeout"), default=30,
                                  help="seconds to let in-flight requests finish and WebSockets close "
                                       "after SIGTERM before the server stops anyway (default 30)")
@@ -332,9 +336,12 @@ def main():
                                                       else args.command == "start"),
                                    cors_allowed_origins=tuple(args.cors_origin),
                                    cors_allow_credentials=args.cors_credentials,
+                                   websocket_allowed_origins=tuple(args.ws_allowed_origin),
+                                   websocket_allow_missing_origin=args.ws_allow_missing_origin,
                                    csp_nonce_enabled=args.csp_nonce)
                     if (args.csrf is not None or args.csrf_cookie_secure is not None or args.cors_origin or
-                        args.cors_credentials or args.csp_nonce) else None)
+                        args.cors_credentials or args.csp_nonce or args.ws_allowed_origin or
+                        args.ws_allow_missing_origin) else None)
     except ValueError as exc:
         parser.error(str(exc))
     extra = {"observability": obs_config} if obs_config is not None else {}
