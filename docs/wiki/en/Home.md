@@ -1,8 +1,8 @@
 # PyNext Wiki
 
-**PyNext 0.1.0 — experimental Python + Rust full-stack framework**
+**PyNext 0.1.2 — experimental Python + Rust full-stack framework**
 
-[한국어](../ko/Home.md) · [Source](https://github.com/Duioolllll/PyNext) · [Release](https://github.com/Duioolllll/PyNext/releases/tag/0.1.0v) · [License](../../../LICENSE)
+[한국어](../ko/Home.md) · [Source](https://github.com/Duioolllll/PyNext) · [Release](https://github.com/Duioolllll/PyNext/releases/tag/v0.1.2) · [License](../../../LICENSE)
 
 PyNext is an independent, Next.js-inspired experiment in **file-based Python pages and APIs** combined with a **Rust router, HTML renderer, and Axum/Tokio HTTP engine**. It is **not Next.js, React, or React Server Components compatible**.
 

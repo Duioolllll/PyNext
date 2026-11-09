@@ -20,6 +20,7 @@ from types import MappingProxyType
 from urllib.parse import quote, unquote_to_bytes
 
 from . import _native
+from .admission import DecisionGate
 from .assets import read_public_artifacts, read_public_sources
 from .auth import check_authorization
 from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
@@ -42,13 +43,15 @@ from .observability import (
     span,
 )
 from .proxy import ProxyTrust
-from .ratelimit import RateLimitUnavailable, _is_exempt_path, rate_limited_response
+from .ratelimit import _is_exempt_path, rate_limited_response
 from .sessions import SessionMiddleware
 from .static import asset_response
 from .ws_origin import websocket_origin_allowed
 
 log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
+ASGI_DECISION_CAPACITY = 64
+ASGI_DECISION_TIMEOUT = 2.0
 
 
 class _SyncHandlerBusy(Exception):
@@ -438,6 +441,7 @@ class App:
             self._inflight_streams = 0
             self._sync_active = 0
             self._inflight_lock = threading.Lock()
+            self._asgi_admission = DecisionGate(ASGI_DECISION_CAPACITY, ASGI_DECISION_TIMEOUT)
         except BaseException:
             self._release_modules()
             raise
@@ -746,13 +750,14 @@ class App:
         """Wait until in-flight HTTP requests and streams drain.
 
         Returns True when nothing is in flight, False on timeout. The
-        counters are updated by the native bridge (HTTP) and by
-        ``_NativeStream`` (streaming bodies), both from Rust threads.
+        Includes native requests/streams, unfinished synchronous handlers,
+        and ASGI admission callbacks, even after their caller timed out.
         """
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
             with self._inflight_lock:
                 remaining = self._inflight + self._inflight_streams + self._sync_active
+            remaining += self._asgi_admission.inflight
             if remaining <= 0:
                 return True
             if time.monotonic() >= deadline:
@@ -1259,6 +1264,33 @@ class App:
         return {path: list(getattr(handler, "__pynext_websocket_protocols__", ()))
                 for path, handler in self.websocket_entries.items()}
 
+    async def _rate_limit_denied(self, scope, path):
+        """One bounded admission check for both ASGI HTTP and WebSocket."""
+        limiter = self.rate_limit
+        if limiter is None:
+            return None
+        client = scope.get("client")
+        client_ip = client[0] if client else None
+        headers = tuple(scope.get("headers", ()))
+
+        def decide():
+            if _is_exempt_path(limiter, path):
+                return True, None
+            key = limiter.key_for(client_ip, headers)
+            allowed, retry_after = limiter.allow(key)
+            if type(allowed) is not bool or (retry_after is not None and (
+                    not isinstance(retry_after, int) or not 0 <= retry_after <= 2**64 - 1)):
+                raise ValueError("Invalid rate-limit decision")
+            return allowed, retry_after
+
+        try:
+            allowed, retry_after = await self._asgi_admission.check(decide)
+        except Exception:
+            # Match native admission: callback failures and overload fail
+            # closed regardless of a backend's own failure-policy choice.
+            return Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
+        return None if allowed else rate_limited_response(max(1, retry_after or 1))
+
     async def _websocket_rate_limit_denied(self, scope, path):
         """Return the denial response for an over-limit WS handshake, else ``None``.
 
@@ -1281,23 +1313,7 @@ class App:
         middleware-based limiter is ever introduced, the pre-flight must
         be exempted from it instead.
         """
-        if self.rate_limit is None:
-            return None
-        if _is_exempt_path(self.rate_limit, path):
-            return None
-        client = scope.get("client")
-        client_ip = client[0] if client else None
-        key = self.rate_limit.key_for(client_ip, scope.get("headers", []))
-        try:
-            if getattr(self.rate_limit, "blocking", False):
-                allowed, retry_after = await asyncio.to_thread(self.rate_limit.allow, key)
-            else:
-                allowed, retry_after = self.rate_limit.allow(key)
-        except RateLimitUnavailable:
-            return Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
-        if not allowed:
-            return rate_limited_response(retry_after)
-        return None
+        return await self._rate_limit_denied(scope, path)
 
     async def _authorize_websocket(self, path, query_string=b"", headers=()):
         """Pre-handshake authorization for a WebSocket upgrade.
@@ -1531,38 +1547,22 @@ class App:
             _reset_request_context()
 
     async def _handle_http(self, scope, receive, send):
-        # Health probes bypass rate limiting (B6): a saturated limiter
-        # must never make the process look dead to a load balancer.
-        is_health = scope.get("path") in ("/healthz", "/readyz")
-        if self.rate_limit is not None and not (is_health or _is_exempt_path(self.rate_limit, scope.get("path", ""))):
-            # Check before reading the body: an over-limit request is
-            # rejected without handler execution or body intake.
-            client = scope.get("client")
-            client_ip = client[0] if client else None
-            key = self.rate_limit.key_for(client_ip, scope.get("headers", []))
-            try:
-                if getattr(self.rate_limit, "blocking", False):
-                    allowed, retry_after = await asyncio.to_thread(self.rate_limit.allow, key)
-                else:
-                    allowed, retry_after = self.rate_limit.allow(key)
-            except RateLimitUnavailable:
-                response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
-                if scope["method"].upper() == "HEAD":
-                    response.body = b""
-                await _send_response(response, send, config=self.security, production=self.production)
-                return
-            if not allowed:
-                response = rate_limited_response(retry_after)
-                if scope["method"].upper() == "HEAD":
-                    response.body = b""
-                await _send_response(response, send, config=self.security, production=self.production)
-                return
+        # Normalize before admission, as the native adapter does: malformed
+        # paths never consume a token, even when the client's bucket is empty.
         request = None
         try:
             path = _decode_path(scope["path"], scope.get("raw_path"))
         except (ValueError, UnicodeError):
             response = Response("Bad Request", status=400)
         else:
+            # Liveness/readiness remain available when decision slots are full.
+            denied = (None if path in ("/healthz", "/readyz") else
+                      await self._rate_limit_denied(scope, path))
+            if denied is not None:
+                if scope["method"].upper() == "HEAD":
+                    denied.body = b""
+                await _send_response(denied, send, config=self.security, production=self.production)
+                return
             chunks, total = [], 0
             try:
                 while True:

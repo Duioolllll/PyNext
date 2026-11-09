@@ -45,11 +45,19 @@ global sliding window (at most ``max_new_keys_per_window`` new keys per
 the table to reset buckets. Existing keys are never denied by table
 pressure.
 
-When a limiter is configured, static files and fresh ISR pages also pass
-through the Python bridge. Both adapters check admission from headers,
+When a limiter is configured, static files and fresh ISR pages are also
+charged. Axum calls the Python decision callback from the Rust header
+stage and can send an allowed static response directly. Both adapters
+check admission from headers,
 before reading the body or executing a handler. Each admitted request
 consumes one token even if the upload is abandoned or later fails a body
 or execution limit; it is never charged again by the native bridge.
+The development ASGI adapter shares a bounded decision gate between HTTP
+and WebSocket (64 unfinished checks, a 2-second deadline for each). Work
+that has already started can finish after the response deadline; its
+slot is retained until completion. An expired executor-queued check is
+discarded before calling the limiter. The host's default executor also
+determines how many callbacks can actually run simultaneously.
 Paths listed in ``exempt_paths`` skip the check entirely
 (for example health-check endpoints that load balancers must always
 reach); nothing is exempt by default.

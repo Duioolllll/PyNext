@@ -4,7 +4,7 @@
 
 Generated from the code in this checkout by `scripts/generate_feature_table.py`. Do not edit by hand; regenerate instead. If a capability below disagrees with the manuals, this file (the code) wins.
 
-- Package: `pynext-framework` **0.1.1** (see `pyproject.toml`)
+- Package: `pynext-framework` **0.1.2** (see `pyproject.toml`)
 - Supported Python: `>=3.13,<3.15`
 - Canonical documentation: [English manual](en/manual.md)
 

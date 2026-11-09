@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [日本語](../ja/manual.md)
 
-本手册适用于当前检出的 **0.1.0** 实验版本代码。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
+本手册适用于当前检出的 **0.1.2** 实验版本代码。PyNext 是基于 Python 和 Rust 的实验性全栈框架，不兼容 Next.js、React 或 React Server Components。当前原型不应直接暴露到公共互联网，也不应运行不受信任的应用。请参阅[版本记录](../../CHANGELOG.md)和[后续计划](../PRODUCTION_ROADMAP.md)。
 
 > 本手册是英文手册的翻译。如内容不一致，以英文手册为准。功能列表由代码自动生成 — 参见 [FEATURES](../FEATURES.md)。
 
@@ -325,3 +325,5 @@ uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 - 若动态 SSG 路径返回 404，请将其加入 `generate_static_params()` 并重新构建。
 - 若 hydration 不匹配，请确保服务端 fallback 与客户端 `render` 产生一致且确定的结果。
 - 若工作进程之间的 ISR 结果不同，请检查缓存后端：内存后端按进程隔离；SQLite 后端在共享存储故障时会回退到进程内副本。
+
+0.1.2 的 ASGI HTTP/WebSocket 共用最多64个未完成判定，每个判定的期限为2秒。先验证路径再扣除令牌；运行中的判定在实际完成前保留容量。排队时已取消或过期的任务不会调用 limiter。整个请求的超时仍由 ASGI 宿主单独配置。参见[判定契约](../ASGI_ADMISSION.md)。

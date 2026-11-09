@@ -2,7 +2,7 @@
 
 [한국어](../ko/manual.md) · [日本語](../ja/manual.md) · [简体中文](../zh-CN/manual.md)
 
-This manual describes the code in this checkout, corresponding to the experimental **0.1.0** version. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
+This manual describes the code in this checkout, corresponding to the experimental **0.1.2** version. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
 
 > Canonical source: this English manual is the single source of truth for PyNext documentation. The Korean, Japanese, and Simplified Chinese manuals are translations of it; if they disagree, this manual wins. The capability list is generated from code — see [FEATURES](../FEATURES.md).
 
@@ -341,3 +341,5 @@ Run `uv run --extra dev python benchmarks/bench.py --mode axum --requests 100 --
 - If an SSG dynamic path returns 404, add it to `generate_static_params()` and rebuild.
 - If hydration reports a mismatch, make server fallback and client `render` output deterministic and equivalent.
 - If an ISR page looks different across workers, check the cache backend: the memory backend is per-process, and SQLite falls back to process-local copies if the shared store is unavailable.
+
+ASGI admission in 0.1.2 shares a 64-check budget and a two-second deadline between HTTP and WebSocket. Path validation precedes charging. Already running callbacks retain capacity until completion; expired or cancelled executor-queued work never calls the limiter. These are admission deadlines, separate from the ASGI host's whole-request timeouts. See the [decision contract](../ASGI_ADMISSION.md).

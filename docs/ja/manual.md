@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [简体中文](../zh-CN/manual.md)
 
-このマニュアルは、チェックアウトした **0.1.0** の実験版のコードを対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
+このマニュアルは、チェックアウトした **0.1.2** の実験版のコードを対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
 
 > このマニュアルは英語マニュアルの翻訳です。内容が異なる場合は英語マニュアルが優先されます。機能一覧はコードから自動生成されています — [FEATURES](../FEATURES.md) を参照してください。
 
@@ -325,3 +325,5 @@ uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 - 動的 SSG パスが 404 の場合、`generate_static_params()` に追加して再ビルドします。
 - Hydration が一致しない場合は、サーバー fallback とクライアント `render` の結果を決定的に一致させてください。
 - ワーカーごとに ISR の結果が異なる場合は、キャッシュバックエンドを確認してください。メモリバックエンドはプロセス単位であり、SQLite バックエンドは共有ストアの障害時にプロセス内コピーへフォールバックします。
+
+0.1.2 の ASGI HTTP/WebSocket は、未完了の判定を最大64件、各判定を2秒に制限します。課金前にパスを検証し、実行中の判定は完了まで枠を保持します。待機中に取消・期限切れとなった処理は limiter を呼びません。リクエスト全体の期限は ASGI ホストで別途設定します。[判定の契約](../ASGI_ADMISSION.md)を参照してください。
