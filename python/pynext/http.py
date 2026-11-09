@@ -916,6 +916,40 @@ def content_security_policy(nonce=None, *, config=DEFAULT_SECURITY):
             f"; frame-ancestors {config.csp_frame_ancestors}")
 
 
+BUILD_ID_HEADER = b"x-pynext-build-id"
+DEPLOYMENT_ID_HEADER = b"x-pynext-deployment-id"
+
+
+def build_headers(*, build_id=None, deployment_id=None):
+    """Build-identity headers as ``(name, value)`` byte pairs.
+
+    ``X-PyNext-Build-Id`` names the build that produced the response;
+    ``X-PyNext-Deployment-Id`` names the deployment (rolling deploys)
+    when one is configured. A client holding an old HTML page can
+    compare these against a fresh API response to detect skew.
+    """
+    headers = []
+    if build_id is not None:
+        headers.append((BUILD_ID_HEADER, build_id.encode("ascii")))
+    if deployment_id is not None:
+        headers.append((DEPLOYMENT_ID_HEADER, deployment_id.encode("ascii")))
+    return headers
+
+
+def apply_build_headers(response, *, build_id=None, deployment_id=None):
+    """Add the build-identity headers to ``response`` (in place).
+
+    A header the response already carries wins and is never overwritten.
+    Idempotent: calling it twice, or on a response that already went
+    through dispatch, changes nothing. Returns the response for
+    call-site chaining.
+    """
+    for key, value in build_headers(build_id=build_id, deployment_id=deployment_id):
+        if not any(k == key for k, _ in response.headers):
+            response.headers.append((key, value))
+    return response
+
+
 def security_headers(*, config=DEFAULT_SECURITY, nonce=None, production=True):
     """Return the A1 default security headers as ``(name, value)`` byte pairs.
 

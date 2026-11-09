@@ -43,7 +43,7 @@ from .dynamic import (DYNAMIC_MODES, MAX_DYNAMIC_ACCESSES, format_dynamic_access
                       suppress_dynamic_tracking, track_prerender)
 from .errors import SignalError, digest_for_error, error_count
 from .http import (SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
-                   StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
+                   StreamingResponse, WebSocket, WebSocketDisconnect, apply_build_headers, apply_cors_headers,
                    apply_path_headers, apply_security_headers, compile_path_headers,
                    cors_preflight_response, csrf_token_response, filter_internal_headers, new_csp_nonce, sanitize_response_headers,
                    validate_csrf, validate_request_framing)
@@ -1341,6 +1341,17 @@ class App:
         self.root = Path(root).resolve()
         self.manifest = manifest
         self.production = production
+        # Build identity for skew protection: the build ID names this
+        # build's sources, the deployment ID names its deployment.
+        # Both are None for a development manifest (discover() output)
+        # and for manifests built before build IDs existed; responses
+        # then simply carry no build headers.
+        self.build_id = manifest.get("build_id")
+        self.deployment_id = manifest.get("deployment_id")
+        if self.build_id is not None and not isinstance(self.build_id, str):
+            raise ValueError("Invalid build_id in manifest; rebuild the application")
+        if self.deployment_id is not None and not isinstance(self.deployment_id, str):
+            raise ValueError("Invalid deployment_id in manifest; rebuild the application")
         self.router = _native.Router(list(manifest["routes"]))
         self.entries = {}
         # Authorization policies snapshotted at registration (S-P1-33):
@@ -2614,7 +2625,7 @@ class App:
     async def dispatch(self, request):
         """Return a response. Exceptions are converted at the transport boundary."""
         try:
-            return await self._dispatch_response(request)
+            response = await self._dispatch_response(request)
         except _SyncHandlerBusy:
             response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
             apply_path_headers(response, request.path, path_headers=self.path_headers)
@@ -2622,7 +2633,6 @@ class App:
             apply_security_headers(response, config=self.security, production=self.production)
             if request.method == "HEAD":
                 response.body = b""
-            return response
         except RequestCancelled:
             if request.cancelled:
                 # A cooperative worker may observe the signal before its
@@ -2633,6 +2643,14 @@ class App:
         except asyncio.CancelledError:
             request._cancel_event.set()
             raise
+        # Skew protection: every dispatched response (pages, API, static
+        # assets, HTML) carries the build and deployment IDs, so a client
+        # holding an old page can tell it is talking to a newer deploy.
+        # The native transport serves static assets itself, so it applies
+        # the same headers from ServerState (see server.start_native);
+        # bridge responses pass through here and are not re-tagged there.
+        apply_build_headers(response, build_id=self.build_id, deployment_id=self.deployment_id)
+        return response
 
     async def _dispatch_response(self, request):
         # Health probes are reserved framework paths (B6): they bypass

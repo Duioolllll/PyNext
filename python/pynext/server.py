@@ -15,7 +15,8 @@ from .config import DEFAULT_CONFIG, effective_allowed_hosts
 from .errors import SignalError, digest_for_error
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
                    WebSocketDisconnect, _FALLBACK_CSRF_SIGNING_KEY, _RequestCancellation,
-                   apply_path_headers, apply_security_headers, ensure_shared_csrf_signing_key,
+                   apply_path_headers, apply_security_headers, build_headers,
+                   ensure_shared_csrf_signing_key,
                    filter_internal_headers, security_headers)
 from .mgmtplane import ManagementPlaneConfig
 from .observability import begin_request_context, get_request_id, queue_wait_var
@@ -895,7 +896,14 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_
                                 # behind it are enforced at request time by
                                 # the trust-resolved rate limiter.
                                 trusted_proxies=_trusted_proxy_strings(app),
-                                allowed_hosts=list(effective_allowed_hosts(allowed_hosts, host)))
+                                allowed_hosts=list(effective_allowed_hosts(allowed_hosts, host)),
+                                # The Rust layer serves static assets and
+                                # static HTML itself, so it needs the build
+                                # identity headers up front; bridge responses
+                                # already carry them from Python dispatch.
+                                build_headers=build_headers(
+                                    build_id=getattr(app, "build_id", None),
+                                    deployment_id=getattr(app, "deployment_id", None)))
 
 
 async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
@@ -1012,7 +1020,19 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               ws_max_lifetime_secs=ws_max_lifetime_secs,
                               ws_ping_interval_secs=ws_ping_interval_secs,
                               allowed_hosts=allowed_hosts)
-        print(f"PyNext listening on http://{server.address}", flush=True)
+        # The build identity rides on the first log line, so an operator
+        # sees at a glance which build (and deployment) just started.
+        # It goes before the address so the address stays the last token.
+        listening = "PyNext listening"
+        build_id = getattr(app, "build_id", None)
+        if build_id is not None:
+            listening += f" (build {build_id}"
+            deployment_id = getattr(app, "deployment_id", None)
+            if deployment_id is not None:
+                listening += f", deployment {deployment_id}"
+            listening += ")"
+        listening += f" on http://{server.address}"
+        print(listening, flush=True)
         # S-P1-28 (M-19): a debug server bound to a non-loopback address
         # exposes detailed dev error pages to the network; warn at startup
         # and let the app suppress those pages while externally bound.

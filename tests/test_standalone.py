@@ -222,7 +222,7 @@ def test_standalone_runs_after_relocation_and_refuses_overwrite(tmp_path):
         # Accept either line — a worker's own "PyNext listening ..." line
         # can win the race — and pull the address out with a regex, since
         # the supervisor line's " with N workers" suffix is not part of it.
-        match = re.search(r"PyNext (?:supervisor )?listening on http://(\S+)", line)
+        match = re.search(r"PyNext (?:supervisor )?listening(?: \(build [^\r\n)]*\))? on http://(\S+)", line)
         assert match is not None, line
         address = match.group(1)
         with urllib.request.urlopen("http://" + address + "/", timeout=5) as response:
@@ -412,7 +412,7 @@ def test_standalone_start_logs_bundle_info(tmp_path):
         line = lines.get(timeout=60)
         # See the relocation test: the default 2-worker start logs the
         # supervisor line (a worker's single-process line can also come first).
-        match = re.search(r"PyNext (?:supervisor )?listening on http://(\S+)", line or "")
+        match = re.search(r"PyNext (?:supervisor )?listening(?: \(build [^\r\n)]*\))? on http://(\S+)", line or "")
         assert match is not None, line
         info = json.loads((relocated / "bundle-manifest.json").read_text(encoding="utf-8"))
         bundle_line = None
