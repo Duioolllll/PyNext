@@ -32,6 +32,10 @@ ISR은 크기가 제한된 캐시와 single-flight 재생성을 사용합니다.
 
 태그 기반 무효화는 경로가 아니라 페이지가 의존하는 데이터 단위로 묶습니다. ISR 페이지에 `@page(render="isr", revalidate=30, stale=60, tags=("post:42", "author:7"))`처럼 태그를 선언합니다(페이지당 최대 64개, 태그는 `[A-Za-z0-9:_-./]` 1–256자). `await app.revalidate_tag("post:42")`를 호출하면 해당 태그를 가진 항목이 모두 즉시 만료되고, `await app.revalidate_tag("post:42", expire=60)`은 60초 동안은 stale 상태로(한 번 더 서빙하면서 백그라운드로 재생성) 유지한 뒤 만료시킵니다. 호출 이후에 생성된 항목은 영향받지 않으며, `sqlite`/`redis` 백엔드에서는 무효화 기록이 공유 저장소에 저장돼 다른 워커도 봅니다(`memory` 백엔드는 프로세스별입니다). 프로덕션에서는 페이지 태그를 바꾸면 다시 빌드해야 합니다.
 
+ISR 응답에는 정책 기반 `Cache-Control` 헤더가 붙어 PyNext 앞단의 CDN이 stale-while-revalidate를 수행할 수 있습니다: `public, s-maxage={revalidate}`에 SWR 구간이 0이 아닌 페이지는 `stale-while-revalidate={stale}`이 추가됩니다(2축 `{revalidate, stale}` 정책에 대한 Next.js `getCacheControlHeader` 포팅). 최초 생성·신선 히트·stale 서빙·스트리밍 ISR 응답과 L1 캐시에서 직접 나가는 네이티브 신선 히트에 모두 적용되며, private(쿠키/인증) 응답은 그대로 `private, no-store`입니다.
+
+stale 재생성이 실패하면 이전 항목을 유지합니다. 신선 구간을 3~30초로 조이고 stale 구간을 최소 3초로 두어(Next.js `retainPreviousCacheEntry`), 원래 stale 구간이 끝나도 이전 본문이 계속 서빙되면서 다음 재시도까지 호흡을 둡니다. 이전 항목이 없는 최초 생성 실패는 그대로 500입니다.
+
 ## 안전 주의
 
 네이티브 어댑터가 Python 요청을 504로 마무리해도 실행 중인 동기 함수는 계속 실행될 수 있습니다. 상태 변경 작업에는 DB 타임아웃과 멱등성을 적용하세요. 관련 문서: [배포와 보안](Deployment-and-Security.md).

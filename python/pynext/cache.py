@@ -87,6 +87,14 @@ MAX_SQLITE_ENTRIES = 10_000
 #: development the floor instead extends retention (see
 #: :func:`dev_retention_policy`), so reloads still hit the cache.
 MIN_PRERENDERABLE_EXPIRE = 300.0
+# Next.js `response-cache/index.ts:retainPreviousCacheEntry` clamps the
+# retained revalidate into 3..30s and keeps expire at least revalidate+3,
+# so a failing origin is retried at most every 3s and at least every 30s.
+# In PyNext's two-axis policy that is a fresh window of 3..30s and a stale
+# window of at least 3s.
+RETAIN_MIN_REVALIDATE_SECONDS = 3.0
+RETAIN_MAX_REVALIDATE_SECONDS = 30.0
+RETAIN_MIN_STALE_SECONDS = 3.0
 _SHARED_UNAVAILABLE = object()
 _VARIANT_GENERATION_TTL = 86400
 _MAX_LOCAL_VARIANT_PATHS = 1024
@@ -283,6 +291,46 @@ class CacheBackend:
 
     def close(self):
         pass
+
+
+def _format_seconds(value):
+    """Render a duration for a header without scientific notation."""
+    text = format(float(value), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def cache_control_header(policy):
+    """Build the SWR ``Cache-Control`` header for an ISR policy.
+
+    A port of Next.js ``server/lib/cache-control.ts:getCacheControlHeader``
+    for PyNext's two-axis policy (``revalidate`` = fresh window,
+    ``stale`` = stale-while-revalidate window): ``s-maxage`` is the fresh
+    window and ``stale-while-revalidate`` the SWR window, so a CDN in
+    front of PyNext can serve stale while revalidating. With no SWR
+    window (``stale == 0``) only ``s-maxage`` is emitted. The header uses
+    the declared ``stale`` window (as the L1 insert does); a policy with
+    an explicit ``expire`` has a wider effective window
+    (``expire - revalidate``, see :func:`policy_windows`).
+    """
+    header = f"public, s-maxage={_format_seconds(policy['revalidate'])}"
+    if policy["stale"] > 0:
+        header += f", stale-while-revalidate={_format_seconds(policy['stale'])}"
+    return header
+
+
+def _retain_durations(policy):
+    """Durations for a retained entry after a failed regeneration.
+
+    Mirrors Next.js ``retainPreviousCacheEntry``: the fresh window is the
+    policy revalidate clamped to 3..30s and the stale window is at least
+    3s, so the previous body keeps serving while retries breathe.
+    """
+    fresh = min(max(float(policy["revalidate"]), RETAIN_MIN_REVALIDATE_SECONDS),
+                RETAIN_MAX_REVALIDATE_SECONDS)
+    stale = max(float(policy["stale"]), RETAIN_MIN_STALE_SECONDS)
+    return fresh, stale
 
 
 def _valid_durations(fresh_seconds, stale_seconds):
@@ -2637,13 +2685,20 @@ class ISRCache:
             return await self._get_or_render_local(key, policy, render, status, body, tags)
         return await self._get_or_render_shared(key, policy, render, status, body, tags)
 
-    async def _generate(self, key, policy, render, lease=None, tags=()):
+    async def _generate(self, key, policy, render, lease=None, tags=(), previous_body=None):
         """Render once and store the result, fenced by the lease version.
 
         ``lease`` is ``(expected_version, owner)`` for a shared-cache
         generation that holds the cross-process lease. A fallback without a
         lease is stored only locally. A fenced-out generation still serves
         its own caller, but cannot replace either cache layer.
+
+        When ``previous_body`` is given (a stale entry was being
+        regenerated) and the render fails, the previous body is retained
+        with tightened durations (Next.js ``retainPreviousCacheEntry``):
+        it keeps serving while the next retry breathes 3..30s instead of
+        the entry expiring on its original schedule and every request
+        paying for a slow blocking render.
         """
         owner = lease[1] if lease is not None else None
         expected_version = lease[0] if lease is not None else None
@@ -2692,6 +2747,26 @@ class ISRCache:
                     else:
                         log.info("ISR response for %s is private; served but not cached", key)
                 return response.body
+        except Exception:
+            # A cancelled generation (shutdown) does not reach here:
+            # CancelledError is BaseException, so it skips retention.
+            if previous_body is not None and self._inflight.get(key) is asyncio.current_task():
+                fresh, stale = _retain_durations(policy)
+                shared_stored = True
+                if self.shared is not None and owner is not None:
+                    shared_stored = await self._shared_store(
+                        key, previous_body, {"revalidate": fresh, "stale": stale},
+                        expected_version, owner, tags)
+                    if not shared_stored:
+                        log.warning("Shared ISR retain for %s failed or was fenced out;"
+                                    " previous entry was not extended", key)
+                if shared_stored:
+                    if not self._store_insert(key, previous_body, fresh, stale):
+                        log.warning("ISR cache retain failed for %s; previous entry was not extended", key)
+                log.warning("ISR regeneration failed for %s; retaining previous entry"
+                            " (fresh %.0fs, stale %.0fs) before the next retry",
+                            key, fresh, stale)
+            raise
         finally:
             if owner is not None and self.shared is not None:
                 await self._shared_release(key, owner)
@@ -2700,7 +2775,9 @@ class ISRCache:
         task = self._inflight.get(key)
         if task is None and len(self._tasks) < MAX_INFLIGHT:
             task = self._register(key, asyncio.create_task(
-                self._generate(key, policy, render, tags=tags), context=contextvars.Context()))
+                self._generate(key, policy, render, tags=tags,
+                               previous_body=body if status == "stale" else None),
+                context=contextvars.Context()))
         if status == "stale":
             return body
         if task is None:
@@ -2747,7 +2824,8 @@ class ISRCache:
                     return await self._get_or_render_local(key, policy, render, "stale", entry.body, tags)
                 if version is not None:
                     task = self._register(key, asyncio.create_task(
-                        self._generate(key, policy, render, lease=(version, owner), tags=tags),
+                        self._generate(key, policy, render, lease=(version, owner), tags=tags,
+                                       previous_body=entry.body),
                         context=contextvars.Context()), owner)
                 return entry.body
             # First generation (or expired): become the generator if the

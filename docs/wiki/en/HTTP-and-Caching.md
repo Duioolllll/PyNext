@@ -41,6 +41,10 @@ An ISR page can opt out of time-based expiry with `@page(render="isr", revalidat
 
 External systems can trigger the same invalidations over HTTP: `POST /_pynext/revalidate` with `{"paths": [...], "tags": [...], "type": "page"|"layout", "expire": 60}`. The endpoint is disabled (404) unless a secret is configured — pass `revalidate_secret=` to `create_app()` or set `PYNEXT_REVALIDATE_SECRET` — and otherwise requires `Authorization: Bearer <secret>`. Every target is validated before anything is invalidated, so a bad request changes nothing.
 
+ISR responses carry a policy-based `Cache-Control` header so a CDN in front of PyNext can serve stale while revalidating: `public, s-maxage={revalidate}` plus `stale-while-revalidate={stale}` when the page's SWR window is non-zero (a port of Next.js `getCacheControlHeader` for the two-axis `{revalidate, stale}` policy). The header is set on first-generation, fresh-hit, stale-serve and streaming ISR responses, including native fresh hits served directly from the L1 cache. Private (cookie/authorization) responses still use `private, no-store`.
+
+If a stale regeneration fails, the previous entry is retained with its fresh window clamped to 3..30 seconds and its stale window kept at at least 3 seconds (Next.js `retainPreviousCacheEntry`), so the previous body keeps serving while the next retry breathes instead of every request paying for a slow blocking render once the original stale window expires. A first-generation failure has no previous entry to retain and still surfaces as a 500.
+
 ## Safety notes
 
 The native adapter can return 504 after a Python request timeout, but an already-running synchronous function may continue. Always add DB deadlines and idempotency for state-changing operations. This framework is still experimental; see [Deployment and security](Deployment-and-Security.md).

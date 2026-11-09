@@ -12,6 +12,7 @@ from . import _native
 from .app import _decode_path, _invoke, _split_request_path, _typed_params
 from .config import DEFAULT_CONFIG
 from .errors import SignalError, digest_for_error
+from .cache import cache_control_header
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
                    WebSocketDisconnect, _RequestCancellation, apply_path_headers, build_headers,
                    apply_security_headers, filter_internal_headers, security_headers)
@@ -569,6 +570,10 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 route_patterns=app.router.ordered_routes(),
                                 middleware_enabled=bool(app.middleware) or app.hot_reload,
                                 shared_cache_enabled=app.isr.shared is not None,
+                                isr_cache_control={
+                                    pattern: cache_control_header(policy)
+                                    for pattern, policy in app.isr_policies.items()
+                                },
                                 websocket_protocols=app.websocket_protocols,
                                 websocket_max_message=app.websocket_max_message, listener=listener,
                                 security_headers=security_headers(config=app.security,

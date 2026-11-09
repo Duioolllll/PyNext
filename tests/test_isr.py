@@ -90,16 +90,20 @@ def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
                 assert (await client.get("/blog/alpha")).text == page_html(f"<p>alpha:{previous_calls + 1}</p>")
                 await until(lambda: "/blog/alpha" not in app.isr._inflight)
 
-                # Failure keeps the old response only until the stale window expires.
+                # Failure retains the old response past its stale window:
+                # the next retry breathes instead of hammering a failing origin.
                 assert app.isr.store.insert("/blog/alpha", b"<p>old</p>", 0.02, 1)
                 await until(lambda: app.isr.store.lookup("/blog/alpha")[0] == "stale")
                 module.started, module.gate, module.fail = asyncio.Event(), None, True
                 assert (await client.get("/blog/alpha")).text == "<p>old</p>"
                 await asyncio.wait_for(module.started.wait(), 3)
                 await until(lambda: "/blog/alpha" not in app.isr._inflight)
-                assert app.isr.store.lookup("/blog/alpha")[0] == "stale"
-                await until(lambda: app.isr.store.lookup("/blog/alpha")[0] == "expired")
-                assert (await client.get("/blog/alpha")).status_code == 500
+                # The original stale window (1s) is long past, yet the
+                # retained entry still serves and no retry has started.
+                await asyncio.sleep(1.5)
+                assert app.isr.store.lookup("/blog/alpha")[0] == "fresh"
+                assert (await client.get("/blog/alpha")).text == "<p>old</p>"
+                assert module.calls == previous_calls + 2
 
                 # One cancelled caller cannot cancel a shared generation.
                 module.fail = False
@@ -214,7 +218,7 @@ def test_isr_shared_render_does_not_inherit_request_context(tmp_path):
             assert app.isr.store.lookup("/")[0] == "miss"
             public = await client.get("/")
             assert public.text == page_html("<p>public</p>")
-            assert public.headers["cache-control"] == "public, max-age=0, must-revalidate"
+            assert public.headers["cache-control"] == "public, s-maxage=30, stale-while-revalidate=60"
             assert public.headers["vary"] == "Cookie, Authorization"
             assert app.isr.store.lookup("/")[1] == page_html("<p>public</p>").encode()
         await app.isr.close()

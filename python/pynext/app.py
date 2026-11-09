@@ -30,7 +30,7 @@ from .admission import DecisionGate
 from .assets import read_public_artifacts, read_public_sources
 from .auth import check_authorization
 from .cache import (MAX_CACHE_SECONDS, CacheBusy, ISRCache, SharedCacheUnavailable,
-                    dev_retention_policy, validate_cache_tag)
+                    cache_control_header, dev_retention_policy, validate_cache_tag)
 from .client import compile_client, read_client_artifacts
 from .components import (_isr_policy, _isr_query_keys, _node, _partial_isr_policy, _validate_tags,
                         bind_islands, reduce_segment_config)
@@ -339,10 +339,10 @@ class _ISRStreamFeed:
 
 
 class _ISRStreamingResponse(StreamingResponse):
-    def __init__(self, feed):
+    def __init__(self, feed, cache_control):
         self._feed = feed
         super().__init__(feed.chunks(), media_type="text/html; charset=utf-8", headers=[
-            (b"cache-control", b"public, max-age=0, must-revalidate"),
+            (b"cache-control", cache_control),
             (b"vary", b"Cookie, Authorization"),
         ])
 
@@ -1989,7 +1989,7 @@ class App:
             if task.done():
                 feed.detach()
                 return task.result()
-            return _ISRStreamingResponse(feed)
+            return _ISRStreamingResponse(feed, cache_control_header(self.isr_policies[pattern]).encode("ascii"))
         except BaseException:
             # Do not cancel a shared generation when the initiating client
             # disconnects; other requests can still use its eventual result.
@@ -2525,7 +2525,7 @@ class App:
                             self.metrics.observe_regeneration("started")
                         response = Response(
                             body, media_type="text/html; charset=utf-8", headers=[
-                                (b"cache-control", b"public, max-age=0, must-revalidate"),
+                                (b"cache-control", cache_control_header(self.isr_policies[pattern]).encode("ascii")),
                                 (b"vary", b"Cookie, Authorization"),
                             ])
             else:
