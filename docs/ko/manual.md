@@ -56,6 +56,53 @@ async def Page(params):
 
 `h(tag, attrs, *children)`는 HTML 트리를 만들며 문자열을 이스케이프합니다. SSR은 기본적으로 전체 응답을 모아 반환하며, 페이지는 UI 청크를 스트리밍할 수도 있습니다(아래 스트리밍 SSR 참고). 임의의 raw HTML 삽입 API는 제공하지 않습니다.
 
+## 설정 파일 (`pynext.config.py`)
+
+지금까지 명령줄에서만 주던 설정을 프로젝트 루트의 `pynext.config.py`
+파일에도 쓸 수 있습니다. 파일은 `config` 딕셔너리 하나만 정의합니다:
+
+~~~python
+# pynext.config.py
+config = {
+    "port": 4000,
+    "max_concurrent": 128,
+    "cache_backend": "sqlite",
+    "cors_allowed_origins": ["https://example.com"],
+}
+~~~
+
+우선순위는 명시적 CLI 옵션 > 환경변수(`PYNEXT_*`) > 설정 파일 > 내장
+기본값이므로, CLI 플래그는 항상 파일을 이깁니다. 반복 가능한 옵션
+(`--trusted-proxy`, `--cors-origin`, `--ws-allowed-origin`,
+`--rate-limit-exempt-path`)은 파일의 목록에 덧붙이지 않고 교체합니다.
+
+파일은 `pynext dev`·`pynext build`·`pynext start` 실행 시 로드되고
+검증됩니다. 알 수 없는 키는 경고만 하고 무시합니다(비슷한 키가 있으면
+"did you mean …?" 힌트를 함께 냅니다). 타입이 틀리거나, 범위를 벗어나거나,
+보안 값이 잘못된 경우(예: 너무 짧은 `csrf_signing_key`)는 종료 코드 2로
+시작에 실패하고 설정 이름을 적은 메시지를 냅니다 — 설정이 깨진 상태로
+서버가 뜨지 않습니다. 두 가지 조합은 경고합니다: `cache_path`는
+`cache_backend`가 `"sqlite"`일 때만 쓰고, `workers`가 1보다 크면서
+`memory` 캐시 백엔드이면 워커마다 ISR 캐시가 따로 유지됩니다. 개발
+모드에서는 파일을 감시합니다. 파일을 고치면 서버가 다시 시작되고,
+깨진 수정은 다른 변경을 기다리지 않고 설정 오류로 개발 루프를
+종료합니다(앱 파일을 고쳐서는 깨진 설정을 고칠 수 없기 때문입니다).
+
+모든 설정과 기본값은 코드 한곳(`pynext.config.DEFAULT_CONFIG`)에
+있습니다. 필드가 곧 전체 키 목록입니다: host, port, max_concurrent,
+acquire_timeout_ms, max_waiting, body_capacity, body_timeout_ms,
+max_connections, max_connections_per_ip, header_read_timeout_ms,
+body_min_rate_bytes_per_sec, shutdown_timeout, workers, cache_backend,
+cache_path, cache_failure_policy, rate_limit, rate_limit_window,
+rate_limit_backend, rate_limit_ipv6_prefix_len,
+rate_limit_failure_policy, rate_limit_exempt_paths, trusted_proxies,
+csrf_enabled, csrf_signing_key, csrf_cookie_secure, cors_allowed_origins,
+cors_allow_credentials, csp_nonce_enabled, websocket_max_message,
+websocket_allowed_origins, websocket_allow_missing_origin,
+structured_logs, metrics, tracing, log_level. 읽는 환경변수는
+`PYNEXT_STRUCTURED_LOGS`, `PYNEXT_METRICS`, `PYNEXT_TRACING`,
+`PYNEXT_LOG_LEVEL`, `PYNEXT_CSRF_SIGNING_KEY`입니다.
+
 ## 앱 import와 이전 버전에서의 변경
 
 페이지·레이아웃·API 모듈에서 `from .helpers import title`처럼 상대 import를 사용할 수 있습니다. 앱마다 모듈 공간이 분리되며 프로젝트 루트를 전역 `sys.path`에 자동 추가하지 않습니다. v0.5에서 사용하던 루트 기준 절대 import가 실패하면 상대 import로 바꾸거나 프로젝트를 Python 패키지로 설치하세요. 외부 패키지는 실행 환경에 설치해야 합니다.

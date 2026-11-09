@@ -53,6 +53,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 
+from .config import DEFAULT_CONFIG
 from .http import SecurityConfig, ensure_shared_csrf_signing_key
 
 log = logging.getLogger("pynext.supervisor")
@@ -63,7 +64,7 @@ SUPERVISOR_POLL_INTERVAL = 0.2
 # Default graceful-shutdown budget; WorkerConfig.shutdown_timeout
 # overrides it per deployment. The old 5s default could SIGKILL a worker
 # that was still draining a request the Rust layer allows 30s for.
-SHUTDOWN_TIMEOUT = 30.0
+SHUTDOWN_TIMEOUT = DEFAULT_CONFIG.shutdown_timeout
 _MAX_RESTART_BACKOFF = 8.0
 
 
@@ -80,32 +81,32 @@ class WorkerConfig:
     body_capacity: int
     body_timeout_ms: int
     # Connection limits (A4); defaults mirror server.DEFAULT_*.
-    max_connections: int = 1024
-    max_connections_per_ip: int = 128
-    header_read_timeout_ms: int = 10000
-    body_min_rate_bytes_per_sec: int = 1024
+    max_connections: int = DEFAULT_CONFIG.max_connections
+    max_connections_per_ip: int = DEFAULT_CONFIG.max_connections_per_ip
+    header_read_timeout_ms: int = DEFAULT_CONFIG.header_read_timeout_ms
+    body_min_rate_bytes_per_sec: int = DEFAULT_CONFIG.body_min_rate_bytes_per_sec
     max_waiting: int | None = None  # None keeps the native default min(max_concurrent, 64)
-    rate_limit: int = 0  # 0 disables rate limiting
-    rate_limit_window: float = 60.0
-    rate_limit_backend: str = "memory"
+    rate_limit: int = DEFAULT_CONFIG.rate_limit  # 0 disables rate limiting
+    rate_limit_window: float = DEFAULT_CONFIG.rate_limit_window
+    rate_limit_backend: str = DEFAULT_CONFIG.rate_limit_backend
     rate_limit_exempt_paths: tuple = ()
-    rate_limit_ipv6_prefix_len: int = 64  # IPv6 bucket grouping (see ratelimit.py)
+    rate_limit_ipv6_prefix_len: int = DEFAULT_CONFIG.rate_limit_ipv6_prefix_len  # IPv6 bucket grouping (see ratelimit.py)
     trusted_proxies: tuple = ()
     # Shared-cache / observability settings, forwarded to each worker's
     # create_app so multi-worker mode honours them (finding #42/#45).
-    cache_backend: str = "memory"
+    cache_backend: str = DEFAULT_CONFIG.cache_backend
     cache_path: str | None = None
-    cache_failure_policy: str = "fail_open"
-    rate_limit_failure_policy: str = "fail_closed"
+    cache_failure_policy: str = DEFAULT_CONFIG.cache_failure_policy
+    rate_limit_failure_policy: str = DEFAULT_CONFIG.rate_limit_failure_policy
     observability: object = None  # ObservabilityConfig or None
     security: object = None  # SecurityConfig or None
-    websocket_max_message: int = 65_536
+    websocket_max_message: int = DEFAULT_CONFIG.websocket_max_message
     # Graceful-shutdown budget (B6): how long a worker may take to drain
     # in-flight requests and close WebSockets after SIGTERM before the
     # supervisor SIGKILLs it. It bounds the Python drain in serve() and
     # the native connection drain; it must cover the 30s request timeout
     # or a slow request can still be cut off mid-flight.
-    shutdown_timeout: float = 30.0
+    shutdown_timeout: float = DEFAULT_CONFIG.shutdown_timeout
 
 
 def _heartbeat_loop(stop, heartbeat):

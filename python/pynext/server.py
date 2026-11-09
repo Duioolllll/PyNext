@@ -10,6 +10,7 @@ import time
 
 from . import _native
 from .app import _decode_path, _invoke
+from .config import DEFAULT_CONFIG
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
                    WebSocketDisconnect, apply_security_headers, security_headers)
 from .observability import begin_request_context, queue_wait_var
@@ -21,14 +22,16 @@ REQUEST_TIMEOUT = 30
 STREAM_CHUNK_TIMEOUT = 30
 # Connection limits (A4). These are the native server defaults; the Rust
 # accept loop enforces them, so a client that never completes a request
-# cannot hold a Python worker thread or an execution slot.
-DEFAULT_MAX_CONNECTIONS = 1024
-DEFAULT_MAX_CONNECTIONS_PER_IP = 128
-DEFAULT_HEADER_READ_TIMEOUT_MS = 10_000
+# cannot hold a Python worker thread or an execution slot. The values live
+# in config.DEFAULT_CONFIG (the single default source); these names stay
+# as the public aliases other modules import.
+DEFAULT_MAX_CONNECTIONS = DEFAULT_CONFIG.max_connections
+DEFAULT_MAX_CONNECTIONS_PER_IP = DEFAULT_CONFIG.max_connections_per_ip
+DEFAULT_HEADER_READ_TIMEOUT_MS = DEFAULT_CONFIG.header_read_timeout_ms
 # Minimum average body receive rate in bytes/second, enforced after a
 # 2-second grace window (see read_limited_body in the native crate). 0
 # disables the rate check; the whole-body timeout still applies.
-DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC = 1024
+DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC = DEFAULT_CONFIG.body_min_rate_bytes_per_sec
 # Upper bounds for the server limits (review #4 #5). The CLI enforces
 # these at parse time; start_native enforces them again so a direct
 # Python caller cannot smuggle a value past the CLI that overflows the
@@ -544,14 +547,17 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 drain_timeout_secs=shutdown_timeout)
 
 
-async def serve(app, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,
-                body_capacity=16, body_timeout_ms=10000, stop_event=None, observability=None, *,
+async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
+                max_concurrent=DEFAULT_CONFIG.max_concurrent,
+                acquire_timeout_ms=DEFAULT_CONFIG.acquire_timeout_ms,
+                body_capacity=DEFAULT_CONFIG.body_capacity,
+                body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms, stop_event=None, observability=None, *,
                 reuse_port=False, on_ready=None, listener=None,
                 max_connections=DEFAULT_MAX_CONNECTIONS,
                 max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                 header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                 body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
-                shutdown_timeout=30.0, max_waiting=None):
+                shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
