@@ -283,6 +283,8 @@ SSG 빌드는 최대 10,000페이지를 생성하며 개발 모드에서는 요�
 
 정적 렌더링은 동적 접근을 추적합니다. SSG 페이지가 빌드 중 렌더링되거나 ISR 페이지가 생성되는 동안 `time.time()`, `datetime.now()`, `random.*`, `uuid.uuid4()`, `Database.session()` 같은 읽기는 읽은 페이지 위치와 함께 기록됩니다. `no_store()`는 스코프를 의도적으로 동적으로 표시하고, `mark_dynamic_access("...")`은 자동 후크가 볼 수 없는 나머지(외부 fetch나, 프리렌더 패치를 피해 가는 `from datetime import datetime` 바인딩)를 기록합니다. 기본값 `@page(dynamic="auto")`은 빌드를 계속하고 접근 내역을 빌드 매니페스트의 `dynamic_accesses` 리포트에 경고와 함께 남깁니다. `@page(dynamic="error")`는 처음 기록된 접근에서 빌드(또는 ISR 생성)를 실패시키고, 에러에 표현식과 사용자 코드 위치를 포함합니다. 운영 환경의 ISR/SSG 페이지에는 `dynamic="error"`를 권장합니다. 자동 탐지는 환경변수, 파일, 네트워크 호출, 프레임워크 밖의 데이터베이스를 볼 수 없고, 기본값 `auto`는 경고만 하고 값을 그대로 굽기 때문입니다. `@page(render="ssg", dynamic="force-dynamic")`는 빌드 시 생성을 건너뛰고 운영에서는 페이지를 동적으로 제공합니다. 개발 모드에서 `generate_static_params()`가 만들지 않을 SSG 경로를 요청하면 운영에서 404가 될 것이라는 경고를 남깁니다. `pynext dev --strict-ssg`(또는 `create_app(..., strict_ssg=True)`)를 쓰면 개발 모드에서도 404로 응답합니다.
 
+`pynext start --warm-isr`는 서버가 리스닝을 시작한 뒤 동적 세그먼트나 쿼리 키가 없는 ISR 경로를 백그라운드에서 미리 생성해 캐시를 채웁니다. 웜업은 시작을 막지 않고, 웜업 중 들어온 요청은 일반적인 캐시 미스 경로를 탑니다. 동적 ISR 경로와 쿼리 변형 경로는 건너뛰고, 페이지별 실패는 경고로 남기고 개수만 셉니다. 시작하지 않고 코드에서 미리 채우려면 `await app.warm_isr_cache()`를 호출하세요. 워커마다 자기 캐시를 채우며, 공유 백엔드가 있으면 lease로 생성이 중복되지 않습니다.
+
 권한을 확인한 API 핸들러에서는 `await request.revalidate("/news/example")`, 앱 인스턴스를 가진 코드에서는 `await app.revalidate(path)`를 사용할 수 있습니다. 쿼리 문자열이 없는 디코딩된 ISR 경로를 전달합니다. 로컬 또는 공유 캐시 항목을 제거하거나 진행 중인 생성을 무효화했다면 `True`를 반환합니다. 공유 백엔드가 있는 경우 저장소에 닿을 수 있을 때는 공유 항목도 함께 제거되지만, `fail_open` 모드에서는 공유 저장소에 닿지 않을 때 `True`여도 공유 항목이 제거됐다고 보장하지 않습니다(공유 제거는 최선 노력 방식이라 다른 워커는 만료될 때까지 오래된 항목을 계속 제공할 수 있습니다) — 적용되지 않은 무효화를 성공으로 보고하지 않으려면 `fail_closed`를 사용하세요. 기존 요청은 이전 생성 결과를 받을 수 있지만 그 결과가 캐시를 다시 덮어쓰지는 않습니다. 메모리 백엔드에서는 무효화가 프로세스별이며 다른 워커에 전파되지 않고, SQLite 백엔드에서는 공유 항목도 제거되며 정상 상태의 다른 워커는 다음 조회에서 이를 확인합니다. 외부에 노출하는 엔드포인트는 인증·권한 검사가 필요합니다.
 
 ## 공개 파일과 islands
@@ -342,7 +344,7 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 구조화 로그가 기본으로 켜져 있습니다. `pynext` 로거는 한 줄마다 `timestamp`, `level`, `message`, `request_id`, `trace_id`(`traceparent` 헤더를 받은 경우), `route`, `status`, `latency_ms`를 담은 JSON 객체 하나를 출력합니다. 요청마다 요청 ID가 부여됩니다. 유효한 `X-Request-Id` 헤더가 있으면 그대로 사용하고, 없으면 새로 생성해 요청 전체에 전파하고 `x-request-id` 응답 헤더로 반환합니다. 로그 메시지에는 헤더·쿠키·본문·`Authorization` 값을 절대 넣지 마세요. JSON 포맷터는 자격 증명처럼 보이는 이름의 추가 필드를 버리며, 액세스 로그는 원시 URL이 아니라 라우트 패턴(예: `/blog/[slug]`)만 기록합니다.
 
-지표는 메모리에서 수집되며 기본으로 켜져 있습니다. `app.metrics.snapshot()`은 라우트 패턴별 요청 수·상태 코드, 라우트별 지연 p50/p95/p99, Python 실행 큐 길이와 대기 시간, Python 실행 시간 대 Rust 렌더링 시간, ISR 캐시 hit/miss/stale와 재생성 성공·실패·시작, 워커 시작·타임아웃·불가용, 응답 크기와 island 번들 크기를 반환합니다. `app.metrics.prometheus_text()`는 같은 카운터를 Prometheus 텍스트 형식으로 노출합니다. 지연 샘플은 라우트당 2048개로 제한됩니다. Rust가 Python을 거치지 않고 제공하는 신선한 ISR 히트는 여기서 집계되지 않습니다. Python dispatch에 도달한 ISR 결과만 집계됩니다.
+지표는 메모리에서 수집되며 기본으로 켜져 있습니다. `app.metrics.snapshot()`은 라우트 패턴별 요청 수·상태 코드, 라우트별 지연 p50/p95/p99, Python 실행 큐 길이와 대기 시간, Python 실행 시간 대 Rust 렌더링 시간, ISR 캐시 hit/miss/stale와 재생성 성공·실패·시작, ISR 웜업 warmed/skipped/failed/pending/timed_out, 워커 시작·타임아웃·불가용, 응답 크기와 island 번들 크기를 반환합니다. `app.metrics.prometheus_text()`는 같은 카운터를 Prometheus 텍스트 형식으로 노출합니다. 지연 샘플은 라우트당 2048개로 제한됩니다. Rust가 Python을 거치지 않고 제공하는 신선한 ISR 히트는 여기서 집계되지 않습니다. Python dispatch에 도달한 ISR 결과만 집계됩니다.
 
 OpenTelemetry 트레이싱은 기본으로 꺼져 있으며 선택 사항입니다. `opentelemetry-api`(및 원하는 SDK/익스포터)를 설치하고 `--tracing` 또는 `PYNEXT_TRACING=1`로 켜세요. 켜면 `pynext.request`와 `pynext.render` 스팬이 생성되고 들어온 W3C `traceparent`/`tracestate` 컨텍스트가 전파됩니다. 패키지가 설치돼 있지 않으면 트레이싱은 no-op이며 아무것도 깨지지 않습니다.
 

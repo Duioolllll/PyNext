@@ -618,6 +618,11 @@ def _build_parser():
                                       " (default: <project>/.pynext/export)")
             command.add_argument("--analyze", action="store_true",
                                  help="list the largest esbuild inputs per island bundle")
+        if name == "start":
+            command.add_argument("--warm-isr", action="store_true",
+                                 help="pre-fill the ISR cache for statically addressable ISR routes"
+                                      " in the background after the server starts listening;"
+                                      " warmup is best-effort and never blocks startup")
         if name != "build":
             command.add_argument("--host", default=DEFAULT_CONFIG.host)
             command.add_argument("--port", type=_port, default=DEFAULT_CONFIG.port)
@@ -1012,7 +1017,8 @@ def main():
                               observability=obs_config, security=security,
                               websocket_max_message=args.ws_max_message_bytes,
                               shutdown_timeout=args.shutdown_timeout, strict_ssg=args.strict_ssg,
-                              allowed_hosts=values.allowed_hosts)
+                              allowed_hosts=values.allowed_hosts,
+                              warm_isr=getattr(args, "warm_isr", False))
         return run_supervisor(config, workers=workers)
     # Only forward a stage/adaptive timeout that differs from serve()'s
     # default: the historical call shape is preserved otherwise (see
@@ -1066,6 +1072,7 @@ def main():
                           shutdown_timeout=args.shutdown_timeout,
                           **({"allowed_hosts": values.allowed_hosts} if values.allowed_hosts else {}),
                           **({"max_waiting": args.max_waiting} if args.max_waiting is not None else {}),
+                          **({"warm_isr": True} if getattr(args, "warm_isr", False) else {}),
                           **extra, **conn_kwargs, **timeout_kwargs))
     except KeyboardInterrupt:
         pass

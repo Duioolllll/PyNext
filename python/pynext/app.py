@@ -2952,6 +2952,48 @@ class App:
         self.isr_policy_overrides.clear()
         return count
 
+    async def warm_isr_cache(self, *, timeout=None):
+        """Pre-fill the ISR cache for statically addressable ISR routes.
+
+        Warms every ISR pattern without dynamic segments or query keys —
+        those are the routes whose cache key is just the path, so they
+        can be rendered without request input. Dynamic ISR routes need
+        ``generate_static_params`` (not yet supported for ISR) and
+        query-variant routes need concrete query values, so both are
+        skipped and reported under ``skipped_routes``. Best-effort:
+        per-page failures are logged and counted, never raised — a
+        failed entry is simply rendered on its first real request.
+        Returns the :meth:`ISRCache.warmup` summary plus
+        ``skipped_routes`` (``{"dynamic": [...], "query": [...]}``).
+        """
+        entries = []
+        skipped_routes = {"dynamic": [], "query": []}
+        for pattern, policy in self.isr_policies.items():
+            if "[" in pattern:
+                skipped_routes["dynamic"].append(pattern)
+                continue
+            if self.isr_queries.get(pattern):
+                skipped_routes["query"].append(pattern)
+                continue
+
+            async def render(pattern=pattern):
+                return await self._render_isr_response(pattern, {}, {})
+
+            entries.append((pattern, policy, render))
+        result = await self.isr.warmup(entries, timeout=timeout)
+        result["skipped_routes"] = skipped_routes
+        self.metrics.observe_warmup(result)
+        if skipped_routes["dynamic"]:
+            log.info("ISR warmup skipped dynamic routes "
+                     "(generate_static_params is not supported for ISR yet): %s",
+                     ", ".join(sorted(skipped_routes["dynamic"])))
+        if skipped_routes["query"]:
+            log.info("ISR warmup skipped query-variant routes: %s",
+                     ", ".join(sorted(skipped_routes["query"])))
+        log.info("ISR warmup finished: %(warmed)d warmed, %(skipped)d skipped, "
+                 "%(failed)d failed, %(pending)d pending", result)
+        return result
+
     async def _render_stream_chunk(self, node):
         """Serialize one streamed UI node to HTML on a worker thread."""
         bound = bind_islands(_node(node), self.client_manifest, include_runtime=False)
@@ -3206,6 +3248,47 @@ class App:
                 len(json.dumps(selected, ensure_ascii=True).encode("ascii")) > 2048):
             raise BadRequest("ISR query values are too large")
         return selected
+
+    async def _render_isr_response(self, pattern, params, query, *, feed=None):
+        """Render an ISR page to a plain Response, consuming streams fully.
+
+        When ``feed`` is given, each chunk is also sent to the feed as
+        it arrives (the live-request path); warmup passes no feed and
+        just needs the finished body for the cache.
+        """
+        response = await self.render_page(pattern, None, params, csp_nonce=False, query=query)
+        if not isinstance(response, StreamingResponse):
+            return response
+        if feed is not None:
+            feed.begin()
+        body = bytearray()
+        try:
+            # The loading placeholder is for the live client only; feed
+            # it through but keep it out of the cached body, the same
+            # rule _render_isr_cached applies below.
+            index = 0
+            loading_index = getattr(response, "_pynext_loading_index", None)
+            while (chunk := await response._next_chunk()) is not None:
+                if index == loading_index:
+                    index += 1
+                    if feed is not None:
+                        await feed.send(chunk)
+                    continue
+                index += 1
+                if len(body) + len(chunk) > _MAX_ISR_STREAM_BYTES:
+                    raise ValueError("Streamed ISR page exceeds the size limit")
+                body.extend(chunk)
+                if feed is not None:
+                    await feed.send(chunk)
+            if feed is not None:
+                await feed.finish()
+            return Response(bytes(body), status=response.status, headers=response.headers)
+        except BaseException as exc:
+            if feed is not None:
+                feed.fail(exc)
+            raise
+        finally:
+            await response.aclose()
 
     async def _render_isr_cached(self, pattern, params, query, key, policy=None, tags=None):
         # Tee: one render feeds two consumers — the ISR cache body (``body``

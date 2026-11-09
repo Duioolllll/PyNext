@@ -125,6 +125,10 @@ class WorkerConfig:
     # Dev-only: answer 404 (like production) for SSG paths that
     # generate_static_params would not produce, instead of merely warning.
     strict_ssg: bool = False
+    # ISR warmup (CacheSignal): each worker pre-fills its own cache in
+    # the background after listening; a shared backend dedupes the
+    # generations across workers via the cross-process lease.
+    warm_isr: bool = False
 
 
 def _heartbeat_loop(stop, heartbeat):
@@ -195,6 +199,7 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                         shutdown_timeout=config.shutdown_timeout,
                         max_waiting=config.max_waiting,
                         allowed_hosts=config.allowed_hosts,
+                        warm_isr=config.warm_isr,
                         on_ready=lambda _address: ready.set())
         finally:
             shutdown_task.cancel()

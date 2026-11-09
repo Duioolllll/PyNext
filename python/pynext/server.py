@@ -922,12 +922,23 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_
                                     deployment_id=getattr(app, "deployment_id", None)))
 
 
+async def _warm_isr_in_background(app):
+    """Best-effort ISR warmup after the server starts listening.
+
+    Runs detached: requests are already being served, and a warmup
+    failure must never take the server down.
+    """
+    try:
+        await app.warm_isr_cache()
+    except Exception:
+        log.exception("ISR warmup failed")
+
+
 async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                 max_concurrent=DEFAULT_CONFIG.max_concurrent,
                 acquire_timeout_ms=DEFAULT_CONFIG.acquire_timeout_ms,
                 body_capacity=DEFAULT_CONFIG.body_capacity,
-                body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms, stop_event=None, observability=None, *,
-                reuse_port=False, on_ready=None, listener=None,
+                body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms, stop_event=None, observability=None, *,                reuse_port=False, on_ready=None, listener=None,
                 max_connections=DEFAULT_MAX_CONNECTIONS,
                 max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                 max_concurrent_per_ip=DEFAULT_CONFIG.max_concurrent_per_ip,
@@ -944,7 +955,7 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                 ws_idle_timeout_secs=DEFAULT_CONFIG.ws_idle_timeout_secs,
                 ws_max_lifetime_secs=DEFAULT_CONFIG.ws_max_lifetime_secs,
                 ws_ping_interval_secs=DEFAULT_CONFIG.ws_ping_interval_secs,
-                allowed_hosts=None):
+                allowed_hosts=None, warm_isr=False):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
@@ -1004,6 +1015,7 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
     """
     await app.startup()
     server = None
+    warmup_task = None
     if stop_event is None:
         stop_event = asyncio.Event()
         if threading.current_thread() is threading.main_thread():
@@ -1060,10 +1072,19 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
         # a Python/PyNext version mismatch) after the listening line so
         # the first line stays the address.
         log_bundle_info(getattr(app, "root", None))
+        print(f"PyNext listening on http://{server.address}", flush=True)
+        if warm_isr:
+            # Pre-fill the ISR cache in the background: the server is
+            # already listening, and requests that arrive mid-warmup
+            # take the normal miss path.
+            warmup_task = asyncio.create_task(_warm_isr_in_background(app))
         if on_ready is not None:
             on_ready(server.address)
         await stop_event.wait()
     finally:
+        if warmup_task is not None and not warmup_task.done():
+            warmup_task.cancel()
+            await asyncio.gather(warmup_task, return_exceptions=True)
         # Two-phase drain (C-P2-5): one shared shutdown budget starting
         # here. Every stage gets only what is left of it, so the whole
         # shutdown stays within shutdown_timeout instead of each stage

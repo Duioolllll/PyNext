@@ -261,6 +261,141 @@ PENDING_SET_WAIT_TIMEOUT = 5.0
 PENDING_SET_GET_TIMEOUT = 1.0
 
 
+class CacheSignal:
+    """Counts in-progress cache reads and reports when they settle.
+
+    An asyncio port of Next.js ``server/app-render/cache-signal.ts``.
+    ``begin_read``/``end_read`` bracket one cache read (here: one ISR
+    generation); ``cache_ready`` waits until no read is in flight,
+    giving work that can start new reads a loop turn to register first;
+    ``input_ready`` waits only until the reads already running drain.
+    Warmup uses it to know when a batch of generations has finished
+    without polling, and ``_wait_for_shared`` uses it to wake promptly
+    when local generation work settles instead of sleeping out its
+    poll interval.
+
+    A signal belongs to one event loop: the idle event is created
+    lazily on the running loop and recreated if the loop changes.
+    """
+
+    def __init__(self):
+        self._count = 0
+        self._idle = None
+        self._idle_loop = None
+        self._subscribers = None
+
+    def _sync_idle(self, *, set_idle):
+        # Keep the idle event in step with the count. begin/end_read
+        # run on a loop in practice (generation done-callbacks), but
+        # stay usable without one.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._idle is None or self._idle_loop is not loop:
+            self._idle = asyncio.Event()
+            self._idle_loop = loop
+        if set_idle:
+            self._idle.set()
+        else:
+            self._idle.clear()
+
+    def _idle_event(self):
+        loop = asyncio.get_running_loop()
+        if self._idle is None or self._idle_loop is not loop:
+            self._idle = asyncio.Event()
+            self._idle_loop = loop
+            if self._count == 0:
+                self._idle.set()
+        return self._idle
+
+    def begin_read(self):
+        self._count += 1
+        self._sync_idle(set_idle=False)
+        if self._subscribers is not None:
+            for subscriber in self._subscribers:
+                subscriber.begin_read()
+
+    def end_read(self):
+        if self._count == 0:
+            raise ValueError(
+                "CacheSignal got more end_read() calls than begin_read() calls")
+        self._count -= 1
+        if self._count == 0:
+            self._sync_idle(set_idle=True)
+        if self._subscribers is not None:
+            for subscriber in self._subscribers:
+                subscriber.end_read()
+
+    def has_pending_reads(self):
+        return self._count > 0
+
+    async def input_ready(self):
+        """Wait until the reads already running have drained.
+
+        Resolves a loop turn after the count reaches zero, so a read
+        that starts in the same turn is still observed; unlike
+        ``cache_ready`` it does not wait for further work to start new
+        reads.
+        """
+        while True:
+            if self._count == 0:
+                await asyncio.sleep(0)
+                if self._count == 0:
+                    return
+            else:
+                await self._idle_event().wait()
+
+    async def cache_ready(self):
+        """Wait until no cache read is in flight.
+
+        When the count is already zero this still waits two loop turns
+        first, so work that can start new reads gets a chance to
+        register — the asyncio equivalent of Next.js's
+        microtask/nextTick/immediate/timeout cascade. New reads that
+        start during the wait delay the resolution.
+        """
+        while True:
+            if self._count == 0:
+                await asyncio.sleep(0)
+                if self._count == 0:
+                    await asyncio.sleep(0)
+                    if self._count == 0:
+                        return
+            else:
+                await self._idle_event().wait()
+
+    async def track_read(self, awaitable):
+        """Bracket ``awaitable`` with begin/end_read and return its result."""
+        self.begin_read()
+        try:
+            return await awaitable
+        finally:
+            self.end_read()
+
+    def subscribe_to_reads(self, subscriber):
+        """Forward every read on this signal to ``subscriber``.
+
+        Returns an ``unsubscribe`` callable. Mirrors Next.js: the
+        subscriber gets one begin_read for each read already in flight,
+        and matching end_reads as they finish. Unsubscribing while reads
+        are in flight leaves those counts on the subscriber, so only
+        unsubscribe once this signal is settled.
+        """
+        if subscriber is self:
+            raise ValueError("A CacheSignal cannot subscribe to itself")
+        if self._subscribers is None:
+            self._subscribers = set()
+        self._subscribers.add(subscriber)
+        for _ in range(self._count):
+            subscriber.begin_read()
+        return lambda: self.unsubscribe_from_reads(subscriber)
+
+    def unsubscribe_from_reads(self, subscriber):
+        if self._subscribers is not None:
+            self._subscribers.discard(subscriber)
+
+
 class CacheBusy(Exception):
     pass
 
@@ -2389,6 +2524,11 @@ class ISRCache:
         # issuing a duplicate write, and a read waits (bounded) and re-reads
         # the shared entry once the write lands.
         self._pending_sets = {}
+        # CacheSignal (Next.js cache-signal.ts): counts in-flight
+        # generations so warmup and cross-worker waits can tell when
+        # cache reads have settled without polling. Every task added by
+        # _register brackets one read; see its done callback.
+        self.signal = CacheSignal()
         self._variant_paths = OrderedDict()
         # Tag invalidation state. ``_tag_manifest`` is the process-local
         # copy of the tag manifest (authoritative for the memory backend;
@@ -3037,12 +3177,14 @@ class ISRCache:
         self._inflight[key] = task
         self._task_leases[task] = owner
         self._tasks.add(task)
+        self.signal.begin_read()
 
         def completed(finished):
             self._tasks.discard(finished)
             self._task_leases.pop(finished, None)
             if self._inflight.get(key) is finished:
                 self._inflight.pop(key, None)
+            self.signal.end_read()
             if not finished.cancelled():
                 error = finished.exception()
                 if error is not None and not isinstance(error, (SignalError, ISRRenderStatusError)):
@@ -3054,11 +3196,21 @@ class ISRCache:
         task.add_done_callback(completed)
         return task
 
-    async def _wait_for_shared(self, key, timeout):
+    async def _wait_for_shared(self, key, timeout, signal=None):
         """Wait for another worker's first generation to land in the shared
         cache. Returns the fresh body, or None on timeout. If the other
         worker's lease expires while we wait, take the lease and report
-        the observed version so the caller becomes the generator."""
+        the observed version so the caller becomes the generator.
+
+        ``signal`` (a :class:`CacheSignal`, normally this cache's own)
+        lets the poll wake early: while local cache reads are in flight
+        the wait ends as soon as they settle instead of sleeping out
+        the poll interval, so a waiter re-checks the shared entry the
+        moment a warmup or generation finishes. The poll interval stays
+        ``LEASE_WAIT_INTERVAL`` as the worst-case cadence, and the loop
+        re-checks the entry on every wake, so correctness never depends
+        on the signal.
+        """
         deadline = time.monotonic() + timeout
         owner = f"{os.getpid()}:{uuid.uuid4().hex}"
         while True:
@@ -3074,7 +3226,13 @@ class ISRCache:
                 return ("unavailable", None)
             if version is not None:
                 return ("lease", (version, owner))
-            await asyncio.sleep(LEASE_WAIT_INTERVAL)
+            if signal is not None and signal.has_pending_reads():
+                try:
+                    await asyncio.wait_for(signal.cache_ready(), LEASE_WAIT_INTERVAL)
+                except TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(LEASE_WAIT_INTERVAL)
 
     def _remember_key_generated(self, key, generated_at=None):
         # ``generated_at`` is the render *start* time when the caller
@@ -3139,6 +3297,98 @@ class ISRCache:
             return await self._get_or_render_local(key, policy, render, status, body, tags)
         return await self._get_or_render_shared(key, policy, render, status, body, tags)
 
+    async def warmup(self, entries, *, timeout=None):
+        """Pre-fill the cache for ``entries`` without failing the caller.
+
+        ``entries`` is an iterable of ``(key, policy, render)`` triples,
+        the same shape :meth:`get_or_render` takes. Entries already
+        fresh in the local cache are skipped (and duplicates after the
+        first); the rest render concurrently through the normal
+        single-flight path, so a warmup never duplicates a generation a
+        request already started, and at most ``MAX_INFLIGHT``
+        generations run at once.
+
+        Completion is detected with :attr:`signal` — the warmup returns
+        once the in-flight generation count reaches zero instead of
+        polling. A per-entry failure is logged and counted, never
+        raised: warmup is best-effort, and the entry is simply rendered
+        on its first real request instead.
+
+        Returns ``{"requested", "warmed", "skipped", "failed",
+        "pending", "timed_out", "failures"}``; ``failures`` maps keys to
+        ``"ErrorType: message"``. With ``timeout``, entries still
+        running when the wait expires are reported as ``pending`` and
+        keep generating in the background.
+        """
+        if self._closed:
+            raise CacheBusy("ISR cache is shutting down")
+        self._check_loop()
+        outcomes = {}
+        seen = set()
+        requested = 0
+        skipped = 0
+        tasks = []
+        semaphore = asyncio.Semaphore(MAX_INFLIGHT)
+        for key, policy, render in entries:
+            if key in seen:
+                skipped += 1
+                continue
+            seen.add(key)
+            requested += 1
+            status, _ = self.store.lookup(key)
+            if status == "fresh":
+                skipped += 1
+                continue
+            tasks.append(asyncio.ensure_future(
+                self._warm_one(key, policy, render, outcomes, semaphore)))
+        timed_out = False
+        try:
+            async with asyncio.timeout(timeout):
+                await self.signal.cache_ready()
+                if tasks:
+                    await asyncio.gather(*tasks)
+        except TimeoutError:
+            timed_out = True
+            # gather() above already cancels the still-running warmups
+            # when the timeout fires mid-gather; cancel any that were
+            # still only queued behind cache_ready() and let each record
+            # "pending" before it stops. The underlying generations are
+            # shielded and keep running, so a timed-out entry still
+            # lands in the cache.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        warmed = sum(1 for outcome in outcomes.values() if outcome == "warmed")
+        pending = sum(1 for outcome in outcomes.values() if outcome == "pending")
+        failures = {key: outcome[1] for key, outcome in outcomes.items()
+                    if isinstance(outcome, tuple)}
+        result = {"requested": requested, "warmed": warmed, "skipped": skipped,
+                  "failed": len(failures), "pending": pending,
+                  "timed_out": timed_out, "failures": failures}
+        for key, error in failures.items():
+            log.warning("ISR warmup failed for %s: %s", key, error)
+        if timed_out:
+            log.warning("ISR warmup timed out after %ss with %d entries still pending",
+                        timeout, pending)
+        return result
+
+    async def _warm_one(self, key, policy, render, outcomes, semaphore):
+        """Render one warmup entry and record its outcome."""
+        try:
+            async with semaphore:
+                await self.get_or_render(key, policy, render)
+        except asyncio.CancelledError:
+            # The warmup wait expired (or the caller went away). The
+            # generation itself is shielded and keeps running, so this
+            # entry is pending, not failed.
+            outcomes[key] = "pending"
+            raise
+        except Exception as exc:
+            outcomes[key] = ("failed", f"{type(exc).__name__}: {exc}")
+        else:
+            outcomes[key] = "warmed"
     async def _generate(self, key, policy, render, lease=None, tags=(), previous_body=None):
         """Render once and store the result, fenced by the lease version.
 
@@ -3381,7 +3631,7 @@ class ISRCache:
                     self._generate(key, policy, render, lease=(version, owner), tags=tags),
                     context=contextvars.Context()), owner)
             else:
-                outcome, payload = await self._wait_for_shared(key, GENERATION_TIMEOUT)
+                outcome, payload = await self._wait_for_shared(key, GENERATION_TIMEOUT, self.signal)
                 if outcome == "fresh":
                     entry = payload
                     self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)

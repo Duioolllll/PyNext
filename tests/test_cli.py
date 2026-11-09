@@ -286,6 +286,25 @@ def test_cli_accepts_boundary_limits(tmp_path, monkeypatch):
                     ("serve", app, "127.0.0.1", 3000, 1, 0, 1, 0, 30, None)]
 
 
+def test_cli_warm_isr_reaches_serve(tmp_path, monkeypatch):
+    root = tmp_path.resolve()
+    seen = []
+    app = object()
+    monkeypatch.setattr(cli, "create_app", lambda path, production, cache_backend="memory", cache_path=None,
+                        rate_limit=None, **kwargs:
+                        seen.append(("app", path, production, cache_backend, cache_path)) or app)
+
+    async def serve(received_app, host, port, max_concurrent, acquire_timeout_ms,
+                   body_capacity, body_timeout_ms, shutdown_timeout=30, max_waiting=None,
+                   warm_isr=False):
+        seen.append(("serve", received_app, host, port, warm_isr))
+
+    monkeypatch.setattr(cli, "serve", serve)
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--warm-isr"])
+    cli.main()
+    assert seen[1] == ("serve", app, "127.0.0.1", 3000, True)
+
+
 def test_cli_max_waiting_reaches_serve(tmp_path, monkeypatch):
     root = tmp_path.resolve()
     seen = []

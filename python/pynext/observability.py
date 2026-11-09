@@ -588,6 +588,7 @@ class MetricsCollector:
         self._regeneration = {"success": 0, "failure": 0, "started": 0}
         self._rate_limit = {"allowed": 0, "denied": 0, "exempt": 0, "error": 0, "fail_open": 0}
         self._middleware = {"continued": 0, "short_circuited": 0, "error": 0}
+        self._warmup = {"warmed": 0, "skipped": 0, "failed": 0, "pending": 0, "timed_out": 0}
         self._workers = {"starts": 0, "timeouts": 0, "unavailable": 0}
         # H-2: "fail_open" counts rate-limit decisions that could not be
         # produced (decision gate full or deadline expired) and failed
@@ -795,6 +796,16 @@ class MetricsCollector:
         with self._lock:
             self._middleware[outcome] += 1
 
+    def observe_warmup(self, result):
+        """Add one ISR warmup run's summary counts to the warmup counters."""
+        if not self.enabled:
+            return
+        with self._lock:
+            for key in ("warmed", "skipped", "failed", "pending"):
+                self._warmup[key] += int(result.get(key, 0) or 0)
+            if result.get("timed_out"):
+                self._warmup["timed_out"] += 1
+
     # -- sizes ------------------------------------------------------------
     def observe_island_bundle(self, path, size_bytes):
         if not self.enabled:
@@ -865,6 +876,7 @@ class MetricsCollector:
                 "regeneration": dict(self._regeneration),
                 "rate_limit": dict(self._rate_limit),
                 "middleware": dict(self._middleware),
+                "warmup": dict(self._warmup),
                 "workers": dict(self._workers),
                 "rate_limit": dict(self._rate_limit),
                 "stage_timeouts": dict(self._stage_timeouts),
@@ -908,6 +920,10 @@ class MetricsCollector:
                   "# TYPE pynext_middleware_total counter"]
         for outcome, count in snap["middleware"].items():
             lines.append(f'pynext_middleware_total{{outcome="{outcome}"}} {count}')
+        lines += ["# HELP pynext_warmup_total ISR warmup outcomes.",
+                  "# TYPE pynext_warmup_total counter"]
+        for outcome, count in snap["warmup"].items():
+            lines.append(f'pynext_warmup_total{{outcome="{outcome}"}} {count}')
         lines += ["# HELP pynext_worker_total Worker starts, timeouts and unavailability.",
                   "# TYPE pynext_worker_total counter"]
         for outcome, count in snap["workers"].items():
