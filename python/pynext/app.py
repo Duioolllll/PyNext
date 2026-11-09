@@ -37,7 +37,11 @@ from .observability import (
     begin_request_context,
     configure_logging,
     get_request_id,
+    middleware_actor_var,
+    middleware_outcome_var,
+    middleware_rewrote_path_var,
     queue_wait_var,
+    rate_limit_outcome_var,
     render_ms_var,
     route_var,
     span,
@@ -324,6 +328,14 @@ def _module_key(root, relative):
     # App/Page.py vs app/page.py on a case-insensitive filesystem) maps to
     # one cached module instead of being loaded twice.
     return str((root / relative).resolve()).casefold()
+
+
+def _middleware_name(middleware):
+    """Short, bounded label for a middleware callable (app code, never user input)."""
+    name = getattr(middleware, "__qualname__", None) or getattr(middleware, "__name__", None)
+    if isinstance(name, str) and name:
+        return name
+    return type(middleware).__name__
 
 
 class App:
@@ -937,27 +949,104 @@ class App:
         WebSocket pre-flight sentinel): it only runs when every middleware
         called ``call_next``. A middleware that returns its own response
         short-circuits the chain, and that response is the result.
+
+        The chain outcome is recorded for observability (P2-2, §3.3 #18):
+        ``continued`` when the chain reached the terminal, ``short_circuited``
+        when a middleware answered on its own, ``error`` when a middleware
+        raised or violated the chain contract. The outcome, the acting
+        middleware's name and whether the terminal saw a different path
+        (a rewrite) go into request contextvars so the access log line
+        and the ``pynext.request`` span carry them, and the outcome is
+        counted in ``pynext_middleware_total``. ``continued`` is about
+        the chain, not the handler: a handler failure behind the terminal
+        still counts as ``continued`` (the 500 in the log is the handler's
+        failure), and a middleware that recovers from a downstream failure
+        and answers on its own short-circuits.
         """
+        original_path = request.path
+        outcome = {"value": None, "actor": None, "rewrote_path": False}
+        terminal_reached = False
+
+        def record():
+            value = outcome["value"] or "error"
+            middleware_outcome_var.set(value)
+            middleware_actor_var.set(outcome["actor"])
+            middleware_rewrote_path_var.set(outcome["rewrote_path"] or None)
+            self.metrics.observe_middleware(value)
+
+        async def terminal_wrapper(current):
+            nonlocal terminal_reached
+            terminal_reached = True
+            if current.path != original_path:
+                outcome["rewrote_path"] = True
+            response = await terminal(current)
+            outcome["value"] = "continued"
+            return response
+
         async def invoke(index, current):
             if not isinstance(current, Request):
                 raise TypeError("call_next requires a Request")
             if index == len(self.middleware):
-                return await terminal(current)
+                return await terminal_wrapper(current)
             called = False
+            downstream_raised = False
 
             async def call_next(next_request):
-                nonlocal called
+                nonlocal called, downstream_raised
                 if called:
                     raise RuntimeError("call_next may be called only once")
+                if not isinstance(next_request, Request):
+                    raise TypeError("call_next requires a Request")
                 called = True
-                return await invoke(index + 1, next_request)
+                try:
+                    return await invoke(index + 1, next_request)
+                except BaseException:
+                    # The failure came from deeper in the chain (or the
+                    # terminal): the frame that owns it records the
+                    # outcome, not this one.
+                    downstream_raised = True
+                    raise
 
-            result = await self.middleware[index](current, call_next)
+            try:
+                result = await self.middleware[index](current, call_next)
+            except Exception:
+                if not downstream_raised:
+                    # This middleware itself raised (after the terminal
+                    # returned, or without calling it): its own error,
+                    # even if the terminal already ran.
+                    outcome["value"] = "error"
+                    outcome["actor"] = _middleware_name(self.middleware[index])
+                raise
             if not isinstance(result, Response):
+                # Returning a non-Response is this middleware's own
+                # contract violation, even when the terminal already ran.
+                outcome["value"] = "error"
+                outcome["actor"] = _middleware_name(self.middleware[index])
                 raise TypeError("middleware must return a Response")
+            if outcome["value"] is None:
+                outcome["value"] = "short_circuited"
+                outcome["actor"] = _middleware_name(self.middleware[index])
             return result
 
-        return await invoke(0, request)
+        try:
+            response = await invoke(0, request)
+        except BaseException:
+            if outcome["value"] is None and terminal_reached:
+                # The chain reached the terminal and the failure came from
+                # behind it (the handler): the chain continued; the 500
+                # in the request log is the handler's failure.
+                outcome["value"] = "continued"
+            if outcome["value"] is not None:
+                record()
+            # Otherwise a middleware raised before the terminal ran and
+            # the owning frame already recorded the ``error`` outcome;
+            # a bare failure with no outcome (cancellation) records
+            # nothing.
+            raise
+        # A ``return`` inside the ``try`` would skip an ``else`` clause,
+        # so the success outcome is recorded here, after the ``try``.
+        record()
+        return response
 
     async def dispatch(self, request):
         """Return a response. Exceptions are converted at the transport boundary."""
@@ -1056,6 +1145,21 @@ class App:
                 latency_ms = (time.monotonic() - started) * 1000
                 route = route_var.get() or "__unmatched__"
                 request_span.set_attribute("http.route", route)
+                # Middleware/security decisions for this request (P2-2):
+                # the chain outcome and the admission decision, when one
+                # ran. Both are bounded outcome words, never raw URLs.
+                middleware_outcome = middleware_outcome_var.get()
+                middleware_actor = middleware_actor_var.get()
+                middleware_rewrote = middleware_rewrote_path_var.get()
+                rate_limit_outcome = rate_limit_outcome_var.get()
+                if middleware_outcome is not None:
+                    request_span.set_attribute("middleware.outcome", middleware_outcome)
+                if middleware_actor is not None:
+                    request_span.set_attribute("middleware.actor", middleware_actor)
+                if middleware_rewrote:
+                    request_span.set_attribute("middleware.rewrote_path", True)
+                if rate_limit_outcome is not None:
+                    request_span.set_attribute("rate_limit.outcome", rate_limit_outcome)
                 rust_ms = render_ms_var.get() or 0.0
                 queue_wait_ms = queue_wait_var.get()
                 response_bytes = (len(response.body) if response is not None
@@ -1072,6 +1176,10 @@ class App:
                     "queue_wait_ms": round(queue_wait_ms, 3) if queue_wait_ms is not None else None,
                     "python_ms": round(max(0.0, latency_ms - rust_ms), 3),
                     "rust_ms": round(rust_ms, 3) if rust_ms else None,
+                    "middleware": middleware_outcome,
+                    "middleware_actor": middleware_actor,
+                    "middleware_rewrote_path": middleware_rewrote,
+                    "rate_limit": rate_limit_outcome,
                 })
 
     async def _dispatch(self, request):
@@ -1274,21 +1382,32 @@ class App:
         headers = tuple(scope.get("headers", ()))
 
         def decide():
+            # Returns the decision plus its outcome word. ``decide`` runs
+            # in an executor thread on a copied context, so the outcome
+            # is returned (not recorded here) and observed by the caller.
             if _is_exempt_path(limiter, path):
-                return True, None
+                return True, None, "exempt"
             key = limiter.key_for(client_ip, headers)
             allowed, retry_after = limiter.allow(key)
             if type(allowed) is not bool or (retry_after is not None and (
                     not isinstance(retry_after, int) or not 0 <= retry_after <= 2**64 - 1)):
                 raise ValueError("Invalid rate-limit decision")
-            return allowed, retry_after
+            return allowed, retry_after, ("allowed" if allowed else "denied")
 
         try:
-            allowed, retry_after = await self._asgi_admission.check(decide)
+            allowed, retry_after, outcome = await self._asgi_admission.check(decide)
         except Exception:
             # Match native admission: callback failures and overload fail
             # closed regardless of a backend's own failure-policy choice.
+            self.metrics.observe_rate_limit("error")
+            rate_limit_outcome_var.set("error")
             return Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
+        # One observation per decision (P2-2): a denied request never
+        # reaches dispatch, so this counter is its only record — and an
+        # exempt 404 shows up here next to the 404 in the request
+        # counters, the shape a B-1 style bypass takes.
+        self.metrics.observe_rate_limit(outcome)
+        rate_limit_outcome_var.set(outcome)
         return None if allowed else rate_limited_response(max(1, retry_after or 1))
 
     async def _websocket_rate_limit_denied(self, scope, path):
@@ -1366,11 +1485,22 @@ class App:
             response = await (self._run_middleware(request, terminal) if self.middleware
                               else terminal(request))
         except Exception:
-            log.exception("WebSocket authorization failed")
+            log.exception("WebSocket authorization failed", extra={
+                "middleware": middleware_outcome_var.get(),
+                "middleware_actor": middleware_actor_var.get(),
+            })
             return Response("Service Unavailable", status=503)
         if not terminal_reached:
             # A middleware answered the upgrade itself: its response is
-            # the denial (for example 403 from an auth middleware).
+            # the denial (for example 403 from an auth middleware). The
+            # chain outcome is already counted by _run_middleware; the
+            # denial itself is logged here because the pre-flight has no
+            # access log line (§3.3 #18).
+            log.info("websocket authorization denied by middleware", extra={
+                "middleware": middleware_outcome_var.get() or "short_circuited",
+                "middleware_actor": middleware_actor_var.get(),
+                "status": response.status,
+            })
             return response
         denied = check_authorization(seen.get("request", request), handler)
         if denied is not None:
