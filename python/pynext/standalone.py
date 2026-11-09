@@ -55,7 +55,32 @@ def build_standalone(root, output):
         raise ValueError("PyNext native extension is missing")
     if output.exists() or output.is_symlink():
         raise FileExistsError(f"Refusing to overwrite {output}")
+    # Check every build artifact before creating or copying anything:
+    # a missing artifact used to surface only after the runtime and app
+    # trees were already copied, leaving a partial bundle behind that
+    # blocked the retry with FileExistsError.
+    static = root / ".pynext" / "static"
+    files = {f"{entry['sha256']}.html" for entry in built["static_pages"].values()}
+    files.update(f"{entry['sha256']}.asset" for entry in built["assets"].values())
+    client = built["client"]
+    files.update(f"{digest}.js" for digest in
+                 {client["runtime"], *client["bundles"].values()} if digest is not None)
+    for filename in sorted(files):
+        if not (static / filename).is_file():
+            raise ValueError(f"Missing standalone build artifact: {filename}")
     output.mkdir(parents=True, exist_ok=False)
+    try:
+        _populate_standalone(root, output, built, purelib, package)
+    except BaseException:
+        # Never leave a partial bundle behind: a failed build must not
+        # block the retry, and a half-copied output must not look usable.
+        shutil.rmtree(output, ignore_errors=True)
+        raise
+    return output
+
+
+def _populate_standalone(root, output, built, purelib, package):
+    """Copy the runtime, project and launcher into ``output`` (freshly made)."""
     runtime = output / "runtime"
     python_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
     stdlib = Path(sysconfig.get_path("stdlib"))
@@ -89,6 +114,7 @@ def build_standalone(root, output):
             _project_copy(source, project / name)
     build = project / ".pynext"
     build.mkdir()
+    manifest = root / ".pynext" / "manifest.json"
     _project_copy(manifest, build / "manifest.json")
     static = root / ".pynext" / "static"
     files = {f"{entry['sha256']}.html" for entry in built["static_pages"].values()}
@@ -115,4 +141,3 @@ def build_standalone(root, output):
     license_path = Path(f"/usr/share/doc/{python_version}/copyright")
     if license_path.is_file():
         shutil.copy2(license_path, output / "PYTHON-LICENSE")
-    return output
