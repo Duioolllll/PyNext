@@ -100,6 +100,28 @@ async def update(request):
 
 With SessionMiddleware, CSRF turns on automatically — no security config needed. Without sessions, pass `security=SecurityConfig(csrf_enabled=True)` to `create_app` to protect every state-changing API route instead of marking handlers one by one. The double-submit token only proves the request came from a page that could read the cookie. A page that can read the cookie through XSS can bypass it, as with any double-submit scheme. The cookie defaults to `SameSite=Lax` without `HttpOnly` (JavaScript must read it) and is `Secure` by default; for plain-`http://` local development pass `csrf_cookie_secure=False` to both the app config and `set_csrf_cookie()` (`pynext dev` does this automatically). Multi-worker deployments must share one `csrf_signing_key` (or the `PYNEXT_CSRF_SIGNING_KEY` environment variable) on every worker so a cookie issued by one worker verifies on the others.
 
+## Sessions
+
+Server-side sessions live in `request.state["session"]` when a `SessionMiddleware` is installed (`SQLiteSessionStore` for a single file shared by workers, `RedisSessionStore` for Redis). The session cookie holds only an opaque token and is `HttpOnly`, `Secure` by default, and `SameSite=Lax`. Session data must be JSON-serializable: assigning a value that is not (for example an arbitrary object or a set) raises `TypeError` naming the key at assignment time, instead of failing later when the session is saved. Stored data is capped at 16 KiB. A request that presents the session cookie name more than once is treated as having no session at all (fail-closed).
+
+Rotate the session id on login — this is required, not optional. After verifying credentials and storing the authenticated identity, call `session.rotate_on_login()` before returning the login response:
+
+~~~python
+from pynext import JSONResponse, route
+
+@route("POST")
+def login(request):
+    user = authenticate(request)  # verify credentials; raise/return 401 on failure
+    session = request.state["session"]
+    session["user_id"] = user.id
+    session.rotate_on_login()  # fresh session id + fresh CSRF token; old id stops working
+    return JSONResponse({"ok": True})
+~~~
+
+Skipping rotation leaves the session open to fixation: a session id fixed by an attacker before login would stay valid after it. Rotate again whenever privilege changes (for example after a password change). Call `session.invalidate()` on logout to delete the server-side session and clear the cookie.
+
+A `RedisSessionStore` follows a failure policy when Redis is unreachable (see `failure_policy`): the default is `fail_closed`, which raises `SessionUnavailable` and the request is answered 503 instead of silently losing session state. Pass `failure_policy="fail_open"` to start a fresh ephemeral session instead — the request proceeds, but nothing is persisted, so a login made during the outage does not survive the next request, and a rotation during the outage may leave the old session id usable until it expires. Only use `fail_open` where availability matters more than session continuity.
+
 Cross-origin requests are denied by default (spec v0.2 §11): no `Access-Control-Allow-Origin` header is sent unless the origin is configured. Pass the policy to `create_app` with `SecurityConfig`:
 
 ~~~python

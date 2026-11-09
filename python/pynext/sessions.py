@@ -264,7 +264,18 @@ class RedisSessionStore:
 
 
 class Session(MutableMapping):
-    """Per-request session data. Call rotate() on login and invalidate() on logout."""
+    """Per-request session data.
+
+    Security rule: rotate the session id on login. Call
+    :meth:`rotate_on_login` (or :meth:`rotate`) immediately after
+    verifying credentials — on every login, including re-login after a
+    privilege change — so a session id issued before authentication
+    (which an attacker may have fixed) cannot become an authenticated
+    session. The rotation preserves the session data and issues a fresh
+    CSRF token; the old id stops working as soon as the response is
+    sent. Call :meth:`invalidate` on logout to delete the server-side
+    session and clear the cookie.
+    """
 
     def __init__(self, data=None, csrf=None, token=None, version=None):
         self._data = data if data is not None else {}
@@ -300,10 +311,36 @@ class Session(MutableMapping):
         return self._csrf
 
     def rotate(self):
+        """Mark this session for id rotation when the response is sent.
+
+        The middleware then issues a fresh opaque token, moves the
+        stored data to it (version 1), and deletes the old server-side
+        entry, so the pre-rotation id stops working. Rotation also
+        issues a fresh CSRF token. The session data itself is preserved.
+        Call this (or :meth:`rotate_on_login`) after successful
+        authentication — never skip it on login, or the session is
+        vulnerable to fixation: an id fixed by an attacker before login
+        would stay valid after it.
+        """
         if self._invalidated:
             raise RuntimeError("session has been invalidated")
         self._rotate = True
         self._csrf = secrets.token_urlsafe(32)
+
+    def rotate_on_login(self):
+        """Rotate the session id at login (see :meth:`rotate`).
+
+        This is the login hook: call it immediately after verifying
+        credentials, once the authenticated identity is stored (for
+        example ``session["user_id"] = user.id``), and before returning
+        the login response. It is equivalent to :meth:`rotate` but names
+        the call site, so a login handler that forgets it stands out in
+        review. Rotation preserves the session data and issues a fresh
+        CSRF token; the old id is deleted server-side when the response
+        is sent. Also call it again whenever privilege changes
+        (for example after a password change or privilege escalation).
+        """
+        self.rotate()
 
     def invalidate(self):
         self._data.clear()
@@ -316,6 +353,14 @@ class Session(MutableMapping):
 
 class SessionMiddleware:
     """Attach ``request.state['session']`` and persist changes before sending headers.
+
+    The session cookie is ``HttpOnly`` and ``Secure`` by default with
+    ``SameSite=Lax``. A request that presents the cookie name more than
+    once (duplicate ``Cookie`` headers or a duplicated name in one
+    header) is treated as having no session at all — fail-closed, so an
+    attacker cannot smuggle a chosen session id past the single-value
+    check by sending two values. Login handlers must rotate the session
+    id after authentication; see :meth:`Session.rotate_on_login`.
 
     When ``purge_interval`` is set (seconds, default 3600), the middleware
     runs the store's ``purge_expired`` in a background task while requests

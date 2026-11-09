@@ -121,3 +121,75 @@ def test_authenticated_static_pages_are_rejected(tmp_path):
     )
     with pytest.raises(ValueError, match="cannot require authentication"):
         create_app(tmp_path)
+
+
+def test_rotate_on_login_preserves_data_and_rotates_csrf():
+    """The login hook rotates the id and the CSRF token, keeping the data."""
+    from pynext.sessions import Session
+
+    session = Session({"user_id": "alice"}, csrf="old-csrf", token="old-token", version=1)
+    session["user_id"] = "alice"
+    session.rotate_on_login()
+    assert session._rotate is True
+    assert session["user_id"] == "alice"
+    assert session._csrf != "old-csrf"
+    assert session.csrf_token() == session._csrf
+    # Rotating twice, or after invalidation, behaves like rotate().
+    session.rotate_on_login()
+    assert session._rotate is True
+    session.invalidate()
+    with pytest.raises(RuntimeError, match="invalidated"):
+        session.rotate_on_login()
+
+
+def test_duplicate_session_cookie_is_treated_as_no_session(tmp_path):
+    """Review #4 #8: two values for the cookie name fail closed (401).
+
+    A request presenting the session cookie name twice — in one Cookie
+    header or as two Cookie headers — must not be authenticated as
+    either value; the middleware treats it as having no session.
+    """
+    api = tmp_path / "app" / "api"
+    (api / "token").mkdir(parents=True)
+    (api / "token" / "route.py").write_text(
+        'from pynext import JSONResponse, route\n@route("GET")\n'
+        'def get(request): return JSONResponse({"token": request.state["session"].csrf_token()})\n'
+    )
+    (api / "login").mkdir()
+    (api / "login" / "route.py").write_text(
+        'from pynext import JSONResponse, route\n@route("POST")\n'
+        'def post(request):\n'
+        '    session = request.state["session"]\n'
+        '    session["user_id"] = "alice"\n'
+        '    session.rotate_on_login()\n'
+        '    return JSONResponse({"ok": True})\n'
+    )
+    (api / "private").mkdir()
+    (api / "private" / "route.py").write_text(
+        'from pynext import JSONResponse, require_auth, route\n@route("GET")\n@require_auth\n'
+        'def get(request): return JSONResponse({"user": request.state["session"]["user_id"]})\n'
+    )
+    app = make_app(tmp_path, SQLiteSessionStore(tmp_path / "sessions.sqlite3"))
+
+    async def run():
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://test") as client:
+                token = (await client.get("/api/token")).json()["token"]
+                assert (await client.post("/api/login",
+                                          headers={"x-csrf-token": token})).status_code == 200
+                cookie = client.cookies.get("pynext_session")
+                assert cookie
+                assert (await client.get("/api/private")).status_code == 200
+                dup = f"pynext_session={cookie}; pynext_session={cookie}"
+                assert (await client.get("/api/private",
+                                         headers={"Cookie": dup})).status_code == 401
+                assert (await client.get(
+                    "/api/private",
+                    headers=[("Cookie", f"pynext_session={cookie}"),
+                             ("Cookie", f"pynext_session={cookie}")])).status_code == 401
+                # And a single cookie still authenticates afterwards.
+                assert (await client.get("/api/private")).status_code == 200
+        finally:
+            await app.isr.close()
+    asyncio.run(run())
