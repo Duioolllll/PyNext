@@ -1,0 +1,20 @@
+services:
+  web:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        APP_DIR: examples/basic
+    image: pynext-example:local
+    ports:
+      - "127.0.0.1:3000:3000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    stop_grace_period: 40s
+    restart: unless-stopped

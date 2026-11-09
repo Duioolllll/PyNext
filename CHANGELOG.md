@@ -6,6 +6,13 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 - Check native HTTP rate limits from headers before body intake and Python execution. Over-limit uploads are rejected before `100 Continue`; HTTP/1.1 connections with unread bodies close, while HTTP/2 keeps other streams available. HTTP and WebSocket checks share a bounded admission budget. Each admitted request consumes one token, including uploads that are later abandoned or rejected by body/execution limits.
 - Match built-in rate-limit exemptions against decoded paths without treating an encoded question mark as a query delimiter. Preserve custom `is_exempt` overrides and the query-aware public `is_exempt()` helper.
+- Apply one CORS policy to native static/SSG/ISR responses and ASGI, including range, conditional, HEAD and preflight responses.
+- Abort superseded client navigation and fence both late successes and failures; cover ignored aborts and browser history in Chromium on Axum and Uvicorn.
+- Compare CSRF Origin scheme, canonical host and effective port using the trusted proxy identity; reject duplicate and non-ASCII Origin/Host headers.
+- Add cooperative request cancellation and retain bounded synchronous handler capacity until threads actually finish (`sync_workers=32` by default); document the limits for external side effects.
+- Record repeated production-build benchmarks, drain server log pipes, and serialize the benchmark fixture's shared SQLite connection after reproducing concurrent cursor corruption.
+- Add a multi-stage non-root Docker example, read-only/SIGTERM smoke checks, Python/image SBOMs and Python/npm/Rust/image vulnerability CI. Upgrade Pillow to 13 and PyO3 to the fixed 0.29 series.
+- Ship public API stubs and `py.typed` in wheels/sdists; check installed-wheel consumers with mypy and pyright. Implementation details and remaining production gates live in `docs/RUNTIME_HARDENING.md`.
 - Reject non-object JSON build manifests with a clear rebuild error, clean up newly created scaffold ancestors on failure, warn when a partial standalone bundle cannot be removed, and include both bounds in non-integer CLI count errors. Align the roadmap audit totals and document DSL runtime non-finite values, best-effort logout, WebSocket pre-flight limits and shared-only invalidation results (review #5 N1–N13).
 
 ## 0.1.1 (2026-11-09)

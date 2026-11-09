@@ -389,7 +389,7 @@ fn render(py: Python<'_>, tree_json: &str, nonce: Option<&str>) -> PyResult<Stri
             return Err(PyValueError::new_err("Invalid CSP nonce"));
         }
     }
-    py.allow_threads(|| {
+    py.detach(|| {
         let node: Value =
             serde_json::from_str(tree_json).map_err(|e| PyValueError::new_err(e.to_string()))?;
         let mut result = String::new();
@@ -472,7 +472,7 @@ enum BridgeBody {
 
 fn close_stream(stream: Arc<Py<PyAny>>) {
     tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let _ = stream.bind(py).call_method0("close");
         });
     });
@@ -496,7 +496,7 @@ fn streaming_body(stream: Py<PyAny>, permit: OwnedSemaphorePermit) -> Body {
             };
             let next_stream = Arc::clone(&stream);
             let next = tokio::task::spawn_blocking(move || {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     next_stream
                         .bind(py)
                         .call_method0("next_chunk")?
@@ -948,7 +948,7 @@ enum WsPush {
 async fn ws_call(session: &Arc<Py<PyAny>>, method: &'static str, arg: WsPush) -> bool {
     let session = Arc::clone(session);
     tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let bound = session.bind(py);
             match arg {
                 WsPush::Text(text) => bound.call_method1(method, (text,)),
@@ -966,7 +966,7 @@ async fn ws_call(session: &Arc<Py<PyAny>>, method: &'static str, arg: WsPush) ->
 async fn ws_is_done(session: &Arc<Py<PyAny>>) -> bool {
     let session = Arc::clone(session);
     tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             session
                 .bind(py)
                 .call_method0("_is_done")
@@ -989,7 +989,7 @@ async fn ws_take_outgoing(session: &Arc<Py<PyAny>>, timeout: Duration) -> Option
     let session = Arc::clone(session);
     let millis = timeout.as_millis() as u64;
     tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let item = session.bind(py).call_method1("_take_outgoing", (millis,))?;
             let item = item.extract::<Option<(
                 String,
@@ -1036,7 +1036,7 @@ async fn run_ws_session(
     mut socket: WebSocket,
 ) {
     let Some(ws_callback) =
-        Python::with_gil(|py| state.ws_callback.as_ref().map(|cb| cb.clone_ref(py)))
+        Python::attach(|py| state.ws_callback.as_ref().map(|cb| cb.clone_ref(py)))
     else {
         let _ = socket
             .send(ws_close_frame(1011, "websocket setup failed"))
@@ -1044,7 +1044,7 @@ async fn run_ws_session(
         return;
     };
     let session = tokio::task::spawn_blocking(move || {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let session = ws_callback
                 .bind(py)
                 .call1((path, query, headers, protocol))?;
@@ -1205,7 +1205,7 @@ async fn rate_limit_denial(
         tokio::task::spawn_blocking(move || {
             // A timed-out blocking task retains its permit until it exits.
             let _permit = permit;
-            Python::with_gil(|py| -> PyResult<(bool, Option<u64>)> {
+            Python::attach(|py| -> PyResult<(bool, Option<u64>)> {
                 let raw_headers = PyList::empty(py);
                 for (name, value) in &headers {
                     raw_headers.append((PyBytes::new(py, name), PyBytes::new(py, value)))?;
@@ -1304,7 +1304,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             tokio::task::spawn_blocking(move || {
                 // The permit stays with the task even if the timeout expires.
                 let _permit = permit;
-                Python::with_gil(|py| -> PyResult<bool> {
+                Python::attach(|py| -> PyResult<bool> {
                     let headers = PyList::empty(py);
                     for (name, value) in &origin_headers {
                         headers.append((PyBytes::new(py, name), PyBytes::new(py, value)))?;
@@ -1370,7 +1370,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             tokio::task::spawn_blocking(move || {
                 // The permit stays with the task even if the timeout expires.
                 let _permit = auth_permit;
-                Python::with_gil(|py| -> PyResult<Option<bool>> {
+                Python::attach(|py| -> PyResult<Option<bool>> {
                     let headers = PyList::empty(py);
                     for (name, value) in &auth_headers {
                         headers.append((PyBytes::new(py, name), PyBytes::new(py, value)))?;
@@ -1532,6 +1532,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         }
     };
     if !state.middleware_enabled
+        // Origin-bearing responses, including static ranges and 304s,
+        // use the same Python CORS policy as ASGI.
+        && !parts.headers.contains_key(header::ORIGIN)
         && (parts.method == axum::http::Method::GET || parts.method == axum::http::Method::HEAD)
         // Health probes are reserved framework paths (B6): a public
         // asset or static page with the same name must not shadow them,
@@ -1662,7 +1665,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         .map(|peer| peer.0.ip().to_string());
     let security_headers = state.security_headers.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let result = Python::with_gil(|py| {
+        let result = Python::attach(|py| {
             let cb = state.callback.bind(py);
             let token = Py::new(
                 py,
@@ -2244,7 +2247,7 @@ impl NativeServer {
             let _ = shutdown.send(());
         }
         if let Some(thread) = self.thread.take() {
-            py.allow_threads(move || {
+            py.detach(move || {
                 let _ = thread.join();
             });
         }

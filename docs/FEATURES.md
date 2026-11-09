@@ -29,6 +29,7 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `DjangoResource` | `pynext.django` |
 | `BadRequest` | `pynext.http` |
 | `Request` | `pynext.http` |
+| `RequestCancelled` | `pynext.http` |
 | `Response` | `pynext.http` |
 | `JSONResponse` | `pynext.http` |
 | `StreamingResponse` | `pynext.http` |

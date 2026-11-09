@@ -474,6 +474,9 @@ ASGITransport이므로 HTTP 모드와 수치를 직접 비교하면 안 됩니�
 503 비율, 응답 크기와 p50/p95/p99를 함께 기록하세요.
 
 개발 단계와 Next.js 원본을 참조하는 범위는 [구현 로드맵](docs/ROADMAP.md)을 참고하세요.
+
+개발 버전의 CORS·탐색·요청 취소 보강과 Docker·타입 배포의 현재 구현 범위는
+[후속 구현 현황](docs/RUNTIME_HARDENING.md)에 정리했습니다.
 ## 라이선스
 
 PyNext 자체 코드는 [MIT License](LICENSE)로 배포됩니다. `third_party/` 아래의

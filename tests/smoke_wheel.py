@@ -53,6 +53,9 @@ with ZipFile(wheels[0]) as archive:
         raise RuntimeError("Wheel is missing third-party notices")
     if not any(name.endswith("pynext/browser/runtime.js") for name in names):
         raise RuntimeError("Wheel is missing its browser runtime")
+    for suffix in ("pynext/py.typed", "pynext/__init__.pyi", "pynext/http.pyi", "pynext/types.py"):
+        if not any(name.endswith(suffix) for name in names):
+            raise RuntimeError(f"Wheel is missing its public typing contract: {suffix}")
 
 if not skip_sdist:
     with tarfile.open(sources[0]) as archive:
@@ -61,6 +64,8 @@ if not skip_sdist:
             raise RuntimeError("Source distribution is missing its license")
         if not any(name.endswith("/third_party/NEXTJS.md") for name in names):
             raise RuntimeError("Source distribution is missing third-party notices")
+        if not any(name.endswith("/python/pynext/py.typed") for name in names):
+            raise RuntimeError("Source distribution is missing py.typed")
 
 with tempfile.TemporaryDirectory(prefix="pynext-wheel-check-") as directory:
     venv = Path(directory) / "venv"
