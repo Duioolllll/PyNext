@@ -4,6 +4,11 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+## 0.1.2 (2026-11-09)
+
+- Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.
+- Validate ASGI HTTP paths before rate limiting so malformed paths return 400 without consuming tokens, matching native admission. Add the public `is_exempt_path()` type signature and real Redis/shared-capacity regression coverage.
+
 ## 0.1.1 (2026-11-09)
 
 - Check native HTTP rate limits from headers before body intake and Python execution. Over-limit uploads are rejected before `100 Continue`; HTTP/1.1 connections with unread bodies close, while HTTP/2 keeps other streams available. HTTP and WebSocket checks share a bounded admission budget. Each admitted request consumes one token, including uploads that are later abandoned or rejected by body/execution limits.

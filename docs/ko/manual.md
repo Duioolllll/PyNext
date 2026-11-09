@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [日本語](../ja/manual.md) · [简体中文](../zh-CN/manual.md)
 
-이 설명서는 현재 체크아웃한 코드인 **0.1.0** 실험판를 기준으로 합니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
+이 설명서는 현재 체크아웃한 코드인 **0.1.2** 실험판를 기준으로 합니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
 
 > 이 문서는 영문 매뉴얼의 번역본입니다. 내용이 다르면 영문 매뉴얼이 우선합니다. 기능 목록은 코드에서 자동 생성됩니다 — [FEATURES](../FEATURES.md) 참고.
 
@@ -325,3 +325,5 @@ uv run --with playwright==1.62.0 python tests/browser/run_smoke.py
 - 동적 SSG 경로가 404이면 `generate_static_params()`에 경로를 추가하고 재빌드합니다.
 - hydration이 일치하지 않으면 서버 fallback과 클라이언트 `render` 결과를 결정적으로 동일하게 만듭니다.
 - ISR 결과가 워커마다 다르면 캐시 백엔드를 확인합니다. 메모리 백엔드는 프로세스별이며, SQLite 백엔드는 공유 저장소 장애 시 프로세스별 복사본으로 대체합니다.
+
+0.1.2의 ASGI HTTP·WebSocket은 판정 64개 상한과 판정별 2초 기한을 공유합니다. 경로 검증을 먼저 하고 진행 중 작업은 실제 종료까지 용량을 유지하며, 실행기에서 취소·만료된 대기 작업은 limiter를 호출하지 않습니다. 전체 요청 시간 제한은 ASGI 호스트가 별도로 설정합니다. [판정 계약](../ASGI_ADMISSION.md)을 참고하세요.
