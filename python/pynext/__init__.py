@@ -8,10 +8,11 @@ from .database import Database
 from .django import DjangoBusyError, DjangoResource
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN
 from .forms import UploadFile
-from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
-                   StreamingResponse, WebSocket, WebSocketDisconnect, apply_security_headers,
-                   content_security_policy, csrf_protect, new_csrf_token, new_csp_nonce,
-                   security_headers, set_csrf_cookie, sign_csrf_token, validate_csrf)
+from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, PathHeaderRule, PathHeaders, Request,
+                   RequestCancelled, Response, SecurityConfig, StreamingResponse, WebSocket,
+                   WebSocketDisconnect, apply_path_headers, apply_security_headers,
+                   compile_path_headers, content_security_policy, csrf_protect, new_csrf_token,
+                   new_csp_nonce, security_headers, set_csrf_cookie, sign_csrf_token, validate_csrf)
 from .observability import MetricsCollector, ObservabilityConfig
 from .proxy import ProxyTrust, ResolvedProxy, parse_trusted_proxies
 from .pubsub import PubSubOverflow, WebSocketPubSub
@@ -26,6 +27,7 @@ __all__ = ["App", "create_app", "h", "fragment", "island", "layout", "model_prop
            "csrf_protect", "new_csrf_token", "new_csp_nonce", "set_csrf_cookie", "sign_csrf_token",
            "validate_csrf",
            "content_security_policy", "security_headers", "apply_security_headers",
+           "PathHeaderRule", "PathHeaders", "apply_path_headers", "compile_path_headers",
            "ObservabilityConfig", "MetricsCollector", "WebSocket", "WebSocketDisconnect", "MAX_WS_MESSAGE",
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
            "Session", "SessionMiddleware", "SQLiteSessionStore", "RedisSessionStore", "require_auth", "require_permission",

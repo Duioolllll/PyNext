@@ -43,6 +43,10 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `content_security_policy` | `pynext.http` |
 | `security_headers` | `pynext.http` |
 | `apply_security_headers` | `pynext.http` |
+| `PathHeaderRule` | `pynext.http` |
+| `PathHeaders` | `pynext.http` |
+| `apply_path_headers` | `pynext.http` |
+| `compile_path_headers` | `pynext.http` |
 | `ObservabilityConfig` | `pynext.observability` |
 | `MetricsCollector` | `pynext.observability` |
 | `WebSocket` | `pynext.http` |
