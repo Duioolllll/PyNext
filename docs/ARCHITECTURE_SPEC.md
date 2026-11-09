@@ -99,6 +99,8 @@ Hydration 상태는 `unseen → scheduled → loading → active → disposed`�
 
 기본 L1은 워커별 메모리이며 SQLite L2는 **같은 파일을 안전하게 공유하는 워커**를 대상으로 한다. 공개 콘텐츠만 공유한다. 쿠키/Authorization 요청은 공유 ISR을 우회하고 `private, no-store`로 처리한다. `Set-Cookie`, `private`, `no-store` 응답은 캐시하지 않는다.
 
+최소 수명 하한: ISR 정책의 전체 수명(`revalidate + stale`)이 `MIN_PRERENDERABLE_EXPIRE`(300초)보다 짧은 페이지는 동적이다. 동적 페이지는 프리렌더/정적 대상에서 제외된다. 이 하한은 분류 규칙이며 프로덕션 동작은 그대로 둔다 — 프로덕션에서도 동적 페이지는 선언한 정책대로 ISR 캐시를 거친다. 개발(`pynext dev`)에서는 stale 항목을 `expire`까지 서빙하고 항목을 최소 300초간 유지하므로 다시 로드하면 캐시를 맞는다. 이 하한은 Next.js의 `MIN_PRERENDERABLE_EXPIRE`과 같은 규칙이다.
+
 SQLite에서 재생성자는 키별 소유 토큰·만료시각이 있는 lease를 획득한다. 저장 트랜잭션은 현재 버전과 만료되지 않은 lease 소유권을 함께 확인한다. 무효화는 공유 항목과 lease를 함께 제거하므로 오래된 생성자는 공유 캐시를 다시 채울 수 없다. 이미 진행 중인 요청은 자신의 이전 결과를 받을 수 있다. 공유 백엔드가 정상일 때는 매 캐시 조회가 공유 저장소를 확인하므로 다른 워커의 무효화가 다음 조회에 반영된다. L2 장애 시 로컬 생성/캐시로 저하되며 워커 간 single-flight와 즉시 일관성은 보장하지 않는다. SQLite DB 전체 저장 용량, 만료 항목의 주기적 정리 및 WAL 디스크 사용량에는 아직 전역 상한이 없다.
 
 다중 노드 후속 설계는 `(build_id, route, locale, policy_version)` 키, 원자적 세대 번호, 만료 가능한 lease와 저장소 측 fencing, invalidation 이벤트 및 L1 세대 검증을 필요로 한다. 이벤트 유실·노드 재시작·네트워크 분할 시 일관성 정책을 정하고, Redis/객체 스토어의 장애와 조건부 쓰기를 별도로 시험한다. 응답 시간 1ms 미만은 배포 환경의 측정 목표이며 API 보장이 아니다.

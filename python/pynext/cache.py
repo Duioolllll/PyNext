@@ -45,9 +45,49 @@ LEASE_WAIT_INTERVAL = 0.05
 MAX_CACHE_KEY_BYTES = 4096
 MAX_CACHE_BODY_BYTES = 2_097_152
 MAX_CACHE_SECONDS = 604_800.0
+#: Minimum total ISR lifetime (``revalidate + stale`` seconds) for a page to
+#: be treated as prerenderable/static. Mirrors Next.js
+#: ``MIN_PRERENDERABLE_EXPIRE = 300`` (``use-cache/constants.ts``). A page
+#: whose total lifetime is below this floor is dynamic: it is excluded from
+#: prerender/static treatment (see :func:`is_prerenderable_policy`). This is
+#: a classification rule, not a production enforcement — production keeps
+#: serving such pages through the ISR cache with their declared policy. In
+#: development the floor instead extends retention (see
+#: :func:`dev_retention_policy`), so reloads still hit the cache.
+MIN_PRERENDERABLE_EXPIRE = 300.0
 _SHARED_UNAVAILABLE = object()
 _VARIANT_GENERATION_TTL = 86400
 _MAX_LOCAL_VARIANT_PATHS = 1024
+
+
+def is_prerenderable_policy(policy):
+    """Return whether an ISR policy's total lifetime reaches the floor.
+
+    ``policy`` is the ``{"revalidate": seconds, "stale": seconds}`` mapping
+    produced by :func:`pynext.components._isr_policy`. Below
+    :data:`MIN_PRERENDERABLE_EXPIRE` the page is dynamic and is excluded
+    from prerender/static treatment. The classification is a documented
+    rule; production still serves such pages through the ISR cache with
+    their declared policy.
+    """
+    return (float(policy["revalidate"]) + float(policy["stale"])
+            >= MIN_PRERENDERABLE_EXPIRE)
+
+
+def dev_retention_policy(policy):
+    """Return the effective ISR policy for ``pynext dev``.
+
+    Dev serves stale entries until ``expire`` and retains entries for at
+    least :data:`MIN_PRERENDERABLE_EXPIRE` so a reload hits the cache
+    (the Next.js ``default.ts`` dev relaxation). Only the stale window is
+    extended to reach the floor; ``revalidate`` keeps its real value, so
+    staging decisions are unchanged.
+    """
+    revalidate = float(policy["revalidate"])
+    stale = float(policy["stale"])
+    if revalidate + stale >= MIN_PRERENDERABLE_EXPIRE:
+        return {"revalidate": revalidate, "stale": stale}
+    return {"revalidate": revalidate, "stale": MIN_PRERENDERABLE_EXPIRE - revalidate}
 
 
 class CacheBusy(Exception):
