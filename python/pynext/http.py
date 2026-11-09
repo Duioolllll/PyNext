@@ -858,6 +858,13 @@ class Request:
 
 
 class Response:
+    """A finished ("closing") response: the body is fully materialized.
+
+    Nothing more will ever be written to it — the stream is already closed
+    at construction time. Contrast :class:`StreamingResponse`, whose body
+    is still open (a "non-closing" stream) until its iterator ends.
+    """
+
     def __init__(self, body=b"", *, status=200, headers=(), media_type="text/plain; charset=utf-8",
                  csp_nonce=None):
         if not 100 <= status <= 599:
@@ -903,7 +910,16 @@ MAX_STREAM_CHUNK = 1_048_576
 
 
 class StreamingResponse(Response):
-    """A response produced by an asynchronous iterable, one bounded chunk at a time."""
+    """An open ("non-closing") response: chunks arrive from an async iterator.
+
+    The stream stays open until the iterator ends or :meth:`aclose` is
+    called — unlike :class:`Response`, whose body is complete at
+    construction. This is the "non-closing" side of the boundary Next.js
+    draws with ``createUnclosingStream``/``createClosingStream``: a tee
+    consumer (see ``_ISRStreamFeed`` in ``app.py``) must be given the
+    non-closing side so the producer can keep feeding the other consumer
+    after this stream ends.
+    """
 
     def __init__(self, content, *, status=200, headers=(), media_type="application/octet-stream"):
         if status < 200 or status in (204, 304):
