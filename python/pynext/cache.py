@@ -20,18 +20,43 @@ with ``Set-Cookie`` or ``Cache-Control: private``/``no-store`` is served
 but not written to either layer (spec section 10.2). Requests carrying
 a Cookie or Authorization header bypass the cache entirely in
 ``App.dispatch`` and never reach this module.
+
+Cache handlers (Next.js ``CacheHandler`` plugin contract, adapted):
+
+* ``CacheHandler`` is the five-method plugin contract — ``get``,
+  ``set``, ``remove``, ``get_expiration`` and ``update_tags`` — plus
+  ``refresh_tags``. A handler stores ``CacheEntry`` values
+  (``value``, ``tags``, ``stale``, ``timestamp``, ``expire``,
+  ``revalidate``) and owns eviction: the framework never deletes
+  entries except through an explicit ``remove`` (path invalidation);
+  a handler must apply its own TTL or capacity eviction, exactly as
+  Next.js requires (``cache-handlers/types.ts``).
+* The three built-in backends (``memory``, ``sqlite``, ``redis``) are
+  handlers registered by name; ``register_cache_handler`` adds more.
+  ``ISRCache(cache_handler=...)`` accepts a registered name, a
+  factory, or a handler instance, and ``create_app`` forwards it.
+* Cross-process single-flight needs more than the five methods, so
+  ``SharedCacheHandler`` extends the contract with the lease/fencing
+  operations (``acquire_lease``, ``insert_fenced``, ...) that the
+  SQLite and Redis handlers implement. A plain ``CacheHandler`` still
+  works with ``ISRCache`` — reads and writes go through it, but
+  generation is coordinated only within the process.
 """
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
 import threading
 import time
 import uuid
+from abc import ABC, abstractmethod
 from collections import OrderedDict
+from dataclasses import dataclass, field
 
 from . import _native
 from .components import MAX_CACHE_SECONDS, _validate_tag, _validate_tag_expire, _validate_tags
@@ -349,6 +374,392 @@ than rejected.
 """
 
 
+# ---------------------------------------------------------------------------
+# CacheHandler plugin contract (Next.js server/lib/cache-handlers/types.ts)
+# ---------------------------------------------------------------------------
+
+_MAX_CACHE_TAGS = 64
+_MAX_CACHE_TAG_BYTES = 256
+_MAX_HANDLER_META_ENTRIES = 8192
+
+
+def _validate_tags(tags):
+    """Return ``tags`` as a tuple of strings, or ``None`` when invalid.
+
+    Tags are non-empty strings (at most 256 bytes each, at most 64 per
+    entry), matching the ``validateTags`` limits Next.js applies to
+    ``cacheTag()``/fetch tags.
+    """
+    if isinstance(tags, str) or not isinstance(tags, (tuple, list)):
+        return None
+    if len(tags) > _MAX_CACHE_TAGS:
+        return None
+    cleaned = []
+    for tag in tags:
+        if not isinstance(tag, str) or not tag or len(tag.encode("utf-8")) > _MAX_CACHE_TAG_BYTES:
+            return None
+        cleaned.append(tag)
+    if len(set(cleaned)) != len(cleaned):
+        return None
+    return tuple(cleaned)
+
+
+def _tag_status(tags, tag_times, timestamp, now, soft_tags=()):
+    """Decide how tag revalidation affects an entry created at ``timestamp``.
+
+    ``tag_times`` maps a tag to ``(stale_at, expired_at)`` wall-clock
+    seconds (either may be ``None``). A revalidation only applies when it
+    happened after the entry was created — an invalidation stamped before
+    the entry is never retroactive, as in Next.js ``areTagsExpired`` /
+    ``areTagsStale``. Returns ``"ok"``, ``"stale"`` (serve once more,
+    then replace) or ``"expired"`` (miss). Tags listed in ``soft_tags``
+    can only make an entry stale, never expired.
+    """
+    soft = set(soft_tags or ())
+    stale = False
+    for tag in tags:
+        times = tag_times.get(tag)
+        if times is None:
+            continue
+        stale_at, expired_at = times
+        if expired_at is not None and timestamp < expired_at <= now:
+            if tag not in soft:
+                return "expired"
+            stale = True
+        if stale_at is not None and timestamp < stale_at <= now:
+            stale = True
+    return "stale" if stale else "ok"
+
+
+def _validate_tag_update(tags, durations):
+    """Validate ``update_tags`` arguments. Returns ``(tags, expire)``.
+
+    ``expire`` is ``None`` for immediate expiry, else a positive finite
+    number of seconds after which the tags fully expire (until then they
+    only mark entries stale). Raises ``ValueError`` on bad input.
+    """
+    cleaned = _validate_tags(tags)
+    if cleaned is None:
+        raise ValueError("tags must be a list or tuple of up to 64 non-empty strings")
+    expire = None
+    if durations is not None:
+        if not isinstance(durations, dict) or set(durations) != {"expire"}:
+            raise ValueError("durations must be None or {'expire': seconds}")
+        try:
+            expire = float(durations["expire"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("durations['expire'] must be a positive number of seconds") from exc
+        if expire <= 0 or expire != expire or expire == float("inf"):
+            raise ValueError("durations['expire'] must be a positive number of seconds")
+    return cleaned, expire
+
+
+def _entry_durations(entry):
+    """Map a ``CacheEntry`` to ``(fresh_seconds, stale_seconds)`` for storage.
+
+    Returns ``None`` when the entry cannot be stored (oversized body,
+    invalid durations, invalid tags); the caller then returns ``False``
+    instead of raising, mirroring ``CacheBackend.insert``.
+    """
+    if not isinstance(entry.value, (bytes, bytearray)) or len(entry.value) > MAX_CACHE_BODY_BYTES:
+        return None
+    tags = _validate_tags(entry.tags)
+    if tags is None:
+        return None
+    try:
+        revalidate = float(entry.revalidate)
+        stale = float(entry.stale)
+    except (TypeError, ValueError):
+        return None
+    if not _valid_durations(revalidate, stale):
+        return None
+    if entry.expire is None:
+        return revalidate, stale
+    try:
+        expire = float(entry.expire)
+    except (TypeError, ValueError):
+        return None
+    if expire != expire or expire == float("inf") or expire < revalidate:
+        return None
+    stale_for = expire - revalidate
+    if stale_for > MAX_CACHE_SECONDS:
+        return None
+    return revalidate, stale_for
+
+
+@dataclass
+class CacheEntry:
+    """One cached value, as exchanged with a ``CacheHandler``.
+
+    This is Next.js ``CacheEntry`` (``cache-handlers/types.ts``) with one
+    PyNext addition: ``tag_state`` records the tag decision made by
+    ``get`` (``"ok"`` or ``"stale"``). Next.js overloads ``revalidate``
+    with ``-1`` for the same signal; PyNext keeps the durations intact
+    and reports the decision separately.
+
+    * ``value`` — the cached body bytes.
+    * ``tags`` — tags attached at write time (soft tags excluded).
+    * ``stale`` — seconds after ``revalidate`` during which the entry may
+      be served stale while it is regenerated (the SWR window).
+    * ``timestamp`` — creation time, wall-clock seconds (``time.time()``).
+      Handlers stamp their own write time and ignore this field on ``set``.
+    * ``expire`` — absolute hard cap, seconds after ``timestamp``; ``None``
+      means ``revalidate + stale``. Past ``expire`` the entry is never
+      served, even while a regeneration is failing.
+    * ``revalidate`` — seconds the entry stays fresh.
+    """
+
+    value: bytes
+    tags: tuple = ()
+    stale: float = 0.0
+    timestamp: float = field(default_factory=time.time)
+    expire: float | None = None
+    revalidate: float = 0.0
+    tag_state: str = "ok"
+
+    def _total(self):
+        if self.expire is not None:
+            return float(self.expire)
+        return float(self.revalidate) + float(self.stale)
+
+    def status(self, now=None):
+        """``"fresh"`` | ``"stale"`` | ``"expired"``, by age and tags."""
+        now = time.time() if now is None else now
+        age = now - self.timestamp
+        if age >= self._total():
+            return "expired"
+        if self.tag_state == "stale" or age >= float(self.revalidate):
+            return "stale"
+        return "fresh"
+
+    def fresh_remaining(self, now=None):
+        """Seconds left fresh (0 once stale); tag-stale entries are 0."""
+        if self.tag_state == "stale":
+            return 0.0
+        now = time.time() if now is None else now
+        return max(0.0, float(self.revalidate) - (now - self.timestamp))
+
+    def stale_remaining(self, now=None):
+        """Seconds left in the stale window (0 once fresh or expired)."""
+        now = time.time() if now is None else now
+        age = now - self.timestamp
+        if age < float(self.revalidate):
+            return float(self.stale)
+        return max(0.0, self._total() - age)
+
+
+class CacheHandler(ABC):
+    """Plugin contract for a cache backend (Next.js ``CacheHandler``).
+
+    Five methods, all synchronous — ``ISRCache`` calls them from a worker
+    thread. ``get``/``set`` exchange ``CacheEntry`` values; ``set``
+    returns ``False`` instead of raising when the entry cannot be stored
+    (oversized body, invalid durations), mirroring ``CacheBackend.insert``.
+    Backend failures raise :class:`SharedCacheUnavailable` so the
+    caller's failure policy decides what happens next.
+
+    Tag methods: ``update_tags`` records a revalidation instant per tag
+    (``durations=None`` expires immediately; ``{"expire": s}`` marks
+    stale now and expires after ``s`` seconds). ``get`` consults those
+    instants for the entry's tags — an expired tag is a miss, a stale tag
+    returns the entry with ``tag_state == "stale"`` — and
+    ``get_expiration`` returns the latest revalidation instant across
+    the given tags (wall-clock seconds, ``0.0`` when never revalidated).
+    ``refresh_tags`` lets a handler resync a cached tag manifest at
+    request start; handlers that read tags live (SQLite, Redis, memory)
+    leave the default no-op.
+
+    Eviction belongs to the handler: the framework never deletes entries
+    except through an explicit ``remove`` (path invalidation). A handler
+    must apply its own TTL or capacity eviction.
+    """
+
+    #: Registry name (``"memory"``, ``"sqlite"``, ``"redis"``, ...).
+    name = "custom"
+
+    @abstractmethod
+    def get(self, key, soft_tags=()):
+        """Return the entry for ``key``, or ``None`` on a miss.
+
+        ``soft_tags`` are tags whose revalidation may only make the
+        entry stale, never a miss.
+        """
+
+    @abstractmethod
+    def set(self, key, entry):
+        """Store ``entry`` under ``key``. Returns ``True`` on success."""
+
+    @abstractmethod
+    def remove(self, key):
+        """Delete the entry for ``key``. Returns ``True`` when removed."""
+
+    @abstractmethod
+    def get_expiration(self, tags):
+        """Latest revalidation instant (seconds) across ``tags``."""
+
+    @abstractmethod
+    def update_tags(self, tags, durations=None):
+        """Record a revalidation of ``tags`` (see class docstring)."""
+
+    def refresh_tags(self):
+        """Resync a cached tag manifest. No-op for live-read handlers."""
+        return None
+
+    def open(self):
+        """Reopen the handler after :meth:`close`. No-op by default."""
+        return None
+
+    def close(self):
+        """Release the handler's resources. No-op by default."""
+        return None
+
+
+class SharedCacheHandler(CacheHandler):
+    """A ``CacheHandler`` with PyNext cross-process coordination.
+
+    Next.js leaves multi-process single-flight to the remote handler;
+    PyNext's ``ISRCache`` needs leases and fenced writes to keep two
+    workers from generating the same key twice and to stop an old
+    generation refilling the cache after invalidation. Handlers that
+    subclass this (SQLite, Redis) get the full shared-cache behaviour;
+    a plain ``CacheHandler`` still works, with in-process single-flight
+    only.
+    """
+
+    @abstractmethod
+    def lookup_entry(self, key):
+        """Like ``lookup`` but returns a versioned :class:`SharedEntry`."""
+
+    @abstractmethod
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
+        """Store ``body`` only if the version/lease fences still hold."""
+
+    @abstractmethod
+    def acquire_lease(self, key, owner, ttl=LEASE_TTL):
+        """Take the generation lease; ``None`` when another worker holds it."""
+
+    @abstractmethod
+    def release_lease(self, key, owner):
+        """Release a lease, but only the one this worker owns."""
+
+    @abstractmethod
+    def owns_lease(self, key, owner):
+        """Whether ``owner`` still holds a live lease for ``key``."""
+
+    @abstractmethod
+    def variant_generation(self, key, *, invalidate=False):
+        """Get or replace a path generation atomically across workers."""
+
+    def lookup(self, key):
+        """``CacheBackend``-compatible read: ``(status, body)``.
+
+        Kept so code written against ``ISRCache.shared`` (a backend)
+        keeps working when the shared store is a handler instead.
+        """
+        entry = self.lookup_entry(key)
+        if entry is None:
+            return ("miss", None)
+        return (entry.status, entry.body)
+
+    def insert(self, key, body, fresh_seconds, stale_seconds):
+        """``CacheBackend``-compatible unfenced write."""
+        return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None)
+
+
+class _TagManifest:
+    """Process-local tag revalidation instants (``_tag_status`` storage).
+
+    Shared by the memory handler and by ``ISRCache`` when no shared
+    handler is configured. Thread-safe.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._tags = {}
+
+    def update(self, tags, durations=None):
+        cleaned, expire = _validate_tag_update(tags, durations)
+        now = time.time()
+        with self._lock:
+            for tag in cleaned:
+                if expire is None:
+                    self._tags[tag] = (None, now)
+                else:
+                    self._tags[tag] = (now, now + expire)
+        return None
+
+    def times(self, tags):
+        cleaned = _validate_tags(tags)
+        if cleaned is None:
+            raise ValueError("tags must be a list or tuple of up to 64 non-empty strings")
+        with self._lock:
+            return {tag: self._tags.get(tag, (None, None)) for tag in cleaned}
+
+    def expiration(self, tags):
+        cleaned = _validate_tags(tags)
+        if cleaned is None:
+            raise ValueError("tags must be a list or tuple of up to 64 non-empty strings")
+        with self._lock:
+            instants = [self._tags[tag][0] if self._tags[tag][0] is not None
+                        else self._tags[tag][1]
+                        for tag in cleaned if tag in self._tags]
+        return max(instants) if instants else 0.0
+
+
+def _shared_entry_from_cache_entry(entry, now=None):
+    """Convert a handler ``CacheEntry`` to the versioned ``SharedEntry``.
+
+    Plain handlers have no entry versions, so the version is ``0`` and
+    the write is unfenced.
+    """
+    now = time.time() if now is None else now
+    status = entry.status(now)
+    if status == "expired":
+        return SharedEntry("expired", None, 0, 0.0, 0.0)
+    return SharedEntry(status, entry.value, 0,
+                       entry.fresh_remaining(now), entry.stale_remaining(now))
+
+
+def _validate_cache_handler(handler):
+    """Raise ``TypeError`` unless ``handler`` implements the contract."""
+    for method in ("get", "set", "remove", "get_expiration", "update_tags"):
+        if not callable(getattr(handler, method, None)):
+            raise TypeError(f"cache_handler must implement {method}(...)")
+    return handler
+
+
+_CACHE_HANDLER_FACTORIES = {}
+
+
+def register_cache_handler(name, factory, *, override=False):
+    """Register a cache handler factory under ``name``.
+
+    ``factory`` is called as ``factory(cache_path=None, cache_url=None)``
+    and must return a :class:`CacheHandler`. Registering an existing name
+    without ``override=True`` raises ``ValueError``. Built-ins
+    (``memory``, ``sqlite``, ``redis``) can be replaced with
+    ``override=True``.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("cache handler name must be a non-empty string")
+    if not callable(factory):
+        raise TypeError("cache handler factory must be callable")
+    if name in _CACHE_HANDLER_FACTORIES and not override:
+        raise ValueError(f"Cache handler {name!r} is already registered")
+    _CACHE_HANDLER_FACTORIES[name] = factory
+    return factory
+
+
+def get_cache_handler_factory(name):
+    """Return the factory registered under ``name`` (``KeyError`` if none)."""
+    return _CACHE_HANDLER_FACTORIES[name]
+
+
+def list_cache_handlers():
+    """Names of all registered cache handlers, sorted."""
+    return tuple(sorted(_CACHE_HANDLER_FACTORIES))
+
+
 class MemoryCacheBackend(CacheBackend):
     """The original process-local backend, backed by the Rust PageCache."""
 
@@ -393,17 +804,441 @@ class MemoryCacheBackend(CacheBackend):
                            expired_at if expired_at is not None else old_expired)
 
 
+class MemoryCacheHandler(CacheHandler):
+    """Process-local handler backed by the Rust ``PageCache``.
+
+    Entry durations and tags live in a side table because the Rust
+    store only keeps the body and its fresh/stale windows; an entry
+    whose metadata is missing (never written through :meth:`set`) is
+    treated as a miss rather than served with guessed durations.
+    """
+
+    name = "memory"
+
+    def __init__(self, store=None):
+        self._store = store if store is not None else _native.PageCache()
+        self._lock = threading.RLock()
+        self._meta = OrderedDict()  # key -> (timestamp, revalidate, stale, expire, tags)
+        self._tags = _TagManifest()
+
+    @property
+    def store(self):
+        return self._store
+
+    def _prune_meta(self, key):
+        self._meta.pop(key, None)
+
+    def get(self, key, soft_tags=()):
+        status, body = self._store.lookup(key)
+        now = time.time()
+        with self._lock:
+            if status in ("miss", "expired") or body is None:
+                self._prune_meta(key)
+                return None
+            meta = self._meta.get(key)
+            if meta is None:
+                return None
+            timestamp, revalidate, stale, expire, tags = meta
+            tag_state = _tag_status(tags, self._tags.times(tags) if tags else {},
+                                    timestamp, now, soft_tags)
+            if tag_state == "expired":
+                # A miss for this read only: the entry stays stored, so a
+                # later read with the tag as soft can still serve it stale.
+                return None
+            return CacheEntry(value=body, tags=tags, stale=stale, timestamp=timestamp,
+                              expire=expire, revalidate=revalidate, tag_state=tag_state)
+
+    def set(self, key, entry):
+        durations = _entry_durations(entry)
+        if durations is None or len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES:
+            return False
+        revalidate, stale_for = durations
+        if not self._store.insert(key, bytes(entry.value), revalidate, stale_for):
+            return False
+        with self._lock:
+            self._meta[key] = (time.time(), revalidate, stale_for,
+                               entry.expire if entry.expire is not None else revalidate + stale_for,
+                               _validate_tags(entry.tags) or ())
+            self._meta.move_to_end(key)
+            while len(self._meta) > _MAX_HANDLER_META_ENTRIES:
+                self._meta.popitem(last=False)
+        return True
+
+    def remove(self, key):
+        with self._lock:
+            self._prune_meta(key)
+        return self._store.remove(key)
+
+    def get_expiration(self, tags):
+        return self._tags.expiration(tags)
+
+    def update_tags(self, tags, durations=None):
+        return self._tags.update(tags, durations)
+
+
+class SQLiteCacheHandler(SharedCacheHandler):
+    """SQLite-backed shared handler.
+
+    The body, leases and generations live in :class:`SQLiteCacheBackend`;
+    entry metadata (timestamp, durations, tags) and tag revalidation
+    instants live in two extra tables in the same file
+    (``handler_meta`` / ``handler_tags``), so tags are shared across
+    processes exactly like entries. ``get`` returns ``None`` when the
+    entry has no metadata (never written through :meth:`set`), mirroring
+    :class:`MemoryCacheHandler`.
+    """
+
+    name = "sqlite"
+
+    def __init__(self, cache_path=None, cache_url=None):
+        if cache_path is None:
+            raise ValueError("cache_path is required for the sqlite cache handler")
+        self._path = os.fspath(cache_path)
+        self._lock = threading.RLock()
+        self._closed = False
+        self._open_backend()
+
+    def _open_backend(self):
+        self.backend = SQLiteCacheBackend(self._path)
+        self._meta_conn = sqlite3.connect(self._path, timeout=10.0, check_same_thread=False)
+        self._meta_conn.execute("PRAGMA busy_timeout=10000")
+        self._meta_conn.executescript(
+            "CREATE TABLE IF NOT EXISTS handler_meta ("
+            "  key TEXT PRIMARY KEY, timestamp REAL NOT NULL,"
+            "  revalidate REAL NOT NULL, stale REAL NOT NULL,"
+            "  expire REAL NOT NULL, tags TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS handler_tags ("
+            "  tag TEXT PRIMARY KEY, stale_at REAL, expired_at REAL);"
+        )
+        self._meta_conn.commit()
+        self._closed = False
+
+    # -- CacheHandler contract -------------------------------------------
+    def get(self, key, soft_tags=()):
+        entry = self.backend.lookup_entry(key)
+        now = time.time()
+        if entry is None or entry.status == "expired":
+            self._drop_meta(key)
+            return None
+        meta = self._read_meta(key)
+        if meta is None:
+            return None
+        timestamp, revalidate, stale, expire, tags = meta
+        tag_state = _tag_status(tags, self._tag_times(tags) if tags else {},
+                                timestamp, now, soft_tags)
+        if tag_state == "expired":
+            # A miss for this read only: the entry stays stored, so a
+            # later read with the tag as soft can still serve it stale.
+            return None
+        return CacheEntry(value=entry.body, tags=tags, stale=stale, timestamp=timestamp,
+                          expire=expire, revalidate=revalidate, tag_state=tag_state)
+
+    def set(self, key, entry):
+        durations = _entry_durations(entry)
+        if durations is None or len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES:
+            return False
+        revalidate, stale_for = durations
+        if not self.backend.insert_fenced(key, bytes(entry.value), revalidate, stale_for, None):
+            return False
+        expire = entry.expire if entry.expire is not None else revalidate + stale_for
+        self._write_meta(key, time.time(), revalidate, stale_for, expire,
+                         _validate_tags(entry.tags) or ())
+        return True
+
+    def remove(self, key):
+        removed = self.backend.remove(key)
+        return self._drop_meta(key) or removed
+
+    def get_expiration(self, tags):
+        cleaned = _validate_tags(tags)
+        if cleaned is None:
+            raise ValueError("tags must be a list or tuple of up to 64 non-empty strings")
+        with self._lock:
+            instants = []
+            for tag in cleaned:
+                row = self._meta_conn.execute(
+                    "SELECT stale_at, expired_at FROM handler_tags WHERE tag = ?", (tag,)
+                ).fetchone()
+                if row is not None:
+                    instants.append(row[0] if row[0] is not None else row[1])
+        return max(instants) if instants else 0.0
+
+    def update_tags(self, tags, durations=None):
+        cleaned, expire = _validate_tag_update(tags, durations)
+        now = time.time()
+        with self._lock:
+            for tag in cleaned:
+                if expire is None:
+                    self._meta_conn.execute(
+                        "INSERT INTO handler_tags (tag, stale_at, expired_at) VALUES (?, NULL, ?)"
+                        " ON CONFLICT(tag) DO UPDATE SET stale_at=NULL, expired_at=excluded.expired_at",
+                        (tag, now))
+                else:
+                    self._meta_conn.execute(
+                        "INSERT INTO handler_tags (tag, stale_at, expired_at) VALUES (?, ?, ?)"
+                        " ON CONFLICT(tag) DO UPDATE SET stale_at=excluded.stale_at,"
+                        " expired_at=excluded.expired_at",
+                        (tag, now, now + expire))
+            self._meta_conn.commit()
+        return None
+
+    # -- SharedCacheHandler coordination (delegated to the backend) ------
+    def lookup_entry(self, key):
+        return self.backend.lookup_entry(key)
+
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
+        return self.backend.insert_fenced(key, body, fresh_seconds, stale_seconds,
+                                          expected_version, owner)
+
+    def acquire_lease(self, key, owner, ttl=LEASE_TTL):
+        return self.backend.acquire_lease(key, owner, ttl)
+
+    def release_lease(self, key, owner):
+        return self.backend.release_lease(key, owner)
+
+    def owns_lease(self, key, owner):
+        return self.backend.owns_lease(key, owner)
+
+    def variant_generation(self, key, *, invalidate=False):
+        return self.backend.variant_generation(key, invalidate=invalidate)
+
+    # -- lifecycle --------------------------------------------------------
+    def open(self):
+        with self._lock:
+            if self._closed:
+                self._open_backend()
+        return None
+
+    def close(self):
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                try:
+                    self.backend.close()
+                except Exception:
+                    pass
+                try:
+                    self._meta_conn.close()
+                except sqlite3.Error:
+                    pass
+        return None
+
+    # -- metadata / tag storage ------------------------------------------
+    def _read_meta(self, key):
+        with self._lock:
+            row = self._meta_conn.execute(
+                "SELECT timestamp, revalidate, stale, expire, tags FROM handler_meta"
+                " WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None
+        timestamp, revalidate, stale, expire, tags_json = row
+        try:
+            tags = tuple(json.loads(tags_json))
+        except (TypeError, ValueError):
+            return None
+        return timestamp, revalidate, stale, expire, tags
+
+    def _write_meta(self, key, timestamp, revalidate, stale, expire, tags):
+        with self._lock:
+            self._meta_conn.execute(
+                "INSERT INTO handler_meta (key, timestamp, revalidate, stale, expire, tags)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET timestamp=excluded.timestamp,"
+                " revalidate=excluded.revalidate, stale=excluded.stale,"
+                " expire=excluded.expire, tags=excluded.tags",
+                (key, timestamp, revalidate, stale, expire, json.dumps(list(tags))))
+            self._meta_conn.commit()
+
+    def _drop_meta(self, key):
+        with self._lock:
+            deleted = self._meta_conn.execute(
+                "DELETE FROM handler_meta WHERE key = ?", (key,)).rowcount
+            self._meta_conn.commit()
+            return deleted > 0
+
+    def _tag_times(self, tags):
+        with self._lock:
+            times = {}
+            for tag in tags:
+                row = self._meta_conn.execute(
+                    "SELECT stale_at, expired_at FROM handler_tags WHERE tag = ?", (tag,)
+                ).fetchone()
+                times[tag] = (row[0], row[1]) if row is not None else (None, None)
+            return times
+
+
+class RedisCacheHandler(SharedCacheHandler):
+    """Redis-backed shared handler.
+
+    The body, leases and generations live in :class:`RedisCacheBackend`;
+    entry metadata lives in a ``:meta`` hash next to the entry key and
+    tag revalidation instants in ``pynext:isr:tag:<sha256>`` hashes, so
+    both are shared across processes. Tag rows expire after
+    ``MAX_CACHE_SECONDS`` (entries cannot outlive that), meta rows
+    expire with their entry.
+    """
+
+    name = "redis"
+
+    def __init__(self, cache_url=None, cache_path=None, url=None):
+        from .redis_cache import RedisCacheBackend
+        resolved = cache_url or url or os.environ.get("PYNEXT_REDIS_URL")
+        self.backend = RedisCacheBackend(resolved)
+        self._lock = threading.RLock()
+
+    @property
+    def client(self):
+        return self.backend.client
+
+    @staticmethod
+    def _meta_key(key):
+        from .redis_cache import RedisCacheBackend
+        entry_key, _lease_key = RedisCacheBackend._keys(key)
+        return entry_key[: -len(":entry")] + ":meta"
+
+    @staticmethod
+    def _tag_key(tag):
+        return "pynext:isr:tag:" + hashlib.sha256(tag.encode("utf-8")).hexdigest()
+
+    # -- CacheHandler contract -------------------------------------------
+    def get(self, key, soft_tags=()):
+        entry = self.backend.lookup_entry(key)
+        now = time.time()
+        if entry is None or entry.status == "expired":
+            self._drop_meta(key)
+            return None
+        meta = self._read_meta(key)
+        if meta is None:
+            return None
+        timestamp, revalidate, stale, expire, tags = meta
+        tag_state = _tag_status(tags, self._tag_times(tags) if tags else {},
+                                timestamp, now, soft_tags)
+        if tag_state == "expired":
+            # A miss for this read only: the entry stays stored, so a
+            # later read with the tag as soft can still serve it stale.
+            return None
+        return CacheEntry(value=entry.body, tags=tags, stale=stale, timestamp=timestamp,
+                          expire=expire, revalidate=revalidate, tag_state=tag_state)
+
+    def set(self, key, entry):
+        durations = _entry_durations(entry)
+        if durations is None or len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES:
+            return False
+        revalidate, stale_for = durations
+        if not self.backend.insert_fenced(key, bytes(entry.value), revalidate, stale_for, None):
+            return False
+        expire = entry.expire if entry.expire is not None else revalidate + stale_for
+        self._write_meta(key, time.time(), revalidate, stale_for, expire,
+                         _validate_tags(entry.tags) or ())
+        return True
+
+    def remove(self, key):
+        removed = self.backend.remove(key)
+        return self._drop_meta(key) or removed
+
+    def get_expiration(self, tags):
+        cleaned = _validate_tags(tags)
+        if cleaned is None:
+            raise ValueError("tags must be a list or tuple of up to 64 non-empty strings")
+        instants = []
+        for tag in cleaned:
+            row = self.client.hmget(self._tag_key(tag), "stale_at", "expired_at")
+            stale_at, expired_at = row[0], row[1]
+            if stale_at is not None or expired_at is not None:
+                instants.append(float(stale_at) if stale_at is not None else float(expired_at))
+        return max(instants) if instants else 0.0
+
+    def update_tags(self, tags, durations=None):
+        cleaned, expire = _validate_tag_update(tags, durations)
+        now = time.time()
+        for tag in cleaned:
+            key = self._tag_key(tag)
+            if expire is None:
+                self.client.hset(key, mapping={"expired_at": repr(now)})
+                self.client.hdel(key, "stale_at")
+            else:
+                self.client.hset(key, mapping={"stale_at": repr(now),
+                                               "expired_at": repr(now + expire)})
+            self.client.pexpire(key, math.ceil(MAX_CACHE_SECONDS * 1000))
+        return None
+
+    # -- SharedCacheHandler coordination (delegated to the backend) ------
+    def lookup_entry(self, key):
+        return self.backend.lookup_entry(key)
+
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
+        return self.backend.insert_fenced(key, body, fresh_seconds, stale_seconds,
+                                          expected_version, owner)
+
+    def acquire_lease(self, key, owner, ttl=LEASE_TTL):
+        return self.backend.acquire_lease(key, owner, ttl)
+
+    def release_lease(self, key, owner):
+        return self.backend.release_lease(key, owner)
+
+    def owns_lease(self, key, owner):
+        return self.backend.owns_lease(key, owner)
+
+    def variant_generation(self, key, *, invalidate=False):
+        return self.backend.variant_generation(key, invalidate=invalidate)
+
+    # -- lifecycle --------------------------------------------------------
+    def open(self):
+        # redis-py reopens its pool on demand after close().
+        return None
+
+    def close(self):
+        self.backend.close()
+        return None
+
+    # -- metadata / tag storage ------------------------------------------
+    def _read_meta(self, key):
+        row = self.client.hmget(self._meta_key(key), "timestamp", "revalidate",
+                                "stale", "expire", "tags")
+        if row[0] is None:
+            return None
+        try:
+            return (float(row[0]), float(row[1]), float(row[2]), float(row[3]),
+                    tuple(json.loads(row[4].decode("utf-8"))))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _write_meta(self, key, timestamp, revalidate, stale, expire, tags):
+        meta_key = self._meta_key(key)
+        self.client.hset(meta_key, mapping={
+            "timestamp": repr(timestamp), "revalidate": repr(revalidate),
+            "stale": repr(stale), "expire": repr(expire),
+            "tags": json.dumps(list(tags))})
+        self.client.pexpire(meta_key, math.ceil(
+            (revalidate + stale + LEASE_TTL) * 1000))
+
+    def _drop_meta(self, key):
+        return bool(self.client.delete(self._meta_key(key)))
+
+    def _tag_times(self, tags):
+        times = {}
+        for tag in tags:
+            row = self.client.hmget(self._tag_key(tag), "stale_at", "expired_at")
+            stale_at = float(row[0]) if row[0] is not None else None
+            expired_at = float(row[1]) if row[1] is not None else None
+            times[tag] = (stale_at, expired_at)
+        return times
+
+
 class SharedEntry:
     """One shared-cache row as observed by a lookup."""
 
-    __slots__ = ("status", "body", "version", "fresh_remaining", "stale_remaining")
+    __slots__ = ("status", "body", "version", "fresh_remaining", "stale_remaining", "timestamp")
 
-    def __init__(self, status, body, version, fresh_remaining, stale_remaining):
+    def __init__(self, status, body, version, fresh_remaining, stale_remaining, timestamp=None):
         self.status = status
         self.body = body
         self.version = version
         self.fresh_remaining = fresh_remaining
         self.stale_remaining = stale_remaining
+        # Creation time (wall-clock seconds) when the backend knows it;
+        # None when it does not (Redis reports it via the handler meta).
+        self.timestamp = timestamp
 
 
 class SQLiteCacheBackend(CacheBackend):
@@ -1065,9 +1900,138 @@ def _is_storable(response):
     return True
 
 
+class _PlainHandlerSharedAdapter(SharedCacheHandler):
+    """Give a plain :class:`CacheHandler` the shared-cache operations.
+
+    Leases, versions and generations live in process-local tables, so
+    generation is coordinated only within this process — exactly the
+    limit the module docstring promises for plain handlers. Entry
+    reads/writes go through the wrapped handler's ``get``/``set``.
+    """
+
+    name = "custom"
+
+    def __init__(self, handler):
+        self.handler = _validate_cache_handler(handler)
+        self.name = getattr(handler, "name", "custom")
+        self._lock = threading.RLock()
+        self._versions = {}      # key -> int
+        self._leases = {}        # key -> (owner, expires_at)
+        self._generations = {}   # key -> (token, expires_at)
+
+    # -- CacheHandler contract (delegated) -------------------------------
+    def get(self, key, soft_tags=()):
+        return self.handler.get(key, soft_tags)
+
+    def set(self, key, entry):
+        return self.handler.set(key, entry)
+
+    def remove(self, key):
+        with self._lock:
+            self._versions.pop(key, None)
+            self._leases.pop(key, None)
+        return self.handler.remove(key)
+
+    def get_expiration(self, tags):
+        return self.handler.get_expiration(tags)
+
+    def update_tags(self, tags, durations=None):
+        return self.handler.update_tags(tags, durations)
+
+    def refresh_tags(self):
+        return self.handler.refresh_tags()
+
+    def open(self):
+        return self.handler.open()
+
+    def close(self):
+        return self.handler.close()
+
+    # -- SharedCacheHandler coordination (process-local) -----------------
+    def lookup_entry(self, key):
+        entry = self.handler.get(key)
+        if entry is None:
+            return None
+        with self._lock:
+            version = self._versions.get(key, 0)
+        shared = _shared_entry_from_cache_entry(entry)
+        shared.version = version
+        return shared
+
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
+        if len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES or len(body) > MAX_CACHE_BODY_BYTES:
+            return False
+        if not _valid_durations(fresh_seconds, stale_seconds):
+            return False
+        with self._lock:
+            now = time.monotonic()
+            if owner is not None:
+                lease = self._leases.get(key)
+                if lease is None or lease[0] != owner or lease[1] <= now:
+                    return False
+            version = self._versions.get(key, 0)
+            if expected_version is not None and version != expected_version:
+                return False
+            entry = CacheEntry(value=bytes(body), revalidate=float(fresh_seconds),
+                               stale=float(stale_seconds))
+            if not self.handler.set(key, entry):
+                return False
+            self._versions[key] = version + 1
+            return True
+
+    def acquire_lease(self, key, owner, ttl=LEASE_TTL):
+        with self._lock:
+            now = time.monotonic()
+            lease = self._leases.get(key)
+            if lease is not None and lease[1] > now:
+                return None
+            self._leases[key] = (owner, now + ttl)
+            return self._versions.get(key, 0)
+
+    def release_lease(self, key, owner):
+        with self._lock:
+            lease = self._leases.get(key)
+            if lease is not None and lease[0] == owner:
+                del self._leases[key]
+                return True
+            return False
+
+    def owns_lease(self, key, owner):
+        with self._lock:
+            lease = self._leases.get(key)
+            return lease is not None and lease[0] == owner and lease[1] > time.monotonic()
+
+    def variant_generation(self, key, *, invalidate=False):
+        with self._lock:
+            now = time.monotonic()
+            current = self._generations.get(key)
+            if current is not None and current[1] > now and not invalidate:
+                return current[0], True
+            token = uuid.uuid4().hex
+            self._generations[key] = (token, now + _VARIANT_GENERATION_TTL)
+            return token, current is not None
+
+
+def _memory_handler_factory(cache_path=None, cache_url=None):
+    return MemoryCacheHandler()
+
+
+def _sqlite_handler_factory(cache_path=None, cache_url=None):
+    return SQLiteCacheHandler(cache_path=cache_path)
+
+
+def _redis_handler_factory(cache_path=None, cache_url=None):
+    return RedisCacheHandler(cache_url=cache_url)
+
+
+register_cache_handler("memory", _memory_handler_factory)
+register_cache_handler("sqlite", _sqlite_handler_factory)
+register_cache_handler("redis", _redis_handler_factory)
+
+
 class ISRCache:
     def __init__(self, cache_backend="memory", cache_path=None, namespace="", cache_url=None,
-                 failure_policy=None, sqlite_max_entries=None, sqlite_max_bytes=None):
+                 failure_policy=None, sqlite_max_entries=None, sqlite_max_bytes=None, cache_handler=None):
         """Create an ISR cache.
 
         ``failure_policy`` (roadmap item B4) decides what happens when
@@ -1084,7 +2048,61 @@ class ISRCache:
         backend's capacity caps (``None`` selects the backend defaults,
         currently 10,000 entries / 128 MiB); they are ignored for the
         other backends.
+
+        ``cache_handler`` selects the cache store through the
+        :class:`CacheHandler` plugin contract instead of the
+        ``cache_backend`` name: a registered name (``"memory"``,
+        ``"sqlite"``, ``"redis"`` or a custom one), a factory called
+        as ``factory(cache_path=None, cache_url=None)``, or a handler
+        instance. A :class:`SharedCacheHandler` is used directly for
+        cross-process coordination; a plain :class:`CacheHandler` is
+        wrapped so reads/writes go through it while generation is
+        coordinated only within this process. When ``cache_handler``
+        is given, ``cache_backend`` is ignored.
         """
+        self.handler = None
+        self._shared_builder = None
+        if cache_handler is not None:
+            factory = None
+            instance = None
+            if isinstance(cache_handler, str):
+                try:
+                    factory = get_cache_handler_factory(cache_handler)
+                except KeyError as exc:
+                    raise ValueError(
+                        f"Unknown cache handler {cache_handler!r}: expected one of "
+                        f"{', '.join(list_cache_handlers())}") from exc
+            elif isinstance(cache_handler, CacheHandler):
+                instance = cache_handler
+            elif callable(cache_handler):
+                factory = cache_handler
+            else:
+                raise TypeError(
+                    "cache_handler must be a registered name, a factory, or a CacheHandler")
+
+            def _build_shared():
+                handler = (factory(cache_path=cache_path, cache_url=cache_url)
+                           if factory is not None else instance)
+                return self._wrap_handler(handler)
+
+            self._shared_builder = _build_shared
+            self.shared = _build_shared()
+            self._sync_handler()
+            self.backend_name = getattr(self.handler, "name", "custom") or "custom"
+            self._cache_path = cache_path
+            self._cache_url = cache_url
+            self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_OPEN)
+            # The process-local store stays the native fast path in both modes:
+            # the Axum server reads it directly for fresh hits.
+            self.store = _native.PageCache()
+            self._inflight = {}
+            self._task_leases = {}
+            self._tasks = set()
+            self._variant_paths = OrderedDict()
+            self._loop = None
+            self._closed = False
+            self.namespace = namespace
+            return
         if cache_backend not in ("memory", "sqlite", "redis"):
             raise ValueError(
                 f"Unknown cache backend {cache_backend!r}: expected 'memory', 'sqlite' or 'redis'"
@@ -1132,9 +2150,31 @@ class ISRCache:
         self._closed = False
         self.namespace = namespace
 
+    @staticmethod
+    def _wrap_handler(handler):
+        """Validate ``handler`` and adapt it to the shared-cache role."""
+        _validate_cache_handler(handler)
+        handler.open()
+        if isinstance(handler, SharedCacheHandler):
+            return handler
+        return _PlainHandlerSharedAdapter(handler)
+
+    def _sync_handler(self):
+        """Point ``self.handler`` at the handler behind ``self.shared``."""
+        if isinstance(self.shared, _PlainHandlerSharedAdapter):
+            self.handler = self.shared.handler
+        else:
+            self.handler = self.shared
+
     def open(self):
         # A previous shutdown or failed app startup closes the shared store.
         # Reopening must restore it rather than silently falling back to L1.
+        if self._shared_builder is not None:
+            if self.shared is None:
+                self.shared = self._shared_builder()
+                self._sync_handler()
+            self._closed = False
+            return
         if self.shared is None and self.backend_name == "sqlite":
             self.shared = SQLiteCacheBackend(
                 self._cache_path, max_entries=self._sqlite_max_entries,
