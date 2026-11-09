@@ -295,3 +295,19 @@ def test_handler_sees_assignment_error_before_returning(tmp_path):
         finally:
             await app.isr.close()
     asyncio.run(run())
+
+
+def test_session_changed_names_key_mutated_in_place():
+    """In-place mutation bypasses __setitem__; _changed() still names the key.
+
+    ``session["tags"].append(object())`` cannot be caught at assignment
+    time, so the error still surfaces after the handler — but now with
+    the offending key in the message instead of a bare TypeError.
+    """
+    from pynext.sessions import Session
+
+    session = Session()
+    session["tags"] = ["a"]
+    session["tags"].append(object())
+    with pytest.raises(TypeError, match="'tags'"):
+        session._changed()

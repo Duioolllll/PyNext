@@ -436,7 +436,16 @@ class Session(MutableMapping):
         self._invalidated = True
 
     def _changed(self):
-        return self._rotate or json.dumps({"data": self._data, "csrf": self._csrf}, sort_keys=True) != self._initial
+        try:
+            return self._rotate or json.dumps({"data": self._data, "csrf": self._csrf}, sort_keys=True) != self._initial
+        except (TypeError, ValueError):
+            # A value mutated in place after assignment (for example
+            # ``session["tags"].append(obj)``) bypasses __setitem__
+            # validation; name the offending key instead of failing
+            # with a bare error from the middleware save.
+            for key, value in self._data.items():
+                _check_json_serializable(key, value)
+            raise
 
 
 class SessionMiddleware:
