@@ -110,7 +110,7 @@ def test_router_construction_is_clean_and_matches_are_deterministic(data):
     first = router.matches(path)
     assert router.matches(path) == first
     if first is not None:
-        pattern, params = first
+        pattern, params, _kinds = first
         assert _rebuild_path(pattern, params) == path
         assert router.matches(_rebuild_path(pattern, params)) == first
 
@@ -135,7 +135,7 @@ def test_router_matches_never_raises(path):
     router = _native.Router(["/", "/posts/[id]", "/posts/new", "/[...rest]"])
     result = router.matches(path)
     assert result is None or (
-        isinstance(result, tuple) and len(result) == 2
+        isinstance(result, tuple) and len(result) == 3
         and isinstance(result[0], str) and isinstance(result[1], dict)
     )
 

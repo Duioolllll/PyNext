@@ -17,6 +17,17 @@ enum ParamKind {
     OptionalCatchAll,
 }
 
+/// A matched route: the route pattern, each parameter's matched segments,
+/// and each parameter's kind (`"dynamic"`, `"catch_all"` or `"optional"`,
+/// the same strings `python/pynext/build.py` `_segment_param` uses).
+/// The kind travels with the match so callers never re-derive it from
+/// the pattern string.
+pub type RouteMatch = (
+    String,
+    HashMap<String, Vec<String>>,
+    HashMap<String, &'static str>,
+);
+
 #[derive(Debug, Default)]
 struct Node {
     endpoint: Option<String>,
@@ -181,10 +192,17 @@ impl Router {
         &self.routes
     }
 
-    pub fn matches(&self, path: &str) -> Option<(String, HashMap<String, Vec<String>>)> {
+    pub fn matches(&self, path: &str) -> Option<RouteMatch> {
         let path_parts = parts(path).ok()?;
         let mut params = HashMap::new();
-        self.match_node(&self.root, &path_parts, 0, &mut params)
+        // Parameter kinds travel with the match instead of being re-derived
+        // from the pattern string: the trie knows whether a slot is a
+        // dynamic segment, a catch-all or an optional catch-all, and a
+        // substring test on the pattern cannot tell them apart reliably
+        // (for example "[...a]" is a substring of "/[a]/[...a2]").
+        // Kind strings match python/pynext/build.py `_segment_param`.
+        let mut kinds = HashMap::new();
+        self.match_node(&self.root, &path_parts, 0, &mut params, &mut kinds)
     }
 
     // Walk the trie instead of re-parsing every route: static segments win over
@@ -196,58 +214,67 @@ impl Router {
         path_parts: &[&str],
         index: usize,
         params: &mut HashMap<String, Vec<String>>,
-    ) -> Option<(String, HashMap<String, Vec<String>>)> {
+        kinds: &mut HashMap<String, &'static str>,
+    ) -> Option<RouteMatch> {
         if index == path_parts.len() {
             if let Some(route) = &node.endpoint {
-                return Some((route.clone(), params.clone()));
+                return Some((route.clone(), params.clone(), kinds.clone()));
             }
             // An optional catch-all matches zero segments: the route below
             // it is reachable with an empty parameter list.
             if let Some((name, child)) = &node.optional_catch_all {
                 params.insert(name.clone(), vec![]);
-                let hit = self.match_node(child, path_parts, index, params);
+                kinds.insert(name.clone(), "optional");
+                let hit = self.match_node(child, path_parts, index, params, kinds);
                 if hit.is_some() {
                     return hit;
                 }
                 params.remove(name);
+                kinds.remove(name);
             }
             return None;
         }
         let segment = path_parts[index];
         if let Some(child) = node.static_children.get(segment) {
-            if let Some(hit) = self.match_node(child, path_parts, index + 1, params) {
+            if let Some(hit) = self.match_node(child, path_parts, index + 1, params, kinds) {
                 return Some(hit);
             }
         }
         if let Some((name, child)) = &node.dynamic {
             params.insert(name.clone(), vec![segment.to_string()]);
-            let hit = self.match_node(child, path_parts, index + 1, params);
+            kinds.insert(name.clone(), "dynamic");
+            let hit = self.match_node(child, path_parts, index + 1, params, kinds);
             if hit.is_some() {
                 return hit;
             }
             params.remove(name);
+            kinds.remove(name);
         }
         if let Some((name, child)) = &node.catch_all {
             params.insert(
                 name.clone(),
                 path_parts[index..].iter().map(|s| s.to_string()).collect(),
             );
-            let hit = self.match_node(child, path_parts, path_parts.len(), params);
+            kinds.insert(name.clone(), "catch_all");
+            let hit = self.match_node(child, path_parts, path_parts.len(), params, kinds);
             if hit.is_some() {
                 return hit;
             }
             params.remove(name);
+            kinds.remove(name);
         }
         if let Some((name, child)) = &node.optional_catch_all {
             params.insert(
                 name.clone(),
                 path_parts[index..].iter().map(|s| s.to_string()).collect(),
             );
-            let hit = self.match_node(child, path_parts, path_parts.len(), params);
+            kinds.insert(name.clone(), "optional");
+            let hit = self.match_node(child, path_parts, path_parts.len(), params, kinds);
             if hit.is_some() {
                 return hit;
             }
             params.remove(name);
+            kinds.remove(name);
         }
         None
     }
@@ -338,10 +365,10 @@ mod tests {
             let path = format!("/{}", path_segments.join("/"));
             let first = router.matches(&path);
             prop_assert_eq!(&router.matches(&path), &first);
-            if let Some((pattern, params)) = first {
+            if let Some((pattern, params, _kinds)) = first {
                 let rebuilt = rebuild_path(&pattern, &params);
                 prop_assert_eq!(&rebuilt, &path);
-                prop_assert_eq!(router.matches(&rebuilt), Some((pattern, params)));
+                prop_assert_eq!(router.matches(&rebuilt), Some((pattern, params, _kinds)));
             }
         }
         #[test]
@@ -425,6 +452,25 @@ mod tests {
         assert_eq!(r.matches("/").unwrap().0, "/[[...rest]]");
         assert_eq!(r.matches("/").unwrap().1["rest"], Vec::<String>::new());
         assert_eq!(r.matches("/a/b").unwrap().1["rest"], vec!["a", "b"]);
+    }
+    #[test]
+    fn matches_reports_parameter_kinds() {
+        let r = router(&["/posts/[id]", "/docs/[...path]", "/files/[[...rest]]"]);
+        let (_, _, kinds) = r.matches("/posts/42").unwrap();
+        assert_eq!(kinds["id"], "dynamic");
+        let (_, _, kinds) = r.matches("/docs/a/b").unwrap();
+        assert_eq!(kinds["path"], "catch_all");
+        let (_, _, kinds) = r.matches("/files").unwrap();
+        assert_eq!(kinds["rest"], "optional");
+        // A catch-all name must not leak into a plain dynamic parameter
+        // whose name is its prefix: "[...a]" is a substring of
+        // "/[a]/[...a2]", so a string test on the pattern misclassifies it.
+        let r = router(&["/[a]/[...a2]"]);
+        let (_, params, kinds) = r.matches("/x/y/z").unwrap();
+        assert_eq!(kinds["a"], "dynamic");
+        assert_eq!(kinds["a2"], "catch_all");
+        assert_eq!(params["a"], vec!["x"]);
+        assert_eq!(params["a2"], vec!["y", "z"]);
     }
     #[test]
     fn rejects_conflicts_and_invalid_patterns() {
