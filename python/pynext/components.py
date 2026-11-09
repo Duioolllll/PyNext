@@ -595,6 +595,10 @@ def layout(fn=None, *, revalidate=None, stale=None, expire=None, dynamic=False):
     layout) only wins with a shorter value, per ``reduce_segment_config``.
     Non-ISR pages ignore the policy.
 
+    The ``stale`` value also caps the ``X-PyNext-Stale-Time`` prefetch
+    hint of pages below the layout (the hint is the minimum of the
+    page stale time and the layout stale times).
+
     Layouts receive only ``children`` — never the request or route
     params — so the layout shell (the layouts applied to a marker in
     place of the page) is the same for every request to a route and the
@@ -615,6 +619,8 @@ def layout(fn=None, *, revalidate=None, stale=None, expire=None, dynamic=False):
         target.__pynext_layout__ = True
         target.__pynext_layout_policy__ = policy
         target.__pynext_layout_dynamic__ = dynamic
+        if policy["stale"] is not None:
+            target.__pynext_stale__ = float(policy["stale"])
         return target
     if fn is None:
         return decorate

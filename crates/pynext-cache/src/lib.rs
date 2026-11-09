@@ -185,6 +185,31 @@ impl PageCache {
         self.lookup_at(key, Instant::now())
     }
 
+    /// Seconds until the entry for `key` goes stale, or `None` when the
+    /// entry is missing, already stale, or expired. A fresh entry's
+    /// remaining fresh window is the prefetch stale-time hint: a client
+    /// may reuse a prefetched copy for that long before it must treat
+    /// the copy as stale (Next.js `staleTimes`, min over segments).
+    /// Like `lookup`, an expired entry is dropped instead of refreshed.
+    pub fn fresh_remaining(&self, key: &str) -> Option<Duration> {
+        self.fresh_remaining_at(key, Instant::now())
+    }
+
+    fn fresh_remaining_at(&self, key: &str, now: Instant) -> Option<Duration> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = state.entries.get(key)?;
+        let age = now.saturating_duration_since(entry.generated_at);
+        if age >= entry.fresh_for.saturating_add(entry.stale_for) {
+            let removed = state.entries.remove(key).expect("entry present");
+            state.total_bytes -= removed.body.len();
+            return None;
+        }
+        if age >= entry.fresh_for {
+            return None;
+        }
+        Some(entry.fresh_for - age)
+    }
+
     pub fn remove(&self, key: &str) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(&slot) = state.index.get(key) else {
@@ -416,6 +441,38 @@ mod tests {
             CacheResult::Expired
         );
         assert_eq!(cache.lookup_at("/other", now), CacheResult::Miss);
+    }
+
+    #[test]
+    fn fresh_remaining_reports_the_prefetch_stale_time() {
+        let cache = PageCache::new(2, 100, 100);
+        let now = Instant::now();
+        assert!(cache.insert_at(
+            "/a".into(),
+            Bytes::from_static(b"one"),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+            now
+        ));
+        assert_eq!(
+            cache.fresh_remaining_at("/a", now + Duration::from_secs(1)),
+            Some(Duration::from_secs(1))
+        );
+        // Already stale: no fresh window is left to hint at.
+        assert_eq!(
+            cache.fresh_remaining_at("/a", now + Duration::from_secs(2)),
+            None
+        );
+        // Expired entries are dropped, like a lookup would.
+        assert_eq!(
+            cache.fresh_remaining_at("/a", now + Duration::from_secs(5)),
+            None
+        );
+        assert_eq!(
+            cache.lookup_at("/a", now + Duration::from_secs(5)),
+            CacheResult::Miss
+        );
+        assert_eq!(cache.fresh_remaining_at("/missing", now), None);
     }
 
     #[test]

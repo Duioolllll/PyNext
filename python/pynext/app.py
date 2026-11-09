@@ -104,6 +104,19 @@ ASGI_BODY_TIMEOUT_SECS = DEFAULT_CONFIG.body_timeout_ms / 1000.0
 ASGI_BODY_MIN_RATE_BYTES_PER_SEC = DEFAULT_CONFIG.body_min_rate_bytes_per_sec
 ASGI_BODY_MIN_RATE_GRACE_SECS = 2.0
 ASGI_BODY_MIN_RATE_CHECK_INTERVAL_SECS = 0.25
+# Prefetch hint (P2-5, Next.js `staleTimes`): `X-PyNext-Stale-Time` states,
+# in whole seconds, how long a prefetched response may be reused before it
+# must be treated as stale. The value is min(page stale time, layout stale
+# times); a layout without a declared stale time puts no constraint on it.
+# Static pages never change until a rebuild, so they carry the Next.js
+# `staleTimes.static` default of 300 seconds; the client runtime still
+# caps prefetch retention at 60 seconds. ISR pages carry their remaining
+# fresh window (a fresh hit) or `revalidate` (a newly generated entry).
+# Stale-served, private, and dynamic responses carry no hint, so a client
+# never retains a copy that is already stale or user-specific.
+PREFETCH_STALE_TIME_HEADER = b"x-pynext-stale-time"
+SSG_PREFETCH_STALE_SECONDS = 300
+MAX_PREFETCH_STALE_SECONDS = 604_800
 
 # Development error page (P1-3): how much of a traceback the dev page keeps.
 # The tail is kept so the frames nearest the failure survive; anything cut
@@ -1678,6 +1691,10 @@ class App:
         self.isr_static_paths = {}
         self._ssg_fallback_tasks = {}
         self._isr_warmup_task = None
+        # Per-path prefetch stale-time hints for static pages, handed to the
+        # native server so its fast path can emit the same header Python
+        # dispatch emits (empty outside production: no static pages exist).
+        self.prefetch_stale_times = {}
         if cache_backend == "sqlite" and cache_path is None:
             cache_path = self.root / ".pynext" / "isr-cache.sqlite3"
         build_id = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"),
@@ -1752,6 +1769,18 @@ class App:
                             [("route", pattern)],
                             [f"Add a children parameter to Layout in {relative}"]))
                     layouts.append(layout_fn)
+                    # A hand-set __pynext_stale__ (or a @layout(stale=...)
+                    # value that escaped policy validation) is checked here
+                    # so the prefetch hint can never exceed the cap.
+                    stale = getattr(layout_fn, "__pynext_stale__", None)
+                    if stale is not None and (
+                            not isinstance(stale, (int, float)) or isinstance(stale, bool)
+                            or stale != stale or stale < 0 or stale > MAX_PREFETCH_STALE_SECONDS):
+                        raise ValueError(_config_error(
+                            f"Invalid layout stale time in {relative}",
+                            [("route", pattern), ("got", _short_repr(stale))],
+                            [f"Pass stale as a finite number of seconds between 0 and "
+                             f"{MAX_PREFETCH_STALE_SECONDS} to @layout in {relative}"]))
                     raw_layout_policy = getattr(layout_fn, "__pynext_layout_policy__", None)
                     if raw_layout_policy is not None:
                         if not isinstance(raw_layout_policy, dict) or set(raw_layout_policy) != {"revalidate", "stale", "expire"}:
@@ -2107,6 +2136,15 @@ class App:
             self.client_report = None
             self.static_pages = read_static_pages(self.root, manifest, self.router)
             self.public_assets = read_public_artifacts(self.root, manifest)
+            # Static pages are served by the native fast path without
+            # Python dispatch, so precompute their prefetch hints here.
+            for path in self.static_pages:
+                match = self.router.matches(path)
+                if match is None:
+                    continue
+                seconds = self.prefetch_stale_seconds(match[0], SSG_PREFETCH_STALE_SECONDS)
+                if seconds is not None:
+                    self.prefetch_stale_times[path] = seconds
             conflicting = set(self.static_pages).intersection(self.public_assets)
             if conflicting:
                 path = sorted(conflicting)[0]
@@ -3266,6 +3304,36 @@ class App:
         return ("\0isr:" + hashlib.sha256(path.encode("utf-8")).hexdigest() + ":" +
                 generation + ":" + hashlib.sha256(encoded).hexdigest())
 
+    def _layout_stale_seconds(self, pattern):
+        """Minimum declared stale time over the route's layouts, or None.
+
+        Layouts declare it with ``@layout(stale=<seconds>)``; a layout
+        without one puts no constraint on the prefetch hint.
+        """
+        _, layouts = self.entries[pattern]
+        declared = [getattr(layout_fn, "__pynext_stale__", None) for layout_fn in layouts]
+        declared = [value for value in declared if value is not None]
+        return min(declared) if declared else None
+
+    def prefetch_stale_seconds(self, pattern, page_seconds):
+        """Prefetch stale-time hint for ``pattern``, in whole seconds.
+
+        ``page_seconds`` is the page's own stale time (SSG: the static
+        default; ISR: remaining fresh window or ``revalidate`` for a newly
+        generated entry). The hint is min(page, layout stale times) —
+        the Next.js `getDynamicStaleTime` rule, min over segments. Returns
+        ``None`` when there is no hint (no page stale time, or the minimum
+        floors to zero, i.e. "already stale, do not retain").
+        """
+        if page_seconds is None:
+            return None
+        candidates = [float(page_seconds)]
+        layout_stale = self._layout_stale_seconds(pattern)
+        if layout_stale is not None:
+            candidates.append(float(layout_stale))
+        seconds = int(min(candidates))
+        return seconds if 1 <= seconds <= MAX_PREFETCH_STALE_SECONDS else None
+
     def _page_query(self, pattern, request):
         keys = self.isr_queries.get(pattern, ())
         if not keys or request is None:
@@ -4299,14 +4367,18 @@ class App:
             if (self.production and self.render_modes[pattern] == "ssg"
                     and self.dynamic_modes.get(pattern) != "force-dynamic"):
                 if path in self.static_pages:
+                    extra_headers = [(b"vary", b"Cookie, Authorization")]
+                    stale_seconds = self.prefetch_stale_seconds(pattern, SSG_PREFETCH_STALE_SECONDS)
+                    if stale_seconds is not None:
+                        extra_headers.append((PREFETCH_STALE_TIME_HEADER,
+                                              str(stale_seconds).encode("ascii")))
                     response = asset_response(request, self.static_pages[path], "text/html; charset=utf-8",
                                               self.asset_etags[path], cache_control=b"public, max-age=0, must-revalidate",
-                                              extra_headers=[(b"vary", b"Cookie, Authorization")])
+                                              extra_headers=extra_headers)
                 elif self.ssg_fallback[pattern]["fallback"] == "blocking":
                     response = await self._render_ssg_blocking(pattern, path, params, request)
                 else:
                     response = await self._render_ssg_prerender(pattern, path, params)
-            elif self.render_modes[pattern] == "isr" and (self.production or self.debug):
                 query = self._page_query(pattern, request)
                 private = any(name.lower() in {b"authorization", b"cookie"} for name, _ in request.headers)
                 if private:
@@ -4336,6 +4408,13 @@ class App:
                         # reload hits the cache. Production keeps the
                         # declared policy.
                         policy = dev_retention_policy(policy)
+                    # Remaining fresh window of the entry being served, for
+                    # the prefetch hint. Only a fresh hit has one; a miss
+                    # or expired entry is newly generated (its fresh window
+                    # is `revalidate`), and a stale entry gets no hint at
+                    # all — it is already stale.
+                    fresh_remaining = (self.isr.store.fresh_remaining(cache_key)
+                                       if cache_before == "fresh" else None)
                     try:
                         # Implicit path tags stay on the decoded path:
                         # the tag charset (letters, digits, "_", ".",
@@ -4380,6 +4459,7 @@ class App:
                     except TimeoutError:
                         self.metrics.observe_regeneration("failure")
                         return Response("Gateway Timeout", status=504)
+                    boundary_response = False
                     if isinstance(body, StreamingResponse):
                         if cache_before in ("miss", "stale"):
                             self.metrics.observe_regeneration("started")
@@ -4390,6 +4470,7 @@ class App:
                         # generation as failed.
                         self.metrics.observe_regeneration("failure")
                         response = body
+                        boundary_response = True
                     else:
                         if cache_before == "miss":
                             self.metrics.observe_regeneration("success")
@@ -4400,6 +4481,17 @@ class App:
                                 (b"cache-control", cache_control_header(self.isr_policies[pattern]).encode("ascii")),
                                 (b"vary", b"Cookie, Authorization"),
                             ])
+                    if not boundary_response:
+                        if cache_before == "fresh":
+                            page_seconds = fresh_remaining
+                        elif cache_before in {"miss", "expired"}:
+                            page_seconds = self.isr_policies[pattern]["revalidate"]
+                        else:
+                            page_seconds = None
+                        stale_seconds = self.prefetch_stale_seconds(pattern, page_seconds)
+                        if stale_seconds is not None:
+                            response.headers.append((PREFETCH_STALE_TIME_HEADER,
+                                                     str(stale_seconds).encode("ascii")))
             else:
                 response = await self._guarded_page_render(
                     request, pattern, params,

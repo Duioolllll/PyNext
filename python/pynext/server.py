@@ -927,7 +927,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_
                                 # already carry them from Python dispatch.
                                 build_headers=build_headers(
                                     build_id=getattr(app, "build_id", None),
-                                    deployment_id=getattr(app, "deployment_id", None)))
+                                    deployment_id=getattr(app, "deployment_id", None)),
+                                prefetch_stale_times=getattr(app, "prefetch_stale_times", {}))
 
 
 async def _warm_isr_in_background(app):

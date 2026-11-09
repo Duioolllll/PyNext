@@ -33,6 +33,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tower_service::Service as TowerService;
 
+/// Prefetch hint header: seconds until the response goes stale, i.e. how
+/// long a prefetched copy may be reused (Next.js `staleTimes`, min over
+/// segments). Only static pages and fresh ISR responses carry it; a stale
+/// or private response carries no hint so the client never retains it.
+const PREFETCH_STALE_TIME_HEADER: HeaderName = HeaderName::from_static("x-pynext-stale-time");
+
 #[pyclass(name = "Router")]
 struct PyRouter {
     inner: Router,
@@ -97,6 +103,13 @@ impl PyPageCache {
             CacheResult::Expired => ("expired", None),
             CacheResult::Miss => ("miss", None),
         }
+    }
+
+    /// Seconds until the entry for `key` goes stale, or `None` when the
+    /// entry is missing, already stale, or expired. This is the prefetch
+    /// stale-time hint for a fresh ISR hit served without Python dispatch.
+    fn fresh_remaining(&self, key: &str) -> Option<f64> {
+        self.inner.fresh_remaining(key).map(|d| d.as_secs_f64())
     }
 
     fn remove(&self, key: &str) -> bool {
@@ -474,6 +487,11 @@ struct ServerState {
     ws_max_lifetime: Duration,
     ws_ping_interval: Duration,
     static_pages: HashMap<String, Bytes>,
+    /// Prefetch stale-time hint (seconds) per static page path, computed
+    /// in Python as min(SSG stale time, layout stale times). The Axum
+    /// fast path serves static pages without Python dispatch, so it
+    /// needs the per-path values up front.
+    prefetch_stale_times: HashMap<String, u64>,
     public_assets: HashMap<String, PublicAsset>,
     client_assets: HashMap<String, Bytes>,
     asset_etags: HashMap<String, HeaderValue>,
@@ -818,6 +836,9 @@ struct AssetPolicy<'a> {
     etag: &'a HeaderValue,
     cache_control: &'static str,
     vary: bool,
+    /// Prefetch stale-time hint (seconds) for static pages; `None` for
+    /// assets, which are never prefetched as pages.
+    stale_time: Option<u64>,
 }
 
 /// Add the Python-configured A1 security headers to a response the Rust
@@ -1036,6 +1057,9 @@ fn static_response(
     }
     if policy.vary {
         builder = builder.header(header::VARY, "Cookie, Authorization");
+    }
+    if let Some(stale_time) = policy.stale_time {
+        builder = builder.header(PREFETCH_STALE_TIME_HEADER, stale_time.to_string());
     }
     builder.body(body).expect("static response is valid")
 }
@@ -2462,6 +2486,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                             etag: &state.asset_etags[&path],
                             cache_control: "public, max-age=31536000, immutable",
                             vary: false,
+                            stale_time: None,
                         },
                         &state.security_headers,
                         &state.build_headers,
@@ -2488,6 +2513,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                             etag: &state.asset_etags[&path],
                             cache_control: "public, max-age=0, must-revalidate",
                             vary: false,
+                            stale_time: None,
                         },
                         &state.security_headers,
                         &state.build_headers,
@@ -2514,14 +2540,14 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                             etag: &state.asset_etags[&path],
                             cache_control: "public, max-age=0, must-revalidate",
                             vary: true,
+                            stale_time: state.prefetch_stale_times.get(&path).copied(),
                         },
                         &state.security_headers,
                         &state.build_headers,
                         Some(fast_permit),
                     ),
                     &path,
-                    &state.path_headers,
-                );
+                    &state.path_headers,                );
             }
             if !state.shared_cache_enabled
                 && !parts.headers.contains_key("authorization")
@@ -2553,17 +2579,25 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         .unwrap_or_else(|| {
                             HeaderValue::from_static("public, max-age=0, must-revalidate")
                         });
+                    // The fresh window still left on this entry is the
+                    // prefetch stale-time hint; a sub-second remainder
+                    // carries no hint rather than a "0" that reads stale.
+                    let mut builder = AxumResponse::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header("content-length", length.to_string())
+                        .header(header::CACHE_CONTROL, cache_control)
+                        .header("vary", "Cookie, Authorization");
+                    if let Some(remaining) = state.isr_cache.fresh_remaining(&path) {
+                        let seconds = remaining.as_secs();
+                        if seconds >= 1 {
+                            builder =
+                                builder.header(PREFETCH_STALE_TIME_HEADER, seconds.to_string());
+                        }
+                    }
                     return apply_path_headers(
                         apply_build_headers(
-                            apply_security_headers(
-                                AxumResponse::builder()
-                                    .status(StatusCode::OK)
-                                    .header("content-type", "text/html; charset=utf-8")
-                                    .header("content-length", length.to_string())
-                                    .header(header::CACHE_CONTROL, cache_control)
-                                    .header("vary", "Cookie, Authorization"),
-                                &state.security_headers,
-                            ),
+                            apply_security_headers(builder, &state.security_headers),
                             &state.build_headers,
                         )
                         .body(body)
@@ -3344,7 +3378,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, build_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, max_concurrent_per_ip=16, acquire_timeout_max_ms=None, fast_path_max_concurrent=None, streaming_max_lifetime_secs=300, body_capacity_per_ip=4, ws_idle_timeout_secs=300, ws_max_lifetime_secs=3600, ws_ping_interval_secs=60, trusted_proxies=None, allowed_hosts=None, isr_cache_control=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, build_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, max_concurrent_per_ip=16, acquire_timeout_max_ms=None, fast_path_max_concurrent=None, streaming_max_lifetime_secs=300, body_capacity_per_ip=4, ws_idle_timeout_secs=300, ws_max_lifetime_secs=3600, ws_ping_interval_secs=60, trusted_proxies=None, allowed_hosts=None, isr_cache_control=None, prefetch_stale_times=None))]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn new(
@@ -3394,6 +3428,7 @@ impl NativeServer {
         trusted_proxies: Option<Vec<String>>,
         allowed_hosts: Option<Vec<String>>,
         isr_cache_control: Option<HashMap<String, String>>,
+        prefetch_stale_times: Option<HashMap<String, u64>>,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -3637,6 +3672,7 @@ impl NativeServer {
                         .into_iter()
                         .map(|(path, body)| (path, Bytes::from(body)))
                         .collect(),
+                    prefetch_stale_times: prefetch_stale_times.unwrap_or_default(),
                     public_assets,
                     client_assets: client_assets
                         .into_iter()
