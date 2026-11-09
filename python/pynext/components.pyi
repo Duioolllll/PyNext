@@ -1,5 +1,5 @@
 from collections.abc import Callable, Iterable
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, overload
 from .types import Attributes, Child, JSONValue, RenderNode
 
 _F = TypeVar("_F", bound=Callable[..., Any])
@@ -11,4 +11,7 @@ def island(name: str, *, props: dict[str, JSONValue] | None = ..., fallback: Chi
            model: RenderNode | None = ...) -> RenderNode: ...
 def page(*, render: Literal["ssr", "ssg", "isr"] = ..., revalidate: int | None = ...,
          stale: int | None = ..., query_keys: Iterable[str] = ...) -> Callable[[_F], _F]: ...
+@overload
 def layout(fn: _F) -> _F: ...
+@overload
+def layout(*, dynamic: bool = ...) -> Callable[[_F], _F]: ...

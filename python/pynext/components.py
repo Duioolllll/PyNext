@@ -264,6 +264,30 @@ def page(*, render="ssr", revalidate=None, stale=None, query_keys=()):
     return decorate
 
 
-def layout(fn):
-    fn.__pynext_layout__ = True
-    return fn
+def layout(fn=None, *, dynamic=False):
+    """Mark a function as a layout.
+
+    Layouts receive only ``children`` — never the request or route
+    params — so the layout shell (the layouts applied to a marker in
+    place of the page) is the same for every request to a route and the
+    framework renders it once and caches it per route. Treat
+    ``children`` as opaque and render it exactly once: the shell is
+    built with a placeholder where the page goes, so a layout that
+    inspects its children would see the placeholder, not the page.
+    A layout that reads other mutable state (a clock, a database, a
+    global counter) must opt out with ``@layout(dynamic=True)``: its
+    shell is rendered on every request instead of being cached.
+    """
+    if not isinstance(dynamic, bool):
+        raise TypeError("dynamic must be a bool")
+
+    def decorate(target):
+        if not callable(target):
+            raise TypeError("layout must decorate a function")
+        target.__pynext_layout__ = True
+        target.__pynext_layout_dynamic__ = dynamic
+        return target
+
+    if fn is None:
+        return decorate
+    return decorate(fn)
