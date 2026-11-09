@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import _native
 from .assets import discover_public
+from .catchall import normalize_catch_all_routes, verify_static_enumeration
 from .client import discover_client
 
 MANIFEST = ".pynext/manifest.json"
@@ -116,6 +117,18 @@ def write_manifest(root):
     rendered = asyncio.run(_render_static_pages(app))
     if discover(root) != manifest:
         raise ValueError("Application sources changed during build; retry the build")
+    # Catch-all normalization over the enumerated static paths (reduced port
+    # of Next.js normalizeCatchAllRoutes): report which static pages a
+    # catch-all route would also match and which catch-all routes serve only
+    # paths generate_static_params did not enumerate, and fail the build if
+    # the enumeration disagrees with the router about who owns a path.
+    # Only page routes take part; API routes do not enumerate static paths.
+    page_patterns = [pattern for pattern, spec in manifest["routes"].items()
+                     if spec["kind"] == "page"]
+    static_paths = {path: pattern for path, (pattern, _body) in rendered.items()}
+    verify_static_enumeration(page_patterns, static_paths)
+    manifest["catch_all_coverage"] = normalize_catch_all_routes(
+        page_patterns, static_paths).to_json()
     manifest["render_modes"] = app.render_modes
     manifest["isr_policies"] = app.isr_policies
     manifest["isr_queries"] = app.isr_queries
