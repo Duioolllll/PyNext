@@ -702,21 +702,30 @@ def _atomic_write(path, contents):
 def _segment_param(segment):
     """Parse one route segment.
 
-    Returns (name, kind) where kind is "dynamic", "catch_all" or
-    "optional", or None for a static segment.
+    Returns (name, kind, prefix, suffix) where kind is "dynamic",
+    "catch_all" or "optional", or None for a static segment. A dynamic
+    parameter may carry a static prefix and/or suffix, as in
+    ``v[version]`` or ``[name].json`` (Next.js PARAMETER_PATTERN in
+    ``get-dynamic-param.ts``); catch-all parameters may not.
     """
-    if not segment.startswith("["):
+    if "[" not in segment:
+        if "]" in segment:
+            raise ValueError(f"Invalid route segment: {segment}")
         return None
-    match = re.fullmatch(r"\[(\[)?(\.\.\.)?([A-Za-z0-9_-]+)\](\])?", segment)
+    match = re.fullmatch(r"([^[]*)\[(\[)?(\.\.\.)?([A-Za-z0-9_-]+)\](\])?(.*)", segment)
     if match is None:
         raise ValueError(f"Invalid route segment: {segment}")
-    double_open, dots, name, double_close = match.groups()
+    prefix, double_open, dots, name, double_close, suffix = match.groups()
     if bool(double_open) != bool(double_close):
         raise ValueError(f"Invalid route segment: {segment}")
     if double_open and not dots:
         raise ValueError(f"Optional catch-all must use [[...name]]: {segment}")
+    if "]" in prefix or "[" in suffix or "]" in suffix:
+        raise ValueError(f"Invalid route segment: {segment}")
     kind = "optional" if double_open else ("catch_all" if dots else "dynamic")
-    return name, kind
+    if kind != "dynamic" and (prefix or suffix):
+        raise ValueError(f"Catch-all parameters cannot have a prefix or suffix: {segment}")
+    return name, kind, prefix, suffix
 
 
 def _route_group(part):
@@ -738,10 +747,19 @@ def _route_group(part):
 def _materialize(pattern, params):
     segments = pattern.strip("/").split("/") if pattern != "/" else []
     keys = {}
+    seen = set()
     for segment in segments:
         parsed = _segment_param(segment)
         if parsed:
-            keys[parsed[0]] = parsed[1]
+            name, kind, _prefix, _suffix = parsed
+            # The Rust router rejects a repeated name in one route; check
+            # here too so _materialize is safe on its own. Names compare
+            # after stripping non-alphanumerics, like the router does.
+            comparable = re.sub(r"[^A-Za-z0-9]", "", name)
+            if comparable in seen:
+                raise ValueError(f"Repeated or ambiguous parameter name: {name}")
+            seen.add(comparable)
+            keys[name] = kind
     if not isinstance(params, dict) or set(params) != set(keys):
         raise ValueError(f"Static params for {pattern} must contain exactly {sorted(keys)}")
     output = []
@@ -750,7 +768,7 @@ def _materialize(pattern, params):
         if not parsed:
             output.append(segment)
             continue
-        name, kind = parsed
+        name, kind, prefix, suffix = parsed
         value = params[name]
         if kind == "catch_all":
             if not isinstance(value, list) or not value:
@@ -770,7 +788,7 @@ def _materialize(pattern, params):
                 part.encode("utf-8")
             except UnicodeEncodeError as exc:
                 raise ValueError(f"Invalid Unicode static parameter in {pattern}") from exc
-            output.append(part)
+            output.append(prefix + part + suffix)
     return "/" + "/".join(output)
 
 

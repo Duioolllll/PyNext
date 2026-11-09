@@ -17,11 +17,22 @@ enum ParamKind {
     OptionalCatchAll,
 }
 
+impl ParamKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ParamKind::Dynamic => "dynamic",
+            ParamKind::CatchAll => "catch_all",
+            ParamKind::OptionalCatchAll => "optional",
+        }
+    }
+}
+
 /// A matched route: the route pattern, each parameter's matched segments,
 /// and each parameter's kind (`"dynamic"`, `"catch_all"` or `"optional"`,
 /// the same strings `python/pynext/build.py` `_segment_param` uses).
 /// The kind travels with the match so callers never re-derive it from
-/// the pattern string.
+/// the pattern string: a substring test cannot tell the kinds apart
+/// (`"[...a]"` is a substring of `"/[a]/[...a2]"`).
 pub type RouteMatch = (
     String,
     HashMap<String, Vec<String>>,
@@ -35,27 +46,57 @@ struct Node {
     dynamic: Option<(String, Box<Node>)>,
     catch_all: Option<(String, Box<Node>)>,
     optional_catch_all: Option<(String, Box<Node>)>,
+    /// Dynamic segments with a static prefix and/or suffix (`v[version]`,
+    /// `[name].json`), keyed by `(prefix, suffix)`; the value is the
+    /// parameter name and the child node. They match only when the request
+    /// segment starts with the prefix, ends with the suffix and has a
+    /// non-empty middle, and they win over a bare `[name]` at the same
+    /// level because their literal parts make them more specific.
+    affixed: BTreeMap<(String, String), (String, Box<Node>)>,
 }
 
-fn parameter(segment: &str) -> Result<Option<(ParamKind, &str)>, String> {
-    if !segment.starts_with('[') && !segment.ends_with(']') {
+/// One dynamic segment of a route pattern.
+///
+/// A plain `[name]` has an empty prefix and suffix; Next.js
+/// `PARAMETER_PATTERN` (`get-dynamic-param.ts`) also allows a static
+/// prefix and/or suffix around the parameter, as in `v[version]` or
+/// `[name].json`. Catch-all parameters cannot carry a prefix or suffix.
+struct SegmentParam {
+    kind: ParamKind,
+    name: String,
+    prefix: String,
+    suffix: String,
+}
+
+fn parameter(segment: &str) -> Result<Option<SegmentParam>, String> {
+    let Some(open) = segment.find('[') else {
+        if segment.contains(']') {
+            return Err(format!("Malformed route segment: {segment}"));
+        }
         return Ok(None);
-    }
-    if !segment.starts_with('[') || !segment.ends_with(']') {
+    };
+    let prefix = &segment[..open];
+    if prefix.contains(']') {
         return Err(format!("Malformed route segment: {segment}"));
     }
-    let inner = &segment[1..segment.len() - 1];
-    let (optional, inner) = match inner.strip_prefix('[') {
-        Some(rest) => {
-            let Some(rest) = rest.strip_suffix(']') else {
-                return Err(format!(
-                    "Optional or malformed route parameters are not supported: {segment}"
-                ));
-            };
-            (true, rest)
-        }
-        None => (false, inner),
+    let rest = &segment[open..];
+    // An optional parameter opens with `[[` and closes with `]]`.
+    let (optional, inner, suffix) = if let Some(after) = rest.strip_prefix("[[") {
+        let Some(end) = after.find("]]") else {
+            return Err(format!(
+                "Optional or malformed route parameters are not supported: {segment}"
+            ));
+        };
+        (true, &after[..end], &after[end + 2..])
+    } else {
+        let Some(end) = rest[1..].find(']') else {
+            return Err(format!("Malformed route segment: {segment}"));
+        };
+        (false, &rest[1..1 + end], &rest[1 + end + 1..])
     };
+    if suffix.contains(['[', ']']) {
+        return Err(format!("Malformed route segment: {segment}"));
+    }
     let (kind, name) = match inner.strip_prefix("...") {
         Some(name) => (
             if optional {
@@ -74,6 +115,11 @@ fn parameter(segment: &str) -> Result<Option<(ParamKind, &str)>, String> {
             (ParamKind::Dynamic, inner)
         }
     };
+    if kind != ParamKind::Dynamic && (!prefix.is_empty() || !suffix.is_empty()) {
+        return Err(format!(
+            "Catch-all parameters cannot have a prefix or suffix: {segment}"
+        ));
+    }
     if name.is_empty()
         || !name
             .chars()
@@ -82,7 +128,12 @@ fn parameter(segment: &str) -> Result<Option<(ParamKind, &str)>, String> {
     {
         return Err(format!("Invalid parameter name: {segment}"));
     }
-    Ok(Some((kind, name)))
+    Ok(Some(SegmentParam {
+        kind,
+        name: name.to_owned(),
+        prefix: prefix.to_owned(),
+        suffix: suffix.to_owned(),
+    }))
 }
 
 fn parts(path: &str) -> Result<Vec<&str>, String> {
@@ -108,35 +159,58 @@ impl Node {
         let mut node = self;
         let mut names = HashSet::new();
         for (i, segment) in segments.iter().enumerate() {
-            if let Some((kind, name)) = parameter(segment)? {
-                if kind != ParamKind::Dynamic && i + 1 != segments.len() {
+            if let Some(param) = parameter(segment)? {
+                if param.kind != ParamKind::Dynamic && i + 1 != segments.len() {
                     return Err("Catch-all must be the last part of the URL".into());
                 }
-                if matches!(kind, ParamKind::CatchAll) && node.optional_catch_all.is_some()
-                    || matches!(kind, ParamKind::OptionalCatchAll) && node.catch_all.is_some()
+                if matches!(param.kind, ParamKind::CatchAll) && node.optional_catch_all.is_some()
+                    || matches!(param.kind, ParamKind::OptionalCatchAll) && node.catch_all.is_some()
                 {
                     return Err(
                         "Cannot combine a catch-all and an optional catch-all at the same level"
                             .into(),
                     );
                 }
-                let comparable_name = comparable(name);
+                let comparable_name = comparable(&param.name);
                 if !names.insert(comparable_name) {
-                    return Err(format!("Repeated or ambiguous parameter name: {name}"));
-                }
-                let slot = match kind {
-                    ParamKind::Dynamic => &mut node.dynamic,
-                    ParamKind::CatchAll => &mut node.catch_all,
-                    ParamKind::OptionalCatchAll => &mut node.optional_catch_all,
-                };
-                let (existing, child) =
-                    slot.get_or_insert_with(|| (name.to_owned(), Box::default()));
-                if comparable(existing) != comparable(name) {
                     return Err(format!(
-                        "Different slug names for the same dynamic path: {existing}, {name}"
+                        "Repeated or ambiguous parameter name: {}",
+                        param.name
                     ));
                 }
-                node = child;
+                if param.prefix.is_empty() && param.suffix.is_empty() {
+                    let slot = match param.kind {
+                        ParamKind::Dynamic => &mut node.dynamic,
+                        ParamKind::CatchAll => &mut node.catch_all,
+                        ParamKind::OptionalCatchAll => &mut node.optional_catch_all,
+                    };
+                    let (existing, child) =
+                        slot.get_or_insert_with(|| (param.name.clone(), Box::default()));
+                    if comparable(existing) != comparable(&param.name) {
+                        return Err(format!(
+                            "Different slug names for the same dynamic path: {existing}, {}",
+                            param.name
+                        ));
+                    }
+                    node = child;
+                } else {
+                    // A prefix/suffix parameter is its own slot, keyed by
+                    // its literal parts: `/files/[name].json` and
+                    // `/files/[name].txt` coexist, but two routes sharing
+                    // the same literals must agree on the parameter name.
+                    let key = (param.prefix.clone(), param.suffix.clone());
+                    let (existing, child) = node
+                        .affixed
+                        .entry(key)
+                        .or_insert_with(|| (param.name.clone(), Box::default()));
+                    if comparable(existing) != comparable(&param.name) {
+                        return Err(format!(
+                            "Different slug names for the same dynamic path: {existing}, {}",
+                            param.name
+                        ));
+                    }
+                    node = child;
+                }
             } else {
                 if segment.contains(['[', ']']) {
                     return Err(format!("Malformed route segment: {segment}"));
@@ -158,6 +232,11 @@ impl Node {
             out.push(route.clone());
         }
         for child in self.static_children.values() {
+            child.ordered(out);
+        }
+        // Affixed segments sort before a bare dynamic segment, matching
+        // their higher match priority (static > affixed > dynamic).
+        for (_, child) in self.affixed.values() {
             child.ordered(out);
         }
         if let Some((_, child)) = &self.dynamic {
@@ -224,7 +303,7 @@ impl Router {
             // it is reachable with an empty parameter list.
             if let Some((name, child)) = &node.optional_catch_all {
                 params.insert(name.clone(), vec![]);
-                kinds.insert(name.clone(), "optional");
+                kinds.insert(name.clone(), ParamKind::OptionalCatchAll.as_str());
                 let hit = self.match_node(child, path_parts, index, params, kinds);
                 if hit.is_some() {
                     return hit;
@@ -240,9 +319,30 @@ impl Router {
                 return Some(hit);
             }
         }
+        // Affixed segments (`v[version]`, `[name].json`) are more specific
+        // than a bare dynamic segment, so they are tried first. Several
+        // affixed entries can match one segment, so a failed child
+        // backtracks to the next candidate.
+        for ((prefix, suffix), (name, child)) in &node.affixed {
+            let Some(middle) = segment
+                .strip_prefix(prefix.as_str())
+                .and_then(|rest| rest.strip_suffix(suffix.as_str()))
+                .filter(|middle| !middle.is_empty())
+            else {
+                continue;
+            };
+            params.insert(name.clone(), vec![middle.to_string()]);
+            kinds.insert(name.clone(), ParamKind::Dynamic.as_str());
+            let hit = self.match_node(child, path_parts, index + 1, params, kinds);
+            if hit.is_some() {
+                return hit;
+            }
+            params.remove(name);
+            kinds.remove(name);
+        }
         if let Some((name, child)) = &node.dynamic {
             params.insert(name.clone(), vec![segment.to_string()]);
-            kinds.insert(name.clone(), "dynamic");
+            kinds.insert(name.clone(), ParamKind::Dynamic.as_str());
             let hit = self.match_node(child, path_parts, index + 1, params, kinds);
             if hit.is_some() {
                 return hit;
@@ -255,7 +355,7 @@ impl Router {
                 name.clone(),
                 path_parts[index..].iter().map(|s| s.to_string()).collect(),
             );
-            kinds.insert(name.clone(), "catch_all");
+            kinds.insert(name.clone(), ParamKind::CatchAll.as_str());
             let hit = self.match_node(child, path_parts, path_parts.len(), params, kinds);
             if hit.is_some() {
                 return hit;
@@ -268,7 +368,7 @@ impl Router {
                 name.clone(),
                 path_parts[index..].iter().map(|s| s.to_string()).collect(),
             );
-            kinds.insert(name.clone(), "optional");
+            kinds.insert(name.clone(), ParamKind::OptionalCatchAll.as_str());
             let hit = self.match_node(child, path_parts, path_parts.len(), params, kinds);
             if hit.is_some() {
                 return hit;
@@ -290,13 +390,30 @@ mod tests {
     }
 
     fn static_segment() -> impl Strategy<Value = &'static str> {
-        prop::sample::select(vec!["a", "b", "blog", "posts", "x1", "new", "about"])
+        prop::sample::select(vec![
+            "a",
+            "b",
+            "blog",
+            "posts",
+            "x1",
+            "new",
+            "about",
+            "v2",
+            "report.json",
+        ])
     }
 
     fn segment_strategy() -> impl Strategy<Value = String> {
         prop_oneof![
             static_segment().prop_map(str::to_owned),
-            prop::sample::select(vec!["[id]", "[slug]"]).prop_map(str::to_owned),
+            prop::sample::select(vec![
+                "[id]",
+                "[slug]",
+                "v[version]",
+                "[name].json",
+                "[name].txt"
+            ])
+            .prop_map(str::to_owned),
         ]
     }
 
@@ -321,8 +438,16 @@ mod tests {
                 .and_then(|s| s.strip_suffix(']'))
             {
                 rebuilt.extend(params[name].iter().cloned());
-            } else if let Some(name) = segment.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                rebuilt.push(params[name][0].clone());
+            } else if let Some(open) = segment.find('[') {
+                // A plain `[name]` or an affixed `v[version]` / `[name].json`
+                // segment rebuilds as prefix + value + suffix.
+                let close = segment.find(']').unwrap();
+                let name = &segment[open + 1..close];
+                let mut out = String::new();
+                out.push_str(&segment[..open]);
+                out.push_str(&params[name][0]);
+                out.push_str(&segment[close + 1..]);
+                rebuilt.push(out);
             } else {
                 rebuilt.push(segment.to_owned());
             }
@@ -473,6 +598,49 @@ mod tests {
         assert_eq!(params["a2"], vec!["y", "z"]);
     }
     #[test]
+    fn prefix_and_suffix_parameters_match() {
+        let r = router(&["/files/[name].json", "/v[version]/api", "/files/[name].txt"]);
+        assert_eq!(
+            r.matches("/files/report.json").unwrap().0,
+            "/files/[name].json"
+        );
+        assert_eq!(
+            r.matches("/files/report.json").unwrap().1["name"],
+            vec!["report"]
+        );
+        assert_eq!(
+            r.matches("/files/report.json").unwrap().2["name"],
+            "dynamic"
+        );
+        assert_eq!(r.matches("/files/data.txt").unwrap().0, "/files/[name].txt");
+        assert_eq!(r.matches("/v2/api").unwrap().1["version"], vec!["2"]);
+        // An empty middle never matches: `/files/.json` has no name.
+        assert!(r.matches("/files/.json").is_none());
+        assert!(r.matches("/v/api").is_none());
+        // A bare dynamic segment does not swallow the suffix.
+        let r = router(&["/files/[name].json", "/files/[name]"]);
+        assert_eq!(
+            r.matches("/files/report.json").unwrap().0,
+            "/files/[name].json"
+        );
+        assert_eq!(r.matches("/files/report").unwrap().0, "/files/[name]");
+        // Affixed segments outrank a bare dynamic segment at the same level.
+        let r = router(&["/v[version]/api", "/[root]/api"]);
+        assert_eq!(r.matches("/v2/api").unwrap().0, "/v[version]/api");
+        // A static segment still wins over an affixed one.
+        let r = router(&["/files/[name].json", "/files/latest.json"]);
+        assert_eq!(
+            r.matches("/files/latest.json").unwrap().0,
+            "/files/latest.json"
+        );
+        // Affixed routes sort before bare dynamic routes.
+        let r = router(&["/[root]", "/v[version]/api", "/files/[name].json"]);
+        assert_eq!(
+            r.routes(),
+            &["/files/[name].json", "/v[version]/api", "/[root]"]
+        );
+    }
+    #[test]
     fn rejects_conflicts_and_invalid_patterns() {
         for paths in [
             vec!["/blog/[id]", "/blog/[slug]"],
@@ -482,6 +650,11 @@ mod tests {
             vec!["/[..id]"],
             vec!["/[...a]", "/[[...b]]"],
             vec!["/[[...a]]/x"],
+            vec!["/files/[...rest].json"],
+            vec!["/v[...version]"],
+            vec!["/files/[[...rest]].json"],
+            vec!["/files/[a].json", "/files/[b].json"],
+            vec!["/[a][b]"],
         ] {
             assert!(
                 Router::new(paths.iter().map(|s| s.to_string()).collect()).is_err(),

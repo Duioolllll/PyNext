@@ -19,6 +19,7 @@ app/
 - **Static routes** outrank dynamic segments, which outrank catch-all segments. The Rust trie supports backtracking.
 - `[slug]` passes a string: `params["slug"] == "hello"`.
 - `[...path]` passes a nonempty list of strings: `params["path"] == ["a", "b"]`.
+- A dynamic parameter may carry a static prefix and/or suffix: `v[version]` matches `/v2`, `[name].json` matches `/report.json`. The middle must be nonempty; catch-all parameters cannot carry a prefix or suffix. Affixed segments outrank a bare dynamic segment, and a static segment still wins over both.
 - Parameter conflicts are checked; syntactically different names may normalize to the same route slot.
 - **Unsupported:** optional catch-all (`[[...slug]]`), route groups, parallel routes, intercepting routes and client-side navigation.
 
