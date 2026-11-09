@@ -390,28 +390,82 @@ def _accepts_html(request):
 
 
 class _ISRStreamFeed:
-    """One bounded stream tap for the request that starts regeneration."""
+    """Tee point for a single ISR render: one producer, two consumers.
+
+    The render in :meth:`App._render_isr_cached` runs once. Its chunks go
+    to two consumers at the same time:
+
+    1. the ISR cache body (the ``bytearray`` accumulated in ``render()``),
+    2. the initiating client's response stream (``feed.chunks()``).
+
+    This is PyNext's equivalent of Next.js ``ReactServerResult.tee()`` /
+    ``ReplayableNodeStream``: a single render fanned out instead of rendered
+    twice. The feed owns the fan-out, so the two consumers can never drift
+    apart — both see the same chunks in the same order, and the cache body
+    is exactly the body that was streamed.
+
+    State machine (``_state``), enforced with :class:`RuntimeError`:
+
+    ``idle -> begun -> finished | failed``
+
+    * ``begin()`` moves ``idle`` to ``begun`` and resolves ``ready``; a
+      second ``begin()`` (or one after a terminal state) raises.
+    * ``send()`` is only valid while ``begun``; before ``begin()`` or after
+      ``finish()``/``fail()`` it raises.
+    * ``finish()``/``fail()`` are terminal; calling them twice raises,
+      except that a second ``fail()`` is a no-op because the first error is
+      already queued for the consumer.
+    * ``chunks()`` may be called only once (``consumed`` flag) — a feed
+      that has already been consumed cannot be replayed, mirroring
+      Next.js ``assertChunks``.
+    * ``detach()`` is separate from the state machine and always allowed:
+      it means "the consumer is gone". After detaching, ``begin()``/
+      ``send()``/``finish()``/``fail()`` silently drop their work so the
+      producer can keep generating for the cache even when the initiating
+      client has disconnected.
+    """
 
     def __init__(self):
         self.ready = asyncio.get_running_loop().create_future()
         self._queue = asyncio.Queue(maxsize=4)
         self._attached = True
+        self._state = "idle"
+        self.consumed = False
 
     def begin(self):
-        if self._attached and not self.ready.done():
+        if not self._attached:
+            return
+        if self._state != "idle":
+            raise RuntimeError(f"ISR stream feed cannot begin() while {self._state}")
+        self._state = "begun"
+        if not self.ready.done():
             self.ready.set_result(None)
 
     async def send(self, chunk):
-        if self._attached:
-            await self._queue.put(("chunk", chunk))
-
-    async def finish(self):
-        if self._attached:
-            await self._queue.put(("end", None))
-
-    def fail(self, error):
         if not self._attached:
             return
+        if self._state == "idle":
+            raise RuntimeError("ISR stream feed send() before begin()")
+        if self._state in ("finished", "failed"):
+            raise RuntimeError(f"ISR stream feed send() after {self._state}()")
+        await self._queue.put(("chunk", chunk))
+
+    async def finish(self):
+        if not self._attached:
+            return
+        if self._state == "idle":
+            raise RuntimeError("ISR stream feed finish() before begin()")
+        if self._state in ("finished", "failed"):
+            raise RuntimeError(f"ISR stream feed finish() after {self._state}()")
+        self._state = "finished"
+        await self._queue.put(("end", None))
+
+    def fail(self, error):
+        if not self._attached or self._state == "failed":
+            return
+        if self._state == "finished":
+            raise RuntimeError("ISR stream feed fail() after finish()")
+        self._state = "failed"
         while not self._queue.empty():
             self._queue.get_nowait()
         self._queue.put_nowait(("error", error))
@@ -421,7 +475,14 @@ class _ISRStreamFeed:
         while not self._queue.empty():
             self._queue.get_nowait()
 
-    async def chunks(self):
+    def chunks(self):
+        """Return the consumer side of the tee (callable only once)."""
+        if self.consumed:
+            raise RuntimeError("ISR stream feed has already been consumed")
+        self.consumed = True
+        return self._iterate()
+
+    async def _iterate(self):
         try:
             while True:
                 kind, value = await self._queue.get()
@@ -2820,6 +2881,10 @@ class App:
         return selected
 
     async def _render_isr_cached(self, pattern, params, query, key, policy=None, tags=None):
+        # Tee: one render feeds two consumers — the ISR cache body (``body``
+        # in render()) and the initiating client's response stream (the
+        # feed). See _ISRStreamFeed: the feed owns the fan-out, so the
+        # cached body is exactly the body that was streamed.
         feed = _ISRStreamFeed()
 
         async def render():
