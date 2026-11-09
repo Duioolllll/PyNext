@@ -8,7 +8,7 @@ import traceback
 from pathlib import Path
 
 from .app import create_app
-from .build import write_manifest
+from .build import export_static, write_manifest
 from .check import DeploySettings, run_deploy_checks
 from .client import compile_client, discover_client
 from .env import load_env
@@ -570,6 +570,20 @@ def _build_parser():
             command.add_argument("--deployment-id", default=None, metavar="ID",
                                  help="deployment label recorded in the manifest and sent as "
                                       "X-PyNext-Deployment-Id (also via PYNEXT_DEPLOYMENT_ID)")
+            command.add_argument("--only-islands", action="store_true",
+                                 help="compile only: bundle the island modules and update the manifest"
+                                      " without rendering static pages (Next.js 'compile' build mode)")
+            command.add_argument("--only-static", action="store_true",
+                                 help="generate only: render the static pages from the island bundles of"
+                                      " an earlier compile, without re-running the bundler"
+                                      " (Next.js 'generate' build mode)")
+            command.add_argument("--static-only", action="store_true",
+                                 help="export a static-only site (SSG pages, public assets and island"
+                                      " bundles) to a directory servable without a server; refuses apps"
+                                      " with dynamic, ISR or API routes")
+            command.add_argument("--export-dir", default=None,
+                                 help="output directory for --static-only"
+                                      " (default: <project>/.pynext/export)")
         if name != "build":
             command.add_argument("--host", default=DEFAULT_CONFIG.host)
             command.add_argument("--port", type=_port, default=DEFAULT_CONFIG.port)
@@ -795,13 +809,37 @@ def main():
     if args.command == "build":
         if args.standalone_dir and not args.standalone:
             parser.error("--standalone-dir requires --standalone")
+        if args.only_islands and args.only_static:
+            parser.error("--only-islands and --only-static are mutually exclusive; "
+                         "run a plain `pynext build` for both stages")
+        if args.static_only and (args.only_islands or args.only_static):
+            parser.error("--static-only runs a complete build first; combine it with "
+                         "neither --only-islands nor --only-static")
+        if args.export_dir and not args.static_only:
+            parser.error("--export-dir requires --static-only")
+        if args.standalone and (args.only_islands or args.only_static):
+            parser.error("--standalone requires a complete build; combine it with "
+                         "neither --only-islands nor --only-static")
         try:
             # write_manifest and build_standalone each take the build
             # lock, so a second build waits (up to --lock-timeout) and a
             # standalone copy always sees one consistent, completed build.
-            manifest = write_manifest(root, deployment_id=args.deployment_id, lock_timeout=args.lock_timeout)
-            print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'} "
-              f"(build {manifest['build_id']})")
+            if args.only_islands:
+                manifest = write_manifest(root, deployment_id=args.deployment_id,
+                                          lock_timeout=args.lock_timeout, stages=("compile",))
+            elif args.only_static:
+                manifest = write_manifest(root, deployment_id=args.deployment_id,
+                                          lock_timeout=args.lock_timeout, stages=("generate",))
+            else:
+                manifest = write_manifest(root, deployment_id=args.deployment_id,
+                                          lock_timeout=args.lock_timeout)
+            if args.only_islands:
+                print(f"Compiled {len(manifest['client']['bundles'])} island bundles in {root / '.pynext'}")
+            elif args.only_static:
+                print(f"Generated {len(manifest['static_pages'])} static pages in {root / '.pynext'}")
+            else:
+                print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'} "
+                      f"(build {manifest['build_id']})")
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
         coverage = manifest.get("catch_all_coverage") or {}
@@ -811,6 +849,14 @@ def main():
             print(f"Catch-all coverage: {len(shadowed)} static page(s) also match a catch-all "
                   f"route (the static page wins); {len(dynamic_only)} catch-all route(s) serve "
                   f"only paths generate_static_params did not enumerate")
+        if args.static_only:
+            output = Path(args.export_dir) if args.export_dir else None
+            try:
+                summary = export_static(root, manifest, output)
+            except (OSError, ValueError) as exc:
+                parser.error(str(exc))
+            print(f"Exported {summary['pages']} static pages to {summary['output']}")
+            print(f"Serve with: python -m http.server --directory {summary['output']}")
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
             try:

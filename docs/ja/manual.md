@@ -24,6 +24,10 @@ http://127.0.0.1:3000/、/about、/guides/intro、/news/example、/hydrate、/st
 
 `pynext dev --dir examples/basic` はビルドなしでソースを提供し、`app/`・`islands/`・`public/`・`pynext.config.py` の変更時に同じポートでサーバーを再起動します。`pynext start` はビルド manifest を使い、追跡対象のソースが変わると再ビルドを要求します。Island を使わないアプリには Node と esbuild は不要です。上記はリポジトリからのインストールであり、PyPI 公開を意味しません。
 
+### ビルドモード
+
+通常の `pynext build` は island バンドルのコンパイルと静的ページの生成の両方を行います。`pynext build --only-islands` は island のコンパイルのみ、`pynext build --only-static` は以前のコンパイル結果を使った静的ページの生成のみを行います。部分ビルドでは `pynext start` は不足している段階を示して起動を拒否します。`pynext build --static-only` は SSG ページ・public アセット・island バンドルを `.pynext/export`（`--export-dir` で変更可）にプレーンなファイルとして書き出し、`python -m http.server` でサーバーなしに提供できます。動的 SSR・ISR・API ルートがあるアプリは拒否されます。詳細は英語マニュアルを参照してください。
+
 開発監視はネイティブ通知とファイルハッシュを使い、必要ならポーリングに切り替えます。JS/TS island の変更は該当モジュールを再ビルドし、ページ全体を再読み込みせず交換します。以前のクリーンアップが実行され、その island の状態は初期化されることがあります。他のソース変更ではサーバーを再起動してページを再読み込みします。壊れた変更では前の正常な版を維持します。`--port 0` のポートは再起動後も維持します。
 
 ## プロジェクト構造とルーティング
