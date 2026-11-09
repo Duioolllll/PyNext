@@ -26,6 +26,26 @@ def _ignore_runtime(directory, names):
             name.endswith((".pyc", ".pth")) or name in {"sitecustomize.py", "usercustomize.py"}}
 
 
+def _copy_site_packages(purelib, packages):
+    """Copy installed third-party packages into the bundle, in sorted order.
+
+    Symlinked top-level entries are rejected, like .pth files: a bundle
+    cannot carry a link to a path outside itself, and silently dropping
+    the entry would ship a bundle missing a dependency it needs.
+    """
+    for item in sorted(purelib.iterdir(), key=lambda entry: entry.name):
+        if item.is_symlink():
+            raise ValueError(f"Standalone does not support symlinked dependencies: {item.name}")
+        if (item.name.startswith(".") or item.name.endswith((".pth", ".pyc")) or
+                item.name == "__pycache__"):
+            continue
+        target = packages / item.name
+        if item.is_dir():
+            shutil.copytree(item, target, dirs_exist_ok=True, ignore=_ignore_runtime)
+        elif item.is_file():
+            shutil.copy2(item, target)
+
+
 def build_standalone(root, output):
     """Create a new bundle; existing output is never overwritten.
 
@@ -59,27 +79,30 @@ def build_standalone(root, output):
     runtime = output / "runtime"
     python_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
     stdlib = Path(sysconfig.get_path("stdlib"))
-    shutil.copytree(stdlib, runtime / "lib" / python_version, ignore=_ignore_runtime)
+    packages = runtime / "lib" / python_version / "site-packages"
+    packages.mkdir(parents=True, exist_ok=True)
+    # Copy installed packages first: symlinked entries are rejected here,
+    # so the build fails before the (slow) stdlib copy instead of after it.
+    _copy_site_packages(purelib, packages)
+    shutil.copytree(stdlib, runtime / "lib" / python_version, dirs_exist_ok=True, ignore=_ignore_runtime)
     (runtime / "bin").mkdir(parents=True)
     shutil.copy2(Path(sys._base_executable).resolve(), runtime / "bin" / "python")
     libdir = sysconfig.get_config_var("LIBDIR")
     if libdir:
-        for name in {sysconfig.get_config_var("LDLIBRARY"), sysconfig.get_config_var("INSTSONAME")} - {None}:
+        for name in sorted({sysconfig.get_config_var("LDLIBRARY"), sysconfig.get_config_var("INSTSONAME")} - {None}):
             lib = Path(libdir) / name
             if lib.is_file():
                 shutil.copy2(lib.resolve(), runtime / "lib" / name)
-    packages = runtime / "lib" / python_version / "site-packages"
-    packages.mkdir(parents=True, exist_ok=True)
-    for item in purelib.iterdir():
-        if (item.name.startswith(".") or item.name.endswith((".pth", ".pyc")) or
-                item.name == "__pycache__" or item.is_symlink()):
-            continue
-        target = packages / item.name
-        if item.is_dir():
-            shutil.copytree(item, target, dirs_exist_ok=True, ignore=_ignore_runtime)
-        elif item.is_file():
-            shutil.copy2(item, target)
-    shutil.copytree(package, packages / "pynext", dirs_exist_ok=True, ignore=_ignore_runtime)
+    # The installed copy above may contain files the running source tree
+    # no longer has; overlaying it with dirs_exist_ok=True would leave
+    # those stale files in the bundle. Replace the directory wholesale
+    # so the bundle holds exactly the running source tree.
+    pynext_target = packages / "pynext"
+    if pynext_target.is_symlink():
+        pynext_target.unlink()
+    elif pynext_target.exists():
+        shutil.rmtree(pynext_target)
+    shutil.copytree(package, pynext_target, ignore=_ignore_runtime)
     project = output / "app"
     project.mkdir()
     names = {"app", "public", "islands", *(path.name for path in root.glob("*.py"))}
@@ -98,7 +121,7 @@ def build_standalone(root, output):
                  {client["runtime"], *client["bundles"].values()} if digest is not None)
     if files:
         (build / "static").mkdir()
-        for filename in files:
+        for filename in sorted(files):
             source = static / filename
             if not source.is_file():
                 raise ValueError(f"Missing standalone build artifact: {filename}")
