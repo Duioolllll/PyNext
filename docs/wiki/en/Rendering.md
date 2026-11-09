@@ -46,10 +46,9 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-A route such as `app/news/[slug]/page.py` generates on demand, serves fresh cached HTML, and can serve stale HTML while one background regeneration runs. The cache is bounded; the default `memory` backend is process-local, while the `sqlite` and `redis` backends share entries across workers. ISR page functions must not accept `request`.
+A route such as `app/news/[slug]/page.py` generates on demand, serves fresh cached HTML, and can serve stale HTML while one background regeneration runs. The cache is bounded; the default `memory` backend is process-local, while the `sqlite`, `redis`, and `filesystem` backends share entries across workers. ISR page functions must not accept `request`.
 
 A dynamic ISR page may export `generate_static_params()` (a static ISR route may not). The listed paths are enumerated at build time and warmed into the cache in the background at startup, so the first request after a deploy does not pay the full render cost. Warmup is best-effort: a path that fails to warm is logged and still renders on demand.
-
 - Anonymous **query strings are not part of the ISR cache key**.
 - Requests with `Cookie` or `Authorization` bypass shared ISR and receive private, no-store responses.
 - Exposed ISR pages should not embed secrets, user information or request-specific content.

@@ -63,6 +63,16 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows platforms
+    msvcrt = None
 
 from . import _native
 from .components import MAX_CACHE_SECONDS, _validate_tag, _validate_tag_expire, _validate_tags
@@ -394,6 +404,13 @@ class CacheSignal:
     def unsubscribe_from_reads(self, subscriber):
         if self._subscribers is not None:
             self._subscribers.discard(subscriber)
+
+# Filesystem backend defaults: entries are bounded, unlike the SQLite
+# backend, which grows without a cap (see the Next.js comparison report,
+# track C section 3.2 #11). Eviction is oldest-first.
+_FS_MAX_ENTRIES = 1024
+_FS_MAX_BYTES = 512 * 1024 * 1024
+_FS_SAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 class CacheBusy(Exception):
@@ -2182,6 +2199,498 @@ class SQLiteCacheBackend(CacheBackend):
                 pass
 
 
+def _fs_entry_name(key):
+    """Map a cache key to a safe, human-readable file stem.
+
+    The stem keeps a sanitized slice of the key so entries are
+    recognizable in a directory listing, plus a 64-bit hash suffix so
+    two keys that sanitize identically never collide. Only
+    ``[A-Za-z0-9._-]`` survives, so the stem can never escape its
+    directory.
+    """
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    slug = _FS_SAFE_CHARS.sub("_", key).strip("._").strip()
+    # Keep the tail: ISR keys are namespaced with a build id up front,
+    # and the path at the end is the part a human recognizes.
+    slug = re.sub(r"_+", "_", slug)[-48:].strip("_")
+    return f"{slug}-{digest[:16]}" if slug else digest[:16]
+
+
+def _fs_monotonic_age(generated_mono, now_mono):
+    age = now_mono - generated_mono
+    return age if age >= 0.0 else None
+
+
+def _fs_wall_age(generated_at, now):
+    age = now - generated_at
+    return age if age >= 0.0 else None
+
+
+class FileSystemCacheBackend(CacheBackend):
+    """A cross-process cache backend on plain files (Next.js
+    ``FileSystemCache``-style, ``server/lib/incremental-cache/
+    file-system-cache.ts``).
+
+    Layout inside ``path``::
+
+        entries/<stem>.body   raw response body
+        entries/<stem>.meta   JSON sidecar: key, version, generated_at
+                              (wall-clock seconds), generated_mono
+                              (monotonic seconds), fresh_for, stale_for
+        leases/<stem>.lease   JSON: owner, expires_at (wall), expires_mono
+        variants/<stem>.variant  JSON: token, expires_at (wall)
+        .lock                 cross-process mutation lock
+
+    The ``.meta`` sidecar is the publish marker, mirroring Next.js's
+    ``.html``/``.body`` + ``.meta`` structure: the body is written first
+    (temp file + atomic rename) and the meta last, so a reader never
+    sees a half-written entry. When the meta is missing or corrupt the
+    entry is a miss, and a body without a meta falls back to nothing —
+    unlike Next.js, which falls back to the file mtime, because PyNext
+    needs the durations and version that only the meta carries.
+
+    Age is the smaller of the monotonic and wall-clock ages, ignoring
+    any negative candidate. A wall-clock jump forward is masked by the
+    monotonic age, a jump backward is masked by the wall age, and after
+    a reboot (monotonic clock reset) the wall age is the surviving
+    candidate. Lease liveness requires *both* clocks to say live, so a
+    pre-reboot lease cannot outlive its wall expiry either.
+
+    Mutations (fenced writes, leases, removals, variant generations)
+    take one global lock: an in-process ``RLock`` plus an ``flock``/
+    ``msvcrt`` byte lock on ``.lock``, released automatically if a
+    worker dies. Reads are lock-free — atomic renames make them
+    consistent — and version checks fence every write, exactly like
+    the SQLite backend. Entries are bounded (``max_entries`` /
+    ``max_bytes``, oldest-first eviction on insert); leased entries
+    are never evicted.
+    """
+
+    def __init__(self, path, *, max_entries=_FS_MAX_ENTRIES, max_bytes=_FS_MAX_BYTES):
+        path = os.fspath(path)
+        if os.path.isfile(path):
+            raise ValueError(f"Filesystem cache path is a file: {path}")
+        self.path = os.path.abspath(path)
+        self.max_entries = int(max_entries)
+        self.max_bytes = int(max_bytes)
+        if self.max_entries <= 0 or self.max_bytes <= 0:
+            raise ValueError("Filesystem cache limits must be positive")
+        self._entries_dir = os.path.join(self.path, "entries")
+        self._leases_dir = os.path.join(self.path, "leases")
+        self._variants_dir = os.path.join(self.path, "variants")
+        self._lock_path = os.path.join(self.path, ".lock")
+        self._lock = threading.RLock()
+        try:
+            os.makedirs(self._entries_dir, exist_ok=True)
+            os.makedirs(self._leases_dir, exist_ok=True)
+            os.makedirs(self._variants_dir, exist_ok=True)
+            with open(self._lock_path, "ab"):
+                pass
+        except OSError as exc:
+            raise ValueError(f"Cannot create filesystem cache at {path}: {exc}") from exc
+
+    # -- paths ---------------------------------------------------------
+
+    def _body_path(self, name):
+        return os.path.join(self._entries_dir, name + ".body")
+
+    def _meta_path(self, name):
+        return os.path.join(self._entries_dir, name + ".meta")
+
+    def _lease_path(self, name):
+        return os.path.join(self._leases_dir, name + ".lease")
+
+    def _variant_path(self, name):
+        return os.path.join(self._variants_dir, name + ".variant")
+
+    # -- locking -------------------------------------------------------
+
+    @contextmanager
+    def _locked(self):
+        """Serialize mutations in-process and cross-process."""
+        with self._lock:
+            handle = open(self._lock_path, "a+b")
+            try:
+                handle.seek(0)
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                elif msvcrt is not None:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    elif msvcrt is not None:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            finally:
+                handle.close()
+
+    # -- atomic file helpers -------------------------------------------
+
+    @staticmethod
+    def _fsync_dir(directory):
+        try:
+            fd = os.open(directory, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def _atomic_write(self, path, data):
+        """Write ``data`` via a temp file + atomic rename, fsynced."""
+        directory = os.path.dirname(path)
+        tmp = os.path.join(directory, f".{os.path.basename(path)}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+        try:
+            with open(tmp, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        self._fsync_dir(directory)
+
+    def _remove_quietly(self, *paths):
+        for path in paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    # -- entry reads ---------------------------------------------------
+
+    def _read_meta(self, name):
+        try:
+            with open(self._meta_path(name), "rb") as handle:
+                meta = json.loads(handle.read().decode("utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(meta, dict):
+            return None
+        try:
+            return {
+                "key": meta["key"],
+                "version": int(meta["version"]),
+                "generated_at": float(meta["generated_at"]),
+                "generated_mono": float(meta["generated_mono"]),
+                "fresh_for": float(meta["fresh_for"]),
+                "stale_for": float(meta["stale_for"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _entry_age(self, meta, now, now_mono):
+        """Dual-clock age; see the class docstring for the rationale."""
+        candidates = [
+            age for age in (
+                _fs_monotonic_age(meta["generated_mono"], now_mono),
+                _fs_wall_age(meta["generated_at"], now),
+            )
+            if age is not None
+        ]
+        return min(candidates) if candidates else 0.0
+
+    def _read_entry(self, key, now, now_mono):
+        name = _fs_entry_name(key)
+        meta = self._read_meta(name)
+        if meta is None:
+            body_path = self._body_path(name)
+            if os.path.exists(body_path):
+                # A body without a readable meta is a torn or corrupt
+                # write: drop it so it can never be served.
+                self._remove_quietly(body_path)
+            return None
+        age = self._entry_age(meta, now, now_mono)
+        fresh_for = meta["fresh_for"]
+        stale_for = meta["stale_for"]
+        if age >= fresh_for + stale_for:
+            lease = self._read_lease(name, now, now_mono)
+            if lease is not None:
+                return SharedEntry("expired", None, meta["version"], 0.0, 0.0)
+            # Delete only the exact expired version seen, and only if
+            # no live generation owns it (re-checked under the lock by
+            # the caller-visible remove path; here the meta match is
+            # the fence against a concurrent replacement).
+            current = self._read_meta(name)
+            if current is not None and current["version"] == meta["version"] \
+                    and current["generated_at"] == meta["generated_at"]:
+                self._remove_quietly(self._body_path(name), self._meta_path(name))
+            return SharedEntry("expired", None, meta["version"], 0.0, 0.0)
+        try:
+            with open(self._body_path(name), "rb") as handle:
+                body = handle.read()
+        except FileNotFoundError:
+            return None
+        if age < fresh_for:
+            return SharedEntry("fresh", body, meta["version"], fresh_for - age, stale_for)
+        return SharedEntry("stale", body, meta["version"], 0.0, fresh_for + stale_for - age)
+
+    def lookup(self, key):
+        try:
+            entry = self._read_entry(key, time.time(), time.monotonic())
+        except OSError:
+            log.warning("Filesystem cache lookup failed for %s", key, exc_info=True)
+            return ("miss", None)
+        if entry is None:
+            return ("miss", None)
+        return (entry.status, entry.body)
+
+    def lookup_entry(self, key):
+        """Like ``lookup`` but also returns the entry version and the
+        remaining fresh/stale windows, which callers need for fencing and
+        for repopulating the process-local cache."""
+        try:
+            return self._read_entry(key, time.time(), time.monotonic())
+        except OSError as exc:
+            raise SharedCacheUnavailable("Filesystem cache lookup failed") from exc
+
+    # -- leases ----------------------------------------------------------
+
+    def _read_lease(self, name, now, now_mono):
+        try:
+            with open(self._lease_path(name), "rb") as handle:
+                lease = json.loads(handle.read().decode("utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(lease, dict):
+            return None
+        try:
+            owner = lease["owner"]
+            expires_at = float(lease["expires_at"])
+            expires_mono = float(lease["expires_mono"])
+            version = int(lease["version"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        # Live only while both clocks agree: a wall jump or a reboot
+        # (monotonic reset) on its own cannot resurrect a dead lease.
+        if now < expires_at and now_mono < expires_mono:
+            return {"owner": owner, "version": version}
+        return None
+
+    def acquire_lease(self, key, owner, ttl=LEASE_TTL):
+        """Take the cross-process generation lease for ``key``.
+
+        Returns the entry version observed at acquisition (``0`` when no
+        entry exists) for fencing the later write, or ``None`` when another
+        worker already holds a live lease. An expired lease may be taken
+        over, so a crashed worker cannot block regeneration forever.
+        """
+        name = _fs_entry_name(key)
+        with self._locked():
+            try:
+                now = time.time()
+                now_mono = time.monotonic()
+                if self._read_lease(name, now, now_mono) is not None:
+                    return None
+                meta = self._read_meta(name)
+                version = meta["version"] if meta is not None else 0
+                lease = {
+                    "owner": owner,
+                    "expires_at": now + ttl,
+                    "expires_mono": now_mono + ttl,
+                    "version": version,
+                }
+                self._atomic_write(
+                    self._lease_path(name),
+                    json.dumps(lease, sort_keys=True).encode("utf-8"),
+                )
+                return version
+            except OSError as exc:
+                raise SharedCacheUnavailable("Filesystem cache lease failed") from exc
+
+    def release_lease(self, key, owner):
+        """Release a lease, but only the one this worker owns."""
+        name = _fs_entry_name(key)
+        with self._locked():
+            try:
+                lease = self._read_lease(name, time.time(), time.monotonic())
+                if lease is not None and lease["owner"] == owner:
+                    self._remove_quietly(self._lease_path(name))
+                    return True
+                # An expired lease file is already dead; remove it only
+                # when it names this owner, so a successor's lease is
+                # never clobbered.
+                try:
+                    with open(self._lease_path(name), "rb") as handle:
+                        raw = json.loads(handle.read().decode("utf-8"))
+                    if isinstance(raw, dict) and raw.get("owner") == owner:
+                        self._remove_quietly(self._lease_path(name))
+                        return True
+                except (FileNotFoundError, OSError, ValueError, UnicodeDecodeError):
+                    pass
+                return False
+            except OSError:
+                log.warning("Filesystem cache lease release failed for %s", key, exc_info=True)
+                return False
+
+    def owns_lease(self, key, owner):
+        try:
+            lease = self._read_lease(
+                _fs_entry_name(key), time.time(), time.monotonic())
+        except OSError as exc:
+            raise SharedCacheUnavailable("Filesystem cache lease lookup failed") from exc
+        return lease is not None and lease["owner"] == owner
+
+    # -- writes ----------------------------------------------------------
+
+    def insert(self, key, body, fresh_seconds, stale_seconds):
+        return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None)
+
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
+        """Store ``body`` only if the entry version still equals
+        ``expected_version`` (``0`` when no entry existed, ``None`` for an
+        unfenced write). When an owner is given, its lease must still be live
+        in the same lock hold. Returns False when either fence has moved."""
+        if len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES or len(body) > MAX_CACHE_BODY_BYTES:
+            return False
+        if not _valid_durations(fresh_seconds, stale_seconds):
+            return False
+        name = _fs_entry_name(key)
+        with self._locked():
+            try:
+                now = time.time()
+                now_mono = time.monotonic()
+                if owner is not None:
+                    lease = self._read_lease(name, now, now_mono)
+                    if lease is None or lease["owner"] != owner:
+                        return False
+                meta = self._read_meta(name)
+                if expected_version is None:
+                    version = (meta["version"] + 1) if meta is not None else 1
+                elif meta is None:
+                    if expected_version != 0:
+                        return False
+                    version = 1
+                elif meta["version"] != expected_version:
+                    return False
+                else:
+                    version = meta["version"] + 1
+                new_meta = {
+                    "key": key,
+                    "version": version,
+                    "generated_at": now,
+                    "generated_mono": now_mono,
+                    "fresh_for": float(fresh_seconds),
+                    "stale_for": float(stale_seconds),
+                }
+                # Body first, meta last: the meta is the publish marker.
+                self._atomic_write(self._body_path(name), bytes(body))
+                self._atomic_write(
+                    self._meta_path(name),
+                    json.dumps(new_meta, sort_keys=True).encode("utf-8"),
+                )
+                self._enforce_capacity(except_name=name)
+                return True
+            except OSError:
+                log.warning("Filesystem cache insert failed for %s", key, exc_info=True)
+                return False
+
+    def _enforce_capacity(self, *, except_name):
+        """Evict oldest-first until the entry count and total body bytes
+        are back under the caps. Best-effort: a scan failure only loses
+        eviction, never the write that just landed. Leased entries and
+        the entry just written are never evicted."""
+        try:
+            now = time.time()
+            now_mono = time.monotonic()
+            entries = []
+            total_bytes = 0
+            for filename in os.listdir(self._entries_dir):
+                if not filename.endswith(".meta"):
+                    continue
+                name = filename[:-len(".meta")]
+                meta = self._read_meta(name)
+                if meta is None:
+                    continue
+                try:
+                    size = os.path.getsize(self._body_path(name))
+                except OSError:
+                    continue
+                total_bytes += size
+                entries.append((self._entry_age(meta, now, now_mono), name))
+            if len(entries) <= self.max_entries and total_bytes <= self.max_bytes:
+                return
+            entries.sort(key=lambda item: -item[0])  # oldest first
+            remaining = len(entries)
+            for _age, name in list(entries):
+                if remaining <= self.max_entries and total_bytes <= self.max_bytes:
+                    break
+                if name == except_name:
+                    continue
+                if self._read_lease(name, now, now_mono) is not None:
+                    continue
+                try:
+                    size = os.path.getsize(self._body_path(name))
+                except OSError:
+                    size = 0
+                self._remove_quietly(self._body_path(name), self._meta_path(name))
+                remaining -= 1
+                total_bytes -= size
+        except OSError:
+            log.debug("Filesystem cache capacity scan failed", exc_info=True)
+
+    def remove(self, key):
+        name = _fs_entry_name(key)
+        with self._locked():
+            removed = False
+            for path in (self._body_path(name), self._meta_path(name), self._lease_path(name)):
+                try:
+                    os.unlink(path)
+                    removed = True
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    log.warning("Filesystem cache remove failed for %s", key, exc_info=True)
+                    return False
+            return removed
+
+    def variant_generation(self, key, *, invalidate=False):
+        """Get or replace a path generation atomically across workers."""
+        name = _fs_entry_name(key)
+        with self._locked():
+            try:
+                now = time.time()
+                token = None
+                existed = False
+                try:
+                    with open(self._variant_path(name), "rb") as handle:
+                        raw = json.loads(handle.read().decode("utf-8"))
+                    if isinstance(raw, dict) and float(raw["expires_at"]) > now:
+                        token = raw["token"]
+                        existed = True
+                except (FileNotFoundError, OSError, ValueError, UnicodeDecodeError, KeyError, TypeError):
+                    token = None
+                if token is None or invalidate:
+                    token = uuid.uuid4().hex
+                    self._atomic_write(
+                        self._variant_path(name),
+                        json.dumps(
+                            {"token": token, "expires_at": now + _VARIANT_GENERATION_TTL},
+                            sort_keys=True,
+                        ).encode("utf-8"),
+                    )
+                return token, existed
+            except OSError as exc:
+                raise SharedCacheUnavailable("Filesystem cache generation failed") from exc
+
+    def close(self):
+        # No connection to close; files are opened per operation.
+        pass
+
+
 def _is_storable(response):
     """A response with Set-Cookie or Cache-Control: private/no-store must
     never land in a cache shared between users (spec section 10.2)."""
@@ -2396,7 +2905,7 @@ class ISRCache:
         """Create an ISR cache.
 
         ``failure_policy`` (roadmap item B4) decides what happens when
-        the shared backend (``sqlite``/``redis``) is unavailable: the
+        the shared backend (``sqlite``/``filesystem``/``redis``) is unavailable: the
         default ``"fail_open"`` falls back to the process-local cache
         and renders locally, while ``"fail_closed"`` raises
         :class:`SharedCacheUnavailable` so the caller can answer 503
@@ -2488,9 +2997,8 @@ class ISRCache:
             self._closed = False
             self.namespace = namespace
             return
-        if cache_backend not in ("memory", "sqlite", "redis"):
-            raise ValueError(
-                f"Unknown cache backend {cache_backend!r}: expected 'memory', 'sqlite' or 'redis'"
+        if cache_backend not in ("memory", "sqlite", "redis", "filesystem"):            raise ValueError(
+                "Unknown cache backend {!r}: expected 'memory', 'sqlite', 'redis' or 'filesystem'".format(cache_backend)
             )
         self.backend_name = cache_backend
         self._cache_path = cache_path
@@ -2515,6 +3023,11 @@ class ISRCache:
                 raise ValueError("cache_path is required when cache_backend is 'sqlite'")
             self.shared = SQLiteCacheBackend(
                 self._cache_path, max_entries=sqlite_max_entries, max_bytes=sqlite_max_bytes)
+            self.shared = SQLiteCacheBackend(self._cache_path)
+        elif cache_backend == "filesystem":
+            if cache_path is None:
+                raise ValueError("cache_path is required when cache_backend is 'filesystem'")
+            self.shared = FileSystemCacheBackend(self._cache_path)
         elif cache_backend == "redis":
             from .redis_cache import RedisCacheBackend
             self.shared = RedisCacheBackend(self._cache_url)
@@ -2587,6 +3100,9 @@ class ISRCache:
             self.shared = SQLiteCacheBackend(
                 self._cache_path, max_entries=self._sqlite_max_entries,
                 max_bytes=self._sqlite_max_bytes)
+            self.shared = SQLiteCacheBackend(self._cache_path)
+        elif self.shared is None and self.backend_name == "filesystem":
+            self.shared = FileSystemCacheBackend(self._cache_path)
         elif self.shared is None and self.backend_name == "redis":
             from .redis_cache import RedisCacheBackend
             self.shared = RedisCacheBackend(self._cache_url)

@@ -43,6 +43,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Make `/readyz` reflect shared-backend health from last-seen state (no probing): a dead `fail_closed` backend (ISR cache, Redis rate limiter, Redis sessions) returns 503, a dead `fail_open` backend returns `ready (degraded: ...)`; stale reports are forgotten after `PYNEXT_BACKEND_HEALTH_TTL_S` seconds (default 300).
 - Log repeated request failures in full once per callsite per window (`PYNEXT_LOG_DEDUP_WINDOW_S`, default 60s, 0 disables grouping) with a suppressed-repeat count, and log client disconnects/cancellations at INFO instead of ERROR; the exception message is never logged.
 - Escape Prometheus label values in `prometheus_text()`.
+- Add an optional `filesystem` ISR cache backend (`--cache-backend filesystem`, Next.js `FileSystemCache`-style): entries live as human-readable `.body` + `.meta` sidecar files in a shared directory, with cross-process leases, fenced writes, monotonic/wall-clock age, and oldest-first eviction (1024 entries / 512 MiB by default).
 
 ## 0.1.2 (2026-11-09)
 

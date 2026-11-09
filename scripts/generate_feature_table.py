@@ -46,6 +46,7 @@ BACKEND_NOTES = {
     "memory": "Process-local memory cache (default).",
     "sqlite": "Shared SQLite file; entries are visible to all workers.",
     "redis": "Shared Redis store via `PYNEXT_REDIS_URL`.",
+    "filesystem": "Shared directory of human-readable `.body` + `.meta` sidecar files (Next.js `FileSystemCache`-style); entries are visible to all workers, bounded to 1024 entries / 512 MiB by default (oldest-first eviction).",
 }
 
 # The build/dev/start subcommands carry no help= text in cli.py; these

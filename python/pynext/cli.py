@@ -681,15 +681,18 @@ def _build_parser():
                                                "--body-min-rate-bytes-per-sec"), default=None,
                                  help="minimum average body receive rate in bytes/second after a 2s grace "
                                       "window; slower bodies get a 408 (0 disables; max 1000000000)")
-            command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis"),
+            command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis", "filesystem"),
                                  default=DEFAULT_CONFIG.cache_backend,
-                                 help="ISR page cache backend: process-local memory (default) or a"
-                                      " shared SQLite file or Redis via PYNEXT_REDIS_URL"
+                                 help="ISR page cache backend: process-local memory (default), a"
+                                      " shared SQLite file, Redis via PYNEXT_REDIS_URL, or a"
+                                      " shared filesystem directory of .body + .meta files"
                                       " (recommended with --workers > 1: the memory cache"
                                       " is per-process and not shared between workers)")
             command.add_argument("--cache-path", default=None,
-                                 help="SQLite cache file for --cache-backend sqlite;"
-                                      " defaults to <project>/.pynext/isr-cache.sqlite3")
+                                 help="SQLite cache file for --cache-backend sqlite, or cache"
+                                      " directory for --cache-backend filesystem;"
+                                      " defaults to <project>/.pynext/isr-cache.sqlite3"
+                                      " (sqlite) or <project>/.pynext/isr-cache (filesystem)")
             command.add_argument("--cache-failure-policy", choices=("fail_open", "fail_closed"),
                                  default=DEFAULT_CONFIG.cache_failure_policy,
                                  help="shared ISR cache behaviour when its backend is unavailable:"

@@ -33,7 +33,7 @@ class App:
     request_insights: RequestInsights
     backend_health: BackendHealth
     def __init__(self, root: str | PathLike[str], manifest: dict[str, Any], *, production: bool = ...,
-                 security: SecurityConfig | None = ..., cache_backend: Literal["memory", "sqlite", "redis"] = ...,
+                 security: SecurityConfig | None = ..., cache_backend: Literal["memory", "sqlite", "redis", "filesystem"] = ...,
                  cache_path: str | PathLike[str] | None = ..., observability: ObservabilityConfig | None = ...,
                  rate_limit: RateLimiter | None = ..., middleware: list[Middleware | ScopedMiddleware] | tuple[Middleware | ScopedMiddleware, ...] | None = ...,
                  headers: list[Any] | tuple[Any, ...] | Iterable[PathHeaderRuleInput] | None = ...,
@@ -76,7 +76,7 @@ class App:
                        send: Callable[[dict[str, Any]], Awaitable[None]]) -> None: ...
 
 def create_app(root: str | PathLike[str] = ..., *, production: bool = ...,
-               security: SecurityConfig | None = ..., cache_backend: Literal["memory", "sqlite", "redis"] = ...,
+               security: SecurityConfig | None = ..., cache_backend: Literal["memory", "sqlite", "redis", "filesystem"] = ...,
                cache_path: str | PathLike[str] | None = ..., observability: ObservabilityConfig | None = ...,
                rate_limit: RateLimiter | None = ..., middleware: list[Middleware | ScopedMiddleware] | tuple[Middleware | ScopedMiddleware, ...] | None = ...,
                headers: list[Any] | tuple[Any, ...] | Iterable[PathHeaderRuleInput] | None = ...,

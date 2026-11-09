@@ -1697,10 +1697,12 @@ class App:
         self.prefetch_stale_times = {}
         if cache_backend == "sqlite" and cache_path is None:
             cache_path = self.root / ".pynext" / "isr-cache.sqlite3"
+        if cache_backend == "filesystem" and cache_path is None:
+            cache_path = self.root / ".pynext" / "isr-cache"
         build_id = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"),
                                              ensure_ascii=True).encode("ascii")).hexdigest()
         self.isr = ISRCache(cache_backend=cache_backend, cache_path=cache_path,
-                            namespace=(build_id + ":") if cache_backend in {"sqlite", "redis"}
+                            namespace=(build_id + ":") if cache_backend in {"sqlite", "redis", "filesystem"}
                             or cache_handler is not None else "",
                             cache_url=cache_url, failure_policy=cache_failure_policy,
                             cache_handler=cache_handler,
