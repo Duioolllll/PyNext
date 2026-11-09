@@ -397,3 +397,84 @@ def test_axum_no_middleware_public_handler_is_unaffected(tmp_path):
             await app.isr.close()
 
     _run(run())
+
+
+PERMISSION_SOURCE = (
+    "from pynext import require_permission, websocket\n"
+    "@websocket\n"
+    "@require_permission('read')\n"
+    "async def handler(websocket):\n"
+    "    await websocket.accept()\n"
+    "    await websocket.send_text('secret-data')\n"
+    "    await websocket.receive()\n"
+)
+
+
+async def _save_session_with_permissions(store, permissions):
+    token = secrets.token_urlsafe(32)
+    await store.save(token, {"user_id": "alice", "permissions": permissions},
+                     None, None, time.time() + 3600)
+    return token
+
+
+def test_asgi_require_permission_denies_without_permission(tmp_path):
+    """@require_permission is enforced for WS too: a session without the
+    permission gets close 1008, even though the user is authenticated."""
+    _project(tmp_path, PERMISSION_SOURCE)
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite3")
+    app = create_app(tmp_path, middleware=[SessionMiddleware(store, secure=False)])
+
+    async def run():
+        token = await _save_session_with_permissions(store, ["write"])
+        conn = _ScriptedConnection([{"type": "websocket.connect"}])
+        await app(_ws_scope(_cookie_headers(token)), conn.receive, conn.send)
+        assert conn.sent == [{"type": "websocket.close", "code": 1008}]
+        allowed = _ScriptedConnection([
+            {"type": "websocket.connect"},
+            {"type": "websocket.receive", "text": "x"},
+            {"type": "websocket.disconnect", "code": 1000},
+        ])
+        token = await _save_session_with_permissions(store, ["read"])
+        await app(_ws_scope(_cookie_headers(token)), allowed.receive, allowed.send)
+        assert allowed.sent[1] == {"type": "websocket.send", "text": "secret-data"}
+        await app.isr.close()
+
+    _run(run())
+
+
+def test_asgi_dynamic_route_auth_uses_path_params(tmp_path):
+    """Authorization resolves dynamic WS routes (params are available to
+    the middleware chain) and rejects unauthenticated upgrades."""
+    room = tmp_path / "app" / "ws" / "[room]"
+    room.mkdir(parents=True)
+    (room / "route.py").write_text(
+        "from pynext import require_auth, websocket\n"
+        "@websocket\n"
+        "@require_auth\n"
+        "async def handler(websocket, params):\n"
+        "    await websocket.accept()\n"
+        "    await websocket.send_text('room:' + params['room'])\n"
+        "    await websocket.receive()\n"
+    )
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite3")
+    app = create_app(tmp_path, middleware=[SessionMiddleware(store, secure=False)])
+
+    async def run():
+        denied = _ScriptedConnection([{"type": "websocket.connect"}])
+        await app({"type": "websocket", "path": "/ws/abc",
+                   "headers": _cookie_headers(None), "query_string": b""},
+                  denied.receive, denied.send)
+        assert denied.sent == [{"type": "websocket.close", "code": 1008}]
+        token = await _save_session(store)
+        allowed = _ScriptedConnection([
+            {"type": "websocket.connect"},
+            {"type": "websocket.receive", "text": "x"},
+            {"type": "websocket.disconnect", "code": 1000},
+        ])
+        await app({"type": "websocket", "path": "/ws/abc",
+                   "headers": _cookie_headers(token), "query_string": b""},
+                  allowed.receive, allowed.send)
+        assert allowed.sent[1] == {"type": "websocket.send", "text": "room:abc"}
+        await app.isr.close()
+
+    _run(run())
