@@ -12,6 +12,7 @@ from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, Request, RequestCan
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_security_headers,
                    content_security_policy, csrf_protect, new_csrf_token, new_csp_nonce,
                    security_headers, set_csrf_cookie, sign_csrf_token, validate_csrf)
+from .middleware import MiddlewareScope, RouteHas, ScopedMiddleware, scoped
 from .observability import MetricsCollector, ObservabilityConfig
 from .proxy import ProxyTrust, ResolvedProxy, parse_trusted_proxies
 from .pubsub import PubSubOverflow, WebSocketPubSub
@@ -30,4 +31,5 @@ __all__ = ["App", "create_app", "h", "fragment", "island", "layout", "model_prop
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
            "Session", "SessionMiddleware", "SQLiteSessionStore", "RedisSessionStore", "require_auth", "require_permission",
            "RedisRateLimiter", "WebSocketPubSub", "PubSubOverflow",
-           "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies", "FAIL_OPEN", "FAIL_CLOSED"]
+           "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies", "FAIL_OPEN", "FAIL_CLOSED",
+           "MiddlewareScope", "RouteHas", "ScopedMiddleware", "scoped"]

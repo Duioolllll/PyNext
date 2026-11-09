@@ -31,6 +31,7 @@ from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Reque
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
+from .middleware import ScopedMiddleware
 from .observability import (
     MetricsCollector,
     ObservabilityConfig,
@@ -407,9 +408,12 @@ class App:
                 # SecurityConfig(csrf_enabled=False). Without sessions the
                 # default stays off (opt in with csrf_enabled=True or
                 # @csrf_protect) so token-less API clients keep working.
+                # A scoped SessionMiddleware still counts: unwrap the scope
+                # so CSRF auto-enable sees the middleware inside.
                 security = dataclasses.replace(
                     security,
-                    csrf_enabled=any(isinstance(item, SessionMiddleware)
+                    csrf_enabled=any(isinstance(item.middleware if isinstance(item, ScopedMiddleware)
+                                                 else item, SessionMiddleware)
                                      for item in self.middleware))
                 self.security = security
             if resources is None:
@@ -1315,7 +1319,7 @@ class App:
         """
         return await self._rate_limit_denied(scope, path)
 
-    async def _authorize_websocket(self, path, query_string=b"", headers=()):
+    async def _authorize_websocket(self, path, query_string=b"", headers=(), raw_path=None):
         """Pre-handshake authorization for a WebSocket upgrade.
 
         Returns ``None`` when the upgrade may proceed, else a ``Response``
@@ -1352,7 +1356,7 @@ class App:
         params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
         request = Request("GET", path, bytes(query_string),
                           tuple((bytes(name), bytes(value)) for name, value in headers),
-                          b"", params, self, {})
+                          b"", params, self, {}, raw_path=raw_path)
         terminal_reached = False
         seen = {}
 
@@ -1430,7 +1434,8 @@ class App:
         # upgrade is refused with a close instead of an accept, so the
         # handler never runs and no data is sent.
         denied = await self._authorize_websocket(path, scope.get("query_string", b""),
-                                                 scope.get("headers", []))
+                                                 scope.get("headers", []),
+                                                 raw_path=scope.get("raw_path"))
         if denied is not None:
             await send({"type": "websocket.close", "code": 1008})
             return
@@ -1579,7 +1584,8 @@ class App:
                     chunks.append(chunk)
                     if not message.get("more_body", False):
                         request = Request(scope["method"].upper(), path, scope.get("query_string", b""),
-                                          tuple(scope.get("headers", [])), b"".join(chunks), _app=self)
+                                          tuple(scope.get("headers", [])), b"".join(chunks), _app=self,
+                                          raw_path=scope.get("raw_path"))
                         break
             except BadRequest as exc:
                 log.info("Bad request: %s", exc)

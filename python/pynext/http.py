@@ -799,6 +799,11 @@ class Request:
     _app: object = field(default=None, repr=False, compare=False)
     state: dict = field(default_factory=dict, compare=False)
     _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+    # Raw request-target bytes as received (still percent-encoded), when
+    # the transport provides them; None otherwise. Middleware scopes match
+    # against this as well as the decoded path so an encoded path cannot
+    # dodge a scoped middleware (fail-closed execution).
+    raw_path: bytes | None = field(default=None, repr=False, compare=False)
 
     @property
     def cancelled(self) -> bool:

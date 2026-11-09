@@ -66,6 +66,10 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `parse_trusted_proxies` | `pynext.proxy` |
 | `FAIL_OPEN` | `pynext.failure_policy` |
 | `FAIL_CLOSED` | `pynext.failure_policy` |
+| `MiddlewareScope` | `pynext.middleware` |
+| `RouteHas` | `pynext.middleware` |
+| `ScopedMiddleware` | `pynext.middleware` |
+| `scoped` | `pynext.middleware` |
 
 ## Security defaults (`SecurityConfig`)
 

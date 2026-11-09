@@ -397,6 +397,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
             try:
                 request = Request(method.upper(), path, bytes(query),
                                   tuple((bytes(k), bytes(v)) for k, v in headers), bytes(body), _app=app,
+                                  raw_path=raw_path.encode("ascii"),
                                   _cancel_event=cancel_event if cancel_event is not None else threading.Event())
                 # Trust-resolved client identity (A6, pynext.proxy), same
                 # values as on ASGI: without trusted proxies these are just

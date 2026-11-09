@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Add conditional middleware scopes (`pynext.scoped`, `MiddlewareScope`, `RouteHas`): a middleware runs only when its `source` path pattern (PyNext route syntax) and its `has`/`missing` conditions (header/query/cookie/host, existence or full-match regex, Next.js `matchHas` semantics) hold. Scopes compile once at registration and invalid patterns fail at startup; source matching is fail-closed against encoded paths, and the WebSocket pre-flight shares the scope.
+
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.
