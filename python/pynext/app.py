@@ -51,6 +51,10 @@ log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
 
 
+class _SyncHandlerBusy(Exception):
+    """All bounded synchronous handler slots are still occupied."""
+
+
 class _FreshSourceLoader(importlib.machinery.SourceFileLoader):
     def get_code(self, fullname):
         # Timestamp-based bytecode can be stale when an edited file keeps its size.
@@ -176,7 +180,11 @@ async def _invoke(fn, **values):
     kwargs = {key: value for key, value in values.items() if key in names}
     if inspect.iscoroutinefunction(fn):
         return await fn(**kwargs)
-    result = await asyncio.to_thread(fn, **kwargs)
+    request = values.get("request")
+    if request is not None and request._app is not None:
+        result = await request._app._invoke_sync(fn, kwargs, request)
+    else:
+        result = await asyncio.to_thread(fn, **kwargs)
     return await result if inspect.isawaitable(result) else result
 
 
@@ -320,7 +328,10 @@ class App:
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
                  resources=None, cache_url=None, cache_failure_policy=None,
                  websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
-                 trusted_proxies=None):
+                 trusted_proxies=None, sync_workers=32):
+        if isinstance(sync_workers, bool) or not isinstance(sync_workers, int) or not 1 <= sync_workers <= 1024:
+            raise ValueError("sync_workers must be an integer from 1 to 1024")
+        self.sync_workers = sync_workers
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
         if production and debug:
@@ -425,9 +436,41 @@ class App:
             self._ws_lock = threading.Lock()
             self._inflight = 0
             self._inflight_streams = 0
+            self._sync_active = 0
             self._inflight_lock = threading.Lock()
         except BaseException:
             self._release_modules()
+            raise
+
+    async def _invoke_sync(self, fn, kwargs, request):
+        # Keep capacity occupied until the actual thread finishes, even if
+        # the awaiter timed out. Cancellation cannot stop a Python thread.
+        request.check_cancelled()
+        with self._inflight_lock:
+            if self._sync_active >= self.sync_workers:
+                raise _SyncHandlerBusy()
+            self._sync_active += 1
+
+        def run():
+            request.check_cancelled()  # a cancelled queued job never starts
+            return fn(**kwargs)
+
+        task = asyncio.create_task(asyncio.to_thread(run))
+
+        def finished(done):
+            with self._inflight_lock:
+                self._sync_active -= 1
+            # A timed-out awaiter cannot retrieve a late exception/result.
+            if not done.cancelled():
+                error = done.exception()
+                if error is None and request.cancelled and inspect.iscoroutine(done.result()):
+                    done.result().close()
+
+        task.add_done_callback(finished)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            request._cancel_event.set()
             raise
 
     def configure_observability(self, config):
@@ -709,7 +752,7 @@ class App:
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
             with self._inflight_lock:
-                remaining = self._inflight + self._inflight_streams
+                remaining = self._inflight + self._inflight_streams + self._sync_active
             if remaining <= 0:
                 return True
             if time.monotonic() >= deadline:
@@ -862,7 +905,7 @@ class App:
         if not isinstance(tree, dict):
             raise TypeError(f"Page {pattern} must return a render node dict, got {type(tree).__name__}")
         for layout_fn in reversed(layouts):
-            tree = await _invoke(layout_fn, children=tree)
+            tree = await _invoke(layout_fn, children=tree, request=request)
             if not isinstance(tree, dict):
                 raise TypeError(f"Layout for {pattern} must return a render node dict, got {type(tree).__name__}")
         tree = bind_islands(tree, self.client_manifest, dev_id=self._dev_id)
@@ -913,6 +956,20 @@ class App:
 
     async def dispatch(self, request):
         """Return a response. Exceptions are converted at the transport boundary."""
+        try:
+            return await self._dispatch_response(request)
+        except _SyncHandlerBusy:
+            response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
+            apply_cors_headers(request, response, config=self.security)
+            apply_security_headers(response, config=self.security, production=self.production)
+            if request.method == "HEAD":
+                response.body = b""
+            return response
+        except asyncio.CancelledError:
+            request._cancel_event.set()
+            raise
+
+    async def _dispatch_response(self, request):
         # Health probes are reserved framework paths (B6): they bypass
         # middleware, CORS preflight and CSRF so a load balancer can probe
         # a half-broken app, and an app route or public asset with the
@@ -1089,7 +1146,7 @@ class App:
         route_var.set(pattern)
         params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
         request = Request(request.method, request.path, request.query_string, request.headers, request.body,
-                          params, self, request.state)
+                          params, self, request.state, request._cancel_event)
         spec = self.manifest["routes"][pattern]
         entry = self.entries[pattern]
         if self.production and self.render_modes.get(pattern) == "ssg" and path not in self.static_pages:
@@ -1559,7 +1616,11 @@ class App:
                     result = self.error_response(exc)
                 if scope["method"].upper() == "HEAD":
                     result.body = b""
-                await _send_response(result, send, config=self.security, production=self.production)
+                try:
+                    await _send_response(result, send, config=self.security, production=self.production)
+                except asyncio.CancelledError:
+                    request._cancel_event.set()
+                    raise
 
             await _run_while_connected(dispatch_and_send(), receive)
             return
@@ -1574,11 +1635,11 @@ class App:
 def create_app(root=".", *, production=False, security=None, cache_backend="memory", cache_path=None,
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
                cache_failure_policy=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
-               trusted_proxies=None):
+               trusted_proxies=None, sync_workers=32):
     root = Path(root).resolve()
     return App(root, load_manifest(root) if production else discover(root), production=production,
                security=security, cache_backend=cache_backend, cache_path=cache_path,
                observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
                resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
                websocket_max_message=websocket_max_message, hot_reload=hot_reload,
-               trusted_proxies=trusted_proxies)
+               trusted_proxies=trusted_proxies, sync_workers=sync_workers)

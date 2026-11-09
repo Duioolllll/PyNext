@@ -39,6 +39,38 @@ with sync_playwright() as playwright:
     assert page.evaluate("window.__navMarker") == "still-here"
     context.close()
 
+    # A superseded request may ignore AbortSignal (cache/transport adapters
+    # can do this). Its late failure must not cause a full document load.
+    for outcome in ("failure", "success", "history"):
+        context = browser.new_context()
+        page = context.new_page()
+        page.goto(base + "/", wait_until="networkidle")
+        page.evaluate("""async () => {
+            window.__navMarker = 'race-survived';
+            const originalFetch = window.fetch.bind(window);
+            window.slowResponse = await originalFetch('/?race-slow=1');
+            window.fetch = (url, options) => String(url).includes('race-slow')
+                ? new Promise((resolve, reject) => {
+                    window.resolveSlow = resolve;
+                    window.rejectSlow = reject;
+                    window.slowSignal = options.signal;
+                }) : originalFetch(url, options);
+            window.__pynextNav.navigate('/?race-slow=1').then(result => window.slowResult = result);
+        }""")
+        page.wait_for_function("typeof window.rejectSlow === 'function'")
+        assert page.evaluate("window.__pynextNav.navigate('/blog/hello')") is True
+        assert page.evaluate("window.slowSignal.aborted") is True
+        if outcome == "history":
+            page.go_back()
+            expect(page.get_by_text("Hello PyNext!")).to_have_count(1)
+        page.evaluate("window.rejectSlow(new Error('late failure'))" if outcome != "success"
+                      else "window.resolveSlow(window.slowResponse)")
+        page.wait_for_function("window.slowResult === false")
+        expect(page).to_have_url(base + ("/" if outcome == "history" else "/blog/hello"))
+        expect(page.get_by_text("Hello PyNext!" if outcome == "history" else "Blog post")).to_have_count(1)
+        assert page.evaluate("window.__navMarker") == "race-survived"
+        context.close()
+
     # Hover prefetch works even without IntersectionObserver (no viewport-entry
     # prefetch in this context), so the hover path is exercised on its own.
     no_io = browser.new_context()

@@ -289,6 +289,7 @@ const prefetchInflight = new Set();
 const observedLinks = new WeakSet();
 let linkObserver = null;
 let navigationToken = 0;
+let activeNavigation = null;
 
 function navigationUrl(anchor) {
   if (!anchor || anchor.tagName !== "A") return null;
@@ -326,10 +327,10 @@ function cachedPage(url) {
   return cached.html;
 }
 
-async function fetchPage(url, { useCache = true } = {}) {
+async function fetchPage(url, { useCache = true, signal } = {}) {
   const cached = useCache ? cachedPage(url) : null;
   if (cached !== null) return { html: cached, maxAge: 0 };
-  const response = await fetch(url.href, { headers: { Accept: "text/html" } });
+  const response = await fetch(url.href, { headers: { Accept: "text/html" }, signal });
   if (!response.ok) throw new Error(`Navigation fetch failed: ${response.status}`);
   const finalUrl = new URL(response.url);
   if (finalUrl.origin !== url.origin || finalUrl.pathname !== url.pathname || finalUrl.search !== url.search) {
@@ -396,12 +397,18 @@ function swapDocument(html, url) {
 
 async function navigate(url, { push = true, onFailure = "full" } = {}) {
   const token = ++navigationToken;
+  activeNavigation?.abort();
+  const controller = new AbortController();
+  activeNavigation = controller;
   let html;
   try {
     const runtime = document.querySelector('script[src^="/_pynext/static/"]');
     if (runtime?.nonce) throw new Error("Nonce CSP requires a full page load");
-    ({ html } = await fetchPage(url));
+    ({ html } = await fetchPage(url, { signal: controller.signal }));
   } catch (error) {
+    // A superseded failure must never redirect or reload the newer page,
+    // even when a transport ignores abort and rejects later.
+    if (token !== navigationToken || controller.signal.aborted) return false;
     if (onFailure === "reload") window.location.reload();
     else window.location.href = url.href;
     return false;
@@ -410,6 +417,7 @@ async function navigate(url, { push = true, onFailure = "full" } = {}) {
   try {
     swapDocument(html, url);
   } catch (error) {
+    if (token !== navigationToken || controller.signal.aborted) return false;
     if (onFailure === "reload") window.location.reload();
     else window.location.href = url.href;
     return false;
@@ -422,6 +430,7 @@ async function navigate(url, { push = true, onFailure = "full" } = {}) {
     }
   }
   scanLinks();
+  if (activeNavigation === controller) activeNavigation = null;
   return true;
 }
 

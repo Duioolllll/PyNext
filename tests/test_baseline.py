@@ -144,5 +144,18 @@ def test_baseline_external_unreachable_server_records_errors_not_crash(tmp_path)
     aggregate = result["scenarios"][0]["results"]["axum"]["aggregate"]
     assert aggregate["error_rate_max"] == 1
     assert aggregate["latency_ms"]["p50"] is None
-    assert result["conditions"]["loadgen_location"] == "separate-machine"
+    assert result["conditions"]["loadgen_location"] == "external-unverified"
     assert result["environment"]["server"]["environment"].startswith("unknown")
+
+
+def test_benchmark_server_drains_logs_without_unbounded_buffering():
+    async def exercise():
+        command = [sys.executable, "-c", (
+            "import os, time; print('PYNEXT_BENCH_READY 127.0.0.1:1', flush=True); "
+            "os.write(2, b'x' * 1000000 + b'complete'); time.sleep(30)")]
+        async with baseline._ServerProcess(command) as server:
+            async with asyncio.timeout(3):
+                while not server._stderr_tail.endswith(b'complete'):
+                    await asyncio.sleep(0.01)
+            assert len(server._stderr_tail) <= 8192
+    asyncio.run(exercise())

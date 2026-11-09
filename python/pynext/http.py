@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import threading
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote_to_bytes
 
@@ -15,6 +16,10 @@ from .ws_origin import canonical_origin
 
 class BadRequest(Exception):
     """A request could not be parsed or failed application validation."""
+
+
+class RequestCancelled(RuntimeError):
+    """The client disconnected or the request's execution deadline expired."""
 
 
 #: Methods that never change server state and are exempt from CSRF checks.
@@ -400,8 +405,14 @@ def _csrf_origin_allowed(request):
     API calls. Disable with ``SecurityConfig(csrf_origin_check=False)``
     when an app legitimately serves its API from another subdomain.
     """
-    origin = _request_origin(request)
-    if origin is not None:
+    origins = _header_values(request, "origin")
+    if origins:
+        if len(origins) != 1:
+            return False
+        try:
+            origin = origins[0].decode("ascii")
+        except UnicodeDecodeError:
+            return False
         return _is_same_origin(request, origin)
     fetch_site = _header_values(request, "sec-fetch-site")
     if fetch_site:
@@ -548,18 +559,23 @@ def _request_origin(request):
 
 
 def _is_same_origin(request, origin):
-    """True when the Origin host matches the Host header.
+    """Compare scheme, canonical host and effective port, using trusted identity.
 
     Same-origin requests are not cross-origin requests, so CORS never
     blocks them: a same-origin page may call the app's own API with custom
     headers (which triggers a preflight) even when no origin is configured.
     """
     values = _header_values(request, "host")
-    if not values:
+    if len(values) != 1:
         return False
-    host = values[0].decode("ascii", "ignore").strip().lower()
-    match = re.fullmatch(r"https?://([^/]+)", origin)
-    return match is not None and match.group(1).lower() == host
+    try:
+        host = values[0].decode("ascii")
+    except UnicodeDecodeError:
+        return False
+    scheme = request.state.get("client_scheme", "http")
+    host = request.state.get("client_host") or host
+    parsed = canonical_origin(origin)
+    return parsed is not None and parsed == canonical_origin(f"{scheme}://{host}")
 
 
 def _cors_origin_allowed(origin, config):
@@ -782,6 +798,17 @@ class Request:
     params: dict = field(default_factory=dict)
     _app: object = field(default=None, repr=False, compare=False)
     state: dict = field(default_factory=dict, compare=False)
+    _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+
+    @property
+    def cancelled(self) -> bool:
+        """Thread-safe cooperative cancellation signal; does not undo writes."""
+        return self._cancel_event.is_set()
+
+    def check_cancelled(self) -> None:
+        """Raise RequestCancelled before starting a new side effect."""
+        if self.cancelled:
+            raise RequestCancelled("Request execution was cancelled")
 
     @property
     def resources(self):
@@ -799,6 +826,7 @@ class Request:
 
     async def revalidate(self, path):
         """Invalidate an ISR path in the current app's process-local cache."""
+        self.check_cancelled()
         if self._app is None:
             raise RuntimeError("This request is not attached to an app")
         return await self._app.revalidate(path)

@@ -1495,6 +1495,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         }
     };
     if !state.middleware_enabled
+        // Origin-bearing responses, including static ranges and 304s,
+        // use the same Python CORS policy as ASGI.
+        && !parts.headers.contains_key(header::ORIGIN)
         && (parts.method == axum::http::Method::GET || parts.method == axum::http::Method::HEAD)
         // Health probes are reserved framework paths (B6): a public
         // asset or static page with the same name must not shadow them,
