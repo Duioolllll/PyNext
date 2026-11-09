@@ -2,6 +2,7 @@
 import asyncio
 import os
 import time
+import threading
 import uuid
 
 import h2.config
@@ -260,9 +261,10 @@ def test_custom_exemption_override_is_preserved(tmp_path, mode):
 
 
 def test_native_limiter_timeout_fails_closed_before_body(tmp_path):
+    release = threading.Event()
     class SlowLimiter(RateLimiter):
         def allow(self, key):
-            time.sleep(2.4)
+            release.wait(10)
             return True, None
     async def run():
         app = create_app(_project(tmp_path), rate_limit=SlowLimiter(1, 60))
@@ -278,10 +280,138 @@ def test_native_limiter_timeout_fails_closed_before_body(tmp_path):
             assert b"retry-after: 1\r\n" in head.lower()
             assert app._module("app/input/route.py").calls == []
         finally:
+            release.set()
             writer.close()
             await writer.wait_closed()
             await asyncio.to_thread(server.stop)
             await app.isr.close()
+    asyncio.run(run())
+
+
+def test_http_and_websocket_share_64_retained_decision_slots(tmp_path):
+    release = threading.Event()
+    lock = threading.Lock()
+    entered = 0
+    class BlockedLimiter(RateLimiter):
+        def allow(self, key):
+            nonlocal entered
+            with lock:
+                entered += 1
+            release.wait(15)
+            return True, None
+
+    async def run():
+        root = _project(tmp_path)
+        folder = root / "app/socket"
+        folder.mkdir()
+        (folder / "route.py").write_text(
+            'from pynext import websocket\n@websocket\nasync def socket(websocket):\n'
+            '    await websocket.accept()\n    await websocket.close()\n', encoding="utf-8")
+        app = create_app(root, rate_limit=BlockedLimiter(1000, 60))
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        host, port = server.address.rsplit(":", 1)
+        connections = []
+        async def open_request(websocket=False):
+            reader, writer = await asyncio.open_connection(host, int(port))
+            connections.append((reader, writer))
+            upgrade = ("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n") if websocket else ""
+            path = "/socket" if websocket else "/input"
+            writer.write((f"GET {path} HTTP/1.1\r\nHost: {server.address}\r\n{upgrade}\r\n").encode())
+            await writer.drain()
+            return reader
+        try:
+            # Mixed transports must occupy the SAME budget. Timed-out
+            # callbacks remain blocked, so their permits must stay held.
+            readers = await asyncio.gather(*(open_request(i % 2 == 0) for i in range(64)))
+            async with asyncio.timeout(10):
+                while entered != 64:
+                    await asyncio.sleep(0.01)
+            heads = await asyncio.gather(*(asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5) for r in readers))
+            assert all(h.startswith(b"HTTP/1.1 503 ") for h in heads)
+            for websocket in (False, True):
+                reader = await open_request(websocket)
+                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+                assert head.startswith(b"HTTP/1.1 503 ")
+                assert b"retry-after: 1\r\n" in head.lower()
+                assert entered == 64  # the 65th callback was never invoked
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", trust_env=False) as client:
+                assert (await client.get("/healthz")).status_code == 200
+                release.set()
+                async with asyncio.timeout(5):
+                    while (await client.get("/input")).status_code == 503:
+                        await asyncio.sleep(0.01)
+                assert entered == 65
+        finally:
+            release.set()
+            for _, writer in connections:
+                writer.close()
+            await asyncio.gather(*(w.wait_closed() for _, w in connections), return_exceptions=True)
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend", ["memory", "redis"])
+@pytest.mark.parametrize("failure", ["body-size", "body-rate", "execution-capacity"])
+def test_admitted_failures_never_refund_a_token(tmp_path, backend, failure):
+    if backend == "redis":
+        pytest.importorskip("redis")
+        url = os.environ.get("PYNEXT_TEST_REDIS_URL")
+        if not url:
+            pytest.skip("PYNEXT_TEST_REDIS_URL is not set")
+        limiter = RedisRateLimiter(1, 60, url=url, namespace=uuid.uuid4().hex, trusted_proxies=("127.0.0.1",))
+    else:
+        limiter = RateLimiter(1, 60, trusted_proxies=("127.0.0.1",))
+
+    async def run():
+        app = create_app(_project(tmp_path), rate_limit=limiter)
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow():
+            entered.set()
+            await release.wait()
+            return Response("done")
+        if failure == "execution-capacity":
+            app.entries["/input"]["GET"] = slow
+        server = start_native(app, asyncio.get_running_loop(), port=0, max_concurrent=1, max_waiting=0,
+                              body_min_rate_bytes_per_sec=1000000, body_timeout_ms=10000)
+        host, port = server.address.rsplit(":", 1)
+        writer = holder = None
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", trust_env=False, timeout=10) as client:
+                if failure == "execution-capacity":
+                    holder = asyncio.create_task(client.get("/input", headers={"X-Forwarded-For": "192.0.2.1"}))
+                    await asyncio.wait_for(entered.wait(), 5)
+                reader, writer = await asyncio.open_connection(host, int(port))
+                size = 1048577 if failure == "body-size" else 100
+                writer.write((f"POST /input HTTP/1.1\r\nHost: {server.address}\r\n"
+                              f"X-Forwarded-For: 192.0.2.2\r\nContent-Length: {size}\r\n\r\n").encode())
+                if failure in {"body-size", "execution-capacity"}:
+                    writer.write(b"x" * size)
+                elif failure == "body-rate":
+                    writer.write(b"x")
+                await writer.drain()
+                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 7)
+                status = {"body-size": 413, "body-rate": 408, "execution-capacity": 503}[failure]
+                assert head.startswith(f"HTTP/1.1 {status} ".encode()), head
+                if holder is not None:
+                    release.set()
+                    assert (await holder).status_code == 200
+                retry = await client.get("/input", headers={"X-Forwarded-For": "192.0.2.2"})
+                assert retry.status_code == 429
+                assert "retry-after" in retry.headers
+                assert app._module("app/input/route.py").calls == []
+        finally:
+            release.set()
+            if writer is not None:
+                writer.close()
+                await writer.wait_closed()
+            if holder is not None:
+                await asyncio.gather(holder, return_exceptions=True)
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+            if backend == "redis":
+                limiter.close()
     asyncio.run(run())
 
 

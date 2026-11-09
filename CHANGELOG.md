@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+## 0.1.1 (2026-11-09)
+
 - Check native HTTP rate limits from headers before body intake and Python execution. Over-limit uploads are rejected before `100 Continue`; HTTP/1.1 connections with unread bodies close, while HTTP/2 keeps other streams available. HTTP and WebSocket checks share a bounded admission budget. Each admitted request consumes one token, including uploads that are later abandoned or rejected by body/execution limits.
 - Match built-in rate-limit exemptions against decoded paths without treating an encoded question mark as a query delimiter. Preserve custom `is_exempt` overrides and the query-aware public `is_exempt()` helper.
 - Apply one CORS policy to native static/SSG/ISR responses and ASGI, including range, conditional, HEAD and preflight responses.
@@ -14,8 +16,6 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Add a multi-stage non-root Docker example, read-only/SIGTERM smoke checks, Python/image SBOMs and Python/npm/Rust/image vulnerability CI. Upgrade Pillow to 13 and PyO3 to the fixed 0.29 series.
 - Ship public API stubs and `py.typed` in wheels/sdists; check installed-wheel consumers with mypy and pyright. Implementation details and remaining production gates live in `docs/RUNTIME_HARDENING.md`.
 - Reject non-object JSON build manifests with a clear rebuild error, clean up newly created scaffold ancestors on failure, warn when a partial standalone bundle cannot be removed, and include both bounds in non-integer CLI count errors. Align the roadmap audit totals and document DSL runtime non-finite values, best-effort logout, WebSocket pre-flight limits and shared-only invalidation results (review #5 N1–N13).
-
-## 0.1.1 (2026-11-09)
 
 - Enforce authorization for WebSocket upgrades (review #4 #1, behavior change): the global middleware chain and the handler's `@require_auth`/`@require_permission` policy now run before the handshake completes on both the ASGI and native servers, so a denied upgrade is rejected instead of an accepted socket leaking data. Handlers that need the identity must re-derive it from the socket (for example from a session cookie the middleware validated); the pre-flight `request.state` is not passed to the handler, and a session rotation/invalidation during the pre-flight is not supported because its `set-cookie` would be discarded.
 - Fix the rate limiter's new-key window (review #4 #3): an existing key whose bucket was evicted under table pressure is no longer treated as a brand-new key and denied 429 when it returns within the window; the Redis limiter and the in-process limiter share the fix. Add `--rate-limit-ipv6-prefix-len` (default 64) so a deployment can group a whole /48 into one bucket — a /48 holder can otherwise mint 65,536 /64s and fill the new-key window, still denying genuinely brand-new keys until the window slides (evicted existing keys are never denied).

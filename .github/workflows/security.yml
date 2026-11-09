@@ -91,8 +91,10 @@ jobs:
           python-version: "3.13"
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --locked --extra typing
+      - run: uv sync --locked --extra typing --extra database
       - run: uv build --wheel
       - name: Check installed public API with mypy and pyright
         shell: bash
-        run: uv run --locked --extra typing python scripts/check_typing.py --wheel dist/*.whl
+        run: uv run --locked --extra typing --extra database python scripts/check_typing.py --wheel dist/*.whl
+      - name: Check declared signatures against runtime
+        run: uv run --locked --extra typing --extra database python -m mypy.stubtest pynext.http pynext.components pynext.routing pynext.app pynext.sessions pynext.pubsub pynext.ratelimit pynext.proxy pynext.observability pynext.server --ignore-missing-stub
