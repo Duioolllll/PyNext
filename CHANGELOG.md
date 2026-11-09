@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Add a route-specificity comparator (`pynext.sortable_routes`, translated from Next.js `sortable-routes.ts`: static < dynamic < catch-all < optional catch-all, then lexicographic, shorter first) and use it to order the routes in the build manifest. A property test pins the comparator's order equal to the Rust trie's `ordered_routes()` on random route sets, and the ported Next.js sort cases are covered as unit tests.
+
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.
