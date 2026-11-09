@@ -157,7 +157,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --locked --extra dev --extra redis
-      - run: uv run --locked --extra dev --extra redis pytest -q tests/test_redis_cache.py tests/test_redis_faults.py tests/test_redis_restart.py tests/test_redis_sessions.py tests/test_isr_query.py tests/test_streaming_isr.py
+      - run: uv run --locked --extra dev --extra redis pytest -q tests/test_redis_cache.py tests/test_redis_faults.py tests/test_redis_restart.py tests/test_redis_sessions.py tests/test_isr_query.py tests/test_streaming_isr.py tests/test_http_admission.py
 
   postgres:
     name: PostgreSQL database integration

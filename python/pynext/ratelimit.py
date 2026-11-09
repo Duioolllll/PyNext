@@ -46,10 +46,11 @@ the table to reset buckets. Existing keys are never denied by table
 pressure.
 
 When a limiter is configured, static files and fresh ISR pages also pass
-through the Python bridge. On the Axum adapter the body has already been read by the time
-the bridge runs, so rate limiting happens at dispatch time there, after
-the body-intake limits; on the ASGI adapter the check runs before the
-body is read. Paths listed in ``exempt_paths`` skip the check entirely
+through the Python bridge. Both adapters check admission from headers,
+before reading the body or executing a handler. Each admitted request
+consumes one token even if the upload is abandoned or later fails a body
+or execution limit; it is never charged again by the native bridge.
+Paths listed in ``exempt_paths`` skip the check entirely
 (for example health-check endpoints that load balancers must always
 reach); nothing is exempt by default.
 """

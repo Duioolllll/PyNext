@@ -20,7 +20,7 @@
 | 라우팅과 렌더링 | 파일 기반 정적·동적·catch-all 라우팅, 중첩 레이아웃, Python 페이지·API, Axum·ASGI, SSR·SSG·ISR | SSG의 비동기 청크는 빌드 시 결합한다. ISR은 최초 생성 응답을 스트리밍하고 완성된 응답만 캐시한다. |
 | 클라이언트 | JS/TS island, load·visible·idle·interaction 활성화, 클라이언트 탐색, 제한된 공유 모델 hydration, 실험적 Python DSL | 공유 모델은 element·text·fragment와 문자열 props 중심이다. 일반 이벤트 재생과 전체 라우트 공통 IR은 완성되지 않았다. |
 | 캐시 | 프로세스별 메모리와 SQLite·Redis 공유 ISR, 빌드·쿼리별 키, lease·fencing 및 워커 간 무효화, 공유 저장소 장애 시 `fail_open`/`fail_closed` 정책(캐시 기본값 `fail_open`, 레이트리미터 기본값 `fail_closed`) | 공유 저장소 장애 시 기본 동작은 로컬 캐시로 대체하므로 즉시 일관성을 보장하지 않는다. SQLite 전체 용량 및 주기적 청소 정책은 없다. |
-| HTTP와 보안 기초 | 전역 HTTP 미들웨어, multipart 업로드, SQLite·Redis 세션과 세션 기반 CSRF, 인증·권한 검사 연결점, 선택적 공유 요청 제한 | 자격 증명 검증은 앱이 담당한다. 요청 제한은 본문 수신 후 적용되며 완성형 사용자 계정·로그인 시스템은 없다. |
+| HTTP와 보안 기초 | 전역 HTTP 미들웨어, multipart 업로드, SQLite·Redis 세션과 세션 기반 CSRF, 인증·권한 검사 연결점, 선택적 공유 요청 제한, 개발 버전의 양 서버 본문 수신 전 제한 | 자격 증명 검증은 앱이 담당한다. 제한 검사를 통과한 시점에 토큰을 차감하므로 업로드 중단·후속 수신/실행 실패도 할당량을 소비한다. 완성형 사용자 계정·로그인 시스템은 없다. |
 | 데이터베이스 | 개발 중인 선택적 SQLAlchemy async 리소스와 Django ORM·폼 연동, SQLite·PostgreSQL 연결, Alembic 안내 | 공개된 0.1.0에는 미포함. 모델·마이그레이션·인증은 앱에서 관리하고, DB 연결 상태를 지속 감시하지 않는다. |
 | 실시간·워커 | WebSocket 크기·서브프로토콜 설정, 개발 버전의 Origin 검사, 제한된 큐, 프로세스 내 pub/sub, 공유 리스너 워커와 재시작, `/healthz`·`/readyz`, SIGTERM 그레이스풀 드레인(진행 요청 완료·WebSocket 1001 종료), SIGHUP 롤링 재시작 | 공개 0.1.0에는 Origin 검사가 없다. 인증은 앱에서 담당하고 pub/sub은 프로세스 내부에 한정된다. Axum 연결 예산은 설정 가능하고 ASGI 서버의 연결 제한은 별도 설정한다. 드레인 타임아웃을 넘긴 요청은 중단될 수 있다. |
 | 개발과 관측 | `pynext init`, 개발 오류 페이지, 네이티브 파일 감시, JS/TS island HMR, 구조화 로그·지표·선택적 OpenTelemetry | HMR은 island 상태 보존을 보장하지 않는다. Rust 빠른 경로부터 외부 서비스까지의 전체 추적은 완성되지 않았다. |
@@ -41,7 +41,7 @@ Linux·macOS·Windows에서 Python 3.13·3.14와 Axum·Uvicorn 조합을 CI로 �
 ### 1. 연결 수명과 보안
 
 - HTTP·WebSocket 전체 연결 예산과 초과 시 응답을 정의한다. 개발 버전의 WebSocket은 같은 Origin만 기본 허용하며 추가 출처와 Origin 누락은 명시적으로 설정한다. 전역 미들웨어와 `@require_auth`/`@require_permission`도 핸드셰이크 전에 강제된다. 신원 확립(로그인·세션)과 프록시의 전달 헤더 덮어쓰기는 앱·배포의 책임이다.
-- 신뢰 프록시 정책을 유지하면서 본문 수신 전 요청 제한을 검토한다. 정적 파일과 캐시 적중 경로도 같은 보안 정책을 따르는지 확인한다.
+- 개발 버전은 신뢰 프록시 정책에 따라 양 서버에서 본문 수신 전에 요청 제한을 검사한다. 정적 파일·SSG·ISR도 포함하며, Axum은 검사의 동시 수와 시간을 제한하고 미수신 본문이 있는 HTTP/1.1 거부 연결을 닫는다. 프록시/NAT 환경에서 정상 사용자 영향과 과부하 지연은 추가 측정한다.
 - 타임아웃이나 연결 해제 후에도 동기 함수와 외부 쓰기가 계속될 수 있다는 계약을 명시하고, upstream 기한·멱등성 및 종료 절차를 정한다.
 - 종료 절차(B6, 구현됨): `/healthz`(liveness)·`/readyz`(readiness, 시작 완료 후·드레인 전만 200)를 두며, SIGTERM 시 신규 연결을 중단하고 진행 요청 완료·WebSocket 1001 종료를 `--shutdown-timeout`(기본 30초) 안에 처리하고, SIGHUP은 워커를 한 대씩 교체하는 롤링 재시작을 수행한다.
 - **완료 기준:** 제한 초과, 위조된 프록시 헤더와 Origin, 느린 업로드, 연결 해제, 종료 중 요청을 Axum·ASGI에서 자동 검증하고 운영 기본값을 문서화한다. 상태(외부 감사 2026-11-09): A1·A2·A3·A4·A6·A7·B6 구현됨.

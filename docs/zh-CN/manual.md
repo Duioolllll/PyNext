@@ -265,9 +265,9 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 已构建的应用需使用 `create_app(project_path, production=True)`。ASGI 请求超时由所使用的服务器管理。Axum 适配器等待 Python 最多 30 秒，之后请求取消并返回 504。已经在线程中运行的同步函数可能在 504 之后继续执行并产生写入等副作用。请确保写入操作幂等，并为数据库与外部服务设置单独超时。进程隔离可通过 `--workers`（见下文）获得；单进程没有该能力。ISR 取消也有相同限制。
 
-分布式限流已通过 `--rate-limit-backend redis` 实现（共享 Redis 令牌桶）。生产环境加固仍是路线图项目。共享存储正常时 SQLite 失效会在下次查询时生效。安装可选包并启用追踪后会生成 OpenTelemetry span（见可观测性一节）。ASGI 一致性由 `tests/test_asgi_conformance.py` 验证（HTTP 事件顺序、分块请求体、断开连接、包含失败路径的 lifespan）。请参阅[生产路线图](. 请参阅[生产路线图](../PRODUCTION_ROADMAP.md)中的计划与验收条件。
+分布式限流已通过 `--rate-limit-backend redis` 实现（共享 Redis 令牌桶）。生产环境加固仍是路线图项目。共享存储正常时 SQLite 失效会在下次查询时生效。安装可选包并启用追踪后会生成 OpenTelemetry span（见可观测性一节）。ASGI 一致性由 `tests/test_asgi_conformance.py` 验证（HTTP 事件顺序、分块请求体、断开连接、包含失败路径的 lifespan）。请参阅[生产路线图](../PRODUCTION_ROADMAP.md)中的计划与验收条件。
 
-两个适配器的请求体上限均为 1 MiB，超出返回 413。Axum 默认同时接收 16 个请求体、接收期限 10 秒（408），Python 执行槽为 64 个，等待队列上限是执行槽数与 64 中较小的值；队列满返回 503。执行和请求体设置可通过 CLI 调整。HTTP/1.1 请求头读取期限为 10 秒，但连接总数没有限制。外部 ASGI 服务器的超时由其自身管理。非根路径末尾的 `/` 会以 308 重定向。编译后的 island 单个上限为 2 MiB，总计 32 MiB。
+两个适配器的请求体上限均为 1 MiB，超出返回 413。Axum 默认同时接收 16 个请求体、接收期限 10 秒（408），Python 执行槽为 64 个，等待队列上限是执行槽数与 64 中较小的值；队列满返回 503。执行和请求体设置可通过 CLI 调整。HTTP/1.1 请求头读取期限为 10 秒。Axum 默认每个 worker 最多 1,024 个连接、每个 IP 最多 128 个连接，可通过 `--max-connections` 和 `--max-connections-per-ip` 调整。外部 ASGI 服务器的超时由其自身管理。非根路径末尾的 `/` 会以 308 重定向。编译后的 island 单个上限为 2 MiB，总计 32 MiB。
 
 ## 可观测性
 
@@ -283,7 +283,9 @@ OpenTelemetry 追踪默认关闭且为可选项：安装 `opentelemetry-api`（�
 
 ## 限流
 
-限流是可选项，采用按进程的令牌桶：`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的动态请求返回 429，并带有以秒为单位的 `Retry-After` 头。WebSocket 握手也以同样方式限流：每次握手从同一个按 IP 划分的桶中消耗一个令牌，超限的握手返回 429 并带有 `Retry-After`。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失。使用 `--rate-limit-backend redis` 时桶在进程间共享；Redis 不可达时遵循故障策略：默认（`fail_closed`，`--rate-limit-failure-policy fail_closed`）返回 503，`fail_open` 则放行请求。静态文件和新鲜的 ISR 页面在到达 Python 桥接之前已由 Rust 层返回，因此不受限流。
+限流是可选项，采用按进程的令牌桶：`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的请求返回 429，并带有以秒为单位的 `Retry-After` 头。WebSocket 握手也以同样方式限流：每次握手从同一个按 IP 划分的桶中消耗一个令牌，超限的握手返回 429 并带有 `Retry-After`。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失。使用 `--rate-limit-backend redis` 时桶在进程间共享；Redis 不可达时遵循故障策略：默认（`fail_closed`，`--rate-limit-failure-policy fail_closed`）返回 503，`fail_open` 则放行请求。配置的限流同样适用于两个适配器的静态文件、SSG 和新鲜的 ISR 页面。
+
+开发版本在两个适配器中均先根据请求头限流，再接收请求体，包括使用 `Expect: 100-continue` 的请求。准入时扣除一个令牌；后续上传中断、大小或速率超限、执行槽不足均不退还。Axum 的 HTTP 与 WebSocket 限流判定合计最多并发 64 个，期限为 2 秒；饱和、超时或意外错误返回 503 和 `Retry-After: 1`。该预算也适用于 `fail_open`，该策略只处理在期限内返回的后端故障。带未读请求体的 HTTP/1.1 拒绝连接会关闭，HTTP/2 的其他流仍可使用。健康检查绕过限流，豁免路径在严格解码后判定。已发布的 0.1.0 不包含此改进。
 
 转发链从右向左遍历受信任的代理，使用最近的不受信任地址。必须准确配置所有中间代理。每个进程最多保留 10,000 个桶；全部处于活跃状态时，新键会逐出最旧的桶而不是收到 429，新键的创建受全局滑动窗口限制（每个窗口最多 10,000 个新键）。桶的分数是取自 Redis `TIME` 的整数微秒；两个脚本可能读到同一微秒，此时分数相同的桶同样陈旧，按桶键确定性地选择要逐出的桶——被逐出的所有者不会被拒绝，下次请求会获得一个新的桶。分数在远超最长一年窗口的范围内仍保持为精确整数（当前纪元下最后一位的单位是 0.25 µs），因此数分钟到数小时的实际窗口不受双精度限制的影响。IPv6 地址按 /64 前缀共享桶。这种分组是一种权衡：持有整个 /48 的攻击者可以生成 65,536 个不同的 /64，填满桶表和新键窗口，在窗口滑动之前真正的新键仍会被拒绝（被逐出的已有键不会被拒绝）。`--rate-limit-ipv6-prefix-len 48` 将整个 /48 归入一个桶，可以阻止这种攻击，但共享该前缀的所有主机也将共享一个桶，繁忙的 /48 会连带限制无辜用户；默认值保持为 64。用 `--rate-limit-exempt-path`（例如 `/healthz`）指定的路径跳过速率限制。
 
