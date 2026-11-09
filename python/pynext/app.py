@@ -41,7 +41,7 @@ from .build import _materialize, discover, load_manifest
 from .config import DEFAULT_CONFIG
 from .dynamic import (DYNAMIC_MODES, MAX_DYNAMIC_ACCESSES, format_dynamic_accesses,
                       suppress_dynamic_tracking, track_prerender)
-from .errors import SignalError, digest_for_error, error_count
+from .errors import NotFoundError, SignalError, digest_for_error, error_count
 from .http import (SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_build_headers, apply_cors_headers,
                    apply_path_headers, apply_security_headers, compile_path_headers,
@@ -322,6 +322,28 @@ async def _invoke(fn, _app=None, **values):
 
 
 _MAX_ISR_STREAM_BYTES = 8 * 1024 * 1024
+# HTML comment a streamed page ends with when rendering fails after the
+# headers were already sent. The status can no longer change to 500, so
+# the marker is the client's only signal that the document is truncated.
+_STREAM_ERROR_MARKER = b"<!-- pynext-stream-error -->"
+
+
+def _accepts_html(request):
+    """True when the request's Accept header lists text/html.
+
+    Error/not-found pages are HTML, so route misses only render them for
+    clients that accept HTML; curl-style requests without an Accept header
+    (and API-style ``*/*``) keep the plain-text body.
+    """
+    if request is None:
+        return False
+    for key, value in request.headers:
+        if key.lower() != b"accept":
+            continue
+        for part in value.decode("latin-1").split(","):
+            if part.strip().split(";")[0].strip().lower() == "text/html":
+                return True
+    return False
 
 
 class _ISRStreamFeed:
@@ -363,6 +385,10 @@ class _ISRStreamFeed:
                 if kind == "end":
                     return
                 if kind == "error":
+                    # Signal the truncated stream before aborting it, so a
+                    # client that already received the 200 headers and the
+                    # first chunks can tell the document is incomplete.
+                    yield _STREAM_ERROR_MARKER
                     if isinstance(value, Exception):
                         raise value
                     raise RuntimeError("ISR stream interrupted")
@@ -1593,6 +1619,26 @@ class App:
                     cache_call_kind(handler_fn)
                 if ws_handler is not None:
                     cache_call_kind(ws_handler)
+        # Segment error boundaries (REPORT §2.1 #15): one ErrorPage /
+        # NotFoundPage / LoadingPage per route, resolved to the nearest
+        # boundary file at build time. Validated eagerly so a typo fails
+        # startup, not the first failing request.
+        self.error_boundaries = {}
+        self.not_found_boundaries = {}
+        self.loading_boundaries = {}
+        for pattern, spec in manifest["routes"].items():
+            if spec["kind"] != "page":
+                continue
+            self.error_boundaries[pattern] = self._load_boundary(
+                spec.get("error"), "ErrorPage", {"error", "request", "params"})
+            self.not_found_boundaries[pattern] = self._load_boundary(
+                spec.get("not_found"), "NotFoundPage", {"request", "params"})
+            self.loading_boundaries[pattern] = self._load_boundary(
+                spec.get("loading"), "LoadingPage", {"request", "params"})
+        self.global_error_boundary = self._load_boundary(
+            manifest.get("error"), "ErrorPage", {"error", "request", "params"})
+        self.global_not_found_boundary = self._load_boundary(
+            manifest.get("not_found"), "NotFoundPage", {"request", "params"})
         if production:
             from .build import read_static_pages
             if manifest.get("render_modes") != self.render_modes:
@@ -1662,6 +1708,104 @@ class App:
         if key not in self.modules:
             self.modules[key] = _load(self.root, path, self._namespace)
         return self.modules[key]
+
+    def _load_boundary(self, relative, export, allowed):
+        """Load one boundary export (``ErrorPage``/``NotFoundPage``/``LoadingPage``).
+
+        Returns the callable, or None when the route has no such boundary.
+        A boundary file that fails to export its function is a startup
+        error: silently ignoring it would turn a typo into a missing
+        fallback on the first failing request.
+        """
+        if not relative:
+            return None
+        fn = getattr(self._module(relative), export, None)
+        if not callable(fn):
+            raise ValueError(f"{relative} must export a {export} function")
+        _check_signature(fn, allowed, relative)
+        return fn
+
+    async def _render_boundary(self, fn, *, request, params, layouts, error=None, status=500):
+        """Render one boundary function to a Response, or None if it fails.
+
+        The boundary is tried with the route layouts first, so a failing
+        page still renders inside the site shell, then bare when a layout
+        itself is what failed. The status is decided by the caller: a
+        boundary returns an ``h()`` tree and can never change the status.
+        """
+        tree = None
+        for attempt_layouts in (layouts, ()):
+            try:
+                tree = await _invoke(fn, error=error, request=request, params=params)
+                if not isinstance(tree, dict):
+                    raise TypeError(
+                        f"Boundary must return a render node dict, got {type(tree).__name__}")
+                for layout_fn in reversed(attempt_layouts):
+                    tree = await _invoke(layout_fn, children=tree, request=request)
+                    if not isinstance(tree, dict):
+                        raise TypeError(
+                            "Layout must return a render node dict, "
+                            f"got {type(tree).__name__}")
+                break
+            except Exception:
+                tree = None
+        if tree is None:
+            log.exception("Error boundary failed to render")
+            return None
+        try:
+            tree = bind_islands(tree, self.client_manifest, dev_id=self._dev_id)
+            payload = json.dumps(tree, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            nonce = new_csp_nonce() if self.security.csp_nonce_enabled else None
+            html = await asyncio.to_thread(_native.render, payload, nonce)
+        except Exception:
+            log.exception("Error boundary failed to render")
+            return None
+        if isinstance(tree, dict) and tree.get("tag", "").lower() == "html":
+            html = "<!DOCTYPE html>" + html
+        return Response(html, status=status, media_type="text/html; charset=utf-8", csp_nonce=nonce)
+
+    async def _error_page_response(self, request, pattern, params, exc):
+        """Nearest segment error boundary for a failed page render.
+
+        Falls back to the global ``app/error.py`` boundary when the nearest
+        one fails, and to the plain 500 page when no boundary renders.
+        The status stays 500 either way.
+        """
+        fn = self.error_boundaries.get(pattern) if pattern else None
+        layouts = self.entries[pattern][1] if pattern and pattern in self.entries else ()
+        if fn is not None:
+            response = await self._render_boundary(
+                fn, request=request, params=params, layouts=layouts, error=exc, status=500)
+            if response is not None:
+                return response
+        if self.global_error_boundary is not None and self.global_error_boundary is not fn:
+            response = await self._render_boundary(
+                self.global_error_boundary, request=request, params=params, layouts=(),
+                error=exc, status=500)
+            if response is not None:
+                return response
+        return self.error_response(exc)
+
+    async def _not_found_page_response(self, request, pattern, params):
+        """Nearest segment not-found boundary, else the global one, else plain 404.
+
+        The status stays 404 either way. Used both for route misses and
+        for pages that raise :class:`NotFoundError`.
+        """
+        fn = self.not_found_boundaries.get(pattern) if pattern else None
+        layouts = self.entries[pattern][1] if pattern and pattern in self.entries else ()
+        if fn is not None:
+            response = await self._render_boundary(
+                fn, request=request, params=params, layouts=layouts, status=404)
+            if response is not None:
+                return response
+        if self.global_not_found_boundary is not None and self.global_not_found_boundary is not fn:
+            response = await self._render_boundary(
+                self.global_not_found_boundary, request=request, params=params, layouts=(),
+                status=404)
+            if response is not None:
+                return response
+        return Response("Not Found", status=404)
 
     def error_response(self, exc, digest=None):
         """Render a 500 for an unexpected failure.
@@ -2387,12 +2531,22 @@ class App:
             entry["prefix"], entry["suffix"] = prefix, suffix
             return prefix, suffix
 
-    async def _streaming_page_response(self, pattern, chunks, layouts, tracker=None, request=None):
+    async def _streaming_page_response(self, pattern, chunks, layouts, tracker=None, request=None, params=None,
+                                       loading=None):
         """Wrap an async iterable of UI nodes in a StreamingResponse.
 
         The layout shell is rendered once per route and cached; the
         cached prefix is sent first, each page chunk is serialized and
         sent as it arrives, and the cached suffix closes the document.
+
+        When the segment defines a ``loading.py`` boundary, its node is
+        rendered and sent as the first chunk, before the page generator's
+        first chunk arrives, so a slow page still paints a placeholder
+        inside the shell. The response is tagged ``_pynext_loading_index``
+        with that chunk's position, so body-building consumers (SSG build,
+        ISR cache) can skip it instead of baking the placeholder into the
+        stored page.
+
         Layouts accepting ``request`` or opting out with
         ``@layout(dynamic=True)`` are rendered on every request. Layouts
         must render their children exactly once; anything else fails
@@ -2425,17 +2579,41 @@ class App:
             prefix, suffix = await self._render_shell_split(pattern, shell, marker)
         else:
             prefix, suffix = await self._layout_shell_html(pattern, entry)
+        loading_html = None
+        if loading is not None:
+            node = await _invoke(loading, request=request, params=params)
+            if not isinstance(node, dict):
+                raise TypeError(
+                    f"LoadingPage for {pattern} must return a render node dict, "
+                    f"got {type(node).__name__}"
+                )
+            loading_html = await self._render_stream_chunk(node)
 
         async def page_stream():
+            suffix_sent = False
             try:
                 if prefix:
                     yield prefix
+                if loading_html:
+                    yield loading_html
                 async for node in chunks:
                     html = await self._render_stream_chunk(node)
                     if html:
                         yield html
                 if suffix:
+                    suffix_sent = True
                     yield suffix
+            except BaseException as exc:
+                # A disconnect or cancellation must not yield into a dying
+                # generator; anything else is a render failure after the
+                # headers were sent, so close the document with the error
+                # marker (the status can no longer become 500) and re-raise
+                # so the build fails and the ISR generation is not cached.
+                if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+                    raise
+                if not suffix_sent:
+                    yield _STREAM_ERROR_MARKER.decode("ascii") + suffix
+                raise
             finally:
                 close = getattr(chunks, "aclose", None)
                 if close is not None:
@@ -2443,7 +2621,14 @@ class App:
                 if tracker is not None:
                     tracker.__exit__(None, None, None)
 
-        return StreamingResponse(page_stream(), media_type="text/html; charset=utf-8")
+        response = StreamingResponse(page_stream(), media_type="text/html; charset=utf-8")
+        if loading_html:
+            # Chunks arrive as [prefix?, loading, ...]; the loading chunk
+            # is index 1 when a shell prefix was sent, else 0. Body-building
+            # consumers (SSG build, ISR cache) use this to drop it instead
+            # of baking the placeholder into the stored page.
+            response._pynext_loading_index = 1 if prefix else 0
+        return response
 
     def _page_query(self, pattern, request):
         keys = self.isr_queries.get(pattern, ())
@@ -2466,7 +2651,16 @@ class App:
             feed.begin()
             body = bytearray()
             try:
+                # The loading placeholder is for the live client only; feed
+                # it through but keep it out of the cached body.
+                index = 0
+                loading_index = getattr(response, "_pynext_loading_index", None)
                 while (chunk := await response._next_chunk()) is not None:
+                    if index == loading_index:
+                        index += 1
+                        await feed.send(chunk)
+                        continue
+                    index += 1
                     if len(body) + len(chunk) > _MAX_ISR_STREAM_BYTES:
                         raise ValueError("Streamed ISR page exceeds the size limit")
                     body.extend(chunk)
@@ -2554,8 +2748,9 @@ class App:
         else:
             result = await _invoke(fn, request=request, params=params, query=query)
         if hasattr(result, "__aiter__"):
-            return await self._streaming_page_response(pattern, result, layouts, tracker=tracker,
-                                                       request=request)
+            return await self._streaming_page_response(
+                pattern, result, layouts, tracker=tracker, request=request, params=params,
+                loading=self.loading_boundaries.get(pattern))
         tree = result
         if not isinstance(tree, dict):
             raise TypeError(f"Page {pattern} must return a render node dict, got {type(tree).__name__}")
@@ -2653,6 +2848,27 @@ class App:
         # bridge responses pass through here and are not re-tagged there.
         apply_build_headers(response, build_id=self.build_id, deployment_id=self.deployment_id)
         return response
+
+    async def _guarded_page_render(self, request, pattern, params, render):
+        """Render a page, answering failures with its segment boundary.
+
+        ``render`` is a no-argument callable returning the page response
+        (or raising). A page failure renders the nearest ``error.py`` with
+        status 500; :class:`NotFoundError` renders the nearest
+        ``not-found.py`` with status 404. Framework signals (bad request,
+        sync-worker exhaustion, cancellation, cache infrastructure,
+        generation timeout) propagate untouched so their existing
+        handling still applies.
+        """
+        try:
+            return await render()
+        except NotFoundError:
+            return await self._not_found_page_response(request, pattern, params)
+        except (BadRequest, _SyncHandlerBusy, RequestCancelled, CacheBusy,
+                SharedCacheUnavailable, TimeoutError):
+            raise
+        except Exception as exc:
+            return await self._error_page_response(request, pattern, params, exc)
 
     async def _dispatch_response(self, request):
         # Health probes are reserved framework paths (B6): they bypass
@@ -2901,6 +3117,8 @@ class App:
         match = self.router.matches(match_path)
         if match is None:
             route_var.set("__not_found__")
+            if _accepts_html(request):
+                return await self._not_found_page_response(request, None, {})
             return Response("Not Found", status=404)
         pattern, raw_params, kinds = match
         route_var.set(pattern)
@@ -2915,6 +3133,8 @@ class App:
         if (self.production and self.render_modes.get(pattern) == "ssg"
                 and self.dynamic_modes.get(pattern) != "force-dynamic"
                 and path not in self.static_pages):
+            if _accepts_html(request):
+                return await self._not_found_page_response(request, pattern, params)
             return Response("Not Found", status=404)
         if (not self.production and self.render_modes.get(pattern) == "ssg"
                 and self.dynamic_modes.get(pattern) != "force-dynamic"):
@@ -2963,7 +3183,9 @@ class App:
                 query = self._page_query(pattern, request)
                 private = any(name.lower() in {b"authorization", b"cookie"} for name, _ in request.headers)
                 if private:
-                    response = await self.render_page(pattern, None, params, query=query)
+                    response = await self._guarded_page_render(
+                        request, pattern, params,
+                        lambda: self.render_page(pattern, None, params, query=query))
                     response.headers.extend([
                         (b"cache-control", b"private, no-store"),
                         (b"vary", b"Cookie, Authorization"),
@@ -3008,7 +3230,9 @@ class App:
                         # because the key itself is the normalized path.
                         tags = (tuple(self.isr_tags.get(pattern, ())) +
                                 tuple(_implicit_path_tags(path)))
-                        body = await self._render_isr_cached(pattern, params, query, cache_key, policy, tags)
+                        body = await self._guarded_page_render(
+                            request, pattern, params,
+                            lambda: self._render_isr_cached(pattern, params, query, cache_key, policy, tags))
                     except CacheBusy:
                         self.metrics.observe_cache("busy")
                         self.metrics.observe_regeneration("failure")
@@ -3040,18 +3264,30 @@ class App:
                     except TimeoutError:
                         self.metrics.observe_regeneration("failure")
                         return Response("Gateway Timeout", status=504)
-                    if cache_before == "miss":
-                        self.metrics.observe_regeneration("started" if isinstance(body, StreamingResponse)
-                                                          else "success")
-                    elif cache_before == "stale":
-                        self.metrics.observe_regeneration("started")
-                    response = body if isinstance(body, StreamingResponse) else Response(
-                        body, media_type="text/html; charset=utf-8", headers=[
-                            (b"cache-control", b"public, max-age=0, must-revalidate"),
-                            (b"vary", b"Cookie, Authorization"),
-                        ])
+                    if isinstance(body, StreamingResponse):
+                        if cache_before in ("miss", "stale"):
+                            self.metrics.observe_regeneration("started")
+                        response = body
+                    elif isinstance(body, Response):
+                        # A segment boundary answered instead of the cache:
+                        # serve it as-is, never cache it, and count the
+                        # generation as failed.
+                        self.metrics.observe_regeneration("failure")
+                        response = body
+                    else:
+                        if cache_before == "miss":
+                            self.metrics.observe_regeneration("success")
+                        elif cache_before == "stale":
+                            self.metrics.observe_regeneration("started")
+                        response = Response(
+                            body, media_type="text/html; charset=utf-8", headers=[
+                                (b"cache-control", b"public, max-age=0, must-revalidate"),
+                                (b"vary", b"Cookie, Authorization"),
+                            ])
             else:
-                response = await self.render_page(pattern, request, params)
+                response = await self._guarded_page_render(
+                    request, pattern, params,
+                    lambda: self.render_page(pattern, request, params))
         else:
             method = "GET" if request.method == "HEAD" and "HEAD" not in entry else request.method
             if (method not in SAFE_METHODS

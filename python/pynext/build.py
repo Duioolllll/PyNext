@@ -461,11 +461,28 @@ def discover(root):
             current = current / part
             dirs.append(current)
         layouts = [(d / "layout.py").relative_to(root).as_posix() for d in dirs if (d / "layout.py").is_file()]
+        # Segment error boundaries (error.py / not-found.py / loading.py):
+        # the nearest file walking up from the route directory wins, like
+        # layouts. Only pages get boundaries; API routes keep the plain
+        # framework error responses.
+        if path.stem == "page":
+            boundaries = {key: _nearest_boundary(dirs, filename, root) for key, filename in
+                          (("error", "error.py"), ("not_found", "not-found.py"),
+                           ("loading", "loading.py"))}
+        else:
+            boundaries = {"error": None, "not_found": None, "loading": None}
         routes[pattern] = {"entry": path.relative_to(root).as_posix(), "kind": path.stem,
-                           "layouts": layouts if path.stem == "page" else []}
+                           "layouts": layouts if path.stem == "page" else [], **boundaries}
     if not routes:
         raise ValueError("No page.py or route.py files found")
     router = validate_routes(routes)
+    # Global boundaries live at the app root. They are also the nearest
+    # boundary for every route (the walk above includes the app directory),
+    # but route misses have no route, so the global not-found needs its
+    # own top-level entry; the global error is the last-resort fallback
+    # when a nearer boundary fails to render.
+    global_error = _nearest_boundary([app_dir], "error.py", root)
+    global_not_found = _nearest_boundary([app_dir], "not-found.py", root)
     public_sources = discover_public(root)
     for path in list(routes) + list(public_sources):
         if path == "/_pynext" or path.startswith("/_pynext/"):
@@ -474,6 +491,7 @@ def discover(root):
     if conflicts:
         raise ValueError(f"Public file conflicts with a page or API route: {sorted(conflicts)[0]}")
     return {"schema_version": VERSION, "routes": {p: routes[p] for p in router.ordered_routes()},
+            "error": global_error, "not_found": global_not_found,
             "sources": {p.relative_to(root).as_posix(): _hash(p) for p in files},
             "public_sources": public_sources, "client_sources": discover_client(root)}
 
@@ -589,6 +607,20 @@ def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECOND
     also records the deterministic 16-hex ``build_id`` (source-hash prefix)
     and the optional ``deployment_id`` served as skew-protection headers.
     """
+
+
+def _nearest_boundary(dirs, filename, root):
+    """Nearest ``filename`` walking up from the route directory, else None.
+
+    ``dirs`` runs from the app directory down to the route directory, so
+    the reversed walk finds the closest boundary first. Returns the path
+    relative to the project root, like the ``layouts`` entries.
+    """
+    for directory in reversed(dirs):
+        candidate = directory / filename
+        if candidate.is_file():
+            return str(candidate.relative_to(root))
+    return None
     root = Path(root).resolve()
     deployment_id = resolve_deployment_id(deployment_id)
     with BuildLock(root, timeout=lock_timeout):
@@ -786,7 +818,15 @@ async def _render_static_pages(app):
                     body = bytearray()
                     try:
                         async with asyncio.timeout(MAX_STREAMED_STATIC_SECONDS):
+                            # The loading placeholder is for live clients only;
+                            # it must not be baked into the static page.
+                            index = 0
+                            loading_index = getattr(response, "_pynext_loading_index", None)
                             while (chunk := await response._next_chunk()) is not None:
+                                if index == loading_index:
+                                    index += 1
+                                    continue
+                                index += 1
                                 if len(body) + len(chunk) > MAX_STREAMED_STATIC_BYTES:
                                     raise ValueError("Streamed static page exceeds build size limit")
                                 body.extend(chunk)
