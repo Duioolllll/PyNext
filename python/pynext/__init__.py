@@ -27,7 +27,8 @@ from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, PathHeaderRule, Pat
                    csrf_token_response, get_csrf_token, mask_csrf_token, new_csrf_token,
                    new_csp_nonce, security_headers, set_csrf_cookie, sign_csrf_token,
                    unmask_csrf_token, validate_csrf)
-from .middleware import MiddlewareScope, RouteHas, scoped
+from .middleware import (MAX_MIDDLEWARE_REWRITES, MiddlewareResult, MiddlewareScope, RouteHas,
+                         redirect_response, rewrite_request, scoped)
 from .matcher import (HeaderRule, Matcher, ScopedMiddleware, compile_header_rules, compile_matcher,
                       scoped_middleware)
 from .observability import MetricsCollector, ObservabilityConfig
@@ -68,6 +69,7 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "generate_fetch_cache_key", "generate_simple_fetch_cache_key",
            "MiddlewareScope", "RouteHas", "scoped",
            "url_for", "preprocess_pathname", "add_base_path",
+           "MiddlewareResult", "rewrite_request", "redirect_response", "MAX_MIDDLEWARE_REWRITES",
            "StaticPathError", "resolve_static_path", "validate_static_request_path",
            "Field", "Schema", "ValidationError", "validate_input", "validate_request",
            "validate_handler", "validate_handler_input", "validation_error_response",

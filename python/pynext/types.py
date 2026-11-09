@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Protocol, TypedDict
 
 if TYPE_CHECKING:
     from .http import Request, Response
+    from .middleware import MiddlewareResult
 
 type JSONValue = None | bool | int | float | str | list[JSONValue] | dict[str, JSONValue]
 type Headers = Iterable[tuple[bytes, bytes]]
@@ -28,7 +29,7 @@ class RenderNode(TypedDict, total=False):
 
 type Child = RenderNode | str | int | float | None
 type NextHandler = Callable[["Request"], Awaitable["Response"]]
-type Middleware = Callable[["Request", NextHandler], Awaitable["Response"]]
+type Middleware = Callable[["Request", NextHandler], Awaitable["Response | MiddlewareResult"]]
 
 
 class Resource(Protocol):
