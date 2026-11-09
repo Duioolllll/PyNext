@@ -447,6 +447,20 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     def ws_origin_callback(headers, peer_ip):
         return websocket_origin_allowed(headers, peer_ip, "http", app.proxy_trust, app.security)
 
+    # WebSocket handshakes run through the same limiter as HTTP requests
+    # (review #4 #21): the Rust upgrade branch calls this before the
+    # origin check and the 101. It returns bridge()'s (allowed,
+    # retry_after) pair; exempt paths skip the check, and a
+    # RateLimitUnavailable propagates so Rust answers 503, like bridge().
+    ws_rate_limit_callback = None
+    if limiter is not None:
+        def ws_rate_limit_callback(path, headers, peer_ip):
+            exempt = getattr(limiter, "is_exempt", None)
+            if exempt and exempt(path):
+                return True, None
+            key = limiter.key_for(peer_ip, headers)
+            return limiter.allow(key)
+
     return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store, app.asset_etags,
                                 max_concurrent=max_concurrent, acquire_timeout_ms=acquire_timeout_ms,
                                 max_waiting=max_waiting,
@@ -458,6 +472,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 websocket_paths=sorted(app.websocket_routes),
                                 websocket_callback=ws_callback,
                                 websocket_origin_callback=ws_origin_callback,
+                                websocket_rate_limit_callback=ws_rate_limit_callback,
                                 reuse_port=reuse_port,
                                 route_patterns=app.router.ordered_routes(),
                                 middleware_enabled=bool(app.middleware) or limiter is not None or app.hot_reload,

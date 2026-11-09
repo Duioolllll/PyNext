@@ -296,6 +296,91 @@ def _axum_client_sequence(address):
     return results
 
 
+def _handshake_status(address, path="/ws/echo"):
+    """Raw WebSocket handshake returning (status line, headers).
+
+    Unlike _RawWSClient this does not assert a 101: a rate-limited or
+    rejected handshake is the point of the call.
+    """
+    host, port = address.split(":")
+    sock = socket.create_connection((host, int(port)), timeout=5)
+    sock.settimeout(5)
+    try:
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            f"GET {path} HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        sock.sendall(request.encode("ascii"))
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        head = response.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+        lines = head.split("\r\n")
+        headers = {}
+        for line in lines[1:]:
+            if ":" in line:
+                name, value = line.split(":", 1)
+                headers[name.strip().lower()] = value.strip()
+        return lines[0] if lines else "", headers
+    finally:
+        sock.close()
+
+
+def test_native_websocket_handshake_is_rate_limited():
+    import httpx
+
+    from pynext.ratelimit import RateLimiter
+
+    async def run():
+        # One token per 60s for the whole client IP: the first handshake
+        # succeeds, the second is refused with 429 + Retry-After.
+        app = create_app(EXAMPLE, rate_limit=RateLimiter(1, 60.0))
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            first, _ = await asyncio.to_thread(_handshake_status, server.address)
+            assert first.startswith("HTTP/1.1 101"), first
+            second, headers = await asyncio.to_thread(_handshake_status, server.address)
+            assert second.startswith("HTTP/1.1 429"), second
+            assert 1 <= int(headers["retry-after"]) <= 60
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+
+        # An exempt WebSocket path skips the check entirely.
+        app = create_app(EXAMPLE, rate_limit=RateLimiter(1, 60.0, exempt_paths=("/ws/echo",)))
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            for _ in range(2):
+                status, _ = await asyncio.to_thread(_handshake_status, server.address)
+                assert status.startswith("HTTP/1.1 101"), status
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+
+        # HTTP requests and handshakes share one bucket per client IP:
+        # a routed page consumes the token, so the handshake after it is
+        # refused; once the window refills the handshake succeeds again.
+        app = create_app(EXAMPLE, rate_limit=RateLimiter(1, 2.0))
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=10) as client:
+                assert (await client.get("/")).status_code == 200
+            status, _ = await asyncio.to_thread(_handshake_status, server.address)
+            assert status.startswith("HTTP/1.1 429"), status
+            await asyncio.sleep(2.5)
+            status, _ = await asyncio.to_thread(_handshake_status, server.address)
+            assert status.startswith("HTTP/1.1 101"), status
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+
+    _run(run())
+
+
 def test_axum_websocket_echo_and_oversized_close():
     async def run():
         app = create_app(EXAMPLE)
