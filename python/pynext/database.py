@@ -7,6 +7,8 @@ explicit and must not be shared between concurrent tasks.
 import asyncio
 from contextlib import asynccontextmanager
 
+from .dynamic import mark_dynamic_access
+
 
 class _MemorySessions:
     def __init__(self):
@@ -107,6 +109,9 @@ class Database:
     @asynccontextmanager
     async def session(self):
         """Yield a fresh session without committing; close it on exit."""
+        # A database read during a prerender bakes live data into static
+        # HTML; flag it so the dynamic-access report explains the page.
+        mark_dynamic_access("Database.session()")
         factory = self._session_factory
         if factory is None:
             raise RuntimeError("database resource has not started")

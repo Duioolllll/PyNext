@@ -34,6 +34,8 @@ def Page(params):
 
 `pynext build --dir PROJECT`를 실행하면 정적 HTML을 생성합니다. 동적 SSG 경로 중 생성하지 않은 URL은 프로덕션에서 **404**입니다. 정적 경로에는 생성기가 필요 없습니다. 빌드당 **최대 10,000 페이지**까지 생성하며 **SSG 페이지 함수는 `request`를 받을 수 없습니다.**
 
+정적 렌더링은 동적 접근을 추적합니다. SSG 페이지가 빌드 중 렌더링되거나 ISR 페이지가 생성되는 동안 `time.time()`, `datetime.now()`, `random.*`, `uuid.uuid4()`, `Database.session()` 같은 읽기는 읽은 페이지 위치와 함께 기록됩니다. 기본값 `@page(dynamic="auto")`은 빌드를 계속하고 접근 내역을 빌드 매니페스트의 `dynamic_accesses` 리포트에 경고와 함께 남깁니다. `@page(dynamic="error")`는 처음 기록된 접근에서 빌드(또는 ISR 생성)를 실패시키고, `@page(render="ssg", dynamic="force-dynamic")`는 빌드 시 생성을 건너뛰고 운영에서는 페이지를 동적으로 제공합니다. `no_store()`는 스코프를 의도적으로 동적으로 표시하고, `mark_dynamic_access("...")`은 자동 후크가 볼 수 없는 나머지(외부 fetch나, 프리렌더 패치를 피해 가는 `from datetime import datetime` 바인딩)를 기록합니다. 개발 모드에서 `generate_static_params()`가 만들지 않을 SSG 경로를 요청하면 운영에서 404가 될 것이라는 경고를 남깁니다. `pynext dev --strict-ssg`(또는 `create_app(..., strict_ssg=True)`)를 쓰면 개발 모드에서도 404로 응답합니다.
+
 ## ISR (공개 캐시)
 
 ~~~python

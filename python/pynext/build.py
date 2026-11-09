@@ -12,7 +12,7 @@ from .assets import discover_public
 from .client import discover_client
 
 MANIFEST = ".pynext/manifest.json"
-VERSION = 9
+VERSION = 10
 MAX_STATIC_PAGES = 10_000
 # One cap for every static page rendered at build time, streaming or
 # not: a non-streaming page used to have no size limit at all while a
@@ -119,6 +119,12 @@ def write_manifest(root):
     manifest["render_modes"] = app.render_modes
     manifest["isr_policies"] = app.isr_policies
     manifest["isr_queries"] = app.isr_queries
+    manifest["dynamic_modes"] = app.dynamic_modes
+    # Prerender report: dynamic accesses recorded while rendering SSG pages
+    # (empty when every static page stayed static). ISR accesses recorded
+    # later at runtime are not part of the build manifest.
+    manifest["dynamic_accesses"] = {pattern: accesses for pattern, accesses in app.dynamic_accesses.items()
+                                    if accesses}
     manifest["client"] = app.client_manifest
     manifest["static_pages"] = {}
     for path, (pattern, body) in rendered.items():
@@ -239,6 +245,9 @@ async def _render_static_pages(app):
     from .http import StreamingResponse
     rendered = {}
     for pattern, generator in app.static_generators.items():
+        if app.dynamic_modes.get(pattern) == "force-dynamic":
+            # Never generated at build time; served dynamically instead.
+            continue
         params_list = [{}] if generator is None else await _invoke(generator)
         if not isinstance(params_list, list):
             raise ValueError(f"generate_static_params for {pattern} must return a list")
@@ -306,7 +315,8 @@ def read_static_pages(root, manifest, router):
             raise ValueError(f"Static page for {path} failed integrity check; rebuild the application")
         result[path] = body
     for pattern, mode in manifest["render_modes"].items():
-        if mode == "ssg" and "[" not in pattern and pattern not in result:
+        if (mode == "ssg" and "[" not in pattern and pattern not in result
+                and manifest.get("dynamic_modes", {}).get(pattern) != "force-dynamic"):
             raise ValueError(f"Missing static page for {pattern}; rebuild the application")
     return result
 

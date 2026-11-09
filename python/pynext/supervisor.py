@@ -106,6 +106,9 @@ class WorkerConfig:
     # the native connection drain; it must cover the 30s request timeout
     # or a slow request can still be cut off mid-flight.
     shutdown_timeout: float = 30.0
+    # Dev-only: answer 404 (like production) for SSG paths that
+    # generate_static_params would not produce, instead of merely warning.
+    strict_ssg: bool = False
 
 
 def _heartbeat_loop(stop, heartbeat):
@@ -137,7 +140,7 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                      cache_failure_policy=config.cache_failure_policy,
                      observability=config.observability, debug=not config.production,
                      security=config.security, websocket_max_message=config.websocket_max_message,
-                     trusted_proxies=config.trusted_proxies)
+                     trusted_proxies=config.trusted_proxies, strict_ssg=config.strict_ssg)
 
     async def run():
         loop = asyncio.get_running_loop()

@@ -66,6 +66,10 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `parse_trusted_proxies` | `pynext.proxy` |
 | `FAIL_OPEN` | `pynext.failure_policy` |
 | `FAIL_CLOSED` | `pynext.failure_policy` |
+| `no_store` | `pynext.dynamic` |
+| `mark_dynamic_access` | `pynext.dynamic` |
+| `StaticGenBailoutError` | `pynext.dynamic` |
+| `is_prerender_bailout` | `pynext.dynamic` |
 
 ## Security defaults (`SecurityConfig`)
 

@@ -245,9 +245,15 @@ def _isr_query_keys(keys):
     return sorted(keys)
 
 
-def page(*, render="ssr", revalidate=None, stale=None, query_keys=()):
+def page(*, render="ssr", revalidate=None, stale=None, query_keys=(), dynamic="auto"):
     if render not in {"ssr", "ssg", "isr"}:
         raise ValueError("render must be 'ssr', 'ssg', or 'isr'")
+    if dynamic not in {"auto", "error", "force-dynamic"}:
+        raise ValueError("dynamic must be 'auto', 'error', or 'force-dynamic'")
+    if dynamic != "auto" and render == "ssr":
+        raise ValueError("dynamic is only valid for SSG and ISR pages")
+    if dynamic == "force-dynamic" and render != "ssg":
+        raise ValueError("dynamic='force-dynamic' is only valid for SSG pages")
     if render == "isr":
         policy = _isr_policy(revalidate, 60.0 if stale is None else stale)
         query_keys = _isr_query_keys(query_keys)
@@ -260,6 +266,7 @@ def page(*, render="ssr", revalidate=None, stale=None, query_keys=()):
         fn.__pynext_render__ = render
         fn.__pynext_cache_policy__ = policy
         fn.__pynext_cache_query__ = query_keys
+        fn.__pynext_dynamic__ = dynamic
         return fn
     return decorate
 

@@ -26,7 +26,9 @@ from .auth import check_authorization
 from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
 from .client import compile_client, read_client_artifacts
 from .components import _isr_policy, _isr_query_keys, _node, bind_islands
-from .build import discover, load_manifest
+from .build import _materialize, discover, load_manifest
+from .dynamic import (DYNAMIC_MODES, MAX_DYNAMIC_ACCESSES, format_dynamic_accesses,
+                      suppress_dynamic_tracking, track_prerender)
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
@@ -331,12 +333,18 @@ class App:
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
                  resources=None, cache_url=None, cache_failure_policy=None,
                  websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
-                 trusted_proxies=None, sync_workers=32):
+                 trusted_proxies=None, sync_workers=32, strict_ssg=False):
         if isinstance(sync_workers, bool) or not isinstance(sync_workers, int) or not 1 <= sync_workers <= 1024:
             raise ValueError("sync_workers must be an integer from 1 to 1024")
         self.sync_workers = sync_workers
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
+        if not isinstance(strict_ssg, bool):
+            raise TypeError("strict_ssg must be a bool")
+        # Dev-only: with strict_ssg, an SSG path that generate_static_params
+        # would not produce is a 404 in development too, instead of merely
+        # warning that it will 404 in production (see _dispatch).
+        self.strict_ssg = strict_ssg
         if production and debug:
             raise ValueError("debug cannot be enabled in production")
         if not isinstance(hot_reload, bool) or (hot_reload and (production or not debug)):
@@ -493,6 +501,11 @@ class App:
         self.entries = {}
         self.websocket_entries = {}
         self.render_modes = {}
+        self.dynamic_modes = {}
+        # Per-pattern dynamic accesses recorded during SSG/ISR prerenders
+        # (see _merge_dynamic_accesses); written to the build manifest.
+        self.dynamic_accesses = {}
+        self._dev_static_paths = {}
         self.isr_policies = {}
         self.isr_queries = {}
         if cache_backend == "sqlite" and cache_path is None:
@@ -522,6 +535,14 @@ class App:
                 if mode in {"ssg", "isr"} and getattr(fn, "__pynext_auth__", False):
                     raise ValueError(f"{mode.upper()} page {spec['entry']} cannot require authentication")
                 self.render_modes[pattern] = mode
+                dynamic = getattr(fn, "__pynext_dynamic__", "auto")
+                if dynamic not in DYNAMIC_MODES:
+                    raise ValueError(f"Unsupported dynamic mode in {spec['entry']}")
+                if mode == "ssr" and dynamic != "auto":
+                    raise ValueError(f"SSR page {spec['entry']} cannot set dynamic={dynamic!r}")
+                if dynamic == "force-dynamic" and mode != "ssg":
+                    raise ValueError(f"Only SSG pages can use dynamic='force-dynamic' in {spec['entry']}")
+                self.dynamic_modes[pattern] = dynamic
                 if mode == "isr":
                     policy = getattr(fn, "__pynext_cache_policy__", None)
                     if not isinstance(policy, dict) or set(policy) != {"revalidate", "stale"}:
@@ -543,11 +564,15 @@ class App:
                 if "query" in inspect.signature(fn).parameters and not query_keys:
                     raise ValueError(f"Page {spec['entry']} needs ISR query_keys to accept query")
                 if mode == "ssg":
-                    dynamic = any(segment.startswith("[") for segment in pattern.split("/"))
+                    is_dynamic = any(segment.startswith("[") for segment in pattern.split("/"))
                     generator = getattr(module, "generate_static_params", None)
-                    if dynamic and (not callable(generator) or inspect.signature(generator).parameters):
+                    if dynamic == "force-dynamic":
+                        # Served dynamically in production, so no generator
+                        # is needed and any exported one is ignored at build.
+                        pass
+                    elif is_dynamic and (not callable(generator) or inspect.signature(generator).parameters):
                         raise ValueError(f"Dynamic SSG page {spec['entry']} must export generate_static_params() with no arguments")
-                    if not dynamic and generator is not None:
+                    elif not is_dynamic and generator is not None:
                         raise ValueError(f"Static SSG page {spec['entry']} cannot export generate_static_params")
                     self.static_generators[pattern] = generator
                 layouts = []
@@ -588,6 +613,8 @@ class App:
                 raise ValueError("ISR policies changed since build; run `pynext build` again")
             if manifest.get("isr_queries") != self.isr_queries:
                 raise ValueError("ISR query keys changed since build; run `pynext build` again")
+            if manifest.get("dynamic_modes") != self.dynamic_modes:
+                raise ValueError("Dynamic modes changed since build; run `pynext build` again")
             self.client_manifest, self.client_assets = read_client_artifacts(self.root, manifest)
             self.static_pages = read_static_pages(self.root, manifest, self.router)
             self.public_assets = read_public_artifacts(self.root, manifest)
@@ -781,13 +808,58 @@ class App:
             return existed
         return await self.isr.invalidate(path)
 
+    def _merge_dynamic_accesses(self, pattern, state):
+        """Fold one prerender's recorded accesses into the app report.
+
+        Only newly seen expressions are logged, so a dev SSG page rendered
+        on every request (or a regenerating ISR page) warns once per
+        expression instead of once per render. The report is written to
+        the build manifest as ``dynamic_accesses``.
+        """
+        if not state.accesses:
+            return
+        known = self.dynamic_accesses.setdefault(pattern, [])
+        seen = {entry["expression"] for entry in known}
+        fresh = [access for access in state.accesses if access.expression not in seen]
+        for access in fresh:
+            seen.add(access.expression)
+            known.append(access.to_dict())
+        if len(known) > MAX_DYNAMIC_ACCESSES:
+            del known[MAX_DYNAMIC_ACCESSES:]
+        if fresh:
+            log.warning("Static page %s read dynamic data during render:\n%s",
+                        pattern, format_dynamic_accesses(fresh))
+
+    async def _dev_generated_paths(self, pattern):
+        """Paths a dynamic SSG pattern would generate, cached per process.
+
+        Returns None when the generator cannot run in development, in
+        which case the dev/prod consistency check is skipped rather than
+        guessed at.
+        """
+        if pattern in self._dev_static_paths:
+            return self._dev_static_paths[pattern]
+        generator = self.static_generators.get(pattern)
+        if generator is None:
+            paths = {pattern}
+        else:
+            try:
+                params_list = await _invoke(generator)
+                paths = {_materialize(pattern, params) for params in params_list}
+            except Exception:
+                log.warning("Cannot determine generated SSG paths for %s; "
+                            "skipping the dev/prod consistency check", pattern, exc_info=True)
+                paths = None
+        self._dev_static_paths[pattern] = paths
+        return paths
+
     async def _render_stream_chunk(self, node):
         """Serialize one streamed UI node to HTML on a worker thread."""
         bound = bind_islands(_node(node), self.client_manifest, include_runtime=False)
         payload = json.dumps(bound, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         return await asyncio.to_thread(_native.render, payload)
 
-    async def _streaming_page_response(self, pattern, chunks, layouts):
+    async def _streaming_page_response(self, pattern, chunks, layouts, tracker=None):
         """Wrap an async iterable of UI nodes in a StreamingResponse.
 
         The layout shell is rendered once with a marker in place of the page
@@ -797,8 +869,15 @@ class App:
         their children exactly once; anything else fails before headers are
         sent. SSG consumes the stream during the build. ISR streams its first
         generation while retaining a bounded copy for the cache.
+
+        When ``tracker`` is given, the stream owns it: ``page_stream()``
+        exits it when the body is fully consumed or the stream is closed,
+        so dynamic accesses in later chunks are still recorded.
         """
-        marker = "__pynext_stream_" + uuid.uuid4().hex + "__"
+        # The marker is framework-generated, not a page read: suppress it so
+        # it is never misreported as the page being dynamic.
+        with suppress_dynamic_tracking():
+            marker = "__pynext_stream_" + uuid.uuid4().hex + "__"
         shell = {"kind": "text", "value": marker}
         for layout_fn in reversed(layouts):
             shell = await _invoke(layout_fn, children=shell)
@@ -833,6 +912,8 @@ class App:
                 close = getattr(chunks, "aclose", None)
                 if close is not None:
                     await close()
+                if tracker is not None:
+                    tracker.__exit__(None, None, None)
 
         return StreamingResponse(page_stream(), media_type="text/html; charset=utf-8")
 
@@ -892,9 +973,44 @@ class App:
             raise
 
     async def render_page(self, pattern, request, params, *, csp_nonce=True, query=None):
+        """Render one page, tracking dynamic accesses for SSG/ISR pages.
+
+        Static renders run under a :class:`PrerenderTracker`: dynamic reads
+        are recorded, and in ``dynamic="error"`` mode the first one raises
+        :class:`StaticGenBailoutError`. A streamed body keeps the tracker
+        alive until the stream ends, so accesses in later chunks count too.
+        ``force-dynamic`` SSG pages render untracked: they are dynamic by
+        design, so tracking them would only produce false warnings.
+        """
         fn, layouts = self.entries[pattern]
         if query is None:
             query = self._page_query(pattern, request)
+        mode = self.render_modes.get(pattern)
+        dynamic_mode = self.dynamic_modes.get(pattern, "auto")
+        if mode not in {"ssg", "isr"} or dynamic_mode == "force-dynamic":
+            # SSR pages and force-dynamic pages are dynamic by design: there
+            # is nothing static to protect, so no tracker is installed and
+            # no "static page read dynamic data" warning is produced.
+            return await self._render_page_inner(pattern, fn, layouts, request, params,
+                                                 query, csp_nonce)
+        tracker = track_prerender(pattern, dynamic_mode,
+                                  on_finish=lambda state: self._merge_dynamic_accesses(pattern, state))
+        tracker.__enter__()
+        try:
+            response = await self._render_page_inner(pattern, fn, layouts, request, params,
+                                                     query, csp_nonce, tracker=tracker)
+        except BaseException:
+            tracker.__exit__(None, None, None)
+            raise
+        if isinstance(response, StreamingResponse):
+            # The stream owns the tracker now: page_stream() exits it when
+            # the body is fully consumed or the stream is closed.
+            return response
+        tracker.__exit__(None, None, None)
+        return response
+
+    async def _render_page_inner(self, pattern, fn, layouts, request, params, query, csp_nonce,
+                                 tracker=None):
         if inspect.isasyncgenfunction(fn):
             # Calling an async generator function only creates the iterator;
             # its body runs when the stream is first pulled. Call it directly
@@ -905,7 +1021,7 @@ class App:
         else:
             result = await _invoke(fn, request=request, params=params, query=query)
         if hasattr(result, "__aiter__"):
-            return await self._streaming_page_response(pattern, result, layouts)
+            return await self._streaming_page_response(pattern, result, layouts, tracker=tracker)
         tree = result
         if not isinstance(tree, dict):
             raise TypeError(f"Page {pattern} must return a render node dict, got {type(tree).__name__}")
@@ -1157,8 +1273,22 @@ class App:
                           params, self, request.state, request._cancel_event)
         spec = self.manifest["routes"][pattern]
         entry = self.entries[pattern]
-        if self.production and self.render_modes.get(pattern) == "ssg" and path not in self.static_pages:
+        if (self.production and self.render_modes.get(pattern) == "ssg"
+                and self.dynamic_modes.get(pattern) != "force-dynamic"
+                and path not in self.static_pages):
             return Response("Not Found", status=404)
+        if (not self.production and self.render_modes.get(pattern) == "ssg"
+                and self.dynamic_modes.get(pattern) != "force-dynamic"):
+            # Dev/prod consistency (§3.2 #4): development renders SSG pages
+            # on request, so a path generate_static_params would never
+            # produce silently works in dev and 404s in production. Warn
+            # here; --strict-ssg makes dev answer 404 as well.
+            generated = await self._dev_generated_paths(pattern)
+            if generated is not None and path not in generated:
+                log.warning("SSG path %s for %s is not generated by generate_static_params; "
+                            "it will 404 in production", path, pattern)
+                if self.strict_ssg:
+                    return Response("Not Found", status=404)
         if spec["kind"] == "page":
             allowed = {"GET", "HEAD", "OPTIONS"}
         else:
@@ -1178,7 +1308,8 @@ class App:
             if denied is not None:
                 return denied
         if spec["kind"] == "page":
-            if self.production and self.render_modes[pattern] == "ssg":
+            if (self.production and self.render_modes[pattern] == "ssg"
+                    and self.dynamic_modes.get(pattern) != "force-dynamic"):
                 response = asset_response(request, self.static_pages[path], "text/html; charset=utf-8",
                                           self.asset_etags[path], cache_control=b"public, max-age=0, must-revalidate",
                                           extra_headers=[(b"vary", b"Cookie, Authorization")])
@@ -1636,11 +1767,11 @@ class App:
 def create_app(root=".", *, production=False, security=None, cache_backend="memory", cache_path=None,
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
                cache_failure_policy=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
-               trusted_proxies=None, sync_workers=32):
+               trusted_proxies=None, sync_workers=32, strict_ssg=False):
     root = Path(root).resolve()
     return App(root, load_manifest(root) if production else discover(root), production=production,
                security=security, cache_backend=cache_backend, cache_path=cache_path,
                observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
                resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
                websocket_max_message=websocket_max_message, hot_reload=hot_reload,
-               trusted_proxies=trusted_proxies, sync_workers=sync_workers)
+               trusted_proxies=trusted_proxies, sync_workers=sync_workers, strict_ssg=strict_ssg)

@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Track dynamic accesses during static renders and record why a page is not static: `time.time()`, `datetime.now()`, `random.*`, `uuid.uuid4()`, `os.urandom()`, `secrets.token_*()`, and `Database.session()` reads during an SSG build render or an ISR generation are recorded with the user-code position; `no_store()` marks a scope dynamic on purpose and `mark_dynamic_access("...")` records anything else. `@page(dynamic="auto")` (default) keeps building and writes the accesses to the build manifest's `dynamic_accesses` report with a warning; `@page(dynamic="error")` fails the build — or the ISR generation — on the first access with a `PYNEXT_PRERENDER_BAILOUT` digest; `@page(render="ssg", dynamic="force-dynamic")` skips build-time generation and serves the page dynamically in production. In development, requesting an SSG path that `generate_static_params()` would not produce logs a warning that it will 404 in production; `pynext dev --strict-ssg` (or `create_app(..., strict_ssg=True)`) answers 404 in development as well.
+
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.
