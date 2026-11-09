@@ -12,7 +12,7 @@ from .build import write_manifest
 from .check import DeploySettings, run_deploy_checks
 from .client import compile_client, discover_client
 from .env import load_env
-from .config import DEFAULT_CONFIG, ConfigError, load_config, resolve_workers
+from .config import DEFAULT_CONFIG, ConfigError, load_config
 from .http import MAX_WS_MESSAGE, SecurityConfig
 from .observability import ObservabilityConfig
 from .ratelimit import RateLimiter
@@ -21,7 +21,7 @@ from .scaffold import TEMPLATES, init_project
 from .server import (MAX_BODY_CAPACITY, MAX_BODY_MIN_RATE_BYTES_PER_SEC,
                      MAX_CONCURRENT, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP,
                      MAX_SHUTDOWN_TIMEOUT, MAX_TIMEOUT_MS, MAX_WAITING, serve)
-from .supervisor import MAX_WORKERS, WorkerConfig, run_supervisor
+from .supervisor import MAX_WORKERS, WorkerConfig, decide_auto_workers, run_supervisor
 from .standalone import build_standalone
 from .watch import Watcher
 
@@ -80,18 +80,28 @@ def _bounded(minimum, maximum, label):
     return convert
 
 
-def _workers_value(value):
-    """``--workers`` value: an integer 1..64, or ``"auto"`` (C-P1-5).
+def _workers(value):
+    """argparse type for --workers: an integer in [1, MAX_WORKERS] or "auto".
 
-    ``"auto"`` means one worker per CPU, clamped to 1..64 — the
-    Sanic ``fast=True`` rule. The probe parse in
-    :func:`_explicit_cli_values` runs this converter too, so an
-    explicit ``--workers auto`` is already an int by the time the
-    config is resolved.
+    "auto" resolves later, in main(), via decide_auto_workers() — the
+    machine's CPU/memory count is only read once the rest of the flags
+    have parsed, so a bad --workers value still fails fast at parse
+    time. Error wording keeps the existing "[1, 64]" / ">= 1" / "<= 64"
+    messages (test_cli asserts on them) with 'auto' added to the
+    not-an-integer case.
     """
-    if isinstance(value, str) and value.strip().lower() == "auto":
-        return resolve_workers(value)
-    return _bounded(1, MAX_WORKERS, "--workers")(value)
+    if value == "auto":
+        return value
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--workers must be an integer in [1, 64] or 'auto'") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("--workers must be an integer >= 1")
+    if number > MAX_WORKERS:
+        raise argparse.ArgumentTypeError("--workers must be an integer <= 64")
+    return number
 
 
 async def _wait_for_change(watcher, server_task):
@@ -641,10 +651,11 @@ def _build_parser():
             command.add_argument("--tracing", dest="tracing",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="emit OpenTelemetry spans when the opentelemetry packages are installed (default: off)")
-            command.add_argument("--workers", type=_workers_value,
+            command.add_argument("--workers", type=_workers,
                                  default=DEFAULT_CONFIG.workers,
                                  help=f"worker processes sharing the port: an integer 1-64, or 'auto' "
-                                      f"for one per CPU (default {DEFAULT_CONFIG.workers} for start, "
+                                      f"for one per CPU core and per GiB of available memory (max 8); "
+                                      f"(default {DEFAULT_CONFIG.workers} for start, "
                                       "single process for dev; max 64); "
                                       "a supervisor restarts crashed workers")
             command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"),
@@ -862,6 +873,17 @@ def main():
         value = getattr(args, key)
         if value is not None and value != getattr(DEFAULT_CONFIG, key):
             conn_kwargs[key] = value
+    # Resolve "auto" once, in main(), via decide_auto_workers (memory-aware).
+    # The track (E P2-10) asks for the decision basis on one startup
+    # line: the resolved count and what capped it. Printed here, not
+    # in run_supervisor, so an auto decision of 1 — the
+    # single-process path, no supervisor — is reported too.
+    if args.workers == "auto":
+        decision = decide_auto_workers()
+        workers = decision.count
+        print(f"PyNext workers: {decision.describe()}", flush=True)
+    else:
+        workers = args.workers
     # `pynext dev` stays on the single-process run_dev path (file watching
     # and reload) unless workers were configured explicitly — via --workers,
     # a config file, or the environment. The multi-worker default
@@ -873,9 +895,9 @@ def main():
     if args.command == "dev":
         workers_explicit = (resolved is not None
                             and resolved.source_of("workers") != "default")
-        use_supervisor = workers_explicit and args.workers > 1
+        use_supervisor = workers_explicit and workers > 1
     else:
-        use_supervisor = args.workers > 1
+        use_supervisor = workers > 1
     if use_supervisor:
         config = WorkerConfig(root=str(root), host=args.host, port=args.port,
                               production=args.command == "start",
@@ -901,7 +923,7 @@ def main():
                               websocket_max_message=args.ws_max_message_bytes,
                               shutdown_timeout=args.shutdown_timeout, strict_ssg=args.strict_ssg,
                               allowed_hosts=values.allowed_hosts)
-        return run_supervisor(config, workers=args.workers)
+        return run_supervisor(config, workers=workers)
     # Only forward a stage/adaptive timeout that differs from serve()'s
     # default: the historical call shape is preserved otherwise (see
     # test_cli_without_observability_flags_keeps_old_call_shape, whose
