@@ -35,7 +35,7 @@ from .proxy import ProxyTrust, ResolvedProxy, parse_trusted_proxies
 from .pubsub import PubSubOverflow, WebSocketPubSub
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
-from .routing import route, state_changing_get, websocket
+from .routing import add_base_path, preprocess_pathname, route, state_changing_get, url_for, websocket
 from .sessions import RedisSessionStore, Session, SessionMiddleware, SessionPayloadCipher, SessionRecord, SQLiteSessionStore
 from .static import StaticPathError, resolve_static_path, validate_static_request_path
 from .validation import (Field, Schema, ValidationError, bind_csrf_token, validate_handler,
@@ -67,6 +67,7 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "FetchCacheDecision", "apply_fetch_revalidate", "decide_fetch_cache", "fetch_cache_store_key",
            "generate_fetch_cache_key", "generate_simple_fetch_cache_key",
            "MiddlewareScope", "RouteHas", "scoped",
+           "url_for", "preprocess_pathname", "add_base_path",
            "StaticPathError", "resolve_static_path", "validate_static_request_path",
            "Field", "Schema", "ValidationError", "validate_input", "validate_request",
            "validate_handler", "validate_handler_input", "validation_error_response",

@@ -64,6 +64,7 @@ from .observability import (
 )
 from .proxy import ProxyTrust
 from .ratelimit import _is_exempt_path, rate_limited_response
+from .routing import normalize_base_path, preprocess_pathname, validate_trailing_slash
 from .sessions import SessionMiddleware, SQLiteSessionStore, WS_PREFLIGHT_STATE_KEY
 from .sync_dispatch import (
     CALL_ASYNC,
@@ -950,7 +951,7 @@ class App:
                  trusted_proxies=None, sync_workers=32, sync_wait_timeout=ASGI_DECISION_TIMEOUT,
                  sync_queue_limit=None, render_workers=None, session_workers=None,
                  strict_ssg=False, headers=None,
-                 revalidate_secret=None,
+                 revalidate_secret=None, base_path="", trailing_slash="redirect",
                  body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms,
                  handler_timeout_ms=DEFAULT_CONFIG.handler_timeout_ms,
                  response_timeout_ms=DEFAULT_CONFIG.response_timeout_ms):
@@ -1014,6 +1015,13 @@ class App:
                 not isinstance(revalidate_secret, str) or not revalidate_secret):
             raise ValueError("revalidate_secret must be a non-empty string")
         self.revalidate_secret = revalidate_secret
+        # Path preprocessing (REPORT.md §2.3 P2, track A §2.8): the base
+        # path is stripped before route matching and re-added by
+        # url_for(); the trailing-slash policy names the 308 behaviour
+        # that used to be hardcoded in _dispatch. Both are validated
+        # here so a bad deployment fails at startup.
+        self.base_path = normalize_base_path(base_path)
+        self.trailing_slash = validate_trailing_slash(trailing_slash)
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
         if not isinstance(strict_ssg, bool):
@@ -2319,12 +2327,17 @@ class App:
         Next.js ``revalidatePath``. ``"/"`` and ``"/index"`` are aliases.
         Returns True when at least one entry (or query-variant generation)
         was invalidated.
+
+        A base-path-prefixed path is accepted and stripped first, so
+        operators can pass the public URL; the trailing-slash rule
+        still applies to the app-relative path.
         """
-        if type is not None and type not in ("page", "layout"):
-            raise ValueError("revalidate type must be 'page' or 'layout'")
         if not isinstance(path, str):
             raise TypeError("ISR path must be a string")
         path = _decode_path(path)
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash="redirect")
+        if path is None:
+            raise ValueError("Path does not match an ISR page")
         if path != "/" and path.endswith("/"):
             raise ValueError("ISR path must not have a trailing slash")
         if _is_dynamic_pattern(path):
@@ -3406,6 +3419,27 @@ class App:
         # for the trailing-slash redirect so the encoding is preserved.
         encoded_path = request.raw_path or request.path
         match_path = _normalize_path_for_matching(encoded_path)
+        # Path preprocessing (track A §2.8): strip the base path before
+        # matching, then apply the trailing-slash policy. Everything
+        # below — route matching, `/_pynext/` assets, public files,
+        # SSG/ISR lookups — sees the app-relative path. A path outside
+        # the base path is a plain 404.
+        raw_path = path
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
+        if path is None:
+            route_var.set("__not_found__")
+            return Response("Not Found", status=404)
+        # The match form follows the stripped path: the base prefix is
+        # whole segments, so strip the same prefix from the normalized
+        # form (the boundary check above already settled it), and
+        # mirror the trailing-slash policy so "ignore" does not redirect.
+        if self.base_path and match_path != "/":
+            if match_path == self.base_path:
+                match_path = "/"
+            elif match_path.startswith(self.base_path + "/"):
+                match_path = match_path[len(self.base_path):]
+        if self.trailing_slash == "ignore" and match_path != "/" and match_path.endswith("/"):
+            match_path = match_path.rstrip("/") or "/"
         if self.hot_reload and path == "/_pynext/dev/client":
             route_var.set("__dev__")
             if request.method not in {"GET", "HEAD"}:
@@ -3816,15 +3850,31 @@ class App:
         response; perform login and session changes through ordinary HTTP
         endpoints before connecting.
         """
+        # Same path preprocessing as _dispatch: the pre-flight matches
+        # the app-relative path, so a prefixed upgrade finds its route.
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
+        if path is None:
+            return Response("Not Found", status=404)
         # Match on the per-segment decoded form (Next.js
         # decodePathParams) so the pre-flight checks the same route the
         # handler will run; when no encoded path is available (native
         # transport, where Rust already decoded it) the decoded path
-        # normalizes to the same form.
+        # normalizes to the same form. When the encoded path is
+        # available the match form still carries the base prefix, so
+        # strip it (the boundary check above already settled it) and
+        # mirror the trailing-slash policy.
         try:
             match_path = _normalize_path_for_matching(raw_path or path)
         except BadRequest:
             return Response("Bad Request", status=400)
+        if raw_path:
+            if self.base_path and match_path != "/":
+                if match_path == self.base_path:
+                    match_path = "/"
+                elif match_path.startswith(self.base_path + "/"):
+                    match_path = match_path[len(self.base_path):]
+            if self.trailing_slash == "ignore" and match_path != "/" and match_path.endswith("/"):
+                match_path = match_path.rstrip("/") or "/"
         match = self.router.matches(match_path)
         if match is None:
             return Response("Not Found", status=404)
@@ -3877,6 +3927,17 @@ class App:
         # before any rate-limit charge (B-1 / review #7). Matching on
         # the normalized form would hide the '?' and let the handshake
         # reach the rate limiter instead.
+        # Same path preprocessing as _dispatch: a prefixed handshake
+        # matches the app-relative path; outside the base path the
+        # upgrade is refused like an unknown route. The raw path is
+        # kept for _authorize_websocket below, which preprocesses it
+        # itself — passing the stripped path twice would 404.
+        raw_path = path
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
+        if path is None:
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        match = self.router.matches(path)
         match = self.router.matches(path)
         handler = None
         params = {}
@@ -3944,7 +4005,7 @@ class App:
         # Authorization runs before the handshake completes: a denied
         # upgrade is refused with a close instead of an accept, so the
         # handler never runs and no data is sent.
-        denied = await self._authorize_websocket(path, scope.get("query_string", b""),
+        denied = await self._authorize_websocket(raw_path, scope.get("query_string", b""),
                                                  scope.get("headers", []), raw_path=encoded_path)
         if denied is not None:
             await send({"type": "websocket.close", "code": 1008})
@@ -4276,7 +4337,7 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                trusted_proxies=None, sync_workers=32, sync_wait_timeout=ASGI_DECISION_TIMEOUT,
                sync_queue_limit=None, render_workers=None, session_workers=None,
                strict_ssg=False, headers=None,
-               revalidate_secret=None,
+               revalidate_secret=None, base_path="", trailing_slash="redirect",
                body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms,
                handler_timeout_ms=DEFAULT_CONFIG.handler_timeout_ms,
                response_timeout_ms=DEFAULT_CONFIG.response_timeout_ms):
@@ -4297,4 +4358,5 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                strict_ssg=strict_ssg,
                headers=headers, revalidate_secret=revalidate_secret,
                body_timeout_ms=body_timeout_ms, handler_timeout_ms=handler_timeout_ms,
-               response_timeout_ms=response_timeout_ms, cache_handler=cache_handler)
+               response_timeout_ms=response_timeout_ms, cache_handler=cache_handler,
+               base_path=base_path, trailing_slash=trailing_slash)

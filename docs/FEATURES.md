@@ -129,6 +129,9 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `MiddlewareScope` | `pynext.middleware` |
 | `RouteHas` | `pynext.middleware` |
 | `scoped` | `pynext.middleware` |
+| `url_for` | `pynext.routing` |
+| `preprocess_pathname` | `pynext.routing` |
+| `add_base_path` | `pynext.routing` |
 | `StaticPathError` | `pynext.static` |
 | `resolve_static_path` | `pynext.static` |
 | `validate_static_request_path` | `pynext.static` |

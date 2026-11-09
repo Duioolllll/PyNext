@@ -29,6 +29,8 @@ class App:
     middleware: tuple[Middleware, ...]
     middleware_scopes: tuple[Scope | None, ...]
     header_rules: tuple[HeaderRule, ...]
+    base_path: str
+    trailing_slash: Literal["redirect", "ignore"]
     def __init__(self, root: str | PathLike[str], manifest: dict[str, Any], *, production: bool = ...,
                  security: SecurityConfig | None = ..., cache_backend: Literal["memory", "sqlite", "redis"] = ...,
                  cache_path: str | PathLike[str] | None = ..., observability: ObservabilityConfig | None = ...,
@@ -42,7 +44,8 @@ class App:
                  sync_wait_timeout: float = ..., sync_queue_limit: int | None = ...,
                  render_workers: int | None = ..., session_workers: int | None = ...,
                  strict_ssg: bool = ...,
-                 revalidate_secret: str | None = ..., body_timeout_ms: int = ...,
+                 revalidate_secret: str | None = ..., base_path: str = ...,
+                 trailing_slash: Literal["redirect", "ignore"] = ..., body_timeout_ms: int = ...,
                  handler_timeout_ms: int = ..., response_timeout_ms: int = ...) -> None: ...
     def configure_observability(self, config: ObservabilityConfig) -> App: ...
     async def startup(self) -> None: ...
@@ -81,5 +84,6 @@ def create_app(root: str | PathLike[str] = ..., *, production: bool = ...,
                sync_wait_timeout: float = ..., sync_queue_limit: int | None = ...,
                render_workers: int | None = ..., session_workers: int | None = ...,
                strict_ssg: bool = ...,
-               revalidate_secret: str | None = ..., body_timeout_ms: int = ...,
+               revalidate_secret: str | None = ..., base_path: str = ...,
+               trailing_slash: Literal["redirect", "ignore"] = ..., body_timeout_ms: int = ...,
                handler_timeout_ms: int = ..., response_timeout_ms: int = ...) -> App: ...
