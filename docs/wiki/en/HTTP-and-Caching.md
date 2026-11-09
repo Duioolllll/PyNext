@@ -28,7 +28,7 @@ The built public assets, SSG output, and JS island bundles support content-deriv
 
 ## ISR boundaries
 
-The bounded ISR cache uses single-flight regeneration. The default `memory` backend is process-local; the `sqlite` and `redis` backends share entries across workers with expiring leases and fenced writes, so another worker's invalidation is observed on the next lookup while the store is available (local fallback during an outage may be stale). Fresh anonymous cache hits can bypass Python; stale entries may be served during background regeneration. `Cookie` or `Authorization` bypass the shared cache. Invalidate through `await request.revalidate("/news/example")` or `await app.revalidate(path)`, after authenticating the API caller.
+The bounded ISR cache uses single-flight regeneration. The default `memory` backend is process-local; the `sqlite` and `redis` backends share entries across workers with expiring leases and fenced writes, so another worker's invalidation is observed on the next lookup while the store is available (local fallback during an outage may be stale). Fresh anonymous cache hits can bypass Python; stale entries may be served during background regeneration. `Cookie` or `Authorization` bypass the shared cache. Invalidate through `await request.revalidate("/news/example")` or `await app.revalidate(path)`, after authenticating the API caller. `revalidate(path, type="page")` invalidates every cached entry for a dynamic route pattern such as `"/news/[slug]"` (a dynamic pattern without `type` only warns and invalidates nothing), and `revalidate(path, type="layout")` invalidates every ISR page using the layout defined at `path` (`"/"` is the root layout, so it covers all pages). `"/"` and `"/index"` are aliases.
 
 ## Safety notes
 

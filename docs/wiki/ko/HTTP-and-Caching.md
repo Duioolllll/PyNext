@@ -28,7 +28,7 @@
 
 ## ISR 범위
 
-ISR은 크기가 제한된 캐시와 single-flight 재생성을 사용합니다. 기본 `memory` 백엔드는 프로세스별이지만, `sqlite`·`redis` 백엔드는 만료되는 lease와 fencing된 쓰기로 워커 간 항목을 공유하므로, 저장소가 정상일 때는 다른 워커의 무효화가 다음 조회에 반영됩니다(장애 중 로컬 폴백은 오래된 값을 줄 수 있습니다). 신선한 익명 결과는 Rust가 직접 전달할 수 있고, 오래된 응답은 백그라운드 재생성 중 제공될 수 있습니다. `Cookie` 또는 `Authorization`은 공유 캐시를 우회합니다. 인증을 거친 API에서 `await request.revalidate("/news/example")` 또는 `await app.revalidate(path)`를 사용할 수 있습니다.
+ISR은 크기가 제한된 캐시와 single-flight 재생성을 사용합니다. 기본 `memory` 백엔드는 프로세스별이지만, `sqlite`·`redis` 백엔드는 만료되는 lease와 fencing된 쓰기로 워커 간 항목을 공유하므로, 저장소가 정상일 때는 다른 워커의 무효화가 다음 조회에 반영됩니다(장애 중 로컬 폴백은 오래된 값을 줄 수 있습니다). 신선한 익명 결과는 Rust가 직접 전달할 수 있고, 오래된 응답은 백그라운드 재생성 중 제공될 수 있습니다. `Cookie` 또는 `Authorization`은 공유 캐시를 우회합니다. 인증을 거친 API에서 `await request.revalidate("/news/example")` 또는 `await app.revalidate(path)`를 사용할 수 있습니다. `revalidate(path, type="page")`는 `"/news/[slug]"` 같은 동적 라우트 패턴의 캐시 항목을 전부 무효화하고(`type` 없는 동적 패턴은 경고만 하고 아무것도 무효화하지 않습니다), `revalidate(path, type="layout")`는 해당 경로에 정의된 레이아웃을 쓰는 ISR 페이지를 전부 무효화합니다(`"/"`는 루트 레이아웃이라 전체 페이지가 대상입니다). `"/"`와 `"/index"`는 별칭입니다.
 
 ## 안전 주의
 

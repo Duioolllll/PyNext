@@ -48,6 +48,12 @@ MAX_CACHE_SECONDS = 604_800.0
 _SHARED_UNAVAILABLE = object()
 _VARIANT_GENERATION_TTL = 86400
 _MAX_LOCAL_VARIANT_PATHS = 1024
+# Concrete paths this process has rendered or served through the ISR
+# cache, so a scoped revalidation can find them without asking the
+# backend to enumerate keys. Entries are evicted oldest-first; a path
+# dropped here is still found through a shared backend's own key list,
+# and a stale path only costs one no-op invalidation.
+_MAX_CACHED_PATHS = 4096
 
 
 class CacheBusy(Exception):
@@ -75,6 +81,17 @@ class CacheBackend:
 
     def remove(self, key):
         raise NotImplementedError
+
+    def keys(self):
+        """Return the raw keys this backend currently stores.
+
+        Backends that cannot enumerate their keys (or have none) return
+        an empty list. Keys are returned exactly as stored, including any
+        namespace prefix the caller added and any internal key form
+        (for example the ``\\0isr:`` hashed key of a query-variant page);
+        callers that need concrete paths filter those out.
+        """
+        return []
 
     def close(self):
         pass
@@ -296,6 +313,22 @@ class SQLiteCacheBackend(CacheBackend):
                 log.warning("Shared cache remove failed for %s", key, exc_info=True)
                 return False
 
+    def keys(self):
+        """Return every stored entry key plus every variant-generation key.
+
+        Entry keys are cache keys (a plain path, or the ``\\0isr:`` hashed
+        key of a query-variant page); variant-generation keys are the
+        concrete paths those hashed entries belong to. Callers that need
+        concrete paths keep the plain keys and drop the ``\\0isr:`` ones.
+        """
+        with self._lock:
+            try:
+                rows = self._conn.execute("SELECT key FROM entries").fetchall()
+                rows += self._conn.execute("SELECT key FROM variant_generations").fetchall()
+                return [row[0] for row in rows]
+            except sqlite3.Error as exc:
+                raise SharedCacheUnavailable("Shared cache key listing failed") from exc
+
     def variant_generation(self, key, *, invalidate=False):
         """Get or replace a path generation atomically across workers."""
         with self._lock:
@@ -458,6 +491,7 @@ class ISRCache:
         self._task_leases = {}
         self._tasks = set()
         self._variant_paths = OrderedDict()
+        self._cached_paths = OrderedDict()
         self._loop = None
         self._closed = False
         self.namespace = namespace
@@ -483,6 +517,7 @@ class ISRCache:
         self._task_leases.clear()
         self._tasks.clear()
         self._variant_paths.clear()
+        self._cached_paths.clear()
         self._loop = None
         if self.shared is not None:
             await asyncio.to_thread(self.shared.close)
@@ -572,10 +607,51 @@ class ISRCache:
             raise CacheBusy("ISR cache is shutting down")
         self._check_loop()
         retired = self._inflight.pop(key, None)
+        self._cached_paths.pop(key, None)
         removed = self.store.remove(key)
         if self.shared is not None:
             removed = await self._shared_remove(key) or removed
         return removed or retired is not None
+
+    def _remember_cached_path(self, key):
+        self._cached_paths[key] = None
+        self._cached_paths.move_to_end(key)
+        while len(self._cached_paths) > _MAX_CACHED_PATHS:
+            self._cached_paths.popitem(last=False)
+
+    async def cached_keys(self):
+        """Return the concrete ISR paths this cache knows about, sorted.
+
+        The union of this process's rendered paths (including the
+        variant-generation paths of query-variant pages, whose cache keys
+        are hashed) and the shared backend's stored keys, with the
+        namespace prefix stripped and internal ``\\0isr:`` hashed keys
+        dropped. Under ``fail_open`` a shared-backend listing failure
+        falls back to the process-local paths (and logs); under
+        ``fail_closed`` it raises :class:`SharedCacheUnavailable`, so a
+        scoped revalidation never reports success it did not check.
+        """
+        if self._closed:
+            raise CacheBusy("ISR cache is shutting down")
+        self._check_loop()
+        keys = set(self._cached_paths) | set(self._variant_paths)
+        if self.shared is not None:
+            try:
+                shared = await asyncio.to_thread(self.shared.keys)
+            except Exception as exc:
+                if self.failure_policy == FAIL_CLOSED:
+                    raise SharedCacheUnavailable("Shared cache key listing failed") from exc
+                log.warning("Shared cache key listing failed for scoped revalidation;"
+                            " using process-local paths only", exc_info=True)
+                shared = []
+            for raw in shared:
+                if not isinstance(raw, str):
+                    continue
+                key = raw[len(self.namespace):] if self.namespace and raw.startswith(self.namespace) else raw
+                if key.startswith("\0isr:"):
+                    continue
+                keys.add(key)
+        return sorted(keys)
 
     def _remember_variant_generation(self, path, token):
         self._variant_paths[path] = token
@@ -658,6 +734,11 @@ class ISRCache:
             self._loop = loop
         elif self._loop is not loop:
             raise RuntimeError("An ISR app instance must use a single event loop")
+        if not key.startswith("\0isr:"):
+            # Plain cache keys are concrete paths; remember them so a
+            # scoped revalidation can find this entry later. Hashed
+            # query-variant keys are covered by _variant_paths instead.
+            self._remember_cached_path(key)
         status, body = self.store.lookup(key)
         if status == "fresh" and self.shared is None:
             return body
