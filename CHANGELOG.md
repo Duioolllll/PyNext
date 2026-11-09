@@ -12,11 +12,11 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 - Bound the CLI count flags (review #4 #5): `--workers` 1..64, `--max-concurrent`/`--max-waiting`/`--max-connections` 1..1,000,000, `--shutdown-timeout` 0..3600 (and bounds on the other count/timeout flags). Out-of-range values are rejected with a clear CLI error instead of an `OverflowError` traceback or silent resource exhaustion.
 - `pynext build` (review #4 #6) now rejects symlinked directories under `app/` (and a symlinked `app/` itself) with a clear error instead of silently skipping the pages inside.
 - `optimize_image` (review #4 #7) now validates width/quality and rejects 0/negative/non-integer values instead of raising `ZeroDivisionError` on `width=0`; the HTTP route already guarded this, this is defense in depth.
-- Session fixation (review #4 #8): call `session.rotate_on_login()` after verifying credentials — rotation on login is now required, not optional. A request presenting the session cookie name more than once is treated as having no session (fail-closed).
+- Session fixation (review #4 #8): the documented session policy now requires calling `session.rotate_on_login()` after verifying credentials — a documentation-level requirement, not enforced by the framework (the application must call the hook). A request presenting the session cookie name more than once is treated as having no session (fail-closed).
 - Session values (review #4 #9) must be JSON-serializable: assigning a non-serializable value now raises `TypeError` naming the key at assignment time instead of failing with a 500 after the handler runs.
 - Standalone builds (review #4 #10) now reject top-level symlinked entries in purelib with a clear error instead of silently skipping them; a nested symlink inside a package is dropped with a warning naming the file.
 - Standalone bundle creation (review #4 #11) is now deterministic: entries are copied in sorted order, and the installed `pynext` copy is refreshed so files deleted from the source tree no longer linger in the bundle.
-- Non-streaming SSG pages (review #4 #12) are now capped at 8 MiB, consistent with the streaming cap; SSG and ISR streams are additionally limited to 30 seconds.
+- Non-streaming SSG pages (review #4 #12) are now capped at 8 MiB, consistent with the streaming cap (the 30-second limit on SSG and ISR streams pre-existed and is unchanged).
 - A streaming static-page build timeout (review #4 #13) is now wrapped as a build error instead of propagating a raw `asyncio.TimeoutError`.
 - A corrupt build manifest (review #4 #14) now raises a wrapped build error instead of propagating a raw `JSONDecodeError`/`UnicodeDecodeError`.
 - Build output files written by `_atomic_write` (review #4 #15) now use mode 0644 instead of 0600, so they are readable as normal build artifacts.
@@ -51,7 +51,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
   `docs/WHEEL_RELEASE.md`. CI still does not upload anything to PyPI;
   publishing stays a manual maintainer step.
 
-The current release is **0.1.0** (top section). The `v0.7.0a1` section below is a release plan superseded by the 0.1.0 decision; its items were merged to `main` and are included in 0.1.0. The `v0.1.0` section at the bottom is the early reconstructed snapshot, not the current release.
+The current release is **0.1.1** (top section). The `v0.7.0a1` section below is a release plan superseded by the 0.1.0 decision; its items were merged to `main` and are included in 0.1.0. The `v0.1.0` section at the bottom is the early reconstructed snapshot, not the current release.
 
 ## 0.1.0
 
