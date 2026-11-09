@@ -34,6 +34,8 @@ http://127.0.0.1:3000/, /about, /guides/intro, /news/example, /hydrate, /strateg
 
 `pynext build --static-only`는 정적 전용 사이트를 내보냅니다. 렌더링된 SSG 페이지·public 자산·island 번들을 일반 파일로 배치합니다(페이지마다 `index.html` 하나, 자산은 URL 경로 그대로, 번들은 `_pynext/static/` 아래). 기본 출력은 `.pynext/export`(`--export-dir <dir>`로 변경 가능)이며, PyNext 서버 없이 `python -m http.server --directory <dir>`로 서빙할 수 있습니다. 의도적으로 좁은 모드이며 완전한 정적 내보내기가 아닙니다. 동적 SSR·ISR·API 라우트가 있는 앱은 조용히 빠뜨리는 대신 거부합니다. `--static-only`는 완전한 빌드를 먼저 수행하므로 `--only-islands`·`--only-static`·`--standalone`과 함께 쓸 수 없습니다.
 
+빌드는 증분 방식입니다. `pynext build`는 소스 해시를 이전 manifest와 비교해 진입점·레이아웃·공유 임포트가 바뀐 정적 페이지만 다시 렌더합니다. island나 public 파일이 바뀌면 island digest가 HTML에 들어가므로 모든 정적 페이지를 다시 렌더합니다. 빌드는 요약(렌더 모드별 라우트 수, 다시 렌더한/재사용한 정적 페이지 수, island 번들 크기, 소요 시간)을 출력하고 같은 내용을 `.pynext/build-report.json`에 기록합니다. `pynext build --analyze`는 번들별 esbuild 입력 중 가장 큰 파일도 보여줍니다. `pynext info`는 버그 신고에 필요한 환경(PyNext/Python/esbuild 버전, 네이티브 확장, manifest 상태)을 출력하고, `pynext doctor`는 같은 항목을 검사해 빠진 것이 있으면 0이 아닌 코드로 종료합니다.
+
 개발 감시기는 네이티브 파일 이벤트와 해시를 사용하고 필요하면 폴링으로 대체합니다. JS/TS island 수정은 영향받은 모듈만 다시 빌드해 문서 새로고침 없이 교체합니다. 이전 정리 함수가 호출되며 해당 island 상태는 초기화될 수 있습니다. 다른 소스 변경은 서버를 재시작하고 열린 문서를 새로고침합니다. 잘못된 수정은 이전 정상 버전을 유지합니다. `--port 0`으로 시작해도 재시작 시 처음 할당된 포트를 재사용합니다.
 
 ## 프로젝트 구조와 라우팅

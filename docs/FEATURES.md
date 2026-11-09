@@ -221,6 +221,7 @@ Backends accepted by `ISRCache` (`--cache-backend`, `create_app(..., cache_backe
 | `check` | audit the deployment configuration for security mistakes (Django 'check --deploy' pattern) |
 | `dev` | Start the development server with file watching. |
 | `doctor` | audit the deployment configuration (alias for 'check --deploy') |
+| `info` | Print environment diagnostics |
 | `init` | create a minimal application |
 | `start` | Start the built application (production mode). |
 

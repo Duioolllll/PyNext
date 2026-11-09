@@ -117,12 +117,22 @@ def _esbuild(root):
 
 
 def compile_client(root, sources):
+    """Bundle island entries with esbuild.
+
+    Returns ``(manifest, assets, report)``: the client manifest, the
+    content-addressed bundle bytes, and a build report derived from the
+    esbuild metafile (per-bundle size and input sizes). The metafile
+    used to be discarded after validation; the report keeps it so
+    ``pynext build`` can summarise bundle sizes (``--analyze`` lists
+    the largest inputs per bundle).
+    """
     entries = _entries(sources)
     runtime = _runtime_bytes()
     runtime_hash = _digest(runtime)
     assets = {PREFIX + runtime_hash + ".js": runtime}
     if not entries:
-        return {"runtime": runtime_hash, "bundles": {}, "hydration": {}, "esbuild_version": None}, assets
+        return {"runtime": runtime_hash, "bundles": {}, "hydration": {}, "esbuild_version": None}, assets, \
+            {"esbuild_version": None, "bundles": {}, "runtime_bytes": len(runtime)}
     executable = _esbuild(root)
     try:
         version = subprocess.run([*executable, "--version"], check=True, encoding="utf-8", errors="replace",
@@ -134,6 +144,7 @@ def compile_client(root, sources):
     directory = (root / "islands").resolve()
     bundles = {}
     hydration = {}
+    report_bundles = {}
     total = len(runtime)
     with tempfile.TemporaryDirectory(prefix="pynext-client-") as temp:
         output = Path(temp) / "bundle.js"
@@ -154,10 +165,14 @@ def compile_client(root, sources):
             except (OSError, subprocess.SubprocessError) as exc:
                 raise ValueError(f"Could not bundle island {name}") from exc
             info = json.loads(metadata.read_text(encoding="utf-8"))
+            inputs = []
             for source in info["inputs"]:
                 resolved = (directory / source).resolve()
                 if not resolved.is_relative_to(directory) or resolved.relative_to(directory).as_posix() not in sources:
                     raise ValueError(f"Island {name} imports outside the islands directory: {source}")
+                inputs.append({"path": resolved.relative_to(directory).as_posix(),
+                               "bytes": info["inputs"][source]["bytes"]})
+            inputs.sort(key=lambda item: -item["bytes"])
             outputs = list(info["outputs"].values())
             if len(outputs) != 1 or outputs[0].get("imports") or "mount" not in outputs[0].get("exports", []):
                 raise ValueError(f"Island {name} must bundle to one module with a named mount export and no external imports")
@@ -169,7 +184,9 @@ def compile_client(root, sources):
             bundles[name] = digest
             hydration[name] = {"render", "hydrate"}.issubset(outputs[0].get("exports", []))
             assets[PREFIX + digest + ".js"] = data
-    return {"runtime": runtime_hash, "bundles": bundles, "hydration": hydration, "esbuild_version": version}, assets
+            report_bundles[name] = {"bytes": len(data), "inputs": inputs[:10]}
+    return {"runtime": runtime_hash, "bundles": bundles, "hydration": hydration, "esbuild_version": version}, assets, \
+        {"esbuild_version": version, "bundles": report_bundles, "runtime_bytes": len(runtime)}
 
 
 def read_client_artifacts(root, manifest):

@@ -57,6 +57,8 @@ LOCK_FILE = ".pynext/.build.lock"
 # and an asset URL, long enough to be unique per source set.
 BUILD_ID_LENGTH = 16
 MAX_DEPLOYMENT_ID_LENGTH = 128
+BUILD_REPORT = ".pynext/build-report.json"
+BUILD_REPORT_VERSION = 1
 VERSION = 10
 MAX_STATIC_PAGES = 10_000
 # One cap for every static page rendered at build time, streaming or
@@ -265,11 +267,19 @@ def _run_stage(stage, func, *args, **kwargs):
 
 
 def _build_app_and_render(root, manifest):
+    """Build the App and render static pages, incrementally.
+
+    Returns ``(app, rendered, reused, reused_bytes)``: the App, freshly
+    rendered ``{path: (pattern, body)}``, reused ``{path: manifest
+    entry}`` from the previous build, and the total bytes of the reused
+    pages. A first build (no previous manifest) renders everything.
+    """
     # Loading user code and running its generators are intentional build steps.
     from .app import App
     app = App(root, manifest)
-    rendered = asyncio.run(_render_static_pages(app))
-    return app, rendered
+    previous = _load_previous_manifest(root)
+    rendered, reused, reused_bytes = _render_incremental(app, manifest, previous)
+    return app, rendered, reused, reused_bytes
 
 
 def _validate_unchanged(root, manifest):
@@ -277,8 +287,10 @@ def _validate_unchanged(root, manifest):
         raise ValueError("Application sources changed during build; retry the build")
 
 
-def _write_build_assets(root, manifest, rendered, app):
-    manifest["static_pages"] = {}
+def _write_build_assets(root, manifest, rendered, app, reused=None):
+    # Reused pages keep their previous manifest entries (their digest
+    # files are already on disk, verified by _render_incremental).
+    manifest["static_pages"] = dict(reused) if reused else {}
     for path, (pattern, body) in rendered.items():
         digest = hashlib.sha256(body).hexdigest()
         _atomic_write(root / ".pynext" / "static" / f"{digest}.html", body)
@@ -763,7 +775,8 @@ def _write_manifest(root, deployment_id, lock_timeout, selected, tracker):
                 file=sys.stderr,
             )
         tracker.stage = "render"
-        app, rendered = _run_stage("render", _build_app_and_render, root, manifest)
+        build_started = time.monotonic()
+        app, rendered, reused, reused_bytes = _run_stage("render", _build_app_and_render, root, manifest)
         isr_static_paths = _run_stage("isr-warmup", lambda: asyncio.run(_enumerate_isr_static_paths(app)))
         _run_stage("validate", _validate_unchanged, root, manifest)
         # Catch-all normalization over the enumerated static paths (reduced port
@@ -774,7 +787,8 @@ def _write_manifest(root, deployment_id, lock_timeout, selected, tracker):
         # Only page routes take part; API routes do not enumerate static paths.
         page_patterns = [pattern for pattern, spec in manifest["routes"].items()
                          if spec["kind"] == "page"]
-        static_paths = {path: pattern for path, (pattern, _body) in rendered.items()}
+        static_paths = {**{path: entry["pattern"] for path, entry in reused.items()},
+                        **{path: pattern for path, (pattern, _body) in rendered.items()}}
         verify_static_enumeration(page_patterns, static_paths)
         manifest["catch_all_coverage"] = normalize_catch_all_routes(
             page_patterns, static_paths).to_json()
@@ -807,10 +821,13 @@ def _write_manifest(root, deployment_id, lock_timeout, selected, tracker):
         manifest["build_id"] = generate_build_id(manifest)
         manifest["deployment_id"] = deployment_id
         tracker.stage = "write"
-        _run_stage("write-assets", _write_build_assets, root, manifest, rendered, app)
+        _run_stage("write-assets", _write_build_assets, root, manifest, rendered, app, reused)
         manifest_bytes = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         _run_stage("write-manifest", _atomic_write, root / MANIFEST, manifest_bytes)
         _run_stage("write-build-id", _write_build_id, root, manifest_bytes)
+        static_bytes = reused_bytes + sum(len(body) for _pattern, body in rendered.values())
+        _write_build_report(root, manifest, app, rendered, reused, static_bytes,
+                            time.monotonic() - build_started)
         _run_stage("prune", _prune_orphans, root, manifest)
         return manifest
 
@@ -976,6 +993,185 @@ def _write_generate_only_manifest(root, deployment_id=None):
     return _finish_manifest(root, manifest, app, rendered, deployment_id=deployment_id)
 
 
+def _load_previous_manifest(root):
+    """Return the previous build manifest, or None when there is none usable.
+
+    A missing, unreadable, or outdated manifest is not an error: the
+    build simply renders every static page from scratch.
+    """
+    target = root / MANIFEST
+    try:
+        saved = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(saved, dict) or saved.get("schema_version") != VERSION:
+        return None
+    return saved
+
+
+def _is_page_scoped_source(relative):
+    """True when a source file can only affect the pages it belongs to.
+
+    A ``page.py``/``route.py`` entry or a ``layout.py`` under ``app/``
+    only feeds the routes it is attached to. Every other source —
+    ``middleware.py``, ``resources.py``, and shared helpers imported by
+    pages — can be imported by any page, so a change to one of them
+    invalidates every static page.
+    """
+    parts = Path(relative).parts
+    return len(parts) >= 2 and parts[0] == "app" and parts[-1] in {"page.py", "route.py", "layout.py"}
+
+
+def _page_dependencies(manifest, pattern):
+    """Source files a static page is rendered from: its entry + layouts.
+
+    The previous manifest's entry/layouts are included too, so a deleted
+    layout (gone from the new manifest) still invalidates the page.
+    """
+    routes = manifest.get("routes") if isinstance(manifest, dict) else None
+    if not isinstance(routes, dict):
+        return set()
+    spec = routes.get(pattern)
+    if not isinstance(spec, dict):
+        return set()
+    deps = set()
+    entry = spec.get("entry")
+    if isinstance(entry, str):
+        deps.add(entry)
+    layouts = spec.get("layouts")
+    if isinstance(layouts, list):
+        deps.update(path for path in layouts if isinstance(path, str))
+    return deps
+
+
+def _previous_static_pages(previous):
+    """Validated ``static_pages`` entries from a previous manifest."""
+    if not isinstance(previous, dict):
+        return {}
+    pages = previous.get("static_pages")
+    if not isinstance(pages, dict):
+        return {}
+    result = {}
+    for path, entry in pages.items():
+        if (isinstance(path, str) and isinstance(entry, dict) and set(entry) == {"pattern", "sha256"}
+                and isinstance(entry["pattern"], str) and isinstance(entry["sha256"], str)
+                and re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])):
+            result[path] = entry
+    return result
+
+
+def _render_incremental(app, manifest, previous):
+    """Render only the static pages whose inputs changed since the last build.
+
+    Returns ``(rendered, reused, reused_bytes)``: freshly rendered
+    ``{path: (pattern, body)}``, reused ``{path: manifest entry}`` from
+    the previous build, and the total bytes of the reused pages. A page
+    is reused only when its entry and layouts are unchanged, no shared
+    source changed, the public files and island sources are unchanged
+    (island digests are embedded in the HTML), and its digest file is
+    still on disk with a matching hash. Anything else re-renders the
+    whole pattern.
+    """
+    prev_pages = _previous_static_pages(previous)
+    prev_sources = previous.get("sources", {}) if isinstance(previous, dict) else {}
+    new_sources = manifest["sources"]
+    changed = {rel for rel, digest in new_sources.items() if prev_sources.get(rel) != digest}
+    changed |= {rel for rel in prev_sources if rel not in new_sources}
+    global_change = (
+        previous is None
+        or any(not _is_page_scoped_source(rel) for rel in changed)
+        or previous.get("public_sources") != manifest["public_sources"]
+        or previous.get("client_sources") != manifest["client_sources"])
+    static_dir = app.root / ".pynext" / "static"
+    stale_patterns = set()
+    reused = {}
+    reused_bytes = 0
+    for path, entry in prev_pages.items():
+        pattern = entry["pattern"]
+        if pattern not in app.static_generators:
+            continue
+        if global_change:
+            stale_patterns.add(pattern)
+            continue
+        deps = _page_dependencies(manifest, pattern) | _page_dependencies(previous, pattern)
+        if deps & changed:
+            stale_patterns.add(pattern)
+            continue
+        try:
+            body = (static_dir / f"{entry['sha256']}.html").read_bytes()
+        except OSError:
+            stale_patterns.add(pattern)
+            continue
+        if hashlib.sha256(body).hexdigest() != entry["sha256"]:
+            stale_patterns.add(pattern)
+            continue
+        reused[path] = entry
+        reused_bytes += len(body)
+    for pattern in app.static_generators:
+        if not any(entry["pattern"] == pattern for entry in reused.values()):
+            stale_patterns.add(pattern)
+    rendered = asyncio.run(_render_static_pages(app, patterns=stale_patterns, existing=len(reused)))
+    overlap = set(rendered) & set(reused)
+    if overlap:
+        raise ValueError(f"Duplicate generated path: {sorted(overlap)[0]}")
+    shadowed = set(reused) & set(app.public_assets)
+    if shadowed:
+        raise ValueError(f"Public file shadows a generated page: {sorted(shadowed)[0]}")
+    return rendered, reused, reused_bytes
+
+
+def _route_counts(manifest):
+    counts = {"total": len(manifest["routes"]), "ssg": 0, "isr": 0, "ssr": 0, "api": 0}
+    for pattern, spec in manifest["routes"].items():
+        if spec["kind"] == "route":
+            counts["api"] += 1
+        else:
+            counts[manifest["render_modes"].get(pattern, "ssr")] += 1
+    return counts
+
+
+def _write_build_report(root, manifest, app, rendered, reused, static_bytes, duration):
+    """Write ``.pynext/build-report.json`` summarising this build.
+
+    The report lives next to the manifest, not inside it: durations
+    vary between builds, and the manifest hash feeds the ISR cache
+    namespace, so build metadata must not change the manifest.
+    """
+    islands = app.client_report or {"esbuild_version": None, "bundles": {}}
+    report = {
+        "version": BUILD_REPORT_VERSION,
+        "duration_seconds": round(duration, 3),
+        "routes": _route_counts(manifest),
+        "static_pages": {"rendered": len(rendered), "reused": len(reused),
+                         "total": len(manifest["static_pages"]), "bytes": static_bytes},
+        "islands": islands,
+        "public_assets": {"count": len(manifest["assets"]),
+                          "bytes": sum(len(body) for body, _ in app.public_assets.values())},
+    }
+    _atomic_write(root / BUILD_REPORT,
+                  (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+
+def read_build_report(root):
+    """Return the last build report, or None when there is none usable."""
+    root = Path(root).resolve()
+    try:
+        report = json.loads((root / BUILD_REPORT).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(report, dict) or report.get("version") != BUILD_REPORT_VERSION:
+        return None
+    return report
+
+
+def format_bytes(count):
+    """Format a byte count as e.g. ``12.3 KB`` for build summaries."""
+    value = float(count)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+
 def export_static(root, manifest=None, output=None):
     """Export a static-only site: SSG pages, public assets, island bundles.
 
@@ -1057,7 +1253,6 @@ def _read_static_file(static_dir, name, digest):
     if hashlib.sha256(body).hexdigest() != digest:
         raise ValueError(f"Build output {name} failed integrity check; rebuild the application")
     return body
-
 def _atomic_write(path, contents):
     # Build outputs (manifest.json, static .html/.asset/.js) are read back
     # by the server process, which may run as a different user than the
@@ -1422,7 +1617,7 @@ async def _enumerate_isr_static_paths(app):
     return enumerated
 
 
-async def _render_static_pages(app):
+async def _render_static_pages(app, patterns=None, existing=0):
     """Render every static page, isolating failures per page.
 
     One page failing used to abort the whole build at the first error,
@@ -1432,6 +1627,11 @@ async def _render_static_pages(app):
     every failed page. The build still fails — a missing SSG page
     would be a 404 in production — but the report is complete and the
     good pages were all rendered.
+
+    ``patterns`` restricts rendering to those patterns (incremental
+    builds re-render only stale patterns); ``existing`` counts pages
+    reused from a previous build, so the ``MAX_STATIC_PAGES`` cap
+    covers reused + freshly rendered pages.
     """
     from .app import _invoke, _strip_client_runtime
     from .http import StreamingResponse
@@ -1439,6 +1639,8 @@ async def _render_static_pages(app):
     failures = []
     rendered_params = {}
     for pattern, generator in app.static_generators.items():
+        if patterns is not None and pattern not in patterns:
+            continue
         entry = app.manifest["routes"][pattern]["entry"]
         if app.dynamic_modes.get(pattern) == "force-dynamic":
             # Never generated at build time; served dynamically instead.
@@ -1453,11 +1655,11 @@ async def _render_static_pages(app):
                 f"generate_static_params for {pattern} must return a list",
                 [("file", entry), ("got", f"{type(params_list).__name__}: {_short_repr(params_list)}")],
                 ["Return a list of dicts, one per path (use [] when the route has no paths)"]))
-        if len(params_list) + len(rendered) > MAX_STATIC_PAGES:
+        if len(params_list) + len(rendered) + existing > MAX_STATIC_PAGES:
             raise ValueError(_config_error(
                 f"Static page limit ({MAX_STATIC_PAGES}) exceeded",
                 [("file", entry), ("pattern", pattern),
-                 ("pages", f"{len(rendered)} already rendered + {len(params_list)} from this route")],
+                 ("pages", f"{len(rendered) + existing} already rendered or reused + {len(params_list)} from this route")],
                 ["Return fewer paths from generate_static_params",
                  "Split the route into smaller routes"]))
         for params in params_list:

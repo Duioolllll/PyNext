@@ -8,12 +8,13 @@ import traceback
 from pathlib import Path
 
 from .app import create_app
-from .build import export_static, write_manifest
+from .build import export_static, format_bytes, read_build_report, write_manifest
 from .check import DeploySettings, run_deploy_checks
 from .client import compile_client, discover_client
 from .env import load_env
 from .config import DEFAULT_CONFIG, ConfigError, load_config
 from .http import MAX_WS_MESSAGE, SecurityConfig
+from .info import collect_info, format_info
 from .observability import ObservabilityConfig
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
@@ -125,7 +126,7 @@ async def _wait_for_change(watcher, server_task):
 
 async def _reload_dev_client(app, root):
     sources = await asyncio.to_thread(discover_client, root)
-    manifest, assets = await asyncio.to_thread(compile_client, root, sources)
+    manifest, assets, _report = await asyncio.to_thread(compile_client, root, sources)
     if await asyncio.to_thread(discover_client, root) != sources:
         raise ValueError("Island sources changed during compilation; retry the edit")
     app.update_dev_client(manifest, assets)
@@ -529,8 +530,36 @@ def _add_audit_args(command):
                               "via the PYNEXT_DEBUG environment variable)")
 
 
+def _print_build_summary(root, analyze=False):
+    """Print the per-build summary from `.pynext/build-report.json`."""
+    report = read_build_report(root)
+    if report is None:
+        return
+    counts = report["routes"]
+    pages = report["static_pages"]
+    islands = report["islands"]
+    bundle_bytes = (sum(bundle["bytes"] for bundle in islands["bundles"].values())
+                    + islands.get("runtime_bytes", 0))
+    print(f"Routes: {counts['total']} total ({counts['ssg']} SSG, {counts['isr']} ISR, "
+          f"{counts['ssr']} SSR, {counts['api']} API)")
+    print(f"Static pages: {pages['total']} total ({pages['rendered']} rendered, "
+          f"{pages['reused']} reused, {format_bytes(pages['bytes'])})")
+    esbuild = (f" (esbuild {islands['esbuild_version']})" if islands["esbuild_version"] else "")
+    print(f"Islands: {len(islands['bundles'])} bundles, {format_bytes(bundle_bytes)} total{esbuild}")
+    print(f"Public assets: {report['public_assets']['count']} files, "
+          f"{format_bytes(report['public_assets']['bytes'])}")
+    print(f"Build finished in {report['duration_seconds']}s")
+    if analyze:
+        for name, bundle in sorted(islands["bundles"].items()):
+            print(f"  {name}: {format_bytes(bundle['bytes'])}")
+            for entry in bundle["inputs"][:5]:
+                print(f"    {format_bytes(entry['bytes'])}  {entry['path']}")
+
+
 def _build_parser():
     """Build the ``pynext`` argument parser (defaults from DEFAULT_CONFIG)."""
+
+
     parser = argparse.ArgumentParser(prog="pynext")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a minimal application")
@@ -555,6 +584,9 @@ def _build_parser():
         help="audit the deployment configuration (alias for 'check --deploy')")
     doctor.add_argument("--dir", default=".", help="application project directory")
     _add_audit_args(doctor)
+    info = sub.add_parser("info",
+                          help="Print environment diagnostics")
+    info.add_argument("--dir", default=".", help="application project directory")
     for name in ("build", "dev", "start"):
         command = sub.add_parser(name)
         command.add_argument("--dir", default=".", help="application project directory")
@@ -584,6 +616,8 @@ def _build_parser():
             command.add_argument("--export-dir", default=None,
                                  help="output directory for --static-only"
                                       " (default: <project>/.pynext/export)")
+            command.add_argument("--analyze", action="store_true",
+                                 help="list the largest esbuild inputs per island bundle")
         if name != "build":
             command.add_argument("--host", default=DEFAULT_CONFIG.host)
             command.add_argument("--port", type=_port, default=DEFAULT_CONFIG.port)
@@ -810,6 +844,10 @@ def main():
         if args.template == "islands":
             print("Islands need Node.js and esbuild for `pynext build`.")
         return
+    if args.command == "info":
+        info = collect_info(root)
+        print(format_info(info), end="")
+        return
     if args.command == "build":
         if args.standalone_dir and not args.standalone:
             parser.error("--standalone-dir requires --standalone")
@@ -845,7 +883,7 @@ def main():
                 print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'} "
                       f"(build {manifest['build_id']})")
         except (OSError, ValueError) as exc:
-            parser.error(str(exc))
+            parser.error(f"{exc}\nRun `pynext info --dir {root}` for environment details to include in a bug report")
         coverage = manifest.get("catch_all_coverage") or {}
         shadowed = coverage.get("shadowed") or {}
         dynamic_only = coverage.get("dynamic_only") or []
@@ -861,6 +899,8 @@ def main():
                 parser.error(str(exc))
             print(f"Exported {summary['pages']} static pages to {summary['output']}")
             print(f"Serve with: python -m http.server --directory {summary['output']}")
+        print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
+        _print_build_summary(root, analyze=args.analyze)
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
             try:

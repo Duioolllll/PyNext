@@ -1688,6 +1688,7 @@ class App:
         self.public_assets = {}
         self.client_assets = {}
         self.client_manifest = {}
+        self.client_report = None
         for pattern, spec in manifest["routes"].items():
             module = self._module(spec["entry"])
             if spec["kind"] == "page":
@@ -2093,6 +2094,7 @@ class App:
                     ["Run `pynext build` again"]))
             self.isr_static_paths = isr_static_paths
             self.client_manifest, self.client_assets = read_client_artifacts(self.root, manifest)
+            self.client_report = None
             self.static_pages = read_static_pages(self.root, manifest, self.router)
             self.public_assets = read_public_artifacts(self.root, manifest)
             conflicting = set(self.static_pages).intersection(self.public_assets)
@@ -2107,8 +2109,10 @@ class App:
             self.public_assets = read_public_sources(self.root, manifest["public_sources"])
             if reuse_client is not None:
                 self.client_manifest, self.client_assets = reuse_client
+                self.client_report = None
             else:
-                self.client_manifest, self.client_assets = compile_client(self.root, manifest["client_sources"])
+                self.client_manifest, self.client_assets, self.client_report = compile_client(
+                    self.root, manifest["client_sources"])
         assets = {**self.static_pages, **self.client_assets,
                   **{path: body for path, (body, _) in self.public_assets.items()}}
         self.asset_etags = {path: f'"{hashlib.sha256(body).hexdigest()}"' for path, body in assets.items()}
