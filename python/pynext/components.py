@@ -236,6 +236,52 @@ def _isr_policy(revalidate, stale):
     return {"revalidate": float(revalidate), "stale": float(stale)}
 
 
+_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_\-./]{0,255}\Z")
+_MAX_ISR_TAGS = 64
+_MAX_TAG_EXPIRE = 604_800
+
+
+def _validate_tag(tag):
+    """Validate one ISR cache tag.
+
+    Tags name the data a page depends on (for example ``"post:42"``), so
+    one :func:`revalidate_tag` call can invalidate every page carrying
+    the tag. A tag is a non-empty string of at most 256 characters from
+    ``[A-Za-z0-9:_-./]`` starting with an alphanumeric character.
+    """
+    if not isinstance(tag, str) or not _TAG.fullmatch(tag):
+        raise ValueError(
+            f"Invalid ISR tag {tag!r}: tags must be 1-256 characters from [A-Za-z0-9:_-./]"
+        )
+    return tag
+
+
+def _validate_tags(tags):
+    """Validate the ``tags`` argument of :func:`page` and return a sorted tuple."""
+    if tags is None:
+        return ()
+    if isinstance(tags, str) or not isinstance(tags, (tuple, list)) or len(tags) > _MAX_ISR_TAGS:
+        raise ValueError(f"tags must be a list or tuple of at most {_MAX_ISR_TAGS} ISR tags")
+    validated = [_validate_tag(tag) for tag in tags]
+    if len(set(validated)) != len(validated):
+        raise ValueError("Duplicate ISR tag")
+    return tuple(sorted(validated))
+
+
+def _validate_tag_expire(expire):
+    """Validate the ``expire`` argument of ``revalidate_tag``.
+
+    ``None`` means the tag expires immediately; otherwise ``expire`` is
+    the number of seconds entries stay merely stale before they expire.
+    """
+    if expire is None:
+        return None
+    if (isinstance(expire, bool) or not isinstance(expire, (int, float)) or
+            expire < 0 or expire > _MAX_TAG_EXPIRE or not math.isfinite(expire)):
+        raise ValueError("expire must be None or a finite number of seconds from 0 to 604800")
+    return float(expire)
+
+
 def _isr_query_keys(keys):
     if not isinstance(keys, (tuple, list)) or len(keys) > 16:
         raise ValueError("query_keys must be a list or tuple of at most 16 names")
@@ -245,21 +291,24 @@ def _isr_query_keys(keys):
     return sorted(keys)
 
 
-def page(*, render="ssr", revalidate=None, stale=None, query_keys=()):
+def page(*, render="ssr", revalidate=None, stale=None, query_keys=(), tags=()):
     if render not in {"ssr", "ssg", "isr"}:
         raise ValueError("render must be 'ssr', 'ssg', or 'isr'")
     if render == "isr":
         policy = _isr_policy(revalidate, 60.0 if stale is None else stale)
         query_keys = _isr_query_keys(query_keys)
+        tags = _validate_tags(tags)
     else:
-        if revalidate is not None or stale is not None or query_keys:
-            raise ValueError("revalidate, stale, and query_keys are only valid for ISR pages")
+        if revalidate is not None or stale is not None or query_keys or tags:
+            raise ValueError("revalidate, stale, query_keys, and tags are only valid for ISR pages")
         policy = None
+        tags = ()
     def decorate(fn):
         fn.__pynext_page__ = True
         fn.__pynext_render__ = render
         fn.__pynext_cache_policy__ = policy
         fn.__pynext_cache_query__ = query_keys
+        fn.__pynext_cache_tags__ = tags
         return fn
     return decorate
 

@@ -119,6 +119,7 @@ def write_manifest(root):
     manifest["render_modes"] = app.render_modes
     manifest["isr_policies"] = app.isr_policies
     manifest["isr_queries"] = app.isr_queries
+    manifest["isr_tags"] = app.isr_tags
     manifest["client"] = app.client_manifest
     manifest["static_pages"] = {}
     for path, (pattern, body) in rendered.items():

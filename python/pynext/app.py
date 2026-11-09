@@ -25,7 +25,7 @@ from .assets import read_public_artifacts, read_public_sources
 from .auth import check_authorization
 from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
 from .client import compile_client, read_client_artifacts
-from .components import _isr_policy, _isr_query_keys, _node, bind_islands
+from .components import _isr_policy, _isr_query_keys, _node, _validate_tags, bind_islands
 from .build import discover, load_manifest
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
@@ -495,6 +495,7 @@ class App:
         self.render_modes = {}
         self.isr_policies = {}
         self.isr_queries = {}
+        self.isr_tags = {}
         if cache_backend == "sqlite" and cache_path is None:
             cache_path = self.root / ".pynext" / "isr-cache.sqlite3"
         build_id = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"),
@@ -538,6 +539,13 @@ class App:
                     except ValueError as exc:
                         raise ValueError(f"Invalid ISR query keys in {spec['entry']}: {exc}") from exc
                     self.isr_queries[pattern] = query_keys
+                    try:
+                        # Lists, not tuples: the manifest round-trips
+                        # through JSON, like isr_queries.
+                        self.isr_tags[pattern] = list(_validate_tags(
+                            getattr(fn, "__pynext_cache_tags__", ())))
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid ISR tags in {spec['entry']}: {exc}") from exc
                 else:
                     query_keys = []
                 if "query" in inspect.signature(fn).parameters and not query_keys:
@@ -588,6 +596,8 @@ class App:
                 raise ValueError("ISR policies changed since build; run `pynext build` again")
             if manifest.get("isr_queries") != self.isr_queries:
                 raise ValueError("ISR query keys changed since build; run `pynext build` again")
+            if manifest.get("isr_tags") != self.isr_tags:
+                raise ValueError("ISR tags changed since build; run `pynext build` again")
             self.client_manifest, self.client_assets = read_client_artifacts(self.root, manifest)
             self.static_pages = read_static_pages(self.root, manifest, self.router)
             self.public_assets = read_public_artifacts(self.root, manifest)
@@ -781,6 +791,17 @@ class App:
             return existed
         return await self.isr.invalidate(path)
 
+    async def revalidate_tag(self, tag, expire=None):
+        """Invalidate every ISR entry carrying ``tag`` for this app instance.
+
+        ``expire=None`` expires matching entries immediately; ``expire``
+        seconds keeps them merely stale until that delay passes. With a
+        shared cache backend the invalidation is visible to other
+        workers; with the memory backend it is process-local. Returns
+        True when the invalidation was recorded.
+        """
+        return await self.isr.revalidate_tag(tag, expire)
+
     async def _render_stream_chunk(self, node):
         """Serialize one streamed UI node to HTML on a worker thread."""
         bound = bind_islands(_node(node), self.client_manifest, include_runtime=False)
@@ -870,7 +891,8 @@ class App:
             finally:
                 await response.aclose()
 
-        task = asyncio.create_task(self.isr.get_or_render(key, self.isr_policies[pattern], render))
+        task = asyncio.create_task(self.isr.get_or_render(
+            key, self.isr_policies[pattern], render, tags=self.isr_tags.get(pattern, ())))
 
         def observe(done):
             # A streamed request stops awaiting this task before generation
