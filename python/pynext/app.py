@@ -1221,6 +1221,10 @@ class App:
         it from the socket (for example from a session cookie the
         middleware already validated, or from a token checked in
         middleware). The check itself is identical on ASGI and native.
+        Middleware must not rotate or invalidate the session during this
+        pre-flight: the pre-flight response is discarded, so a rotated
+        token's ``set-cookie`` would never reach the client while the
+        old token is already gone from the store.
         """
         match = self.router.matches(path)
         if match is None:
