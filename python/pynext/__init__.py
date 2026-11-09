@@ -24,7 +24,13 @@ from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, PathHeaderRule, Pat
                    WebSocketDisconnect, apply_path_headers, apply_security_headers,
                    compile_path_headers, content_security_policy, csrf_protect, new_csrf_token,
                    new_csp_nonce, security_headers, set_csrf_cookie, sign_csrf_token, validate_csrf)
-from .middleware import MiddlewareScope, RouteHas, ScopedMiddleware, scoped
+from .middleware import MiddlewareScope, RouteHas, scoped
+from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
+                   StreamingResponse, WebSocket, WebSocketDisconnect, apply_security_headers,
+                   content_security_policy, csrf_protect, new_csrf_token, new_csp_nonce,
+                   security_headers, set_csrf_cookie, sign_csrf_token, validate_csrf)
+from .matcher import (HeaderRule, Matcher, ScopedMiddleware, compile_header_rules, compile_matcher,
+                      scoped_middleware)
 from .observability import MetricsCollector, ObservabilityConfig
 from .proxy import ProxyTrust, ResolvedProxy, parse_trusted_proxies
 from .pubsub import PubSubOverflow, WebSocketPubSub
@@ -44,6 +50,7 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "validate_csrf",
            "content_security_policy", "security_headers", "apply_security_headers",
            "PathHeaderRule", "PathHeaders", "apply_path_headers", "compile_path_headers",
+           "Matcher", "HeaderRule", "ScopedMiddleware", "scoped_middleware", "compile_matcher", "compile_header_rules",
            "ObservabilityConfig", "MetricsCollector", "WebSocket", "WebSocketDisconnect", "MAX_WS_MESSAGE",
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
            "Session", "SessionMiddleware", "SQLiteSessionStore", "RedisSessionStore", "require_auth", "require_permission",
@@ -53,4 +60,4 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "no_store", "mark_dynamic_access", "StaticGenBailoutError", "is_prerender_bailout",
            "FetchCacheDecision", "apply_fetch_revalidate", "decide_fetch_cache", "fetch_cache_store_key",
            "generate_fetch_cache_key", "generate_simple_fetch_cache_key",
-           "MiddlewareScope", "RouteHas", "ScopedMiddleware", "scoped"]
+           "MiddlewareScope", "RouteHas", "scoped"]

@@ -64,6 +64,12 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `PathHeaders` | `pynext.http` |
 | `apply_path_headers` | `pynext.http` |
 | `compile_path_headers` | `pynext.http` |
+| `Matcher` | `pynext.matcher` |
+| `HeaderRule` | `pynext.matcher` |
+| `ScopedMiddleware` | `pynext.matcher` |
+| `scoped_middleware` | `pynext.matcher` |
+| `compile_matcher` | `pynext.matcher` |
+| `compile_header_rules` | `pynext.matcher` |
 | `ObservabilityConfig` | `pynext.observability` |
 | `MetricsCollector` | `pynext.observability` |
 | `WebSocket` | `pynext.http` |

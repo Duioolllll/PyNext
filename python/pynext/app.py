@@ -42,8 +42,14 @@ from .dynamic import (DYNAMIC_MODES, MAX_DYNAMIC_ACCESSES, format_dynamic_access
 from .errors import NotFoundError, SignalError, digest_for_error, error_count
 from .http import (SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_build_headers, apply_cors_headers,
-                   apply_path_headers, apply_security_headers, compile_path_headers,
+                   apply_path_headers, apply_security_headers, compile_path_headers, PathHeaderRule,
                    cors_preflight_response, filter_internal_headers, new_csp_nonce, validate_csrf)
+from .components import _isr_policy, _isr_query_keys, _node, bind_islands
+from .build import discover, load_manifest
+from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
+                   StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
+                   apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
+from .matcher import compile_header_rules, compile_middleware_entries
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .middleware import ScopedMiddleware
 from .observability import (
@@ -267,6 +273,39 @@ _MAX_ISR_STREAM_BYTES = 8 * 1024 * 1024
 # headers were already sent. The status can no longer change to 500, so
 # the marker is the client's only signal that the document is truncated.
 _STREAM_ERROR_MARKER = b"<!-- pynext-stream-error -->"
+
+
+def _partition_header_rules(rules):
+    """Split ``headers`` between the two per-path header systems.
+
+    Returns ``(path_items, matcher_items)``: dict rules and ``(source,
+    headers)`` tuples whose source uses a ``*`` glob go to the matcher
+    rules (:func:`pynext.matcher.compile_header_rules`); ``PathHeaderRule``
+    objects and all other tuples go to the native-aware
+    :class:`pynext.http.PathHeaders`. A non-iterable ``rules`` value is
+    passed through untouched so :func:`compile_path_headers` raises its
+    usual error for it.
+    """
+    if rules is None:
+        return [], []
+    if isinstance(rules, (str, bytes)):
+        return rules, []
+    try:
+        items = list(rules)
+    except TypeError:
+        return rules, []
+    path_items, matcher_items = [], []
+    for item in items:
+        if isinstance(item, dict):
+            matcher_items.append(item)
+        elif isinstance(item, PathHeaderRule):
+            path_items.append(item)
+        elif (isinstance(item, (list, tuple)) and len(item) == 2
+              and isinstance(item[0], str) and "*" in item[0]):
+            matcher_items.append(item)
+        else:
+            path_items.append(item)
+    return path_items, matcher_items
 
 
 def _accepts_html(request):
@@ -655,7 +694,14 @@ class App:
         # Per-path response headers (Next.js headers() equivalent): compiled
         # and validated here, so a bad rule fails at startup. See
         # http.compile_path_headers for the accepted shapes.
-        self.path_headers = compile_path_headers(headers)
+        # `headers` feeds two per-path header systems: route-syntax tuples
+        # and PathHeaderRule objects go to the native-aware PathHeaders,
+        # while dict rules and `*`-glob sources go to the matcher rules
+        # (see _partition_header_rules). Each rule is compiled by exactly
+        # one system, so a dict rule cannot break PathHeaders startup
+        # validation and a PathHeaderRule cannot break the matcher.
+        _path_header_items, _matcher_header_items = _partition_header_rules(headers)
+        self.path_headers = compile_path_headers(_path_header_items)
         self.observability_config = observability or ObservabilityConfig.from_env()
         self.metrics = MetricsCollector(enabled=self.observability_config.metrics)
         configure_logging(self.observability_config)
@@ -688,19 +734,32 @@ class App:
                              cache_backend=cache_backend, cache_path=cache_path, cache_url=cache_url,
                              cache_failure_policy=cache_failure_policy, cache_handler=cache_handler)
             configured = ()
+            configured_headers = ()
             if "middleware.py" in manifest["sources"]:
                 configured = getattr(self._module("middleware.py"), "MIDDLEWARE", None)
                 if not isinstance(configured, (list, tuple)):
                     raise TypeError("middleware.py must export a MIDDLEWARE list or tuple")
+                configured_headers = getattr(self._module("middleware.py"), "HEADERS", ())
+                if not isinstance(configured_headers, (list, tuple)):
+                    raise TypeError("middleware.py must export a HEADERS list or tuple")
             if middleware is None:
                 middleware = ()
             if not isinstance(middleware, (list, tuple)):
                 raise TypeError("middleware must be a list or tuple")
-            self.middleware = tuple(configured) + tuple(middleware)
-            for item in self.middleware:
-                if not (inspect.iscoroutinefunction(item) or
-                        inspect.iscoroutinefunction(getattr(item, "__call__", None))):
-                    raise TypeError("middleware entries must be async callables")
+            # Middleware scopes and per-path header rules are compiled
+            # once here, at startup (Next.js compiles matchers and custom
+            # headers at build time): an invalid matcher, condition or
+            # header raises here, so app creation — and therefore server
+            # startup — fails instead of the rule silently never firing.
+            # compile_middleware_entries also unwraps ScopedMiddleware;
+            # self.middleware stays the plain callables (a scoped entry
+            # keeps its Scope in the parallel middleware_scopes tuple).
+            compiled_middleware = compile_middleware_entries(
+                tuple(configured) + tuple(middleware))
+            self.middleware = tuple(fn for fn, _scope in compiled_middleware)
+            self.middleware_scopes = tuple(scope for _fn, scope in compiled_middleware)
+            self.header_rules = compile_header_rules(
+                tuple(configured_headers) + tuple(_matcher_header_items))
             if security.csrf_enabled is None:
                 # Auto CSRF: a session middleware means the app keeps
                 # server-side state, so every state-changing API route is
@@ -2092,13 +2151,19 @@ class App:
         ``terminal`` is the final step (the HTTP dispatcher, or the
         WebSocket pre-flight sentinel): it only runs when every middleware
         called ``call_next``. A middleware that returns its own response
-        short-circuits the chain, and that response is the result.
+        short-circuits the chain, and that response is the result. A
+        scoped middleware (see :func:`pynext.matcher.scoped_middleware`)
+        whose scope does not match this request is skipped — the chain
+        continues past it as if it were not registered.
         """
         async def invoke(index, current):
             if not isinstance(current, Request):
                 raise TypeError("call_next requires a Request")
             if index == len(self.middleware):
                 return await terminal(current)
+            scope = self.middleware_scopes[index]
+            if scope is not None and not scope.matches_request(current):
+                return await invoke(index + 1, current)
             called = False
 
             async def call_next(next_request):
@@ -2114,6 +2179,40 @@ class App:
             return result
 
         return await invoke(0, request)
+
+    def _apply_path_headers(self, request, response):
+        """Apply the compiled per-path header rules to ``response``.
+
+        Rules are checked in order and the first matching rule wins per
+        header name; a header the handler (or an earlier rule) already
+        set is never overwritten. The exception is
+        ``content-security-policy``: ``Response`` always adds a default
+        policy on construction, so a rule that sets CSP replaces that
+        default and marks it explicit (a CSP a handler set explicitly
+        still wins over a rule). Health probes bypass this — they return
+        before dispatch — and responses that bypass dispatch entirely
+        (rate-limit 429, 400, 500 error pages) get no path headers.
+        """
+        if not self.header_rules:
+            return response
+        present = {key for key, _value in response.headers}
+        for rule in self.header_rules:
+            if not rule.matches_request(request):
+                continue
+            for key, value in rule.headers:
+                if key in present:
+                    if (key == b"content-security-policy"
+                            and not getattr(response, "_csp_explicit", False)):
+                        index = next(i for i, (k, _v) in enumerate(response.headers)
+                                     if k == key)
+                        response.headers[index] = (key, value)
+                        response._csp_explicit = True
+                    continue
+                response.headers.append((key, value))
+                present.add(key)
+                if key == b"content-security-policy":
+                    response._csp_explicit = True
+        return response
 
     async def dispatch(self, request):
         """Return a response. Exceptions are converted at the transport boundary."""
@@ -2202,6 +2301,7 @@ class App:
                 return await self._dispatch(current)
 
             response = await self._dispatch_timed(request, lambda: self._run_middleware(request, terminal))
+            self._apply_path_headers(request, response)
             if preflight is None:
                 apply_cors_headers(request, response, config=self.security)
             apply_path_headers(response, request.path, path_headers=self.path_headers)
@@ -2213,10 +2313,12 @@ class App:
                 response.body = b""
             return response
         if preflight is not None:
+            self._apply_path_headers(request, preflight)
             apply_path_headers(preflight, request.path, path_headers=self.path_headers)
             apply_security_headers(preflight, config=self.security, production=self.production)
             return preflight
         response = await self._dispatch_timed(request)
+        self._apply_path_headers(request, response)
         apply_cors_headers(request, response, config=self.security)
         apply_path_headers(response, request.path, path_headers=self.path_headers)
         apply_security_headers(response, config=self.security, production=self.production)
@@ -2996,7 +3098,7 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
         revalidate_secret = os.environ.get("PYNEXT_REVALIDATE_SECRET") or None
     return App(root, load_manifest(root) if production else discover(root), production=production,
                security=security, cache_backend=cache_backend, cache_path=cache_path,
-               observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
+               observability=observability, rate_limit=rate_limit, middleware=middleware, headers=headers, debug=debug,
                resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
                websocket_max_message=websocket_max_message, hot_reload=hot_reload,
                trusted_proxies=trusted_proxies, sync_workers=sync_workers, strict_ssg=strict_ssg,
