@@ -10,6 +10,8 @@ the Rust extension being built:
 - security defaults: ``SecurityConfig`` fields in ``python/pynext/http.py``
 - ISR cache backends: the backend tuple validated by ``ISRCache``
 - CLI commands: ``add_parser`` calls in ``python/pynext/cli.py``
+- server controls: ``add_argument`` calls in ``python/pynext/cli.py``
+- health endpoints: request-path checks in ``python/pynext/app.py``
 - island activation strategies: the strategy set in ``components.py``
 - session stores: ``*Store`` classes in ``python/pynext/sessions.py``
 
@@ -60,7 +62,7 @@ COMMAND_NOTES = {
 # scripts/check_docs.py, which asserts the same phrases appear there.
 NON_GOALS = [
     ("React / React Server Components", "Explicit non-goal for 1.0 (see docs/ROADMAP.md)."),
-    ("Django integration", "Direction undecided (ORM use vs ASGI sub-app mount); no integration exists."),
+    ("Django integration", "Deferred; ORM/forms only under consideration. ASGI sub-apps and templates are out of scope."),
 ]
 
 
@@ -172,6 +174,35 @@ def session_stores() -> list[str]:
     )
 
 
+def server_controls() -> list[tuple[str, str]]:
+    """Extract selected operational CLI controls and their declared defaults."""
+    wanted = {"--max-waiting", "--max-connections", "--max-connections-per-ip", "--shutdown-timeout"}
+    rows = {}
+    for node in ast.walk(_parse(ROOT / "python" / "pynext" / "cli.py")):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument"):
+            continue
+        for arg in node.args:
+            name = _const(arg)
+            if name in wanted:
+                default = next((ast.unparse(kw.value) for kw in node.keywords if kw.arg == "default"), "-")
+                rows[name] = default
+    return sorted(rows.items())
+
+
+def health_endpoints() -> list[str]:
+    """Extract the reserved liveness/readiness paths from dispatch."""
+    for node in ast.walk(_parse(ROOT / "python" / "pynext" / "app.py")):
+        if (isinstance(node, ast.Compare) and isinstance(node.left, ast.Attribute)
+                and isinstance(node.left.value, ast.Name)
+                and node.left.value.id == "request" and node.left.attr == "path"):
+            for comparator in node.comparators:
+                values = _string_tuple(comparator)
+                if values and {"/healthz", "/readyz"}.issubset(values):
+                    return sorted(values)
+    return []
+
+
 def render() -> str:
     name, version, requires_python = project_info()
     api = public_api()
@@ -234,6 +265,28 @@ def render() -> str:
     ]
     for command, help_text in commands:
         lines.append(f"| `{command}` | {help_text or COMMAND_NOTES.get(command, '')} |")
+    lines += [
+        "",
+        "## Server controls (`pynext dev` / `pynext start`)",
+        "",
+        "CLI defaults of `None` defer to server defaults; see the manual for scope and units.",
+        "",
+        "| Option | CLI default |",
+        "| --- | --- |",
+    ]
+    for option, default in server_controls():
+        lines.append(f"| `{option}` | `{default}` |")
+    lines += [
+        "",
+        "## Health endpoints",
+        "",
+        "Reserved GET/HEAD paths; readiness reflects startup and draining, not upstream health.",
+        "",
+        "| Path |",
+        "| --- |",
+    ]
+    for endpoint in health_endpoints():
+        lines.append(f"| `{endpoint}` |")
     lines += [
         "",
         "## Island activation strategies",

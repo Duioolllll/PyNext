@@ -57,7 +57,7 @@ jobs:
           enable-cache: true
 
       - name: Install Python dependencies
-        run: uv sync --locked --extra dev --extra images
+        run: uv sync --locked --extra dev --extra images --extra database
 
       - name: Install JavaScript dependencies
         run: npm ci
@@ -72,7 +72,7 @@ jobs:
         run: cargo test --locked --workspace --all-features
 
       - name: Run Python tests
-        run: uv run --locked --extra dev --extra images pytest -q
+        run: uv run --locked --extra dev --extra images --extra database pytest -q
 
       - name: Verify example production build
         run: uv run pynext build --dir examples/basic
@@ -158,3 +158,32 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --locked --extra dev --extra redis
       - run: uv run --locked --extra dev --extra redis pytest -q tests/test_redis_cache.py tests/test_redis_faults.py tests/test_redis_restart.py tests/test_redis_sessions.py tests/test_isr_query.py tests/test_streaming_isr.py
+
+  postgres:
+    name: PostgreSQL database integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pynext
+          POSTGRES_PASSWORD: pynext-test
+          POSTGRES_DB: pynext_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pynext -d pynext_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      PYNEXT_TEST_POSTGRES_URL: postgresql://pynext:pynext-test@127.0.0.1:5432/pynext_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --extra dev --extra postgres
+      - run: uv run --locked --extra dev --extra postgres pytest -q tests/test_database.py
