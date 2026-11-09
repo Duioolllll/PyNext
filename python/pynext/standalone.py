@@ -1,9 +1,13 @@
 """Build a relocatable Linux application directory from the current environment."""
+import logging
 import os
 import shutil
 import sys
 import sysconfig
+from functools import partial
 from pathlib import Path
+
+log = logging.getLogger("pynext")
 
 
 def _project_copy(source, target):
@@ -20,10 +24,21 @@ def _project_copy(source, target):
         shutil.copy2(source, target)
 
 
-def _ignore_runtime(directory, names):
+def _ignore_runtime(directory, names, *, warn=False):
     base = Path(directory)
-    return {name for name in names if (base / name).is_symlink() or name == "__pycache__" or
-            name.endswith((".pyc", ".pth")) or name in {"sitecustomize.py", "usercustomize.py"}}
+    ignored = {name for name in names if (base / name).is_symlink() or name == "__pycache__" or
+               name.endswith((".pyc", ".pth")) or name in {"sitecustomize.py", "usercustomize.py"}}
+    if warn:
+        # Nested symlinks are dropped, not rejected: this ignore function
+        # is shared with the stdlib copy, where a symlink is not
+        # necessarily a problem, so rejecting here could break builds on
+        # environments whose stdlib links files. A warning names the
+        # dropped item so a bundle missing a dependency it needs is
+        # diagnosable instead of silently incomplete.
+        for name in sorted(ignored):
+            if (base / name).is_symlink():
+                log.warning("Standalone bundle drops symlinked item (unsupported): %s", base / name)
+    return ignored
 
 
 def _copy_site_packages(purelib, packages):
@@ -32,6 +47,9 @@ def _copy_site_packages(purelib, packages):
     Symlinked top-level entries are rejected, like .pth files: a bundle
     cannot carry a link to a path outside itself, and silently dropping
     the entry would ship a bundle missing a dependency it needs.
+    Symlinked items nested inside a package are dropped with a warning
+    (see _ignore_runtime): the package still copies, but the missing
+    file is visible in the build log.
     """
     for item in sorted(purelib.iterdir(), key=lambda entry: entry.name):
         if item.is_symlink():
@@ -41,7 +59,7 @@ def _copy_site_packages(purelib, packages):
             continue
         target = packages / item.name
         if item.is_dir():
-            shutil.copytree(item, target, dirs_exist_ok=True, ignore=_ignore_runtime)
+            shutil.copytree(item, target, dirs_exist_ok=True, ignore=partial(_ignore_runtime, warn=True))
         elif item.is_file():
             shutil.copy2(item, target)
 
@@ -102,7 +120,7 @@ def build_standalone(root, output):
         pynext_target.unlink()
     elif pynext_target.exists():
         shutil.rmtree(pynext_target)
-    shutil.copytree(package, pynext_target, ignore=_ignore_runtime)
+    shutil.copytree(package, pynext_target, ignore=partial(_ignore_runtime, warn=True))
     project = output / "app"
     project.mkdir()
     names = {"app", "public", "islands", *(path.name for path in root.glob("*.py"))}

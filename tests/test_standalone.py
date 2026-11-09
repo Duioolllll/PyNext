@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 import select
 import shutil
@@ -67,6 +68,26 @@ def test_copy_site_packages_rejects_symlinked_entries(tmp_path):
     with pytest.raises(ValueError, match="symlinked dependencies"):
         _copy_site_packages(purelib, packages)
     assert not (packages / "linked").exists()
+
+
+def test_copy_site_packages_warns_for_nested_symlink(tmp_path, caplog):
+    purelib = tmp_path / "purelib"
+    pkg = purelib / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    target = tmp_path / "real-file.py"
+    target.write_text("# real\n")
+    (pkg / "linked.py").symlink_to(target)
+    (purelib / "plain.py").write_text("# plain\n")
+    packages = tmp_path / "packages"
+    packages.mkdir()
+    with caplog.at_level(logging.WARNING, logger="pynext"):
+        _copy_site_packages(purelib, packages)
+    # The nested symlink is dropped, like before, but now the build log
+    # names it instead of silently shipping a bundle without that file.
+    assert not (packages / "pkg" / "linked.py").exists()
+    assert (packages / "pkg" / "__init__.py").exists()
+    assert "linked.py" in caplog.text
 
 
 def test_standalone_rejects_symlinked_purelib_entry(tmp_path, monkeypatch):
