@@ -514,6 +514,33 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
             key = limiter.key_for(peer_ip, headers)
             return limiter.allow(key)
 
+    async def _ws_auth_decision(path, query, headers):
+        # True allows the upgrade, False denies it (403), None is a
+        # pre-flight error (503, fail closed). A deliberate denial from
+        # middleware or @require_auth is 401/403; anything else the
+        # pre-flight returns (unknown route, middleware failure) is an
+        # error rather than an authorization verdict.
+        denied = await app._authorize_websocket(path, bytes(query), headers)
+        if denied is None:
+            return True
+        if denied.status in (401, 403):
+            return False
+        return None
+
+    def ws_auth_callback(path, query, headers, peer_ip):
+        # Runs on a Rust blocking thread, so it must not await: schedule
+        # the async pre-flight on the app's event loop and wait with a
+        # timeout, mirroring the Origin callback above.
+        try:
+            future = _submit(loop, _ws_auth_decision(path, query, headers))
+        except RuntimeError:
+            return None
+        try:
+            return future.result(timeout=5)
+        except Exception:
+            future.cancel()
+            return None
+
     return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store, app.asset_etags,
                                 max_concurrent=max_concurrent, acquire_timeout_ms=acquire_timeout_ms,
                                 max_waiting=max_waiting,
@@ -526,6 +553,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 websocket_callback=ws_callback,
                                 websocket_origin_callback=ws_origin_callback,
                                 websocket_rate_limit_callback=ws_rate_limit_callback,
+                                websocket_auth_callback=ws_auth_callback,
                                 reuse_port=reuse_port,
                                 route_patterns=app.router.ordered_routes(),
                                 middleware_enabled=bool(app.middleware) or limiter is not None or app.hot_reload,

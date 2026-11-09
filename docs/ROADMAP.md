@@ -40,7 +40,7 @@ Linux·macOS·Windows에서 Python 3.13·3.14와 Axum·Uvicorn 조합을 CI로 �
 
 ### 1. 연결 수명과 보안
 
-- HTTP·WebSocket 전체 연결 예산과 초과 시 응답을 정의한다. 개발 버전의 WebSocket은 같은 Origin만 기본 허용하며 추가 출처와 Origin 누락은 명시적으로 설정한다. 클라이언트 인증과 프록시의 전달 헤더 덮어쓰기는 앱·배포의 책임이다.
+- HTTP·WebSocket 전체 연결 예산과 초과 시 응답을 정의한다. 개발 버전의 WebSocket은 같은 Origin만 기본 허용하며 추가 출처와 Origin 누락은 명시적으로 설정한다. 전역 미들웨어와 `@require_auth`/`@require_permission`도 핸드셰이크 전에 강제된다. 신원 확립(로그인·세션)과 프록시의 전달 헤더 덮어쓰기는 앱·배포의 책임이다.
 - 신뢰 프록시 정책을 유지하면서 본문 수신 전 요청 제한을 검토한다. 정적 파일과 캐시 적중 경로도 같은 보안 정책을 따르는지 확인한다.
 - 타임아웃이나 연결 해제 후에도 동기 함수와 외부 쓰기가 계속될 수 있다는 계약을 명시하고, upstream 기한·멱등성 및 종료 절차를 정한다.
 - 종료 절차(B6, 구현됨): `/healthz`(liveness)·`/readyz`(readiness, 시작 완료 후·드레인 전만 200)를 두며, SIGTERM 시 신규 연결을 중단하고 진행 요청 완료·WebSocket 1001 종료를 `--shutdown-timeout`(기본 30초) 안에 처리하고, SIGHUP은 워커를 한 대씩 교체하는 롤링 재시작을 수행한다.

@@ -882,6 +882,35 @@ class App:
             html = "<!DOCTYPE html>" + html
         return Response(html, media_type="text/html; charset=utf-8", csp_nonce=nonce)
 
+    async def _run_middleware(self, request, terminal):
+        """Run the global middleware chain around ``terminal(request)``.
+
+        ``terminal`` is the final step (the HTTP dispatcher, or the
+        WebSocket pre-flight sentinel): it only runs when every middleware
+        called ``call_next``. A middleware that returns its own response
+        short-circuits the chain, and that response is the result.
+        """
+        async def invoke(index, current):
+            if not isinstance(current, Request):
+                raise TypeError("call_next requires a Request")
+            if index == len(self.middleware):
+                return await terminal(current)
+            called = False
+
+            async def call_next(next_request):
+                nonlocal called
+                if called:
+                    raise RuntimeError("call_next may be called only once")
+                called = True
+                return await invoke(index + 1, next_request)
+
+            result = await self.middleware[index](current, call_next)
+            if not isinstance(result, Response):
+                raise TypeError("middleware must return a Response")
+            return result
+
+        return await invoke(0, request)
+
     async def dispatch(self, request):
         """Return a response. Exceptions are converted at the transport boundary."""
         # Health probes are reserved framework paths (B6): they bypass
@@ -914,26 +943,7 @@ class App:
                     return preflight
                 return await self._dispatch(current)
 
-            async def invoke(index, current):
-                if not isinstance(current, Request):
-                    raise TypeError("call_next requires a Request")
-                if index == len(self.middleware):
-                    return await terminal(current)
-                called = False
-
-                async def call_next(next_request):
-                    nonlocal called
-                    if called:
-                        raise RuntimeError("call_next may be called only once")
-                    called = True
-                    return await invoke(index + 1, next_request)
-
-                result = await self.middleware[index](current, call_next)
-                if not isinstance(result, Response):
-                    raise TypeError("middleware must return a Response")
-                return result
-
-            response = await self._dispatch_timed(request, lambda: invoke(0, request))
+            response = await self._dispatch_timed(request, lambda: self._run_middleware(request, terminal))
             if preflight is None:
                 apply_cors_headers(request, response, config=self.security)
             apply_security_headers(response, config=self.security, production=self.production)
@@ -1230,6 +1240,68 @@ class App:
             return rate_limited_response(retry_after)
         return None
 
+    async def _authorize_websocket(self, path, query_string=b"", headers=()):
+        """Pre-handshake authorization for a WebSocket upgrade.
+
+        Returns ``None`` when the upgrade may proceed, else a ``Response``
+        describing the denial. Runs the global middleware chain (including
+        ``SessionMiddleware``, which loads the session into
+        ``request.state``) around a synthetic ``GET`` for the upgrade path,
+        then the handler's ``@require_auth``/``@require_permission`` policy
+        — all before the handshake completes, so a denial is a rejected
+        upgrade, never an accepted socket closed afterwards.
+
+        The upgrade is allowed only when the chain reaches the terminal:
+        a middleware that short-circuits with its own response (even a
+        200) denies the upgrade, because the request never reached the
+        handler. A middleware failure fails closed with 503. The
+        authorization state is not passed to the WebSocket handler: the
+        handler receives a ``WebSocket``, not a ``Request``, and the native
+        transport cannot carry the pre-flight ``request.state`` through
+        the Rust upgrade — so handlers that need the identity must re-derive
+        it from the socket (for example from a session cookie the
+        middleware already validated, or from a token checked in
+        middleware). The check itself is identical on ASGI and native.
+        Middleware must not rotate or invalidate the session during this
+        pre-flight: the pre-flight response is discarded, so a rotated
+        token's ``set-cookie`` would never reach the client while the
+        old token is already gone from the store.
+        """
+        match = self.router.matches(path)
+        if match is None:
+            return Response("Not Found", status=404)
+        pattern, raw_params = match
+        handler = self.websocket_entries.get(pattern)
+        if handler is None:
+            return Response("Not Found", status=404)
+        params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
+        request = Request("GET", path, bytes(query_string),
+                          tuple((bytes(name), bytes(value)) for name, value in headers),
+                          b"", params, self, {})
+        terminal_reached = False
+        seen = {}
+
+        async def terminal(current):
+            nonlocal terminal_reached
+            terminal_reached = True
+            seen["request"] = current
+            return Response(b"", status=200)
+
+        try:
+            response = await (self._run_middleware(request, terminal) if self.middleware
+                              else terminal(request))
+        except Exception:
+            log.exception("WebSocket authorization failed")
+            return Response("Service Unavailable", status=503)
+        if not terminal_reached:
+            # A middleware answered the upgrade itself: its response is
+            # the denial (for example 403 from an auth middleware).
+            return response
+        denied = check_authorization(seen.get("request", request), handler)
+        if denied is not None:
+            return denied
+        return None
+
     async def _handle_websocket(self, scope, receive, send):
         try:
             path = _decode_path(scope["path"], scope.get("raw_path"))
@@ -1277,6 +1349,14 @@ class App:
         supported = getattr(handler, "__pynext_websocket_protocols__", ())
         chosen = next((protocol for protocol in supported if protocol in offered), None)
         if supported and offered and chosen is None:
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        # Authorization runs before the handshake completes: a denied
+        # upgrade is refused with a close instead of an accept, so the
+        # handler never runs and no data is sent.
+        denied = await self._authorize_websocket(path, scope.get("query_string", b""),
+                                                 scope.get("headers", []))
+        if denied is not None:
             await send({"type": "websocket.close", "code": 1008})
             return
         try:

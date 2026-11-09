@@ -2,7 +2,12 @@
 
 
 def require_auth(fn):
-    """Require a nonempty string ``user_id`` in the server-side session."""
+    """Require a nonempty string ``user_id`` in the server-side session.
+
+    Applies to HTTP handlers and WebSocket handlers alike: a WebSocket
+    upgrade is rejected before the handshake when the session has no
+    ``user_id``.
+    """
     fn.__pynext_auth__ = True
     return fn
 

@@ -148,7 +148,7 @@ async def stream():
 
 `route.py` 可以在 HTTP 处理函数之外再导出一个 `@websocket` 处理函数。处理函数接收一个 `WebSocket`，在收发消息之前必须调用 `await websocket.accept()`。支持文本和二进制消息往返；对方断开连接时 `receive()` 会抛出 `WebSocketDisconnect`，因此每个连接的清理工作应放在 `finally` 块中。
 
-开发版本在 ASGI 和 Axum 接受连接前检查 `Origin`，默认只允许同源。通过向 `create_app(..., security=...)` 传入 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`，或重复指定 `--ws-allowed-origin https://client.example`，可以添加 HTTP(S) 来源。来源须包含协议及非默认端口；不接受 `*` 和 `null`。不发送 `Origin` 的现有非浏览器客户端必须通过 `websocket_allow_missing_origin=True` 或 `--ws-allow-missing-origin` 显式允许。已发布的 0.1.0 不包含此检查。客户端可以伪造或省略 `Origin`，所以应用仍须对连接进行身份验证和授权。使用代理时，只通过 `--trusted-proxy` 指定实际的代理，并配置代理覆盖客户端提供的转发头。
+开发版本在 ASGI 和 Axum 接受连接前检查 `Origin`，默认只允许同源。通过向 `create_app(..., security=...)` 传入 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`，或重复指定 `--ws-allowed-origin https://client.example`，可以添加 HTTP(S) 来源。来源须包含协议及非默认端口；不接受 `*` 和 `null`。不发送 `Origin` 的现有非浏览器客户端必须通过 `websocket_allow_missing_origin=True` 或 `--ws-allow-missing-origin` 显式允许。已发布的 0.1.0 不包含此检查。客户端可以伪造或省略 `Origin`。在握手完成之前，升级请求还会经过全局中间件链（包括会话中间件）和处理函数的 `@require_auth`/`@require_permission` 策略（ASGI 和 Axum 均适用）；被拒绝的升级会在 101 响应之前被拦截（Axum 返回 HTTP 403，ASGI 返回 close 1008），处理函数不会执行。应用仍须负责建立身份（例如登录路由设置 `session["user_id"]`），会话之外的凭证方式（如令牌）须在中间件中验证。使用代理时，只通过 `--trusted-proxy` 指定实际的代理，并配置代理覆盖客户端提供的转发头。
 
 为了让 PyNext 在 ASGI 下识别可信代理，服务器须在 `scope["client"]` 中保留原始对端地址。如果由 PyNext 解释转发头，请关闭 ASGI 服务器提前处理代理头的功能（Uvicorn 使用 `--no-proxy-headers`）。
 

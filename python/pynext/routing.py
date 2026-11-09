@@ -18,7 +18,10 @@ def websocket(fn=None, *, protocols=()):
     The handler receives a ``WebSocket`` (see ``pynext.http``) and must call
     ``await websocket.accept()`` before sending or receiving messages. A
     module may export at most one WebSocket handler; it may coexist with HTTP
-    handlers in the same ``route.py``.
+    handlers in the same ``route.py``. Before the handshake, the upgrade
+    runs the global middleware chain (including ``SessionMiddleware``) and
+    the handler's ``@require_auth``/``@require_permission`` policy, so a
+    denied upgrade never reaches this handler.
     """
     if (not isinstance(protocols, (list, tuple)) or len(protocols) > 32 or
             any(not isinstance(protocol, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", protocol)
