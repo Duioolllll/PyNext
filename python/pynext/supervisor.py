@@ -289,13 +289,21 @@ def _rolling_restart(pool, config, context, listener):
     return True
 
 
+MAX_WORKERS = 64
+"""Most worker processes worth running: beyond this the supervisor spends
+more time spawning and watching children than serving (review #4 #5:
+--workers 100000 attempted tens of thousands of processes). The CLI
+rejects larger values at parse time; run_supervisor enforces the same
+bound for direct callers."""
+
+
 def run_supervisor(config, *, workers):
     """Spawn and supervise ``workers`` processes. Returns an exit code.
 
     Blocks until SIGINT/SIGTERM, then shuts every worker down gracefully.
     """
-    if workers < 1:
-        raise ValueError("workers must be >= 1")
+    if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= MAX_WORKERS:
+        raise ValueError(f"workers must be an integer between 1 and {MAX_WORKERS}")
     addresses = socket.getaddrinfo(config.host, config.port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
     family, kind, proto, _, address = addresses[0]
     listener = socket.socket(family, kind, proto)

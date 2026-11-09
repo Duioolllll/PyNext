@@ -14,8 +14,10 @@ from .observability import ObservabilityConfig
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
 from .scaffold import init_project
-from .server import serve
-from .supervisor import WorkerConfig, run_supervisor
+from .server import (MAX_BODY_CAPACITY, MAX_BODY_MIN_RATE_BYTES_PER_SEC,
+                     MAX_CONCURRENT, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP,
+                     MAX_SHUTDOWN_TIMEOUT, MAX_TIMEOUT_MS, MAX_WAITING, serve)
+from .supervisor import MAX_WORKERS, WorkerConfig, run_supervisor
 from .standalone import build_standalone
 from .watch import Watcher
 
@@ -47,6 +49,29 @@ def _at_least(minimum, label):
             raise argparse.ArgumentTypeError(f"{label} must be an integer >= {minimum}") from exc
         if number < minimum:
             raise argparse.ArgumentTypeError(f"{label} must be an integer >= {minimum}")
+        return number
+    return convert
+
+
+def _bounded(minimum, maximum, label):
+    """argparse type for an integer that must be within [``minimum``, ``maximum``].
+
+    Same lower-bound story as :func:`_at_least`, plus an upper bound: a
+    value past the native usize/u64/f64 conversion range dies with an
+    OverflowError traceback instead of a CLI error, and an absurd but
+    fitting value (--workers 100000, --max-concurrent in the billions)
+    exhausts resources before serving anything. Both ends are rejected
+    here, at parse time, with a clear ``parser.error`` message.
+    """
+    def convert(value):
+        try:
+            number = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer >= {minimum}") from exc
+        if number < minimum:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer >= {minimum}")
+        if number > maximum:
+            raise argparse.ArgumentTypeError(f"{label} must be an integer <= {maximum}")
         return number
     return convert
 
@@ -198,30 +223,38 @@ def main():
         if name != "build":
             command.add_argument("--host", default="127.0.0.1")
             command.add_argument("--port", type=_port, default=3000)
-            command.add_argument("--max-concurrent", type=_at_least(1, "--max-concurrent"), default=64,
-                                 help="in-flight requests before new ones wait for a slot")
-            command.add_argument("--acquire-timeout-ms", type=_at_least(0, "--acquire-timeout-ms"), default=1000,
-                                 help="how long a request waits for a slot before getting a 503")
-            command.add_argument("--max-waiting", type=_at_least(0, "--max-waiting"), default=None,
+            command.add_argument("--max-concurrent", type=_bounded(1, MAX_CONCURRENT, "--max-concurrent"),
+                                 default=64,
+                                 help="in-flight requests before new ones wait for a slot (1-1000000)")
+            command.add_argument("--acquire-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--acquire-timeout-ms"),
+                                 default=1000,
+                                 help="how long a request waits for a slot before getting a 503 (0-86400000)")
+            command.add_argument("--max-waiting", type=_bounded(0, MAX_WAITING, "--max-waiting"), default=None,
                                  help="requests waiting for an execution slot before new ones get a 503"
-                                      " (default: min(--max-concurrent, 64); 0 waits for nobody)")
-            command.add_argument("--body-capacity", type=_at_least(1, "--body-capacity"), default=16,
-                                 help="concurrent request bodies being read before new ones get a 503")
-            command.add_argument("--body-timeout-ms", type=_at_least(0, "--body-timeout-ms"), default=10000,
-                                 help="how long a request body may take to arrive before a 408")
-            command.add_argument("--max-connections", type=_at_least(1, "--max-connections"), default=None,
-                                 help="concurrent TCP connections before new ones are dropped at accept")
-            command.add_argument("--max-connections-per-ip", type=_at_least(1, "--max-connections-per-ip"),
+                                      " (default: min(--max-concurrent, 64); 0 waits for nobody; max 1000000)")
+            command.add_argument("--body-capacity", type=_bounded(1, MAX_BODY_CAPACITY, "--body-capacity"),
+                                 default=16,
+                                 help="concurrent request bodies being read before new ones get a 503 (1-1000000)")
+            command.add_argument("--body-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--body-timeout-ms"),
+                                 default=10000,
+                                 help="how long a request body may take to arrive before a 408 (0-86400000)")
+            command.add_argument("--max-connections", type=_bounded(1, MAX_CONNECTIONS, "--max-connections"),
                                  default=None,
-                                 help="concurrent TCP connections allowed from one client IP")
-            command.add_argument("--header-read-timeout-ms", type=_at_least(0, "--header-read-timeout-ms"),
+                                 help="concurrent TCP connections before new ones are dropped at accept (1-1000000)")
+            command.add_argument("--max-connections-per-ip",
+                                 type=_bounded(1, MAX_CONNECTIONS_PER_IP, "--max-connections-per-ip"),
+                                 default=None,
+                                 help="concurrent TCP connections allowed from one client IP (1-1000000)")
+            command.add_argument("--header-read-timeout-ms",
+                                 type=_bounded(0, MAX_TIMEOUT_MS, "--header-read-timeout-ms"),
                                  default=None,
                                  help="how long request headers (and idle keep-alive) may take before the "
-                                      "connection is closed")
+                                      "connection is closed (0-86400000)")
             command.add_argument("--body-min-rate-bytes-per-sec",
-                                 type=_at_least(0, "--body-min-rate-bytes-per-sec"), default=None,
+                                 type=_bounded(0, MAX_BODY_MIN_RATE_BYTES_PER_SEC,
+                                               "--body-min-rate-bytes-per-sec"), default=None,
                                  help="minimum average body receive rate in bytes/second after a 2s grace "
-                                      "window; slower bodies get a 408 (0 disables)")
+                                      "window; slower bodies get a 408 (0 disables; max 1000000000)")
             command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis"), default="memory",
                                  help="ISR page cache backend: process-local memory (default) or a"
                                       " shared SQLite file or Redis via PYNEXT_REDIS_URL")
@@ -242,8 +275,8 @@ def main():
             command.add_argument("--tracing", dest="tracing",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="emit OpenTelemetry spans when the opentelemetry packages are installed (default: off)")
-            command.add_argument("--workers", type=_at_least(1, "--workers"), default=1,
-                                 help="worker processes sharing the port (default 1: single process); "
+            command.add_argument("--workers", type=_bounded(1, MAX_WORKERS, "--workers"), default=1,
+                                 help="worker processes sharing the port (default 1: single process; max 64); "
                                       "a supervisor restarts crashed workers")
             command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"), default=0,
                                  help="requests allowed per client per --rate-limit-window (0 disables)")
@@ -281,9 +314,10 @@ def main():
                                  help="allow an additional WebSocket origin (repeatable)")
             command.add_argument("--ws-allow-missing-origin", action="store_true",
                                  help="allow WebSocket clients that omit Origin")
-            command.add_argument("--shutdown-timeout", type=_at_least(0, "--shutdown-timeout"), default=30,
+            command.add_argument("--shutdown-timeout", type=_bounded(0, MAX_SHUTDOWN_TIMEOUT, "--shutdown-timeout"),
+                                 default=30,
                                  help="seconds to let in-flight requests finish and WebSockets close "
-                                      "after SIGTERM before the server stops anyway (default 30)")
+                                      "after SIGTERM before the server stops anyway (default 30; max 3600)")
     args = parser.parse_args()
     root = Path(args.dir).resolve()
     if args.command == "init":
