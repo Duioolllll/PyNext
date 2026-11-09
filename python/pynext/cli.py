@@ -225,6 +225,9 @@ def main():
         if name == "build":
             command.add_argument("--standalone", action="store_true", help="create a Linux standalone directory")
             command.add_argument("--standalone-dir", default=None, help="new output directory for --standalone")
+            command.add_argument("--standalone-exclude", action="append", default=[], metavar="PACKAGE",
+                                 help="omit a top-level site-packages entry from the standalone bundle "
+                                      "(repeatable; recorded in bundle-manifest.json)")
         if name != "build":
             command.add_argument("--host", default="127.0.0.1")
             command.add_argument("--port", type=_port, default=3000)
@@ -355,7 +358,7 @@ def main():
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
             try:
-                build_standalone(root, output)
+                build_standalone(root, output, excludes=tuple(args.standalone_exclude))
             except (OSError, ValueError) as exc:
                 parser.error(str(exc))
             print(f"Created standalone directory in {output}")

@@ -15,6 +15,10 @@ uv run pynext start --dir examples/basic --host 127.0.0.1 --port 3000
 
 The app source's `public/` and `islands/` directories are still required at production startup unless you deploy the Linux standalone directory (`pynext build --dir <app> --standalone`), which bundles the interpreter, installed dependencies and built application into `<app>/.pynext/standalone` (compatible system libraries are still required).
 
+### Standalone bundle contents
+
+The bundle root holds a `bundle-manifest.json` recording the bundle's provenance: manifest schema `version`, `pynext_version`, `python_version`, a deterministic `build_id` (derived from the source hashes when the build manifest records none), `esbuild_version`, the copied third-party packages with versions (`copied_packages`), packages left out with `--standalone-exclude` (`excluded_packages`), symlinked files dropped during the copy (`dropped_symlinks`, bundle-relative paths), the environment files copied in (`env_files`), and the total file count and bytes. The bundle also copies the project root's `.env` and `.env.production` into the bundled app directory; `.env.local` and `.env.*.local` are never copied. When the bundled server starts it logs the bundle's PyNext/Python versions, build id, package count and size, and warns if the bundle was built with a different Python or PyNext version than the one now running it. `--standalone-exclude <name>` (repeatable) omits a top-level site-packages entry from the bundle; `pynext` itself cannot be excluded.
+
 ## External ASGI server
 
 ~~~bash

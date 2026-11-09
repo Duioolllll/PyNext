@@ -1,5 +1,7 @@
 """Public API for the experimental PyNext framework."""
 
+__version__ = "0.1.2"  # Keep in sync with pyproject.toml.
+
 from .app import App, create_app
 from .auth import require_auth, require_permission
 from .client_dsl import ClientDSLCompileError, compile_client_dsl
