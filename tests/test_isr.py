@@ -38,7 +38,7 @@ async def until(condition, timeout=5):
 def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
     make_project(tmp_path)
     manifest = write_manifest(tmp_path)
-    assert manifest["isr_policies"]["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0}
+    assert manifest["isr_policies"]["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0, "tags": []}
 
     async def run():
         app = create_app(tmp_path, production=True)
@@ -106,13 +106,13 @@ def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
                 module.started, module.gate = asyncio.Event(), asyncio.Event()
                 original_get = app.isr.get_or_render
                 both_arrived, count = asyncio.Event(), 0
-                async def record_arrival(key, policy, render):
+                async def record_arrival(key, policy, render, **kwargs):
                     nonlocal count
                     if key == "/blog/cancel":
                         count += 1
                         if count == 2:
                             both_arrived.set()
-                    return await original_get(key, policy, render)
+                    return await original_get(key, policy, render, **kwargs)
                 app.isr.get_or_render = record_arrival
                 first = asyncio.create_task(client.get("/blog/cancel"))
                 await asyncio.wait_for(module.started.wait(), 3)
@@ -262,7 +262,7 @@ def test_loaded_isr_policy_does_not_alias_page_metadata(tmp_path):
     make_project(tmp_path)
     app = create_app(tmp_path)
     app._module("app/blog/[slug]/page.py").Page.__pynext_cache_policy__["revalidate"] = 0
-    assert app.isr_policies["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0}
+    assert app.isr_policies["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0, "tags": []}
 
 
 def test_isr_rejects_request_access_and_static_generator(tmp_path):

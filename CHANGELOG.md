@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- On-demand revalidation: `page(tags=...)` declares cache tags, `App.revalidate_tag()` / `Request.revalidate_tag()` invalidate every entry carrying a tag (immediate, or deferred with `expire=` so entries serve stale once first), `revalidate=False` makes an ISR page on-demand-only, and `App.revalidate(path, type="layout")` invalidates every ISR page sharing a layout (`/` and `/index` are aliases for path revalidation). Tag invalidations are recorded as timestamps in the shared backend (SQLite/Redis) so other workers observe them on next lookup, local entries are evicted eagerly (including native fresh hits), and a generation that started before an invalidation is served but never stored. External webhooks can trigger the same invalidations via `POST /_pynext/revalidate` with a Bearer secret (`PYNEXT_REVALIDATE_SECRET` or `create_app(revalidate_secret=...)`); the endpoint answers 404 while no secret is configured.
+
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.

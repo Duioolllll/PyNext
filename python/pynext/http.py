@@ -824,12 +824,21 @@ class Request:
             raise RuntimeError("This request is not attached to an app")
         return self._app.security
 
-    async def revalidate(self, path):
-        """Invalidate an ISR path in the current app's process-local cache."""
+    async def revalidate(self, path, type="page"):
+        """Invalidate an ISR path in the current app (see ``App.revalidate``)."""
         self.check_cancelled()
         if self._app is None:
             raise RuntimeError("This request is not attached to an app")
-        return await self._app.revalidate(path)
+        return await self._app.revalidate(path, type)
+
+    async def revalidate_tag(self, tag, *, expire=None):
+        """Invalidate every cached ISR entry carrying ``tag`` (see
+        ``App.revalidate_tag``). Returns the number of entries evicted
+        from this worker's local cache."""
+        self.check_cancelled()
+        if self._app is None:
+            raise RuntimeError("This request is not attached to an app")
+        return await self._app.revalidate_tag(tag, expire=expire)
 
     @property
     def query(self):

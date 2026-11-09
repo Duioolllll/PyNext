@@ -23,8 +23,11 @@ a Cookie or Authorization header bypass the cache entirely in
 """
 import asyncio
 import contextvars
+import json
 import logging
+import math
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -48,6 +51,76 @@ MAX_CACHE_SECONDS = 604_800.0
 _SHARED_UNAVAILABLE = object()
 _VARIANT_GENERATION_TTL = 86400
 _MAX_LOCAL_VARIANT_PATHS = 1024
+# Tag invalidation (on-demand revalidation) follows Next.js's timestamp
+# manifest: a tag maps to the wall-clock seconds when it was last marked
+# stale and when it was last expired. Entries generated before a tag's
+# timestamp are affected; entries generated after it are not, so an
+# invalidation never applies retroactively. A tag row only needs to
+# outlive the entries it can affect (at most two max lifetimes).
+_TAG_PRUNE_AFTER = 2 * MAX_CACHE_SECONDS + LEASE_TTL
+_MAX_LOCAL_ENTRY_TAGS = 8192
+MAX_ISR_TAGS_PER_PAGE = 32
+_TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./:-]{0,255}\Z")
+
+
+def validate_cache_tag(tag):
+    """Validate one cache tag name (``page(tags=...)`` / ``revalidate_tag``).
+
+    Tags are 1-256 characters of letters, digits, ``_``, ``.``, ``/``,
+    ``:`` or ``-``. Names starting with ``_pynext_`` are reserved for the
+    framework's implicit path/layout tags; using the prefix yourself
+    aliases those tags.
+    """
+    if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
+        raise ValueError(
+            f"Invalid cache tag {tag!r}: use 1-256 characters of letters, digits,"
+            " '_', '.', '/', ':' or '-'")
+    return tag
+
+
+def validate_cache_tags(tags):
+    """Validate a page's ``tags`` argument and return a sorted deduped list."""
+    if isinstance(tags, (str, bytes)) or not isinstance(tags, (tuple, list)):
+        raise ValueError("tags must be a list or tuple of tag names")
+    if len(tags) > MAX_ISR_TAGS_PER_PAGE:
+        raise ValueError(f"At most {MAX_ISR_TAGS_PER_PAGE} tags per page")
+    return sorted({validate_cache_tag(tag) for tag in tags})
+
+
+def _tag_adjustment(tags, generated_at, tag_times):
+    """Fold tag timestamps into an entry's time-based status.
+
+    Returns ``"expired"`` when a tag's expiry instant has passed since
+    the entry was generated, ``"stale"`` when a tag went stale after
+    generation, and ``None`` when no tag affects the entry. A deferred
+    expiry (``expired_at`` still in the future) only demotes to stale
+    until its instant passes. An entry whose generation time is unknown
+    but which carries tags is treated as expired: it predates tag
+    tracking, so regenerating it once is the safe choice.
+    """
+    if not tags:
+        return None
+    if generated_at is None:
+        return "expired"
+    now = time.time()
+    stale = False
+    for tag in tags:
+        stale_at, expired_at = tag_times.get(tag, (None, None))
+        if (expired_at is not None and expired_at > generated_at
+                and expired_at <= now):
+            return "expired"
+        if stale_at is not None and stale_at > generated_at:
+            stale = True
+    return "stale" if stale else None
+
+
+def _worse_status(time_status, tag_adjustment):
+    """Combine a time-based status with a tag adjustment; worst wins."""
+    if tag_adjustment == "expired" or time_status == "expired":
+        return "expired"
+    if tag_adjustment == "stale" or time_status == "stale":
+        return "stale"
+    return time_status
 
 
 class CacheBusy(Exception):
@@ -70,10 +143,23 @@ class CacheBackend:
     def lookup(self, key):
         raise NotImplementedError
 
-    def insert(self, key, body, fresh_seconds, stale_seconds):
+    def insert(self, key, body, fresh_seconds, stale_seconds, tags=()):
         raise NotImplementedError
 
     def remove(self, key):
+        raise NotImplementedError
+
+    def get_tag_times(self, tags):
+        """Return ``{tag: (stale_at, expired_at)}`` in wall-clock seconds.
+
+        A missing tag maps to ``(None, None)``. Backends that cannot
+        reach their store raise :class:`SharedCacheUnavailable`.
+        """
+        raise NotImplementedError
+
+    def update_tag(self, tag, stale_at=None, expired_at=None):
+        """Record a tag invalidation: ``stale_at``/``expired_at`` are
+        wall-clock seconds, or ``None`` to leave that field unchanged."""
         raise NotImplementedError
 
     def close(self):
@@ -95,6 +181,7 @@ class MemoryCacheBackend(CacheBackend):
 
     def __init__(self, store=None):
         self._store = store if store is not None else _native.PageCache()
+        self._tags = {}
 
     @property
     def store(self):
@@ -103,24 +190,41 @@ class MemoryCacheBackend(CacheBackend):
     def lookup(self, key):
         return self._store.lookup(key)
 
-    def insert(self, key, body, fresh_seconds, stale_seconds):
+    def insert(self, key, body, fresh_seconds, stale_seconds, tags=()):
         return self._store.insert(key, body, fresh_seconds, stale_seconds)
 
     def remove(self, key):
         return self._store.remove(key)
 
+    def get_tag_times(self, tags):
+        return {tag: self._tags.get(tag, (None, None)) for tag in tags}
+
+    def update_tag(self, tag, stale_at=None, expired_at=None):
+        old_stale, old_expired = self._tags.get(tag, (None, None))
+        self._tags[tag] = (stale_at if stale_at is not None else old_stale,
+                           expired_at if expired_at is not None else old_expired)
+
 
 class SharedEntry:
-    """One shared-cache row as observed by a lookup."""
+    """One shared-cache row as observed by a lookup.
 
-    __slots__ = ("status", "body", "version", "fresh_remaining", "stale_remaining")
+    ``generated_at`` is wall-clock seconds (``None`` when the row
+    predates tag tracking) and ``tags`` are the cache tags the entry was
+    stored with; both are what tag invalidation compares against.
+    """
 
-    def __init__(self, status, body, version, fresh_remaining, stale_remaining):
+    __slots__ = ("status", "body", "version", "fresh_remaining", "stale_remaining",
+                 "generated_at", "tags")
+
+    def __init__(self, status, body, version, fresh_remaining, stale_remaining,
+                 generated_at=None, tags=()):
         self.status = status
         self.body = body
         self.version = version
         self.fresh_remaining = fresh_remaining
         self.stale_remaining = stale_remaining
+        self.generated_at = generated_at
+        self.tags = tuple(tags)
 
 
 class SQLiteCacheBackend(CacheBackend):
@@ -161,7 +265,14 @@ class SQLiteCacheBackend(CacheBackend):
                 "  expires_at REAL NOT NULL, version INTEGER NOT NULL);"
                 "CREATE TABLE IF NOT EXISTS variant_generations ("
                 "  key TEXT PRIMARY KEY, token TEXT NOT NULL, expires_at REAL NOT NULL);"
+                "CREATE TABLE IF NOT EXISTS tags ("
+                "  tag TEXT PRIMARY KEY, stale_at REAL, expired_at REAL);"
             )
+            # Databases created before tag invalidation have no tags
+            # column; add it in place instead of forcing a rebuild.
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(entries)")}
+            if "tags" not in columns:
+                self._conn.execute("ALTER TABLE entries ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
             self._conn.commit()
         except sqlite3.Error as exc:
             raise ValueError(f"Cannot open SQLite cache at {path}: {exc}") from exc
@@ -169,19 +280,23 @@ class SQLiteCacheBackend(CacheBackend):
     def _read_entry(self, key, now):
         for _ in range(3):
             row = self._conn.execute(
-                "SELECT body, generated_at, fresh_for, stale_for, version"
+                "SELECT body, generated_at, fresh_for, stale_for, version, tags"
                 " FROM entries WHERE key = ?", (key,)
             ).fetchone()
             if row is None:
                 return None
-            body, generated_at, fresh_for, stale_for, version = row
+            body, generated_at, fresh_for, stale_for, version, tags_json = row
+            try:
+                tags = tuple(json.loads(tags_json)) if tags_json else ()
+            except (ValueError, TypeError):
+                tags = ()
             age = now - generated_at
             if age >= fresh_for + stale_for:
                 lease = self._conn.execute(
                     "SELECT 1 FROM leases WHERE key = ? AND expires_at > ?", (key, now)
                 ).fetchone()
                 if lease is not None:
-                    return SharedEntry("expired", None, version, 0.0, 0.0)
+                    return SharedEntry("expired", None, version, 0.0, 0.0, generated_at, tags)
                 # Another connection can replace the row between the read
                 # and delete, or take a lease. Delete only the exact expired
                 # version seen, and only if no live generation owns it.
@@ -192,12 +307,14 @@ class SQLiteCacheBackend(CacheBackend):
                 ).rowcount
                 self._conn.commit()
                 if deleted:
-                    return SharedEntry("expired", None, version, 0.0, 0.0)
+                    return SharedEntry("expired", None, version, 0.0, 0.0, generated_at, tags)
                 now = time.time()
                 continue
             if age < fresh_for:
-                return SharedEntry("fresh", body, version, fresh_for - age, stale_for)
-            return SharedEntry("stale", body, version, 0.0, fresh_for + stale_for - age)
+                return SharedEntry("fresh", body, version, fresh_for - age, stale_for,
+                                   generated_at, tags)
+            return SharedEntry("stale", body, version, 0.0, fresh_for + stale_for - age,
+                               generated_at, tags)
         # A heavily contended key is retried on the next lookup.
         return None
 
@@ -222,18 +339,21 @@ class SQLiteCacheBackend(CacheBackend):
             except sqlite3.Error as exc:
                 raise SharedCacheUnavailable("Shared cache lookup failed") from exc
 
-    def insert(self, key, body, fresh_seconds, stale_seconds):
-        return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None)
+    def insert(self, key, body, fresh_seconds, stale_seconds, tags=()):
+        return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None, tags=tags)
 
-    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=()):
         """Store ``body`` only if the entry version still equals
         ``expected_version`` (``0`` when no entry existed, ``None`` for an
         unfenced write). When an owner is given, its lease must still be live
-        in the same transaction. Returns False when either fence has moved."""
+        in the same transaction. Returns False when either fence has moved.
+        ``tags`` are stored with the entry so tag invalidation can judge it."""
         if len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES or len(body) > MAX_CACHE_BODY_BYTES:
             return False
         if not _valid_durations(fresh_seconds, stale_seconds):
             return False
+        tags_json = json.dumps(sorted(set(tags)), ensure_ascii=True, separators=(",", ":"))
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -262,12 +382,14 @@ class SQLiteCacheBackend(CacheBackend):
                     else:
                         version = row[0] + 1
                     self._conn.execute(
-                        "INSERT INTO entries (key, body, generated_at, fresh_for, stale_for, version)"
-                        " VALUES (?, ?, ?, ?, ?, ?)"
+                        "INSERT INTO entries (key, body, generated_at, fresh_for, stale_for, version, tags)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?)"
                         " ON CONFLICT(key) DO UPDATE SET body=excluded.body,"
                         " generated_at=excluded.generated_at, fresh_for=excluded.fresh_for,"
-                        " stale_for=excluded.stale_for, version=excluded.version",
-                        (key, bytes(body), now, float(fresh_seconds), float(stale_seconds), version),
+                        " stale_for=excluded.stale_for, version=excluded.version,"
+                        " tags=excluded.tags",
+                        (key, bytes(body), now, float(fresh_seconds), float(stale_seconds), version,
+                         tags_json),
                     )
                     self._conn.execute("COMMIT")
                 except BaseException:
@@ -295,6 +417,50 @@ class SQLiteCacheBackend(CacheBackend):
             except sqlite3.Error:
                 log.warning("Shared cache remove failed for %s", key, exc_info=True)
                 return False
+
+    def get_tag_times(self, tags):
+        with self._lock:
+            try:
+                out = {}
+                for tag in tags:
+                    row = self._conn.execute(
+                        "SELECT stale_at, expired_at FROM tags WHERE tag = ?", (tag,)
+                    ).fetchone()
+                    out[tag] = (row[0], row[1]) if row is not None else (None, None)
+                return out
+            except sqlite3.Error as exc:
+                raise SharedCacheUnavailable("Shared cache tag lookup failed") from exc
+
+    def update_tag(self, tag, stale_at=None, expired_at=None):
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = self._conn.execute(
+                        "SELECT stale_at, expired_at FROM tags WHERE tag = ?", (tag,)
+                    ).fetchone()
+                    new_stale = stale_at if stale_at is not None else (row[0] if row else None)
+                    new_expired = expired_at if expired_at is not None else (row[1] if row else None)
+                    self._conn.execute(
+                        "INSERT INTO tags (tag, stale_at, expired_at) VALUES (?, ?, ?)"
+                        " ON CONFLICT(tag) DO UPDATE SET stale_at=excluded.stale_at,"
+                        " expired_at=excluded.expired_at",
+                        (tag, new_stale, new_expired),
+                    )
+                    # A tag row cannot affect entries generated after its
+                    # timestamps plus the longest an entry can live, so
+                    # rows older than that are pruned on write.
+                    cutoff = time.time() - _TAG_PRUNE_AFTER
+                    self._conn.execute(
+                        "DELETE FROM tags WHERE expired_at IS NOT NULL AND expired_at < ?"
+                        " AND (stale_at IS NULL OR stale_at < ?)", (cutoff, cutoff))
+                    self._conn.execute("COMMIT")
+                except BaseException:
+                    if self._conn.in_transaction:
+                        self._conn.execute("ROLLBACK")
+                    raise
+            except sqlite3.Error as exc:
+                raise SharedCacheUnavailable("Shared cache tag update failed") from exc
 
     def variant_generation(self, key, *, invalidate=False):
         """Get or replace a path generation atomically across workers."""
@@ -457,7 +623,17 @@ class ISRCache:
         self._inflight = {}
         self._task_leases = {}
         self._tasks = set()
+        # ``key -> (task, tags)`` for generations still rendering, so tag
+        # invalidation can retire a generation before it stores anything.
+        self._inflight_tags = {}
         self._variant_paths = OrderedDict()
+        # On-demand revalidation: ``key -> (tags, generated_at)`` for every
+        # entry this worker placed in the process-local cache, bounded so
+        # tag invalidation can evict known keys without growing forever.
+        # The tag manifest itself lives here for the ``memory`` backend and
+        # in the shared backend otherwise (see ``_tag_times``).
+        self._entry_tags = OrderedDict()
+        self._tag_manifest = {}
         self._loop = None
         self._closed = False
         self.namespace = namespace
@@ -482,7 +658,10 @@ class ISRCache:
         self._inflight.clear()
         self._task_leases.clear()
         self._tasks.clear()
+        self._inflight_tags.clear()
         self._variant_paths.clear()
+        self._entry_tags.clear()
+        self._tag_manifest.clear()
         self._loop = None
         if self.shared is not None:
             await asyncio.to_thread(self.shared.close)
@@ -511,14 +690,27 @@ class ISRCache:
             log.warning("Shared cache lookup failed for %s", key, exc_info=True)
             return _SHARED_UNAVAILABLE
 
-    async def _shared_store(self, key, body, policy, expected_version, owner):
+    @staticmethod
+    def _policy_durations(policy):
+        """Map an ISR policy to the (fresh, stale) seconds stored in a cache.
+
+        ``revalidate=False`` is on-demand-only: it never expires by time,
+        so it is stored with the longest lifetime a backend accepts
+        (``MAX_CACHE_SECONDS``) and only an explicit invalidation
+        regenerates it.
+        """
+        revalidate = policy["revalidate"]
+        fresh = MAX_CACHE_SECONDS if revalidate is False else float(revalidate)
+        return fresh, float(policy["stale"])
+
+    async def _shared_store(self, key, body, fresh, stale, expected_version, owner, tags=()):
         # Best-effort in both policies: the page was already rendered
         # correctly, so a failed write only loses caching, never the
         # response. See failure_policy.
         try:
             return await asyncio.to_thread(
                 self.shared.insert_fenced, self.namespace + key, body,
-                policy["revalidate"], policy["stale"], expected_version, owner,
+                fresh, stale, expected_version, owner, tags,
             )
         except Exception:
             log.warning("Shared cache insert failed for %s", key, exc_info=True)
@@ -552,6 +744,138 @@ class ISRCache:
             log.warning("Shared cache remove failed for %s", key, exc_info=True)
             return False
 
+    def _track_entry(self, key, tags, generated_at):
+        """Remember which tags a locally cached entry carries (bounded)."""
+        if not tags:
+            self._entry_tags.pop(key, None)
+            return
+        self._entry_tags[key] = (tuple(tags), generated_at)
+        self._entry_tags.move_to_end(key)
+        while len(self._entry_tags) > _MAX_LOCAL_ENTRY_TAGS:
+            self._entry_tags.popitem(last=False)
+
+    def _namespaced_tag(self, tag):
+        return self.namespace + "tag:" + tag
+
+    async def _tag_times(self, tags):
+        """Read tag timestamps for ``tags`` (raw names, un-namespaced)."""
+        if not tags:
+            return {}
+        if self.shared is None:
+            return {tag: self._tag_manifest.get(self._namespaced_tag(tag), (None, None))
+                    for tag in tags}
+        try:
+            raw = await asyncio.to_thread(
+                self.shared.get_tag_times, [self._namespaced_tag(tag) for tag in tags])
+        except Exception as exc:
+            if self.failure_policy == FAIL_CLOSED:
+                raise SharedCacheUnavailable("Shared cache tag lookup failed") from exc
+            log.warning("Shared cache tag lookup failed", exc_info=True)
+            return {}
+        return {tag: raw.get(self._namespaced_tag(tag), (None, None)) for tag in tags}
+
+    async def _update_tag(self, tag, stale_at, expired_at):
+        namespaced = self._namespaced_tag(tag)
+        if self.shared is None:
+            self._tag_manifest[namespaced] = (stale_at, expired_at)
+            return
+        try:
+            await asyncio.to_thread(self.shared.update_tag, namespaced, stale_at, expired_at)
+        except Exception as exc:
+            if self.failure_policy == FAIL_CLOSED:
+                raise SharedCacheUnavailable("Shared cache tag update failed") from exc
+            log.warning("Shared cache tag update failed for %s", tag, exc_info=True)
+
+    async def _adjust_shared_entry(self, entry):
+        """Demote a shared entry by its tags, in place (fresh/stale/expired).
+
+        A tag invalidated after the entry was generated demotes it:
+        expired tags force a blocking regeneration, stale tags serve once
+        more while one worker regenerates in the background.
+        """
+        if entry is not None and entry.status in ("fresh", "stale"):
+            times = await self._tag_times(entry.tags)
+            adjusted = _tag_adjustment(entry.tags, entry.generated_at, times)
+            if adjusted is not None:
+                entry.status = _worse_status(entry.status, adjusted)
+                if entry.status == "expired":
+                    entry.body = None
+        return entry
+
+    async def _generation_invalidated(self, entry_tags, started):
+        """True when a tag was invalidated after ``started`` (a render began).
+
+        The invalidation instant is the stale mark when one exists
+        (deferred expiry), else the expiry instant. A generation that
+        read data before the invalidation must not refill the cache with
+        it, even though it still serves its caller.
+        """
+        if not entry_tags:
+            return False
+        times = await self._tag_times(entry_tags)
+        for tag in entry_tags:
+            stale_at, expired_at = times.get(tag, (None, None))
+            invalidated_at = stale_at if stale_at is not None else expired_at
+            if invalidated_at is not None and invalidated_at >= started:
+                return True
+        return False
+
+    async def invalidate_tag(self, tag, *, expire=None):
+        """Invalidate every cached entry carrying ``tag`` (on-demand).
+
+        ``expire=None`` expires matching entries immediately: the next
+        lookup regenerates them instead of serving them. ``expire=N``
+        (seconds, Next.js ``revalidateTag(tag, {expire})`` semantics)
+        first marks them stale — served once more while a background
+        regeneration runs — and expires them ``N`` seconds later; a
+        deferred invalidation evicts nothing, so it returns 0.
+        Returns the number of entries evicted from this worker's local
+        cache (stored entries plus generations retired mid-render).
+        Entries held by other workers are caught by the shared tag
+        manifest on their next lookup, so the count is a local lower
+        bound, not a global total.
+        """
+        validate_cache_tag(tag)
+        if expire is not None:
+            if (isinstance(expire, bool) or not isinstance(expire, (int, float))
+                    or not math.isfinite(expire) or expire < 0 or expire > MAX_CACHE_SECONDS):
+                raise ValueError(
+                    "expire must be a finite number of seconds from 0 to 604800")
+        if self._closed:
+            raise CacheBusy("ISR cache is shutting down")
+        self._check_loop()
+        now = time.time()
+        stale_at = now if expire is not None else None
+        expired_at = now + float(expire) if expire is not None else now
+        # Record the manifest first: other workers observe the
+        # invalidation on their next lookup even if local eviction below
+        # is interrupted, and entries generated after this instant are
+        # unaffected by the timestamps.
+        await self._update_tag(tag, stale_at, expired_at)
+        if expire is not None:
+            # Deferred expiry: entries stay in place and are served stale
+            # (with a background regeneration) until the expiry elapses;
+            # evicting them now would turn a stale-serve into a miss.
+            return 0
+        evicted = 0
+        for key in [key for key, (tags, _) in self._entry_tags.items() if tag in tags]:
+            self._inflight.pop(key, None)
+            self._inflight_tags.pop(key, None)
+            self.store.remove(key)
+            self._entry_tags.pop(key, None)
+            if self.shared is not None:
+                await self._shared_remove(key)
+            evicted += 1
+        for key in [key for key, (_, tags) in self._inflight_tags.items() if tag in tags]:
+            # Retire the generation without cancelling it: its caller
+            # still gets the rendered body, but the guard in _generate
+            # keeps it from refilling the cache, and the next lookup
+            # starts a fresh generation.
+            self._inflight.pop(key, None)
+            self._inflight_tags.pop(key, None)
+            evicted += 1
+        return evicted
+
     async def invalidate(self, key):
         """Remove ``key`` from the local cache and, when configured, the shared store.
 
@@ -572,6 +896,8 @@ class ISRCache:
             raise CacheBusy("ISR cache is shutting down")
         self._check_loop()
         retired = self._inflight.pop(key, None)
+        self._inflight_tags.pop(key, None)
+        self._entry_tags.pop(key, None)
         removed = self.store.remove(key)
         if self.shared is not None:
             removed = await self._shared_remove(key) or removed
@@ -610,16 +936,21 @@ class ISRCache:
         self._remember_variant_generation(path, token)
         return token, had_local
 
-    def _register(self, key, task, owner=None):
+    def _register(self, key, task, owner=None, entry_tags=()):
         self._inflight[key] = task
         self._task_leases[task] = owner
         self._tasks.add(task)
+        if entry_tags:
+            self._inflight_tags[key] = (task, tuple(entry_tags))
 
         def completed(finished):
             self._tasks.discard(finished)
             self._task_leases.pop(finished, None)
             if self._inflight.get(key) is finished:
                 self._inflight.pop(key, None)
+            record = self._inflight_tags.get(key)
+            if record is not None and record[0] is finished:
+                self._inflight_tags.pop(key, None)
             if not finished.cancelled():
                 error = finished.exception()
                 if error is not None:
@@ -639,6 +970,8 @@ class ISRCache:
             entry = await self._shared_entry(key)
             if entry is _SHARED_UNAVAILABLE:
                 return ("unavailable", None)
+            if entry is not None:
+                entry = await self._adjust_shared_entry(entry)
             if entry is not None and entry.status == "fresh":
                 return ("fresh", entry)
             if time.monotonic() >= deadline:
@@ -650,7 +983,14 @@ class ISRCache:
                 return ("lease", (version, owner))
             await asyncio.sleep(LEASE_WAIT_INTERVAL)
 
-    async def get_or_render(self, key, policy, render):
+    async def get_or_render(self, key, policy, render, *, tags=None):
+        """Serve ``key`` from cache or render it once.
+
+        ``tags`` are the cache tags the generated entry is stored with
+        (page tags plus the request's implicit path tag); when omitted
+        they default to ``policy["tags"]``. Tag invalidation judges the
+        entry against these tags.
+        """
         loop = asyncio.get_running_loop()
         if self._closed:
             raise CacheBusy("ISR cache is shutting down")
@@ -658,14 +998,25 @@ class ISRCache:
             self._loop = loop
         elif self._loop is not loop:
             raise RuntimeError("An ISR app instance must use a single event loop")
+        entry_tags = tuple(tags) if tags is not None else tuple(policy.get("tags", ()))
         status, body = self.store.lookup(key)
         if status == "fresh" and self.shared is None:
-            return body
+            if entry_tags:
+                record = self._entry_tags.get(key)
+                if record is not None:
+                    times = await self._tag_times(record[0])
+                    adjusted = _tag_adjustment(record[0], record[1], times)
+                    if adjusted is not None:
+                        status = _worse_status(status, adjusted)
+                        if status != "fresh":
+                            body = body if status == "stale" else None
+            if status == "fresh":
+                return body
         if self.shared is None:
-            return await self._get_or_render_local(key, policy, render, status, body)
-        return await self._get_or_render_shared(key, policy, render, status, body)
+            return await self._get_or_render_local(key, policy, render, status, body, entry_tags)
+        return await self._get_or_render_shared(key, policy, render, status, body, entry_tags)
 
-    async def _generate(self, key, policy, render, lease=None):
+    async def _generate(self, key, policy, render, lease=None, entry_tags=()):
         """Render once and store the result, fenced by the lease version.
 
         ``lease`` is ``(expected_version, owner)`` for a shared-cache
@@ -675,34 +1026,50 @@ class ISRCache:
         """
         owner = lease[1] if lease is not None else None
         expected_version = lease[0] if lease is not None else None
+        fresh, stale = self._policy_durations(policy)
+        started = time.time()
         try:
             async with asyncio.timeout(GENERATION_TIMEOUT):
                 if lease is not None:
                     # Another worker may have populated the cache after our
                     # miss but before we obtained the now-free lease. Check
-                    # again while holding the lease before rendering.
+                    # again while holding the lease before rendering; a
+                    # tag-invalidated entry must not satisfy the check.
                     entry = await self._shared_entry(key)
+                    if entry is not _SHARED_UNAVAILABLE and entry is not None:
+                        entry = await self._adjust_shared_entry(entry)
                     if entry is not _SHARED_UNAVAILABLE and entry is not None and entry.status == "fresh":
                         if self._inflight.get(key) is asyncio.current_task():
                             self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                            self._track_entry(key, entry.tags, entry.generated_at)
                         return entry.body
                 response = await render()
                 if response.status != 200:
                     raise ValueError("ISR can cache only successful page responses")
+                if await self._generation_invalidated(entry_tags, started):
+                    # A tag was revalidated while this render read its
+                    # data: serve the body, but do not store it — the
+                    # next lookup regenerates from fresh data.
+                    log.info("ISR generation for %s skipped caching: a tag was revalidated"
+                             " during render", key)
+                    return response.body
                 # An invalidated generation may finish for existing callers,
                 # but must never repopulate the cache after invalidation.
                 if self._inflight.get(key) is asyncio.current_task():
                     if _is_storable(response):
                         shared_stored = True
                         if self.shared is not None and owner is not None:
-                            shared_stored = await self._shared_store(key, response.body, policy, expected_version, owner)
+                            shared_stored = await self._shared_store(
+                                key, response.body, fresh, stale, expected_version, owner, entry_tags)
                             if not shared_stored:
                                 log.warning("Shared ISR insert for %s failed or was fenced out;"
                                             " page was served but not cached", key)
                         # Do not populate L1 after a shared write was rejected
                         # or after this app invalidated the running task.
                         if shared_stored and self._inflight.get(key) is asyncio.current_task():
-                            if not self.store.insert(key, response.body, policy["revalidate"], policy["stale"]):
+                            if self.store.insert(key, response.body, fresh, stale):
+                                self._track_entry(key, entry_tags, time.time())
+                            else:
                                 log.warning("ISR cache insert failed for %s; page was served but not cached", key)
                     else:
                         log.info("ISR response for %s is private; served but not cached", key)
@@ -711,11 +1078,20 @@ class ISRCache:
             if owner is not None and self.shared is not None:
                 await self._shared_release(key, owner)
 
-    async def _get_or_render_local(self, key, policy, render, status, body):
+    async def _get_or_render_local(self, key, policy, render, status, body, entry_tags):
+        record = self._entry_tags.get(key)
+        if record is not None and status in ("fresh", "stale"):
+            times = await self._tag_times(record[0])
+            adjusted = _tag_adjustment(record[0], record[1], times)
+            if adjusted is not None:
+                status = _worse_status(status, adjusted)
+                if status != "stale":
+                    body = None
         task = self._inflight.get(key)
         if task is None and len(self._tasks) < MAX_INFLIGHT:
             task = self._register(key, asyncio.create_task(
-                self._generate(key, policy, render), context=contextvars.Context()))
+                self._generate(key, policy, render, entry_tags=entry_tags), context=contextvars.Context()),
+                entry_tags=entry_tags)
         if status == "stale":
             return body
         if task is None:
@@ -723,16 +1099,21 @@ class ISRCache:
         # A cancelled request must not cancel the shared render for other callers.
         return await asyncio.shield(task)
 
-    async def _get_or_render_shared(self, key, policy, render, status, body):
+    async def _get_or_render_shared(self, key, policy, render, status, body, entry_tags):
         entry = await self._shared_entry(key)
         if entry is _SHARED_UNAVAILABLE:
             if status == "fresh":
                 return body
-            return await self._get_or_render_local(key, policy, render, status, body)
+            return await self._get_or_render_local(key, policy, render, status, body, entry_tags)
+        # A tag invalidated after this entry was generated demotes it:
+        # expired tags force a blocking regeneration, stale tags serve
+        # once more while one worker regenerates in the background.
+        entry = await self._adjust_shared_entry(entry)
         if entry is not None and entry.status == "fresh":
             # Keep a local fallback for shared-store outages. Shared mode
             # still validates each hit against the authoritative store.
             self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+            self._track_entry(key, entry.tags, entry.generated_at)
             return entry.body
         task = self._inflight.get(key)
         if task is not None:
@@ -762,8 +1143,8 @@ class ISRCache:
                     return await self._get_or_render_local(key, policy, render, "stale", entry.body)
                 if version is not None:
                     task = self._register(key, asyncio.create_task(
-                        self._generate(key, policy, render, lease=(version, owner)),
-                        context=contextvars.Context()), owner)
+                        self._generate(key, policy, render, lease=(version, owner), entry_tags=entry_tags),
+                        context=contextvars.Context()), owner, entry_tags=entry_tags)
                 return entry.body
             # First generation (or expired): become the generator if the
             # lease is free, otherwise wait for the worker that holds it.
@@ -773,19 +1154,20 @@ class ISRCache:
                 return await self._get_or_render_local(key, policy, render, status, body)
             if version is not None:
                 task = self._register(key, asyncio.create_task(
-                    self._generate(key, policy, render, lease=(version, owner)),
-                    context=contextvars.Context()), owner)
+                    self._generate(key, policy, render, lease=(version, owner), entry_tags=entry_tags),
+                    context=contextvars.Context()), owner, entry_tags=entry_tags)
             else:
                 outcome, payload = await self._wait_for_shared(key, GENERATION_TIMEOUT)
                 if outcome == "fresh":
                     entry = payload
                     self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                    self._track_entry(key, entry.tags, entry.generated_at)
                     return entry.body
                 if outcome == "lease":
                     version, owner = payload
                     task = self._register(key, asyncio.create_task(
-                        self._generate(key, policy, render, lease=(version, owner)),
-                        context=contextvars.Context()), owner)
+                        self._generate(key, policy, render, lease=(version, owner), entry_tags=entry_tags),
+                        context=contextvars.Context()), owner, entry_tags=entry_tags)
                 else:
                     # The other worker is still generating after the wait.
                     # Render locally rather than failing the request, but
@@ -794,8 +1176,8 @@ class ISRCache:
                         log.warning("ISR first generation for %s is still running in another worker;"
                                     " rendering locally", key)
                     task = self._register(key, asyncio.create_task(
-                        self._generate(key, policy, render),
-                        context=contextvars.Context()))
+                        self._generate(key, policy, render, entry_tags=entry_tags),
+                        context=contextvars.Context()), entry_tags=entry_tags)
         if entry is not None and entry.status == "stale":
             return entry.body
         if task is None:

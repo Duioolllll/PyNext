@@ -3,6 +3,8 @@ import math
 import json
 import re
 
+from .cache import validate_cache_tags
+
 _ISLAND_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 _MAX_PROPS_BYTES = 16_384
 _MODEL_PROP_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
@@ -228,12 +230,26 @@ def bind_islands(tree, manifest, *, include_runtime=True, dev_id=None):
     return {"kind": "fragment", "children": [bound, runtime]}
 
 
-def _isr_policy(revalidate, stale):
-    for name, value, allow_zero in (("revalidate", revalidate, False), ("stale", stale, True)):
-        if (isinstance(value, bool) or not isinstance(value, (int, float)) or
-                value < 0 or (not allow_zero and value == 0) or value > 604_800 or not math.isfinite(value)):
-            raise ValueError(f"{name} must be a finite {'non-negative' if allow_zero else 'positive'} number of seconds, at most 604800")
-    return {"revalidate": float(revalidate), "stale": float(stale)}
+def _isr_policy(revalidate, stale, tags=()):
+    """Normalize an ISR policy to ``{"revalidate", "stale", "tags"}``.
+
+    ``revalidate=False`` is on-demand-only: the entry never expires by
+    time and is regenerated only by ``revalidate()`` / ``revalidate_tag()``
+    (stored with the longest lifetime a backend accepts; see
+    ``ISRCache._policy_durations``).
+    """
+    if revalidate is False:
+        revalidate_value = False
+    elif (isinstance(revalidate, bool) or not isinstance(revalidate, (int, float)) or
+            revalidate <= 0 or revalidate > 604_800 or not math.isfinite(revalidate)):
+        raise ValueError("revalidate must be False (on-demand only) or a finite positive number of seconds, at most 604800")
+    else:
+        revalidate_value = float(revalidate)
+    if (isinstance(stale, bool) or not isinstance(stale, (int, float)) or
+            stale < 0 or stale > 604_800 or not math.isfinite(stale)):
+        raise ValueError("stale must be a finite non-negative number of seconds, at most 604800")
+    return {"revalidate": revalidate_value, "stale": float(stale),
+            "tags": validate_cache_tags(tags)}
 
 
 def _isr_query_keys(keys):
@@ -245,15 +261,15 @@ def _isr_query_keys(keys):
     return sorted(keys)
 
 
-def page(*, render="ssr", revalidate=None, stale=None, query_keys=()):
+def page(*, render="ssr", revalidate=None, stale=None, query_keys=(), tags=()):
     if render not in {"ssr", "ssg", "isr"}:
         raise ValueError("render must be 'ssr', 'ssg', or 'isr'")
     if render == "isr":
-        policy = _isr_policy(revalidate, 60.0 if stale is None else stale)
+        policy = _isr_policy(revalidate, 60.0 if stale is None else stale, tags)
         query_keys = _isr_query_keys(query_keys)
     else:
-        if revalidate is not None or stale is not None or query_keys:
-            raise ValueError("revalidate, stale, and query_keys are only valid for ISR pages")
+        if revalidate is not None or stale is not None or query_keys or tags:
+            raise ValueError("revalidate, stale, query_keys, and tags are only valid for ISR pages")
         policy = None
     def decorate(fn):
         fn.__pynext_page__ = True
