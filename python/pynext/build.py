@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 
@@ -110,6 +111,12 @@ def write_manifest(root):
     root = Path(root).resolve()
     _check_build_paths(root)
     manifest = discover(root)
+    for route, shadowers in find_unreachable_routes(manifest["routes"]).items():
+        print(
+            f"warning: unreachable route {route} is shadowed by "
+            f"{', '.join(shadowers)} and can never match a request",
+            file=sys.stderr,
+        )
     # Loading user code and running its generators are intentional build steps.
     from .app import App
     app = App(root, manifest)
@@ -193,6 +200,185 @@ def _route_group(part):
     if match is None:
         raise ValueError(f"Invalid route group: {part}")
     return match.group(1)
+
+
+# Unreachable-route detection (REPORT.md §2.3 P2, tracks/a-routing.md
+# §2.10). Adapted from Next.js `isRoutePatternCovered()` /
+# `patternCoversAtLength()` / `prefixCovers()` in
+# `shared/lib/router/utils/interception-routes.ts`, with one difference:
+# Next.js only asks whether some ordinary route matches the same URLs,
+# while PyNext must also ask whether that route *wins* the trie match
+# (static > dynamic > catch-all > optional catch-all, with backtracking).
+# A route is unreachable only when every path it could match is both
+# matched and won by another route. Partial shadowing is normal -- e.g.
+# `/docs/[...path]` loses its one-segment paths to `/docs/[slug]` but
+# still serves longer paths -- and is not reported.
+#
+# The check is symbolic: for a fixed-length candidate there is a single
+# length to test, and for an unbounded candidate (catch-all tail) the
+# step kinds are uniform past both prefixes, so one unbounded stealer
+# covering at max(min lengths) covers every longer length, and only the
+# finite lengths below that need per-length checks.
+
+# Trie-step kind ranks: the smaller rank wins when two routes first
+# diverge on the same path. "end" is the endpoint reached when a pattern
+# stops exactly at the end of the path; it beats an optional catch-all
+# that would match zero further segments.
+_STEP_RANK = {"static": 0, "dynamic": 1, "catch_all": 2, "optional": 3, "end": -1}
+
+
+def _parse_route_pattern(pattern):
+    """Split a route pattern into (prefix, tail).
+
+    prefix is a list of ("static", literal) / ("dynamic", name) steps;
+    tail is None (fixed length), "catch_all" or "optional".
+    """
+    segments = pattern.strip("/").split("/") if pattern != "/" else []
+    tail = None
+    if segments:
+        last = segments[-1]
+        if last.startswith("[[...") and last.endswith("]]"):
+            tail = "optional"
+            segments = segments[:-1]
+        elif last.startswith("[...") and last.endswith("]"):
+            tail = "catch_all"
+            segments = segments[:-1]
+    prefix = []
+    for segment in segments:
+        parsed = _segment_param(segment)
+        if parsed is None:
+            prefix.append(("static", segment))
+        else:
+            name, kind = parsed
+            if kind != "dynamic":
+                raise ValueError(f"Catch-all must be the last part of the URL: {pattern}")
+            prefix.append(("dynamic", name))
+    return prefix, tail
+
+
+def _pattern_min_length(parsed):
+    prefix, tail = parsed
+    return len(prefix) + (1 if tail == "catch_all" else 0)
+
+
+def _pattern_accepts_length(parsed, length):
+    prefix, tail = parsed
+    if tail is None:
+        return length == len(prefix)
+    return length >= _pattern_min_length(parsed)
+
+
+def _step_kind(parsed, index):
+    """Kind of the trie step a pattern takes at path position `index`.
+
+    Returns ("static", literal), ("dynamic",), ("catch_all",) or
+    ("optional",). Past the fixed prefix an unbounded pattern is in its
+    tail, which consumes every remaining position.
+    """
+    prefix, tail = parsed
+    if index < len(prefix):
+        kind, value = prefix[index]
+        return (kind, value) if kind == "static" else (kind,)
+    if tail == "catch_all":
+        return ("catch_all",)
+    if tail == "optional":
+        return ("optional",)
+    return ("end",)
+
+
+def _covers_at_length(stealer, candidate, length):
+    """Whether `stealer` matches and wins every length-`length` path that
+    `candidate` matches.
+
+    The stealer must accept `length` (the caller only asks about lengths
+    the candidate accepts). A static step only matches paths whose
+    segment is exactly that literal, so a stealer can take a static step
+    only where the candidate has the identical static step; a dynamic
+    step or a tail matches any value. The winner is decided by the first
+    position where the two patterns take different trie steps: the
+    smaller kind rank wins. If every step agrees, an endpoint beats an
+    optional catch-all that would match zero further segments.
+    """
+    if not _pattern_accepts_length(stealer, length):
+        return False
+    divergence = None
+    for index in range(length):
+        stealer_step = _step_kind(stealer, index)
+        candidate_step = _step_kind(candidate, index)
+        if stealer_step[0] == "static":
+            # Only the paths with exactly this literal are matched.
+            if stealer_step != candidate_step:
+                return False
+        elif stealer_step[0] in ("catch_all", "optional"):
+            # A tail consumes the rest, so it matches any values from
+            # here on; only the kind at this position can still diverge.
+            if divergence is None and stealer_step[0] != candidate_step[0]:
+                divergence = (stealer_step[0], candidate_step[0])
+            break
+        if divergence is None and stealer_step[0] != candidate_step[0]:
+            divergence = (stealer_step[0], candidate_step[0])
+    if divergence is not None:
+        return _STEP_RANK[divergence[0]] < _STEP_RANK[divergence[1]]
+    # Every step agreed. A catch-all has already consumed its segments,
+    # so it counts as ended; only an optional tail whose prefix ends
+    # exactly here can still match zero further segments.
+    stealer_end = "optional" if stealer[1] == "optional" and len(stealer[0]) == length else "end"
+    candidate_end = "optional" if candidate[1] == "optional" and len(candidate[0]) == length else "end"
+    return _STEP_RANK[stealer_end] < _STEP_RANK[candidate_end]
+
+
+def _shadowing_routes(pattern, others):
+    """Routes that together leave `pattern` no path it can win, or [].
+
+    `others` is a list of (route, parsed pattern) pairs.
+    """
+    min_length = _pattern_min_length(pattern)
+    if pattern[1] is None:
+        for route, other in others:
+            if _covers_at_length(other, pattern, min_length):
+                return [route]
+        return []
+    start = None
+    tail_shadow = None
+    for route, other in others:
+        if other[1] is None:
+            continue
+        first_covered = max(min_length, _pattern_min_length(other))
+        if _covers_at_length(other, pattern, first_covered):
+            if start is None or first_covered < start:
+                start, tail_shadow = first_covered, route
+    if start is None:
+        return []
+    shadowers = [tail_shadow]
+    for length in range(min_length, start):
+        for route, other in others:
+            if _covers_at_length(other, pattern, length):
+                shadowers.append(route)
+                break
+        else:
+            return []
+    return shadowers
+
+
+def find_unreachable_routes(routes):
+    """Return {route: [shadowing routes]} for routes that can never match.
+
+    `routes` is an iterable of route patterns; a manifest "routes" dict
+    works because iterating it yields the patterns. A route is reported
+    only when *every* path it could match is matched and won by another
+    route -- partial shadowing is normal and is not reported.
+    """
+    parsed = {}
+    for route in routes:
+        parsed[route] = _parse_route_pattern(route)
+    unreachable = {}
+    for route, pattern in parsed.items():
+        others = [(other, other_pattern) for other, other_pattern in parsed.items()
+                  if other != route]
+        shadowers = _shadowing_routes(pattern, others)
+        if shadowers:
+            unreachable[route] = sorted(shadowers)
+    return unreachable
 
 
 def _materialize(pattern, params):
