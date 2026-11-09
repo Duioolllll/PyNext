@@ -169,6 +169,30 @@ def test_limiter_rejects_invalid_new_key_and_bucket_bounds():
         RateLimiter(10, 60, exempt_paths=[123])
 
 
+def test_key_for_groups_ipv6_by_configured_prefix():
+    # Review #4 #3 follow-up (/48 residual risk): the grouping prefix is
+    # configurable. Default 64 keeps the old behaviour; 48 groups a
+    # whole /48 into one bucket, which stops a /48 holder minting a fresh
+    # bucket per /64 (at the cost of throttling every host in that /48
+    # together). IPv4 and IPv4-mapped addresses are unaffected.
+    default = RateLimiter(10, 60)
+    assert default.key_for("2001:db8:0:1::1") == "2001:db8:0:1::/64"
+    assert default.key_for("2001:db8:0:1::1") != default.key_for("2001:db8:0:2::1")
+    wide = RateLimiter(10, 60, ipv6_prefix_len=48)
+    assert wide.key_for("2001:db8:0:1::1") == "2001:db8::/48"
+    assert wide.key_for("2001:db8:0:1::1") == wide.key_for("2001:db8:0:2::1")
+    assert wide.key_for("2001:db8:1::1") == "2001:db8:1::/48"
+    assert wide.key_for("2001:db8:0:1::1") != wide.key_for("2001:db8:1::1")
+    assert wide.key_for("203.0.113.7") == "203.0.113.7"
+    assert wide.key_for("::ffff:203.0.113.7") == "203.0.113.7"
+    narrow = RateLimiter(10, 60, ipv6_prefix_len=128)
+    assert narrow.key_for("2001:db8:0:1::1") == "2001:db8:0:1::1/128"
+    assert narrow.key_for("2001:db8:0:1::1") != narrow.key_for("2001:db8:0:1::2")
+    for bad in (-1, 129, 64.5, True, "64"):
+        with pytest.raises(ValueError, match="ipv6_prefix_len must be an integer between 0 and 128"):
+            RateLimiter(10, 60, ipv6_prefix_len=bad)
+
+
 def test_key_for_groups_ipv6_by_64_prefix():
     limiter = RateLimiter(10, 60)
     assert limiter.key_for("2001:db8:0:1::1") == "2001:db8:0:1::/64"
@@ -423,6 +447,12 @@ def test_cli_rejects_invalid_rate_limit_flags(monkeypatch, capsys):
          "Invalid trusted proxy"),
         (["pynext", "start", "--rate-limit", "10", "--rate-limit-exempt-path", "healthz"],
          "must be an absolute path"),
+        (["pynext", "start", "--rate-limit", "10", "--rate-limit-ipv6-prefix-len", "-1"],
+         "--rate-limit-ipv6-prefix-len must be an integer >= 0"),
+        (["pynext", "start", "--rate-limit", "10", "--rate-limit-ipv6-prefix-len", "129"],
+         "--rate-limit-ipv6-prefix-len must be an integer <= 128"),
+        (["pynext", "start", "--rate-limit", "10", "--rate-limit-ipv6-prefix-len", "not-a-number"],
+         "--rate-limit-ipv6-prefix-len must be an integer >= 0"),
     ]:
         monkeypatch.setattr(sys, "argv", argv)
         monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: pytest.fail("unexpected startup"))
@@ -456,6 +486,7 @@ def test_cli_passes_rate_limit_to_app(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root),
                                       "--rate-limit", "100", "--rate-limit-window", "30",
                                       "--rate-limit-exempt-path", "/healthz",
+                                      "--rate-limit-ipv6-prefix-len", "48",
                                       "--trusted-proxy", "10.0.0.0/8"])
     cli.main()
     assert len(seen) == 2
@@ -465,6 +496,8 @@ def test_cli_passes_rate_limit_to_app(tmp_path, monkeypatch):
     assert limiter.limit == 100
     assert limiter.window_seconds == 30.0
     assert limiter.exempt_paths == ("/healthz",)
+    assert limiter.ipv6_prefix_len == 48
+    assert limiter.key_for("2001:db8:0:1::1") == limiter.key_for("2001:db8:0:2::1")
     assert len(limiter.trusted_proxies) == 1
     assert seen[1][0] == "serve"
     assert seen[1][-2] == 30  # B6 graceful-shutdown default

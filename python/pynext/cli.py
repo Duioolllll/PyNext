@@ -282,6 +282,12 @@ def main():
                                  help="requests allowed per client per --rate-limit-window (0 disables)")
             command.add_argument("--rate-limit-window", type=_positive_float, default=60.0,
                                  help="rate limit window in seconds")
+            command.add_argument("--rate-limit-ipv6-prefix-len",
+                                 type=_bounded(0, 128, "--rate-limit-ipv6-prefix-len"), default=64,
+                                 help="IPv6 prefix length sharing one rate-limit bucket (default 64;"
+                                      " 48 groups a whole /48 into one bucket, which stops a /48"
+                                      " holder minting fresh buckets, but also throttles every host"
+                                      " sharing that prefix together)")
             command.add_argument("--rate-limit-backend", choices=("memory", "redis"), default="memory",
                                  help="per-process memory (default) or Redis via PYNEXT_REDIS_URL")
             command.add_argument("--rate-limit-failure-policy", choices=("fail_open", "fail_closed"),
@@ -362,7 +368,8 @@ def main():
                    if args.rate_limit_backend == "redis" else {})
         limiter = (limiter_type(args.rate_limit, args.rate_limit_window,
                                 trusted_proxies=args.trusted_proxy,
-                                exempt_paths=tuple(args.rate_limit_exempt_path), **options)
+                                exempt_paths=tuple(args.rate_limit_exempt_path),
+                                ipv6_prefix_len=args.rate_limit_ipv6_prefix_len, **options)
                    if args.rate_limit >= 1 else None)
         security = (SecurityConfig(csrf_enabled=args.csrf,
                                    csrf_cookie_secure=(args.csrf_cookie_secure
@@ -405,6 +412,7 @@ def main():
                               rate_limit_window=args.rate_limit_window,
                               rate_limit_backend=args.rate_limit_backend,
                               rate_limit_exempt_paths=tuple(args.rate_limit_exempt_path),
+                              rate_limit_ipv6_prefix_len=args.rate_limit_ipv6_prefix_len,
                               rate_limit_failure_policy=args.rate_limit_failure_policy,
                               trusted_proxies=tuple(args.trusted_proxy),
                               cache_backend=args.cache_backend, cache_path=args.cache_path,

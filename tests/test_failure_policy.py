@@ -265,6 +265,7 @@ def test_cli_passes_failure_policies(tmp_path, monkeypatch):
     cli.main()
     assert seen["limiter"] == (10, 60.0, {"trusted_proxies": [],
                                            "exempt_paths": (),
+                                           "ipv6_prefix_len": 64,
                                            "namespace": "default",
                                            "failure_policy": "fail_open"})
     assert seen["app"][2]["cache_failure_policy"] == "fail_closed"

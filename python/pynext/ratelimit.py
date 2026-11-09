@@ -17,6 +17,22 @@ address) shares a bucket. A single host rotating addresses inside its
 /64 cannot mint fresh buckets, and a /64 with many hosts shares the
 limit the way one IPv4 address behind NAT does.
 
+That grouping is a tradeoff, not a cure (external audit, review #4
+follow-up). An attacker holding a whole /48 can mint 65,536 distinct
+/64s, enough to fill the 10,000-bucket table and the 10,000-per-window
+new-key window. Filling the table only evicts buckets now — an evicted
+owner gets a fresh full bucket on its next request and is never denied
+— but filling the new-key window still denies genuinely brand-new keys
+until the window slides. ``ipv6_prefix_len`` lets an operator group
+more broadly (48 groups a whole /48 into one bucket, which collapses
+that attack) at the cost of collateral blocking: every host sharing
+the prefix shares one bucket, so a busy /48 (a carrier, a campus)
+throttles its innocent users together. The default stays 64: changing
+it is an operator decision for the network being served, not a safe
+global default. Lowering ``max_new_keys_per_window`` instead only
+slows the attacker down while also admitting fewer legitimate new
+users per window, so it does not fix the exhaustion either.
+
 Bucket table pressure never blocks an existing key. The table is a
 bounded leaderboard of the most recently active keys (at most
 ``_MAX_BUCKETS``): when it is full, a new key evicts the stalest bucket
@@ -79,18 +95,19 @@ def _parse_exempt_paths(exempt_paths):
     return tuple(prefixes)
 
 
-def _bucket_key(address):
+def _bucket_key(address, prefix_len=_IPV6_PREFIX_LEN):
     """Collapse an address to its rate-limit bucket key.
 
-    IPv6 addresses share the bucket of their /64 prefix; IPv4-mapped
-    IPv6 addresses use their IPv4 address; IPv4 addresses are unchanged.
+    IPv6 addresses share the bucket of their ``prefix_len`` prefix;
+    IPv4-mapped IPv6 addresses use their IPv4 address; IPv4 addresses
+    are unchanged.
     """
     if isinstance(address, ipaddress.IPv6Address):
         mapped = address.ipv4_mapped
         if mapped is not None:
             return str(mapped)
-        network = ipaddress.IPv6Network(f"{address}/{_IPV6_PREFIX_LEN}", strict=False)
-        return f"{network.network_address}/{_IPV6_PREFIX_LEN}"
+        network = ipaddress.IPv6Network(f"{address}/{prefix_len}", strict=False)
+        return f"{network.network_address}/{prefix_len}"
     return str(address)
 
 
@@ -103,12 +120,16 @@ class RateLimiter:
     """
 
     def __init__(self, limit, window_seconds, *, trusted_proxies=(), exempt_paths=(),
-                 max_buckets=None, max_new_keys_per_window=None):
+                 max_buckets=None, max_new_keys_per_window=None, ipv6_prefix_len=_IPV6_PREFIX_LEN):
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("rate limit must be an integer >= 1")
         if isinstance(window_seconds, bool) or not isinstance(window_seconds, (int, float)) \
                 or not math.isfinite(window_seconds) or window_seconds <= 0:
             raise ValueError("rate limit window must be a number > 0 seconds")
+        if (isinstance(ipv6_prefix_len, bool) or not isinstance(ipv6_prefix_len, int)
+                or not 0 <= ipv6_prefix_len <= 128):
+            raise ValueError("ipv6_prefix_len must be an integer between 0 and 128")
+        self.ipv6_prefix_len = ipv6_prefix_len
         if max_buckets is not None:
             if isinstance(max_buckets, bool) or not isinstance(max_buckets, int) or max_buckets < 1:
                 raise ValueError("max_buckets must be an integer >= 1")
@@ -161,13 +182,14 @@ class RateLimiter:
         the nearest untrusted address walking the forwarded chain from the
         direct peer, or the peer itself when nothing is trusted. A request
         with no known peer address shares the ``"unknown"`` bucket. IPv6
-        addresses are grouped by /64 prefix (see :func:`_bucket_key`).
+        addresses are grouped by the ``ipv6_prefix_len`` prefix (/64 by
+        default; see :func:`_bucket_key`).
         """
         resolved = self._trust.resolve_client_ip(client_ip, headers)
         if resolved is None:
             return "unknown"
         try:
-            return _bucket_key(ipaddress.ip_address(resolved))
+            return _bucket_key(ipaddress.ip_address(resolved), self.ipv6_prefix_len)
         except ValueError:
             return resolved
 

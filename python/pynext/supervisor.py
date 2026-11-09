@@ -82,6 +82,7 @@ class WorkerConfig:
     rate_limit_window: float = 60.0
     rate_limit_backend: str = "memory"
     rate_limit_exempt_paths: tuple = ()
+    rate_limit_ipv6_prefix_len: int = 64  # IPv6 bucket grouping (see ratelimit.py)
     trusted_proxies: tuple = ()
     # Shared-cache / observability settings, forwarded to each worker's
     # create_app so multi-worker mode honours them (finding #42/#45).
@@ -122,7 +123,8 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                    if config.rate_limit_backend == "redis" else {})
         limiter = limiter_type(config.rate_limit, config.rate_limit_window,
                                trusted_proxies=config.trusted_proxies,
-                               exempt_paths=config.rate_limit_exempt_paths, **options)
+                               exempt_paths=config.rate_limit_exempt_paths,
+                               ipv6_prefix_len=config.rate_limit_ipv6_prefix_len, **options)
     app = create_app(config.root, production=config.production, rate_limit=limiter,
                      cache_backend=config.cache_backend, cache_path=config.cache_path,
                      cache_failure_policy=config.cache_failure_policy,

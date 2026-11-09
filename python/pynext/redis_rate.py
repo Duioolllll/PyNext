@@ -5,7 +5,7 @@ import math
 import os
 
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
-from .ratelimit import RateLimiter, RateLimitUnavailable, _MAX_BUCKETS
+from .ratelimit import RateLimiter, RateLimitUnavailable, _IPV6_PREFIX_LEN, _MAX_BUCKETS
 
 log = logging.getLogger("pynext")
 
@@ -98,10 +98,11 @@ class RedisRateLimiter(RateLimiter):
 
     def __init__(self, limit, window_seconds, *, url=None, namespace="default", trusted_proxies=(),
                  exempt_paths=(), max_buckets=None, max_new_keys_per_window=None,
-                 failure_policy=None):
+                 ipv6_prefix_len=_IPV6_PREFIX_LEN, failure_policy=None):
         super().__init__(limit, window_seconds, trusted_proxies=trusted_proxies,
                          exempt_paths=exempt_paths, max_buckets=max_buckets,
-                         max_new_keys_per_window=max_new_keys_per_window)
+                         max_new_keys_per_window=max_new_keys_per_window,
+                         ipv6_prefix_len=ipv6_prefix_len)
         self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_CLOSED)
         if limit > 1_000_000 or not 0.001 <= self.window_seconds <= 31_536_000:
             raise ValueError("Redis rate limits require at most 1000000 tokens and a window from 0.001 to 31536000 seconds")
