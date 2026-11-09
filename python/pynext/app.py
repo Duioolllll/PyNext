@@ -24,7 +24,7 @@ from .admission import DecisionGate
 from .assets import read_public_artifacts, read_public_sources
 from .auth import check_authorization
 from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
-from .client import compile_client, read_client_artifacts
+from .client import PREFIX, compile_client, read_client_artifacts
 from .components import _isr_policy, _isr_query_keys, _node, bind_islands
 from .build import discover, load_manifest
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, Response, SecurityConfig,
@@ -239,6 +239,85 @@ class _ISRStreamFeed:
                 yield value
         finally:
             self.detach()
+
+
+class _PreludeReplay:
+    """Replay the one item :func:`process_prelude` peeked, then the source.
+
+    The caller still sees the whole stream: the buffered first item comes
+    out first, and every later item is pulled from the source iterator on
+    demand. ``aclose`` closes the source, so a response that is never
+    consumed (HEAD, early disconnect) still releases the page generator.
+    """
+
+    def __init__(self, iterator, first):
+        self._iterator = iterator
+        self._first = first
+        self._pending = True
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._pending:
+            self._pending = False
+            return self._first
+        return await anext(self._iterator)
+
+    async def aclose(self):
+        close = getattr(self._iterator, "aclose", None)
+        if close is not None:
+            await close()
+
+
+class _EmptyPrelude:
+    """An async iterable that ends immediately (the source was empty)."""
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+    async def aclose(self):
+        return None
+
+
+async def process_prelude(chunks):
+    """Peek at the first item of ``chunks`` without consuming the stream.
+
+    Mirrors Next.js ``processPrelude`` (``packages/next/src/server/
+    app-render/app-render-prerender-utils.ts``): pull one item to learn
+    whether the stream is empty, then hand back an async iterable that
+    replays the buffered item first, so the caller still sees the whole
+    stream. Only one item is ever buffered.
+
+    Returns ``(prelude, is_empty)``: ``prelude`` is the replaying async
+    iterable and ``is_empty`` is True when the source produced no items
+    at all. An exception raised while pulling the first item propagates
+    to the caller — the inspection happens before headers are sent, so
+    the failure still surfaces as a 500 instead of a truncated 200.
+    """
+    iterator = aiter(chunks)
+    try:
+        first = await anext(iterator)
+    except StopAsyncIteration:
+        return _EmptyPrelude(), True
+    return _PreludeReplay(iterator, first), False
+
+
+# The client runtime <script> tag that bind_islands() appends to every
+# rendered document. It is framework boilerplate, not page content, so
+# emptiness checks ignore it: without this, a page that yields nothing
+# inside an empty shell would still "have content" (the script tag alone)
+# and the empty-document guard could never fire.
+_CLIENT_RUNTIME_SCRIPT = re.compile(
+    r'<script type="module" src="' + re.escape(PREFIX) + r'[^"]*\.js"[^>]*></script>')
+
+
+def _strip_client_runtime(html):
+    """Remove client runtime boilerplate so emptiness checks see content."""
+    return _CLIENT_RUNTIME_SCRIPT.sub("", html)
 
 
 class _ISRStreamingResponse(StreamingResponse):
@@ -795,8 +874,13 @@ class App:
         The prefix is sent first, each page chunk is serialized and sent as
         it arrives, and the suffix closes the document. Layouts must render
         their children exactly once; anything else fails before headers are
-        sent. SSG consumes the stream during the build. ISR streams its first
-        generation while retaining a bounded copy for the cache.
+        sent. Before the response is built, the page stream is inspected
+        with :func:`process_prelude`: a page that yields nothing inside an
+        empty shell would otherwise go out as a document holding only the
+        client runtime script tag, so that case fails here instead, while
+        headers can still become a 500. SSG consumes the stream during the
+        build. ISR streams its first generation while retaining a bounded
+        copy for the cache.
         """
         marker = "__pynext_stream_" + uuid.uuid4().hex + "__"
         shell = {"kind": "text", "value": marker}
@@ -819,18 +903,33 @@ class App:
         if shell.get("tag", "").lower() == "html":
             prefix = "<!DOCTYPE html>" + prefix
 
+        # processPrelude-style inspection: look at the first page chunk
+        # without consuming the stream. A page that yields nothing inside
+        # an empty shell would otherwise go out as a document holding only
+        # the client runtime script tag; fail here, before headers are
+        # sent, instead. The runtime tag is boilerplate, not content, so
+        # it is stripped before the emptiness test. A non-empty shell is
+        # still a legitimate (if content-free) page.
+        prelude, prelude_is_empty = await process_prelude(chunks)
+        if (prelude_is_empty and not _strip_client_runtime(prefix)
+                and not _strip_client_runtime(suffix)):
+            raise ValueError(
+                f"Streaming page {pattern} rendered an empty document: "
+                "the page produced no content and the layout shell is empty"
+            )
+
         async def page_stream():
             try:
                 if prefix:
                     yield prefix
-                async for node in chunks:
+                async for node in prelude:
                     html = await self._render_stream_chunk(node)
                     if html:
                         yield html
                 if suffix:
                     yield suffix
             finally:
-                close = getattr(chunks, "aclose", None)
+                close = getattr(prelude, "aclose", None)
                 if close is not None:
                     await close()
 

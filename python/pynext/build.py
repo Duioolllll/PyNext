@@ -1,6 +1,7 @@
 """Discover and validate the build inputs, then write a versioned manifest."""
 import hashlib
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -235,7 +236,7 @@ def _materialize(pattern, params):
 
 
 async def _render_static_pages(app):
-    from .app import _invoke
+    from .app import _invoke, _strip_client_runtime
     from .http import StreamingResponse
     rendered = {}
     for pattern, generator in app.static_generators.items():
@@ -253,7 +254,23 @@ async def _render_static_pages(app):
             match = app.router.matches(path)
             if match is None or match[0] != pattern:
                 raise ValueError(f"Generated path {path} is not reachable through {pattern}")
-            response = await app.render_page(pattern, None, params)
+            # The prelude inspection in _streaming_page_response pulls the
+            # first chunk inside render_page, so for streaming pages the
+            # build time limit must cover the render call too — otherwise a
+            # page that never yields would stall the build past the limit
+            # instead of failing it. Non-streaming pages keep their
+            # previous (unbounded) render.
+            fn, _layouts = app.entries[pattern]
+            if inspect.isasyncgenfunction(fn):
+                try:
+                    async with asyncio.timeout(MAX_STREAMED_STATIC_SECONDS):
+                        response = await app.render_page(pattern, None, params)
+                except asyncio.TimeoutError as exc:
+                    raise ValueError(
+                        f"Streamed static page for {path} exceeded the build time limit "
+                        f"({MAX_STREAMED_STATIC_SECONDS}s)") from exc
+            else:
+                response = await app.render_page(pattern, None, params)
             if isinstance(response, StreamingResponse):
                 body = bytearray()
                 try:
@@ -268,10 +285,22 @@ async def _render_static_pages(app):
                         f"({MAX_STREAMED_STATIC_SECONDS}s)") from exc
                 finally:
                     await response.aclose()
+                # Byte-level backstop for the prelude inspection in
+                # _streaming_page_response: a page that yields nodes which
+                # serialize to nothing (or a buffered page below that
+                # renders to nothing) would otherwise be written out as a
+                # file holding only the client runtime script tag. The tag
+                # is boilerplate, not content, so it is stripped before the
+                # emptiness test. Fail the build instead of shipping it.
+                body_text = bytes(body).decode("utf-8", "replace")
+                if not _strip_client_runtime(body_text):
+                    raise ValueError(f"Static page {path} rendered an empty document")
                 rendered[path] = (pattern, bytes(body))
             else:
                 if len(response.body) > MAX_STATIC_PAGE_BYTES:
                     raise ValueError("Static page exceeds build size limit")
+                if not _strip_client_runtime(response.body.decode("utf-8", "replace")):
+                    raise ValueError(f"Static page {path} rendered an empty document")
                 rendered[path] = (pattern, response.body)
     return rendered
 
