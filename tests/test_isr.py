@@ -90,25 +90,26 @@ def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
                 assert (await client.get("/blog/alpha")).text == page_html(f"<p>alpha:{previous_calls + 1}</p>")
                 await until(lambda: "/blog/alpha" not in app.isr._inflight)
 
-                # C-2 (retainPreviousCacheEntry): a failed regeneration
-                # keeps serving the retained previous page even after
-                # the stale window expires, instead of a 500. The
-                # retained value is the last rendered page, not the
-                # directly seeded "<p>old</p>" body (which was never
-                # retained); the exact generation varies with
-                # background regenerations, so only the prefix is
-                # asserted.
+                # Failure retains the old response past its stale window:
+                # the next retry breathes instead of hammering a failing origin.
                 assert app.isr.store.insert("/blog/alpha", b"<p>old</p>", 0.02, 1)
                 await until(lambda: app.isr.store.lookup("/blog/alpha")[0] == "stale")
                 module.started, module.gate, module.fail = asyncio.Event(), None, True
                 assert (await client.get("/blog/alpha")).text == "<p>old</p>"
                 await asyncio.wait_for(module.started.wait(), 3)
                 await until(lambda: "/blog/alpha" not in app.isr._inflight)
-                assert app.isr.store.lookup("/blog/alpha")[0] == "stale"
-                await until(lambda: app.isr.store.lookup("/blog/alpha")[0] == "expired")
+                # The original stale window (1s) is long past, yet the
+                # retained entry still serves and no retry has started.
+                await asyncio.sleep(1.5)
+                assert app.isr.store.lookup("/blog/alpha")[0] == "fresh"
+                assert (await client.get("/blog/alpha")).text == "<p>old</p>"
+                assert module.calls == previous_calls + 2
+                # C-2 also serves the retained copy after the extended
+                # cache entry itself expires.
+                await until(lambda: app.isr.store.lookup("/blog/alpha")[0] == "expired", timeout=8)
                 final = await client.get("/blog/alpha")
                 assert final.status_code == 200
-                assert final.text.startswith("<p>alpha:")
+                assert final.text == "<p>old</p>"
 
                 # One cancelled caller cannot cancel a shared generation.
                 module.fail = False
@@ -223,7 +224,7 @@ def test_isr_shared_render_does_not_inherit_request_context(tmp_path):
             assert app.isr.store.lookup("/")[0] == "miss"
             public = await client.get("/")
             assert public.text == page_html("<p>public</p>")
-            assert public.headers["cache-control"] == "public, max-age=0, must-revalidate"
+            assert public.headers["cache-control"] == "public, s-maxage=30, stale-while-revalidate=60"
             assert public.headers["vary"] == "Cookie, Authorization"
             assert app.isr.store.lookup("/")[1] == page_html("<p>public</p>").encode()
         await app.isr.close()

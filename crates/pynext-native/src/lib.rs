@@ -478,6 +478,11 @@ struct ServerState {
     client_assets: HashMap<String, Bytes>,
     asset_etags: HashMap<String, HeaderValue>,
     isr_cache: Arc<PageCache>,
+    /// Per-route ISR `Cache-Control` values (`pattern -> header`), computed
+    /// in Python from each ISR policy. The native server matches a fresh
+    /// L1 hit against the route trie and serves the policy header; routes
+    /// without a policy fall back to `public, max-age=0, must-revalidate`.
+    isr_cache_control: HashMap<String, HeaderValue>,
     middleware_enabled: bool,
     shared_cache_enabled: bool,
     /// A1 security headers configured in Python (`SecurityConfig`), applied
@@ -2537,6 +2542,17 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     } else {
                         capped_body(content, Some(fast_permit))
                     };
+                    // Serve the route's policy-based SWR header (Next.js
+                    // `getCacheControlHeader`); routes without an ISR
+                    // policy keep the previous no-cache default.
+                    let cache_control = state
+                        .websocket_router
+                        .matches(&path)
+                        .and_then(|(pattern, _)| state.isr_cache_control.get(&pattern))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            HeaderValue::from_static("public, max-age=0, must-revalidate")
+                        });
                     return apply_path_headers(
                         apply_build_headers(
                             apply_security_headers(
@@ -2544,7 +2560,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                                     .status(StatusCode::OK)
                                     .header("content-type", "text/html; charset=utf-8")
                                     .header("content-length", length.to_string())
-                                    .header("cache-control", "public, max-age=0, must-revalidate")
+                                    .header(header::CACHE_CONTROL, cache_control)
                                     .header("vary", "Cookie, Authorization"),
                                 &state.security_headers,
                             ),
@@ -3328,7 +3344,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, build_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, max_concurrent_per_ip=16, acquire_timeout_max_ms=None, fast_path_max_concurrent=None, streaming_max_lifetime_secs=300, body_capacity_per_ip=4, ws_idle_timeout_secs=300, ws_max_lifetime_secs=3600, ws_ping_interval_secs=60, trusted_proxies=None, allowed_hosts=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, build_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, max_concurrent_per_ip=16, acquire_timeout_max_ms=None, fast_path_max_concurrent=None, streaming_max_lifetime_secs=300, body_capacity_per_ip=4, ws_idle_timeout_secs=300, ws_max_lifetime_secs=3600, ws_ping_interval_secs=60, trusted_proxies=None, allowed_hosts=None, isr_cache_control=None))]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn new(
@@ -3377,6 +3393,7 @@ impl NativeServer {
         ws_ping_interval_secs: u64,
         trusted_proxies: Option<Vec<String>>,
         allowed_hosts: Option<Vec<String>>,
+        isr_cache_control: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -3512,6 +3529,15 @@ impl NativeServer {
             _ => default_host_patterns(),
         };
         let isr_cache = isr_cache.inner.clone();
+        let isr_cache_control = isr_cache_control
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(pattern, value)| {
+                let value = HeaderValue::from_str(&value)
+                    .map_err(|_| PyValueError::new_err("Invalid ISR cache-control header"))?;
+                Ok((pattern, value))
+            })
+            .collect::<PyResult<HashMap<_, _>>>()?;
         let public_assets = public_assets
             .into_iter()
             .map(|(path, (body, content_type))| {
@@ -3618,6 +3644,7 @@ impl NativeServer {
                         .collect(),
                     asset_etags,
                     isr_cache,
+                    isr_cache_control,
                     middleware_enabled,
                     shared_cache_enabled,
                     security_headers: security_headers.unwrap_or_default(),
