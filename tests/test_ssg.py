@@ -133,6 +133,20 @@ def test_ssg_artifacts_integrity_and_failed_build_is_atomic(tmp_path):
         create_app(tmp_path, production=True)
 
 
+def test_non_streaming_static_page_size_cap(tmp_path, monkeypatch):
+    from pynext import build as build_module
+
+    app_dir = make_app(tmp_path)
+    (app_dir / "page.py").write_text(
+        'from pynext import page, h\n@page(render="ssg")\n'
+        'def Page(): return h("p", {}, "x" * 200)\n', encoding="utf-8")
+    # The real cap is 8 MiB; shrink it for the test — the check itself
+    # is the same. A 200-char page is over a 100-byte cap.
+    monkeypatch.setattr(build_module, "MAX_STATIC_PAGE_BYTES", 100)
+    with pytest.raises(ValueError, match="exceeds build size limit"):
+        write_manifest(tmp_path)
+
+
 def test_streamed_ssg_timeout_fails_with_a_clear_build_error(tmp_path, monkeypatch):
     from pynext import build as build_module
 

@@ -14,7 +14,11 @@ from .client import discover_client
 MANIFEST = ".pynext/manifest.json"
 VERSION = 9
 MAX_STATIC_PAGES = 10_000
-MAX_STREAMED_STATIC_BYTES = 8 * 1024 * 1024
+# One cap for every static page rendered at build time, streaming or
+# not: a non-streaming page used to have no size limit at all while a
+# streaming page was capped at 8 MiB.
+MAX_STATIC_PAGE_BYTES = 8 * 1024 * 1024
+MAX_STREAMED_STATIC_BYTES = MAX_STATIC_PAGE_BYTES
 MAX_STREAMED_STATIC_SECONDS = 30
 
 
@@ -253,6 +257,8 @@ async def _render_static_pages(app):
                     await response.aclose()
                 rendered[path] = (pattern, bytes(body))
             else:
+                if len(response.body) > MAX_STATIC_PAGE_BYTES:
+                    raise ValueError("Static page exceeds build size limit")
                 rendered[path] = (pattern, response.body)
     return rendered
 
