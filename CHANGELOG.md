@@ -4,6 +4,8 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+- Allow wildcard patterns in `websocket_allowed_origins` with Next.js Server Actions `allowedOrigins` semantics: `*` matches exactly one DNS label (`https://*.example.com`), `**` — only as the leftmost label — matches one or more leading labels (`https://**.example.com`), scheme and effective port must still match exactly, and patterns matching whole domains such as `https://*.com` are rejected at startup. The default (same-origin only) and the strict CSRF Origin check are unchanged.
+
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.
