@@ -35,6 +35,28 @@ from pynext.http import (
 
 ROOT = Path(__file__).resolve().parents[1]
 
+
+@pytest.fixture(autouse=True)
+def _restore_csrf_signing_key_env():
+    """Snapshot PYNEXT_CSRF_SIGNING_KEY around every test in this file.
+
+    ``ensure_shared_csrf_signing_key`` publishes the shared key back
+    into ``os.environ`` by design, and ``monkeypatch.delenv`` records
+    nothing to undo when the variable was already absent — so a test
+    that generates a key would otherwise leave a ``hex:`` value behind
+    for the rest of the pytest process. A stale env key makes
+    in-process default configs disagree with the import-time
+    ``DEFAULT_SECURITY`` and breaks unrelated CSRF tests, so restore
+    the pre-test value here no matter what the test (or monkeypatch)
+    did to it.
+    """
+    old = os.environ.get("PYNEXT_CSRF_SIGNING_KEY")
+    yield
+    if old is None:
+        os.environ.pop("PYNEXT_CSRF_SIGNING_KEY", None)
+    else:
+        os.environ["PYNEXT_CSRF_SIGNING_KEY"] = old
+
 # --- Key parsing: valid forms -------------------------------------------
 
 
