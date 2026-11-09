@@ -12,6 +12,7 @@ import time
 from collections.abc import MutableMapping
 from pathlib import Path
 
+from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
 from .http import Response, StreamingResponse, _add_vary, _header_values
 
 log = logging.getLogger("pynext")
@@ -21,8 +22,36 @@ _COOKIE_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _MAX_SESSION_BYTES = 16_384
 
 
+def _check_json_serializable(key, value):
+    """Raise a key-named error if ``value`` cannot be stored as JSON.
+
+    Session data is persisted with ``json.dumps(..., allow_nan=False)``,
+    so a non-serializable value used to surface only after the handler
+    had run — as a bare ``TypeError`` from the middleware save, i.e. a
+    500 with no pointer at the offending assignment. Validating here,
+    at assignment time, fails fast with the key in the message.
+    """
+    try:
+        json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise type(exc)(
+            f"session value for key {key!r} is not JSON-serializable: {exc}"
+        ) from exc
+
+
 class SessionConflict(Exception):
     """The session was changed or revoked while this request was running."""
+
+
+class SessionUnavailable(Exception):
+    """The session store could not be reached (Redis outage, fail_closed).
+
+    Raised by :class:`RedisSessionStore` under the default
+    ``"fail_closed"`` failure policy instead of leaking the raw Redis
+    client error, so callers can distinguish "the store is down" from a
+    fencing conflict (:class:`SessionConflict`) or corrupt data
+    (``ValueError``). The session middleware answers 503 for it.
+    """
 
 
 def _key(token):
@@ -57,6 +86,8 @@ class SQLiteSessionStore:
         return await asyncio.to_thread(read)
 
     async def save(self, token, data, csrf, version, expires, *, previous_token=None):
+        for key, value in data.items():
+            _check_json_serializable(key, value)
         payload = json.dumps({"data": data, "csrf": csrf}, ensure_ascii=False,
                              separators=(",", ":"), allow_nan=False)
         if len(payload.encode("utf-8")) > _MAX_SESSION_BYTES:
@@ -142,12 +173,26 @@ class RedisSessionStore:
     store. Pass a ``client`` (a ``redis.Redis`` or compatible object) to
     share a connection or to inject a fake in tests; otherwise a client is
     built from ``url`` or the ``PYNEXT_REDIS_URL`` environment variable.
+
+    ``failure_policy`` decides what happens when Redis is unreachable:
+    the default ``"fail_closed"`` raises :class:`SessionUnavailable`
+    (the middleware answers 503) instead of silently losing session
+    state, while ``"fail_open"`` starts a fresh ephemeral session —
+    the request proceeds, but nothing is read or persisted. Reads keep
+    working, but a login cannot complete during the outage: the CSRF
+    token issued for it is never stored, so the login request fails
+    CSRF (403). A rotation during the outage may also leave the old
+    session id usable until it expires. Fencing conflicts
+    (:class:`SessionConflict`) and corrupt data (``ValueError``) are
+    not outages and are never absorbed by either policy.
     """
 
-    def __init__(self, url=None, *, client=None, key_prefix="pynext:session"):
+    def __init__(self, url=None, *, client=None, key_prefix="pynext:session",
+                 failure_policy=None):
         if not isinstance(key_prefix, str) or not key_prefix or len(key_prefix.encode("utf-8")) > 256:
             raise ValueError("session key prefix must be a nonempty string up to 256 bytes")
         self.key_prefix = key_prefix
+        self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_CLOSED)
         self._owns_client = client is None
         if client is not None:
             if not all(callable(getattr(client, name, None))
@@ -168,6 +213,20 @@ class RedisSessionStore:
     def _redis_key(self, token):
         return f"{self.key_prefix}:{_key(token)}"
 
+    def _handle_redis_error(self, operation, exc):
+        """Apply the failure policy to a Redis transport error.
+
+        Returns ``True`` when ``fail_open`` absorbs the error (the
+        caller then degrades: load reports a miss, save reports the
+        version that would have been stored, delete is a no-op).
+        Raises :class:`SessionUnavailable` under ``fail_closed``.
+        """
+        if self.failure_policy == FAIL_OPEN:
+            log.warning("Redis session %s failed; continuing without stored state (fail_open)",
+                        operation, exc_info=True)
+            return True
+        raise SessionUnavailable(f"Redis session {operation} failed: {exc}") from exc
+
     def close(self):
         """Close the Redis client this store created (a no-op for injected clients)."""
         if self._owns_client:
@@ -180,19 +239,38 @@ class RedisSessionStore:
                 return None
             payload = _decode_session(raw)
             return payload["data"], payload.get("csrf"), payload["version"]
-        return await asyncio.to_thread(read)
+        try:
+            return await asyncio.to_thread(read)
+        except ValueError:
+            # Corrupt stored data is not an outage; never absorb it.
+            raise
+        except Exception as exc:
+            self._handle_redis_error("load", exc)
+            return None
 
     async def save(self, token, data, csrf, version, expires, *, previous_token=None):
+        for key, value in data.items():
+            _check_json_serializable(key, value)
         payload = json.dumps({"data": data, "csrf": csrf}, ensure_ascii=False,
                              separators=(",", ":"), allow_nan=False)
         if len(payload.encode("utf-8")) > _MAX_SESSION_BYTES:
             raise ValueError("session data exceeds 16384 bytes")
         ttl_ms = max(0, int((expires - time.time()) * 1000))
-        if previous_token is not None:
-            return await asyncio.to_thread(self._rotate, previous_token, token, data, csrf, version, ttl_ms)
-        if version is None:
-            return await asyncio.to_thread(self._insert, token, data, csrf, ttl_ms)
-        return await asyncio.to_thread(self._update, token, data, csrf, version, ttl_ms)
+        try:
+            if previous_token is not None:
+                return await asyncio.to_thread(self._rotate, previous_token, token, data, csrf, version, ttl_ms)
+            if version is None:
+                return await asyncio.to_thread(self._insert, token, data, csrf, ttl_ms)
+            return await asyncio.to_thread(self._update, token, data, csrf, version, ttl_ms)
+        except (SessionConflict, ValueError):
+            # Fencing and corrupt-data errors are not outages.
+            raise
+        except Exception as exc:
+            self._handle_redis_error("save", exc)
+            # fail_open: the session is ephemeral — nothing was stored —
+            # but report the version that would have been stored so the
+            # request proceeds exactly as if the save had succeeded.
+            return 1 if version is None or previous_token is not None else version + 1
 
     def _insert(self, token, data, csrf, ttl_ms):
         if ttl_ms <= 0:
@@ -256,7 +334,11 @@ class RedisSessionStore:
             pipe.reset()
 
     async def delete(self, token):
-        await asyncio.to_thread(self.client.delete, self._redis_key(token))
+        try:
+            await asyncio.to_thread(self.client.delete, self._redis_key(token))
+        except Exception as exc:
+            # fail_open: logout is best-effort; fail_closed raises.
+            self._handle_redis_error("delete", exc)
 
     async def purge_expired(self):
         """No-op: Redis expires session keys with their TTL automatically."""
@@ -264,10 +346,23 @@ class RedisSessionStore:
 
 
 class Session(MutableMapping):
-    """Per-request session data. Call rotate() on login and invalidate() on logout."""
+    """Per-request session data.
+
+    Security rule: rotate the session id on login. Call
+    :meth:`rotate_on_login` (or :meth:`rotate`) immediately after
+    verifying credentials — on every login, including re-login after a
+    privilege change — so a session id issued before authentication
+    (which an attacker may have fixed) cannot become an authenticated
+    session. The rotation preserves the session data and issues a fresh
+    CSRF token; the old id stops working as soon as the response is
+    sent. Call :meth:`invalidate` on logout to delete the server-side
+    session and clear the cookie.
+    """
 
     def __init__(self, data=None, csrf=None, token=None, version=None):
         self._data = data if data is not None else {}
+        for key, value in self._data.items():
+            _check_json_serializable(key, value)
         self._csrf = csrf
         self._token = token
         self._version = version
@@ -281,6 +376,10 @@ class Session(MutableMapping):
     def __setitem__(self, key, value):
         if self._invalidated:
             raise RuntimeError("session has been invalidated")
+        # Fail here, at assignment time, with the key named — not after
+        # the handler returns, when the middleware save would raise a
+        # bare TypeError and the request would answer 500.
+        _check_json_serializable(key, value)
         self._data[key] = value
 
     def __delitem__(self, key):
@@ -300,10 +399,36 @@ class Session(MutableMapping):
         return self._csrf
 
     def rotate(self):
+        """Mark this session for id rotation when the response is sent.
+
+        The middleware then issues a fresh opaque token, moves the
+        stored data to it (version 1), and deletes the old server-side
+        entry, so the pre-rotation id stops working. Rotation also
+        issues a fresh CSRF token. The session data itself is preserved.
+        Call this (or :meth:`rotate_on_login`) after successful
+        authentication — never skip it on login, or the session is
+        vulnerable to fixation: an id fixed by an attacker before login
+        would stay valid after it.
+        """
         if self._invalidated:
             raise RuntimeError("session has been invalidated")
         self._rotate = True
         self._csrf = secrets.token_urlsafe(32)
+
+    def rotate_on_login(self):
+        """Rotate the session id at login (see :meth:`rotate`).
+
+        This is the login hook: call it immediately after verifying
+        credentials, once the authenticated identity is stored (for
+        example ``session["user_id"] = user.id``), and before returning
+        the login response. It is equivalent to :meth:`rotate` but names
+        the call site, so a login handler that forgets it stands out in
+        review. Rotation preserves the session data and issues a fresh
+        CSRF token; the old id is deleted server-side when the response
+        is sent. Also call it again whenever privilege changes
+        (for example after a password change or privilege escalation).
+        """
+        self.rotate()
 
     def invalidate(self):
         self._data.clear()
@@ -311,11 +436,28 @@ class Session(MutableMapping):
         self._invalidated = True
 
     def _changed(self):
-        return self._rotate or json.dumps({"data": self._data, "csrf": self._csrf}, sort_keys=True) != self._initial
+        try:
+            return self._rotate or json.dumps({"data": self._data, "csrf": self._csrf}, sort_keys=True) != self._initial
+        except (TypeError, ValueError):
+            # A value mutated in place after assignment (for example
+            # ``session["tags"].append(obj)``) bypasses __setitem__
+            # validation; name the offending key instead of failing
+            # with a bare error from the middleware save.
+            for key, value in self._data.items():
+                _check_json_serializable(key, value)
+            raise
 
 
 class SessionMiddleware:
     """Attach ``request.state['session']`` and persist changes before sending headers.
+
+    The session cookie is ``HttpOnly`` and ``Secure`` by default with
+    ``SameSite=Lax``. A request that presents the cookie name more than
+    once (duplicate ``Cookie`` headers or a duplicated name in one
+    header) is treated as having no session at all — fail-closed, so an
+    attacker cannot smuggle a chosen session id past the single-value
+    check by sending two values. Login handlers must rotate the session
+    id after authentication; see :meth:`Session.rotate_on_login`.
 
     When ``purge_interval`` is set (seconds, default 3600), the middleware
     runs the store's ``purge_expired`` in a background task while requests
@@ -400,14 +542,25 @@ class SessionMiddleware:
     async def __call__(self, request, call_next):
         self._ensure_purge_task()
         token = self._cookie(request)
-        loaded = await self.store.load(token) if token is not None else None
+        try:
+            loaded = await self.store.load(token) if token is not None else None
+        except SessionUnavailable:
+            # A fail_closed store reports the outage instead of serving
+            # a request with no session state; fail_open stores never
+            # raise here (they report a miss instead).
+            return Response("Session unavailable", status=503,
+                            headers=[(b"retry-after", b"1"), (b"cache-control", b"no-store")])
         session = Session(*(loaded[:2]), token=token, version=loaded[2]) if loaded else Session()
         request.state["session"] = session
         response = await call_next(request)
         changed = session._changed() if not session._invalidated else False
         if session._invalidated:
             if session._token:
-                await self.store.delete(session._token)
+                try:
+                    await self.store.delete(session._token)
+                except SessionUnavailable:
+                    return Response("Session unavailable", status=503,
+                                    headers=[(b"retry-after", b"1"), (b"cache-control", b"no-store")])
             self._set_cookie(response, "", 0)
         elif changed:
             old_token = session._token
@@ -421,6 +574,11 @@ class SessionMiddleware:
                     await response.aclose()
                 return Response("Session changed; retry the request", status=409,
                                 headers=[(b"cache-control", b"no-store")])
+            except SessionUnavailable:
+                if isinstance(response, StreamingResponse):
+                    await response.aclose()
+                return Response("Session unavailable", status=503,
+                                headers=[(b"retry-after", b"1"), (b"cache-control", b"no-store")])
             self._set_cookie(response, new_token, self.max_age)
         if loaded or changed or session._invalidated:
             response.headers = [(name, value) for name, value in response.headers if name != b"cache-control"]
