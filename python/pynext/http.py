@@ -1615,6 +1615,14 @@ class Request:
             raise RequestCancelled("Request execution was cancelled")
 
     @property
+    def app(self):
+        """The :class:`App` this request is attached to (for
+        ``app.fetch_cache`` / ``app.revalidate`` from handlers)."""
+        if self._app is None:
+            raise RuntimeError("This request is not attached to an app")
+        return self._app
+
+    @property
     def resources(self):
         """Named application resources managed by the server lifespan."""
         if self._app is None:

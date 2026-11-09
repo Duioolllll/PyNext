@@ -49,6 +49,8 @@ from .http import (SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCance
                    cors_preflight_response, csrf_token_response, filter_internal_headers, new_csp_nonce, sanitize_response_headers,
                    validate_csrf, validate_request_framing)
 from .build import _config_error, _short_repr
+from .fetch_cache import FetchCache, fetch_cache_scope
+from .request_memo import clear_request_memo, ensure_request_memo, request_memo_scope
 from .matcher import compile_header_rules, compile_middleware_entries
 from .middleware import MAX_MIDDLEWARE_REWRITES, MiddlewareResult, ScopedMiddleware
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
@@ -1656,6 +1658,11 @@ class App:
                             or cache_handler is not None else "",
                             cache_url=cache_url, failure_policy=cache_failure_policy,
                             cache_handler=cache_handler)
+        # Fetch/data cache over the same backends (track C P1-1); page
+        # handlers reach it as ``request.app.fetch_cache`` or via
+        # ``pynext.fetch_cache`` helpers, and the request memo
+        # (track C P1-2) is installed per request in dispatch().
+        self.fetch_cache = FetchCache(self.isr)
         self.static_generators = {}
         self.static_pages = {}
         self.public_assets = {}
@@ -2665,6 +2672,10 @@ class App:
         if type == "layout":
             return await self.isr.invalidate_tag(_layout_tag(path)) > 0
         match = self.router.matches(path)
+        # In-request invalidation clears the request memo (track C P1-2):
+        # a later read in this same request must see the post-mutation
+        # data, not the pre-mutation memo.
+        clear_request_memo()
         if self.isr_queries.get(match[0]):
             _, existed = await self.isr.variant_generation(path, invalidate=True)
             return existed
@@ -3344,6 +3355,21 @@ class App:
         ``force-dynamic`` SSG pages render untracked: they are dynamic by
         design, so tracking them would only produce false warnings.
         """
+        # ISR generation runs in a fresh task context where the dispatch
+        # memo/scope is not visible; give this render its own memo so a
+        # layout and its page still share one fetch/DB read (track C
+        # P1-2), and install the fetch cache so page functions can call
+        # fetch_cached() (track C P1-1). When a scope already exists
+        # (SSR/API path) these are no-ops for the same instances.
+        ensure_request_memo()
+        with fetch_cache_scope(self.fetch_cache):
+            return await self._render_page_tracked(pattern, request, params,
+                                                 csp_nonce=csp_nonce, query=query)
+
+    async def _render_page_tracked(self, pattern, request, params, *, csp_nonce=True, query=None):
+        # HEAD's render_page body, moved here unchanged: it looks the
+        # page up, installs the prerender tracker, and delegates the
+        # actual rendering to _render_page_inner (7-arg version).
         fn, layouts = self.entries[pattern]
         if query is None:
             query = self._page_query(pattern, request)
@@ -3636,7 +3662,17 @@ class App:
         return response
 
     async def dispatch(self, request):
-        """Return a response. Exceptions are converted at the transport boundary."""
+        """Return a response. Exceptions are converted at the transport boundary.
+
+        Every request runs inside a fresh request memo (track C P1-2):
+        duplicate fetches/DB reads in one request compute once. It also
+        installs this app's fetch cache (track C P1-1) so page functions
+        can call ``fetch_cached()`` without a ``request`` argument.
+        """
+        with request_memo_scope(), fetch_cache_scope(self.fetch_cache):
+            return await self._dispatch_with_memo(request)
+
+    async def _dispatch_with_memo(self, request):
         try:
             response = await self._dispatch_response(request)
         except _SyncHandlerBusy:

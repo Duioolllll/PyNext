@@ -14,8 +14,11 @@ from .django import DjangoBusyError, DjangoResource
 from .env import LoadedEnv, env_file_names, load_env, public_env_defines, public_env_vars
 from .dynamic import StaticGenBailoutError, is_prerender_bailout, mark_dynamic_access, no_store
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN
-from .fetch_cache import (FetchCacheDecision, apply_fetch_revalidate, decide_fetch_cache, fetch_cache_store_key,
-                          generate_fetch_cache_key, generate_simple_fetch_cache_key)
+from .fetch_cache import (FetchCache, FetchCacheDecision, FetchPolicy, FetchResult,
+                          apply_fetch_revalidate, decide_fetch_cache, fetch_cache_key,
+                          fetch_cache_scope, fetch_cache_store_key, fetch_cached,
+                          generate_fetch_cache_key, generate_simple_fetch_cache_key,
+                          get_fetch_cache, resolve_fetch_policy, urllib_fetcher)
 from .forms import UploadFile
 from .errors import (ForbiddenError, NotFoundError, RedirectError, SignalError, UnauthorizedError,
                      compute_digest, digest_for_error, error_count, forbidden, get_digest_for_well_known_error,
@@ -36,6 +39,9 @@ from .proxy import ProxyTrust, ResolvedProxy, parse_trusted_proxies
 from .pubsub import PubSubOverflow, WebSocketPubSub
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
+from .request_memo import (RequestMemo, clear_request_memo, current_memo,
+                           ensure_request_memo, memoize, memoize_sync,
+                           request_memo_scope)
 from .routing import add_base_path, preprocess_pathname, route, state_changing_get, url_for, websocket
 from .sessions import RedisSessionStore, Session, SessionMiddleware, SessionPayloadCipher, SessionRecord, SQLiteSessionStore
 from .static import StaticPathError, resolve_static_path, validate_static_request_path
@@ -67,6 +73,10 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "no_store", "mark_dynamic_access", "StaticGenBailoutError", "is_prerender_bailout",
            "FetchCacheDecision", "apply_fetch_revalidate", "decide_fetch_cache", "fetch_cache_store_key",
            "generate_fetch_cache_key", "generate_simple_fetch_cache_key",
+           "FetchCache", "FetchPolicy", "FetchResult", "fetch_cache_key", "resolve_fetch_policy", "urllib_fetcher",
+           "fetch_cache_scope", "fetch_cached", "get_fetch_cache",
+           "RequestMemo", "request_memo_scope", "current_memo", "ensure_request_memo", "clear_request_memo",
+           "memoize", "memoize_sync",
            "MiddlewareScope", "RouteHas", "scoped",
            "url_for", "preprocess_pathname", "add_base_path",
            "MiddlewareResult", "rewrite_request", "redirect_response", "MAX_MIDDLEWARE_REWRITES",

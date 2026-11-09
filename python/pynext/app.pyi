@@ -2,6 +2,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from os import PathLike
 from typing import Any, Literal
 from .http import PathHeaderRuleInput, PathHeaders, Request, Response, SecurityConfig
+from .fetch_cache import FetchCache
 from .matcher import HeaderRule, Scope, ScopedMiddleware
 from .observability import MetricsCollector, ObservabilityConfig
 from .proxy import ProxyTrust
@@ -31,6 +32,7 @@ class App:
     header_rules: tuple[HeaderRule, ...]
     base_path: str
     trailing_slash: Literal["redirect", "ignore"]
+    fetch_cache: FetchCache
     def __init__(self, root: str | PathLike[str], manifest: dict[str, Any], *, production: bool = ...,
                  security: SecurityConfig | None = ..., cache_backend: Literal["memory", "sqlite", "redis"] = ...,
                  cache_path: str | PathLike[str] | None = ..., observability: ObservabilityConfig | None = ...,

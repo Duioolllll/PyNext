@@ -45,6 +45,43 @@ ISR responses carry a policy-based `Cache-Control` header so a CDN in front of P
 
 If a stale regeneration fails, the previous entry is retained with its fresh window clamped to 3..30 seconds and its stale window kept at at least 3 seconds (Next.js `retainPreviousCacheEntry`), so the previous body keeps serving while the next retry breathes instead of every request paying for a slow blocking render once the original stale window expires. A first-generation failure has no previous entry to retain and still surfaces as a 500.
 
+## Fetch/data cache and per-request memoization
+
+Page handlers fetch upstream data through `pynext.fetch_cached(url, fetcher, ...)`
+(or `request.app.fetch_cache.get_or_fetch(...)` from API handlers, where
+`request` is available). `fetcher` is an async callable returning a
+`FetchResult` — `pynext.urllib_fetcher` for real HTTP, or a stub in tests.
+
+- **Cache key**: `sha256(url without fragment, method, headers, body)`.
+  `Authorization`, `Cookie`, `Proxy-Authorization` and `Set-Cookie` headers
+  are excluded from the key, so a cached response is never served to a
+  different credential. The body is type-tagged (`str:`/`bytes:`/form
+  fields), so `["a", "b"]` and `["a,b"]` cannot collide.
+- **Policy** (`resolve_fetch_policy`, adapted from Next.js `patch-fetch.ts`):
+  an explicit `revalidate` (seconds, or `False` = infinite) wins;
+  `cache="force-cache"` without `revalidate` means infinite;
+  `cache="no-store"`/`"no-cache"` means never store; with no explicit
+  setting, an `Authorization`/`Cookie` header or a non-GET/HEAD method
+  means never store (auto-no-cache, disabled with `build_time=True`
+  during prerender); otherwise the caller's `default_revalidate` (a
+  page's ISR `revalidate` when known, else infinite) applies.
+  Conflicting options (`force-cache` + `revalidate=0`,
+  `no-store` + `revalidate > 0`) warn and are both dropped.
+- **Storage**: entries live in the ISR backends (memory / SQLite / Redis)
+  under separate `\0fetch:` keys. Only 2xx responses are stored, fresh
+  for `revalidate` seconds (`False` maps to the 7-day backend maximum);
+  there is no stale-while-revalidate window — an expired entry is
+  refetched synchronously. Bodies over 2 MiB are served but not stored.
+  Concurrent requests for the same key in one process share one upstream
+  fetch; `await fetch_cache.invalidate(url, ...)` removes one entry.
+- **Per-request memoization**: every request runs inside a fresh memo
+  (`pynext.memoize(key, compute)` / `memoize_sync`), so a layout and its
+  page reading the same data — or two identical DB queries in one handler
+  — compute once, with no TTL and no cross-request sharing. `fetch_cached`
+  results are memoized too, including `no-store` ones. In-request
+  invalidation (`App.revalidate` / `Request.revalidate`) clears the whole
+  memo, so a read after a mutation never sees pre-mutation data.
+
 ## Safety notes
 
 The native adapter can return 504 after a Python request timeout, but an already-running synchronous function may continue. Always add DB deadlines and idempotency for state-changing operations. This framework is still experimental; see [Deployment and security](Deployment-and-Security.md).
