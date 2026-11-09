@@ -138,6 +138,8 @@ def login(request):
 
 `RedisSessionStore`는 Redis에 닿지 않을 때 장애 정책(`failure_policy` 참고)을 따릅니다. 기본값은 `fail_closed`로, `SessionUnavailable`을 발생시켜 세션 상태를 조용히 잃는 대신 요청에 503으로 응답합니다. `failure_policy="fail_open"`을 전달하면 대신 새로 만든 휘발성 세션으로 시작합니다. 읽기는 계속되지만 저장되는 것은 없고, 장애 중에는 로그인을 완료할 수 없습니다. 발급된 CSRF 토큰이 저장되지 않으므로 로그인 요청은 CSRF(403)에서 실패합니다. 장애 중 교체가 일어나면 이전 세션 id가 만료될 때까지 계속 사용될 수 있습니다. `fail_open`은 세션 연속성보다 가용성이 중요한 경우에만 사용하세요.
 
+`fail_open`에서는 로그아웃의 세션 삭제도 최선 노력 방식입니다. 브라우저 쿠키가 지워져도 서버 세션과 이미 복사한 토큰은 TTL 만료 또는 복구 후 삭제 성공까지 유효할 수 있습니다. 이 경우 로그아웃을 서버 측 폐기 완료로 간주하면 안 됩니다.
+
 ## API 응답 스트리밍
 
 `StreamingResponse`에 문자열 또는 바이트를 내보내는 비동기 iterable을 전달합니다. ASGI와 Axum이 청크를 순서대로 전송하며 완료·연결 해제·오류 시 반복자를 닫습니다. 청크당 최대 1 MiB이며 `Content-Length`와 `Transfer-Encoding`은 직접 지정하지 않습니다. Axum은 청크 하나를 대기시키고 다음 청크 생성과 송신 대기에 각각 30초 제한을 적용합니다. 헤더 전송 후 오류는 상태 코드를 바꾸지 못하고 스트림을 중단합니다. HEAD 요청은 스트림을 소비하지 않습니다. React/RSC 스트리밍은 미구현입니다.
@@ -173,6 +175,10 @@ async def stream():
 개발 버전은 ASGI·Axum에서 연결을 수락하기 전에 `Origin`을 검사하며, 기본적으로 같은 출처만 허용합니다. 다른 HTTP(S) 출처는 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`를 `create_app(..., security=...)`에 전달하거나 `--ws-allowed-origin https://client.example`을 반복 지정하세요. 스킴과 기본값이 아닌 포트를 포함하며 `*`와 `null`은 허용하지 않습니다. `Origin`을 생략하는 기존 비브라우저 클라이언트는 `websocket_allow_missing_origin=True` 또는 `--ws-allow-missing-origin`으로 명시적으로 허용해야 합니다. 공개된 0.1.0 패키지에는 이 검사가 없습니다. 클라이언트는 `Origin`을 위조하거나 생략할 수 있습니다. 핸드셰이크 전에는 업그레이드 요청에 전역 미들웨어 체인(세션 미들웨어 포함)과 핸들러의 `@require_auth`/`@require_permission` 정책이 ASGI·Axum 모두에서 적용되며, 거부된 업그레이드는 101 응답 전에 차단됩니다(Axum은 HTTP 403, ASGI는 close 1008). 따라서 핸들러는 실행되지 않습니다. 신원 확립(예: 로그인 라우트에서 `session["user_id"]` 설정)은 여전히 앱의 책임이며, 세션 외의 자격 증명 방식(예: 토큰)은 미들웨어에서 검증해야 합니다. 프록시 뒤에서는 실제 프록시만 `--trusted-proxy`로 지정하고 클라이언트가 보낸 전달 헤더를 프록시가 덮어쓰도록 설정하세요.
 
 ASGI에서 PyNext가 신뢰 프록시를 판정하려면 서버가 `scope["client"]`에 원래 피어 주소를 보존해야 합니다. PyNext가 전달 헤더를 해석할 때는 ASGI 서버의 선행 프록시 헤더 처리를 끄세요(Uvicorn은 `--no-proxy-headers`).
+
+WebSocket 인증 미들웨어에서는 세션을 생성·회전·무효화하지 마세요. 사전 검사 응답의 `Set-Cookie`가 버려져 새 토큰이 브라우저에 전달되지 않고 기존 토큰은 이미 삭제됐을 수 있습니다. 로그인과 세션 변경은 연결 전에 일반 HTTP 엔드포인트에서 처리하세요.
+
+인증 사전 검사에서 거부하면 ASGI는 수락 전에 코드 1008의 `websocket.close`를 보내며, ASGI 서버는 보통 HTTP 403으로 핸드셰이크를 거부합니다. Axum은 사전 검사의 401/403 응답을 HTTP 403으로, 그 외 응답이나 오류를 503으로 처리합니다. 이는 429를 반환할 수 있는 내장 핸드셰이크 속도 제한과 별도 매핑입니다.
 
 ~~~python
 # app/ws/echo/route.py
@@ -216,7 +222,7 @@ SSG와 ISR 페이지는 `request`를 받을 수 없고 공개 콘텐츠에 사�
 
 SSG 빌드는 최대 10,000페이지를 생성하며 개발 모드에서는 요청마다 SSG 페이지를 렌더링합니다. ISR 페이지는 `generate_static_params()`를 내보낼 수 없고 프로세스별 동시 생성 작업은 최대 128개입니다.
 
-권한을 확인한 API 핸들러에서는 `await request.revalidate("/news/example")`, 앱 인스턴스를 가진 코드에서는 `await app.revalidate(path)`를 사용할 수 있습니다. 쿼리 문자열이 없는 디코딩된 ISR 경로를 전달합니다. 로컬 캐시 항목이나 진행 중인 생성을 무효화했다면 `True`를 반환합니다. 공유 백엔드가 있는 경우 저장소에 닿을 수 있을 때는 공유 항목도 함께 제거되지만, `fail_open` 모드에서는 공유 저장소에 닿지 않을 때 `True`여도 공유 항목이 제거됐다고 보장하지 않습니다(공유 제거는 최선 노력 방식이라 다른 워커는 만료될 때까지 오래된 항목을 계속 제공할 수 있습니다) — 적용되지 않은 무효화를 성공으로 보고하지 않으려면 `fail_closed`를 사용하세요. 기존 요청은 이전 생성 결과를 받을 수 있지만 그 결과가 캐시를 다시 덮어쓰지는 않습니다. 메모리 백엔드에서는 무효화가 프로세스별이며 다른 워커에 전파되지 않고, SQLite 백엔드에서는 공유 항목도 제거되며 정상 상태의 다른 워커는 다음 조회에서 이를 확인합니다. 외부에 노출하는 엔드포인트는 인증·권한 검사가 필요합니다.
+권한을 확인한 API 핸들러에서는 `await request.revalidate("/news/example")`, 앱 인스턴스를 가진 코드에서는 `await app.revalidate(path)`를 사용할 수 있습니다. 쿼리 문자열이 없는 디코딩된 ISR 경로를 전달합니다. 로컬 또는 공유 캐시 항목을 제거하거나 진행 중인 생성을 무효화했다면 `True`를 반환합니다. 공유 백엔드가 있는 경우 저장소에 닿을 수 있을 때는 공유 항목도 함께 제거되지만, `fail_open` 모드에서는 공유 저장소에 닿지 않을 때 `True`여도 공유 항목이 제거됐다고 보장하지 않습니다(공유 제거는 최선 노력 방식이라 다른 워커는 만료될 때까지 오래된 항목을 계속 제공할 수 있습니다) — 적용되지 않은 무효화를 성공으로 보고하지 않으려면 `fail_closed`를 사용하세요. 기존 요청은 이전 생성 결과를 받을 수 있지만 그 결과가 캐시를 다시 덮어쓰지는 않습니다. 메모리 백엔드에서는 무효화가 프로세스별이며 다른 워커에 전파되지 않고, SQLite 백엔드에서는 공유 항목도 제거되며 정상 상태의 다른 워커는 다음 조회에서 이를 확인합니다. 외부에 노출하는 엔드포인트는 인증·권한 검사가 필요합니다.
 
 ## 공개 파일과 islands
 
@@ -255,6 +261,8 @@ def Page():
 
 `pynext.client_dsl.compile_client_dsl(source)`은 Python의 작고 고정된 부분집합을 JavaScript로 컴파일합니다(명세 §7.3). 지원하는 것: 리터럴(JavaScript 안전 정수 범위 안의 int, float, str, bool, None, list, tuple, dict), 산술 연산(`+ - * / // % **`), 비교, `and`/`or`/`not`, `if`/`else`, `range()`나 리스트에 대한 `for`, `while`, 함수 정의, `len`, `str`, `int`, `float`, `bool`, `abs`, `min`, `max`, `list`, `print`, `.append()`, 인덱싱, 슬라이스, 한 절짜리 리스트 컴프리헨션입니다. 그 밖의 것은 모두 `ClientDSLCompileError`가 됩니다. import, 리플렉션, 파일 I/O, 클래스, 람다, `try`, f-string, `open`·`os`·`Request`·`h` 같은 서버 전용 이름은 컴파일 시점에 거부되므로 서버 코드가 브라우저 번들에 들어갈 수 없습니다. 정확한 목록과 알려진 의미 차이(예: `str(1.0)`의 `.0`이 사라짐)는 `pynext.client_dsl.SUPPORTED`와 `KNOWN_DIFFERENCES`를 참고하세요. [예제](../../examples/basic/client_dsl_example.py)도 있습니다. DSL은 독립 컴파일러이며 island 번들에 자동으로 넣어주지 않습니다.
 
+비유한 리터럴을 거부해도 실행 중 결과가 유한하다는 보장은 없습니다. `float("Infinity")`, `float("nan")` 또는 `1e308 * 1e308` 같은 산술 오버플로는 Infinity·NaN을 만들 수 있으며 런타임 유한성 검사는 하지 않습니다. `KNOWN_DIFFERENCES`를 참고하세요.
+
 ## ASGI, 시간 초과와 안전성
 
 예제 ASGI 앱을 Uvicorn에서 개발 모드로 실행합니다.
@@ -267,7 +275,7 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 분산 요청 제한은 `--rate-limit-backend redis`로 구현됐습니다(공유 Redis 토큰 버킷). 운영 환경 보안 강화는 아직 로드맵 항목입니다. SQLite 무효화는 공유 저장소가 정상일 때 다음 조회에 반영됩니다. OpenTelemetry 스팬은 선택 패키지를 설치하고 트레이싱을 켰을 때 생성됩니다(관측성 참고). ASGI 적합성은 `tests/test_asgi_conformance.py`로 검증합니다(HTTP 이벤트 순서, 청크 분할 본문, 연결 해제, 실패 경로를 포함한 lifespan). 계획과 완료 기준은 [프로덕션 로드맵](../PRODUCTION_ROADMAP.md)을 참고하세요.
 
-두 어댑터의 요청 본문은 최대 1 MiB이며 초과 시 413입니다. Axum의 기본 본문 수신 슬롯은 16개, 본문 수신 제한은 10초(408), Python 실행 슬롯은 64개입니다. 대기열은 실행 슬롯 수와 64 중 작은 값으로 제한하며 가득 차면 503입니다. 실행 및 본문 설정은 CLI에서 조정할 수 있습니다. HTTP/1.1 헤더 수신은 10초로 제한하지만 전체 연결 수는 제한하지 않습니다. 외부 ASGI 서버의 시간 제한은 해당 서버가 관리합니다. 루트가 아닌 경로의 마지막 `/`는 308로 리디렉션됩니다. 컴파일된 island는 개당 2 MiB, 전체 32 MiB 이하입니다.
+두 어댑터의 요청 본문은 최대 1 MiB이며 초과 시 413입니다. Axum의 기본 본문 수신 슬롯은 16개, 본문 수신 제한은 10초(408), Python 실행 슬롯은 64개입니다. 대기열은 실행 슬롯 수와 64 중 작은 값으로 제한하며 가득 차면 503입니다. 실행 및 본문 설정은 CLI에서 조정할 수 있습니다. HTTP/1.1 헤더 수신은 10초로 제한합니다. Axum 연결 상한은 워커당 전체 1,024개·IP당 128개가 기본이며 `--max-connections`와 `--max-connections-per-ip`로 조정합니다. 외부 ASGI 서버의 시간 제한은 해당 서버가 관리합니다. 루트가 아닌 경로의 마지막 `/`는 308로 리디렉션됩니다. 컴파일된 island는 개당 2 MiB, 전체 32 MiB 이하입니다.
 
 ## 관측성
 

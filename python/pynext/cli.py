@@ -68,7 +68,7 @@ def _bounded(minimum, maximum, label):
         try:
             number = int(value)
         except ValueError as exc:
-            raise argparse.ArgumentTypeError(f"{label} must be an integer >= {minimum}") from exc
+            raise argparse.ArgumentTypeError(f"{label} must be an integer in [{minimum}, {maximum}]") from exc
         if number < minimum:
             raise argparse.ArgumentTypeError(f"{label} must be an integer >= {minimum}")
         if number > maximum:
@@ -451,15 +451,18 @@ def main():
         except KeyboardInterrupt:
             pass
         return
-    app = create_app(root, production=args.command == "start",
-                     cache_backend=args.cache_backend, cache_path=args.cache_path,
-                     rate_limit=limiter,
-                     **({"trusted_proxies": args.trusted_proxy} if args.trusted_proxy else {}),
-                     **({"security": security} if security else {}),
-                     **({"cache_failure_policy": args.cache_failure_policy}
-                        if args.cache_failure_policy != "fail_open" else {}),
-                     **({"websocket_max_message": args.ws_max_message_bytes}
-                        if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}), **extra)
+    try:
+        app = create_app(root, production=args.command == "start",
+                         cache_backend=args.cache_backend, cache_path=args.cache_path,
+                         rate_limit=limiter,
+                         **({"trusted_proxies": args.trusted_proxy} if args.trusted_proxy else {}),
+                         **({"security": security} if security else {}),
+                         **({"cache_failure_policy": args.cache_failure_policy}
+                            if args.cache_failure_policy != "fail_open" else {}),
+                         **({"websocket_max_message": args.ws_max_message_bytes}
+                            if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}), **extra)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     try:
         asyncio.run(serve(app, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
                           args.body_capacity, args.body_timeout_ms,

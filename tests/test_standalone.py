@@ -105,6 +105,27 @@ def test_standalone_mid_build_failure_removes_partial_bundle(tmp_path, monkeypat
     assert (output / "run").is_file()
 
 
+def test_standalone_cleanup_failure_is_reported_without_masking_build_error(tmp_path, monkeypatch, caplog):
+    import pynext.standalone as standalone
+
+    project = _minimal_project(tmp_path)
+    _fake_purelib(monkeypatch, tmp_path)
+    output = tmp_path / "bundle"
+
+    def fail_copy(*args):
+        (output / "partial.txt").write_text("partial", encoding="utf-8")
+        raise OSError("original build failure")
+
+    monkeypatch.setattr(standalone, "_populate_standalone", fail_copy)
+    # rmtree(ignore_errors=True) may return with files still present.
+    monkeypatch.setattr(standalone.shutil, "rmtree", lambda *args, **kwargs: None)
+    with caplog.at_level(logging.WARNING, logger="pynext"):
+        with pytest.raises(OSError, match="original build failure"):
+            build_standalone(project, output)
+    assert (output / "partial.txt").is_file()
+    assert str(output) in caplog.text and "remove it before retrying" in caplog.text
+
+
 def test_copy_site_packages_rejects_symlinked_entries(tmp_path):
     purelib = tmp_path / "purelib"
     purelib.mkdir()

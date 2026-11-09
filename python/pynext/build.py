@@ -321,6 +321,8 @@ def load_manifest(root):
         saved = json.loads(target.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError(f"Invalid build manifest {target}: {exc}; rebuild the application") from exc
+    if not isinstance(saved, dict):
+        raise ValueError(f"Invalid build manifest {target}: expected a JSON object; rebuild the application")
     if saved.get("schema_version") != VERSION:
         raise ValueError("Incompatible manifest version; rebuild the application")
     expected = discover(root)

@@ -138,6 +138,8 @@ def login(request):
 
 `RedisSessionStore` 在 Redis 不可达时遵循故障策略（见 `failure_policy`）：默认是 `fail_closed`，即抛出 `SessionUnavailable`，请求以 503 响应，而不是悄悄丢失会话状态。传入 `failure_policy="fail_open"` 则改为以一个全新的临时会话开始——读取可以继续，但不会持久化任何内容，并且故障期间无法完成登录：为其签发的 CSRF 令牌从未被存储，因此登录请求会在 CSRF（403）上失败。故障期间的轮换还可能让旧会话 id 在过期前继续可用。仅在可用性比会话连续性更重要时使用 `fail_open`。
 
+在 `fail_open` 下，注销时的会话删除也只是尽力而为。浏览器 Cookie 可以被清除，但服务器会话和先前复制的令牌仍可能有效，直到 TTL 到期或恢复后成功删除。因此不能将这样的注销视为服务器端撤销已完成。
+
 ## API 响应流
 
 向 `StreamingResponse` 传入产生字符串或字节的异步 iterable。ASGI 和 Axum 会依次发送数据块，并在完成、断开或出错时关闭迭代器。单块最多 1 MiB；不要手动设置 `Content-Length` 或 `Transfer-Encoding`，协议帧由服务器管理。Axum 最多排队一个数据块，下一块生成与发送等待分别有 30 秒超时。响应头发出后出错会中断流，无法更改状态码。HEAD 不会消费流。尚不支持 React/RSC 流式渲染。
@@ -173,6 +175,10 @@ async def stream():
 开发版本在 ASGI 和 Axum 接受连接前检查 `Origin`，默认只允许同源。通过向 `create_app(..., security=...)` 传入 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`，或重复指定 `--ws-allowed-origin https://client.example`，可以添加 HTTP(S) 来源。来源须包含协议及非默认端口；不接受 `*` 和 `null`。不发送 `Origin` 的现有非浏览器客户端必须通过 `websocket_allow_missing_origin=True` 或 `--ws-allow-missing-origin` 显式允许。已发布的 0.1.0 不包含此检查。客户端可以伪造或省略 `Origin`。在握手完成之前，升级请求还会经过全局中间件链（包括会话中间件）和处理函数的 `@require_auth`/`@require_permission` 策略（ASGI 和 Axum 均适用）；被拒绝的升级会在 101 响应之前被拦截（Axum 返回 HTTP 403，ASGI 返回 close 1008），处理函数不会执行。应用仍须负责建立身份（例如登录路由设置 `session["user_id"]`），会话之外的凭证方式（如令牌）须在中间件中验证。使用代理时，只通过 `--trusted-proxy` 指定实际的代理，并配置代理覆盖客户端提供的转发头。
 
 为了让 PyNext 在 ASGI 下识别可信代理，服务器须在 `scope["client"]` 中保留原始对端地址。如果由 PyNext 解释转发头，请关闭 ASGI 服务器提前处理代理头的功能（Uvicorn 使用 `--no-proxy-headers`）。
+
+不要在 WebSocket 授权中间件中创建、轮换或撤销会话。预检响应及其 `Set-Cookie` 会被丢弃，新令牌无法到达浏览器，而旧令牌可能已经删除。请在连接前通过普通 HTTP 端点完成登录和会话变更。
+
+授权预检拒绝时，ASGI 在接受前发送关闭码 1008 的 `websocket.close`，ASGI 服务器通常以 HTTP 403 拒绝握手。Axum 将预检的 401/403 响应映射为 HTTP 403，其他预检响应或错误映射为 503。这与可以返回 429 的内置握手限流是不同的映射。
 
 ~~~python
 # app/ws/echo/route.py
@@ -216,7 +222,7 @@ SSG 和 ISR 页面不能接收 `request`，仅用于公开内容。ISR 默认忽
 
 SSG 构建最多生成 10,000 个页面；开发模式下每次请求都会渲染 SSG 页面。ISR 页面不能导出 `generate_static_params()`，每个进程最多并发执行 128 个生成任务。
 
-已授权的 API 处理函数可调用 `await request.revalidate("/news/example")`；持有应用实例的代码可调用 `await app.revalidate(path)`。请传入不含查询字符串、已解码的 ISR 路径。如果移除了本地缓存条目或使进行中的生成失效，返回 `True`。使用共享后端时，存储可达则同时删除共享条目；但在 `fail_open` 模式下，共享存储不可达时即使返回 `True` 也不保证共享条目已被删除（共享删除仅为尽力而为，其他工作进程可能继续提供旧条目直至其过期）——如需让未生效的失效报错而非报告成功，请使用 `fail_closed`。已有请求仍可能收到旧生成结果，但该结果不会重新覆盖缓存。内存后端下失效只作用于当前进程，不会传播到其他工作进程；SQLite 后端下也会删除共享条目，共享存储正常时其他工作进程的下次查询会看到失效。对外提供此操作的端点需要认证和授权。
+已授权的 API 处理函数可调用 `await request.revalidate("/news/example")`；持有应用实例的代码可调用 `await app.revalidate(path)`。请传入不含查询字符串、已解码的 ISR 路径。如果移除了本地或共享缓存条目，或使进行中的生成失效，返回 `True`。使用共享后端时，存储可达则同时删除共享条目；但在 `fail_open` 模式下，共享存储不可达时即使返回 `True` 也不保证共享条目已被删除（共享删除仅为尽力而为，其他工作进程可能继续提供旧条目直至其过期）——如需让未生效的失效报错而非报告成功，请使用 `fail_closed`。已有请求仍可能收到旧生成结果，但该结果不会重新覆盖缓存。内存后端下失效只作用于当前进程，不会传播到其他工作进程；SQLite 后端下也会删除共享条目，共享存储正常时其他工作进程的下次查询会看到失效。对外提供此操作的端点需要认证和授权。
 
 ## 公共文件与 islands
 
@@ -255,6 +261,8 @@ def Page():
 
 `pynext.client_dsl.compile_client_dsl(source)` 可将一小部分固定的 Python 子集编译为 JavaScript（规范 §7.3）。支持的内容：字面量（JavaScript 安全整数范围内的 int、float、str、bool、None、list、tuple、dict）、算术运算（`+ - * / // % **`）、比较、`and`/`or`/`not`、`if`/`else`、对 `range()` 或列表的 `for`、`while`、函数定义、`len`、`str`、`int`、`float`、`bool`、`abs`、`min`、`max`、`list`、`print`、`.append()`、索引、切片以及单子句列表推导式。除此之外的所有写法都会抛出 `ClientDSLCompileError`：import、反射、文件 I/O、类、lambda、`try`、f-string，以及 `open`、`os`、`Request`、`h` 等服务器专用名称都会在编译时被拒绝，因此服务器代码无法混入浏览器包。完整列表与已知的语义差异（例如 `str(1.0)` 会丢掉末尾的 `.0`）见 `pynext.client_dsl.SUPPORTED` 与 `KNOWN_DIFFERENCES`，另见[示例](../../examples/basic/client_dsl_example.py)。该 DSL 是独立的编译器，不会自动打包进 island。
 
+拒绝非有限字面量不保证运行时结果有限。`float("Infinity")`、`float("nan")` 或 `1e308 * 1e308` 等算术溢出仍可生成 Infinity 或 NaN；运行时不会强制检查有限性。请参阅 `KNOWN_DIFFERENCES`。
+
 ## ASGI、超时与安全性
 
 通过 Uvicorn 以开发模式启动示例 ASGI 应用：
@@ -267,7 +275,7 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 分布式限流已通过 `--rate-limit-backend redis` 实现（共享 Redis 令牌桶）。生产环境加固仍是路线图项目。共享存储正常时 SQLite 失效会在下次查询时生效。安装可选包并启用追踪后会生成 OpenTelemetry span（见可观测性一节）。ASGI 一致性由 `tests/test_asgi_conformance.py` 验证（HTTP 事件顺序、分块请求体、断开连接、包含失败路径的 lifespan）。请参阅[生产路线图](. 请参阅[生产路线图](../PRODUCTION_ROADMAP.md)中的计划与验收条件。
 
-两个适配器的请求体上限均为 1 MiB，超出返回 413。Axum 默认同时接收 16 个请求体、接收期限 10 秒（408），Python 执行槽为 64 个，等待队列上限是执行槽数与 64 中较小的值；队列满返回 503。执行和请求体设置可通过 CLI 调整。HTTP/1.1 请求头读取期限为 10 秒，但连接总数没有限制。外部 ASGI 服务器的超时由其自身管理。非根路径末尾的 `/` 会以 308 重定向。编译后的 island 单个上限为 2 MiB，总计 32 MiB。
+两个适配器的请求体上限均为 1 MiB，超出返回 413。Axum 默认同时接收 16 个请求体、接收期限 10 秒（408），Python 执行槽为 64 个，等待队列上限是执行槽数与 64 中较小的值；队列满返回 503。执行和请求体设置可通过 CLI 调整。HTTP/1.1 请求头读取期限为 10 秒。Axum 默认每个 worker 最多 1,024 个连接、每个 IP 最多 128 个连接，可通过 `--max-connections` 和 `--max-connections-per-ip` 调整。外部 ASGI 服务器的超时由其自身管理。非根路径末尾的 `/` 会以 308 重定向。编译后的 island 单个上限为 2 MiB，总计 32 MiB。
 
 ## 可观测性
 
