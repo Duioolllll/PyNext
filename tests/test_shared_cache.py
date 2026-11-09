@@ -247,6 +247,27 @@ def test_shared_cache_rejects_private_responses(tmp_path):
     asyncio.run(run())
 
 
+def test_reopen_uses_original_relative_sqlite_path(tmp_path, monkeypatch):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    monkeypatch.chdir(first)
+    cache = ISRCache(cache_backend="sqlite", cache_path="cache.sqlite3")
+
+    async def run():
+        try:
+            assert cache.shared.insert("key", b"cached", 60, 0)
+            await cache.close()
+            monkeypatch.chdir(second)
+            cache.open()
+            assert cache.shared.lookup("key") == ("fresh", b"cached")
+            assert not (second / "cache.sqlite3").exists()
+        finally:
+            await cache.close()
+    asyncio.run(run())
+
+
 def test_shared_cache_failure_preserves_old_entry(tmp_path):
     async def run():
         cache = ISRCache(cache_backend="sqlite", cache_path=tmp_path / "cache.sqlite3")

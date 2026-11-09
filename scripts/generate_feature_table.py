@@ -62,7 +62,7 @@ COMMAND_NOTES = {
 # scripts/check_docs.py, which asserts the same phrases appear there.
 NON_GOALS = [
     ("React / React Server Components", "Explicit non-goal for 1.0 (see docs/ROADMAP.md)."),
-    ("Django integration", "Deferred; ORM/forms only under consideration. ASGI sub-apps and templates are out of scope."),
+    ("Django HTTP / templates", "Out of scope; optional Django ORM/forms are supported by DjangoResource."),
 ]
 
 

@@ -19,7 +19,7 @@ Checks:
    the ko/ja/zh-CN manuals declare themselves translations of it;
    the wiki index points at the English manual as canonical.
 4. Non-goals: the wording in docs/FEATURES.md matches docs/ROADMAP.md
-   (React/RSC is a non-goal, Django direction undecided).
+   (React/RSC and Django HTTP/template integration are non-goals).
 5. Generated table: docs/FEATURES.md matches
    ``scripts/generate_feature_table.py`` output (freshness check).
 
@@ -124,7 +124,7 @@ def check() -> list[str]:
     # Non-goals wording must match docs/ROADMAP.md.
     roadmap = (ROOT / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
     for phrase in ("React 및 React Server Components 호환성은 현재 비목표다",
-                   "Django 통합은 DB 연동 이후로 보류한다"):
+                   "Django ASGI 서브앱 마운트와 Django 템플릿은 범위 밖이다"):
         if phrase not in roadmap:
             failures.append(f"docs/ROADMAP.md: non-goal phrase changed: {phrase!r}")
 

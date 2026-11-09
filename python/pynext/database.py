@@ -4,7 +4,14 @@ Each worker owns its own engine and connection pool. Sessions are deliberately
 explicit and must not be shared between concurrent tasks.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
+
+
+class _MemorySessions:
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.owner = None
 
 
 class Database:
@@ -24,6 +31,8 @@ class Database:
         self._engine_options = dict(engine_options or {})
         self._engine = None
         self._session_factory = None
+        self._memory_sessions = None
+        self._lifecycle_lock = asyncio.Lock()
 
     @property
     def engine(self):
@@ -33,6 +42,10 @@ class Database:
         return self._engine
 
     async def startup(self):
+        async with self._lifecycle_lock:
+            await self._start()
+
+    async def _start(self):
         if self._engine is not None:
             raise RuntimeError("database resource is already started")
         try:
@@ -53,8 +66,17 @@ class Database:
             url = url.set(drivername=drivers[url.drivername])
         if url.drivername not in {"sqlite+aiosqlite", "postgresql+asyncpg"}:
             raise ValueError("Database supports SQLite/aiosqlite and PostgreSQL/asyncpg URLs")
+        memory = (url.drivername == "sqlite+aiosqlite" and
+                  (not url.database or url.database == ":memory:" or
+                   url.database.startswith("file::memory:") or url.query.get("mode") == "memory"))
+        options = self._engine_options.copy()
+        if memory and "poolclass" not in options:
+            # Pin the connection-sharing semantics instead of relying on the
+            # dialect's version-dependent default for SQLite memory URLs.
+            from sqlalchemy.pool import StaticPool
+            options["poolclass"] = StaticPool
         try:
-            engine = create_async_engine(url, **self._engine_options)
+            engine = create_async_engine(url, **options)
         except ModuleNotFoundError as exc:
             extra = "postgres" if url.drivername == "postgresql+asyncpg" else "database"
             raise RuntimeError(f"install pynext-framework[{extra}] to use this database") from exc
@@ -67,13 +89,20 @@ class Database:
             raise
         self._engine = engine
         self._session_factory = factory
+        if memory:
+            # SQLite memory engines normally use a single StaticPool connection.
+            # Overlapping sessions on that connection can commit each other's
+            # work, so their complete lifetimes must not overlap.
+            self._memory_sessions = _MemorySessions()
 
     async def shutdown(self):
-        engine = self._engine
-        self._engine = None
-        self._session_factory = None
-        if engine is not None:
-            await engine.dispose()
+        async with self._lifecycle_lock:
+            engine = self._engine
+            self._engine = None
+            self._session_factory = None
+            self._memory_sessions = None
+            if engine is not None:
+                await engine.dispose()
 
     @asynccontextmanager
     async def session(self):
@@ -81,8 +110,23 @@ class Database:
         factory = self._session_factory
         if factory is None:
             raise RuntimeError("database resource has not started")
-        async with factory() as session:
-            yield session
+        gate = self._memory_sessions
+        if gate is None:
+            async with factory() as session:
+                yield session
+            return
+        task = asyncio.current_task()
+        if gate.owner is task:
+            raise RuntimeError("nested sessions on an in-memory SQLite database are not supported")
+        async with gate.lock:
+            if self._session_factory is not factory:
+                raise RuntimeError("database resource has stopped")
+            gate.owner = task
+            try:
+                async with factory() as session:
+                    yield session
+            finally:
+                gate.owner = None
 
     @asynccontextmanager
     async def transaction(self):
