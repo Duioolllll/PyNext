@@ -282,7 +282,14 @@ def test_cli_without_observability_flags_keeps_old_call_shape(tmp_path, monkeypa
     # No observability kwarg leaks through when no flags are given; the
     # other kwargs are the merged defaults from the cache (#42) and
     # rate-limit (#49) options, plus the graceful-shutdown default (B6).
-    assert seen["create_app"] == {"cache_backend": "memory", "cache_path": None, "rate_limit": None}
+    # Since the P0 High fix the default rate limit is on (300/min), so
+    # the CLI builds a limiter instead of passing None.
+    from pynext import RateLimiter
+    assert seen["create_app"]["cache_backend"] == "memory"
+    assert seen["create_app"]["cache_path"] is None
+    limiter = seen["create_app"]["rate_limit"]
+    assert isinstance(limiter, RateLimiter) and limiter.limit == 300
+    assert set(seen["create_app"]) == {"cache_backend", "cache_path", "rate_limit"}
     assert seen["serve"] == {"shutdown_timeout": 30}
 
 

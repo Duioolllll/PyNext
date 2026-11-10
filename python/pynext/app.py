@@ -26,7 +26,7 @@ from types import MappingProxyType
 from urllib.parse import quote, unquote, unquote_to_bytes
 
 from . import _native
-from .admission import DecisionGate
+from .admission import DecisionGate, DecisionUnavailable
 from .assets import read_public_artifacts, read_public_sources
 from .auth import check_authorization
 from .cache import (MAX_CACHE_SECONDS, CacheBusy, ISRCache, SharedCacheUnavailable,
@@ -572,6 +572,30 @@ def _layout_tag(scope):
     return "_pynext_layout_" + scope
 
 
+# Characters a cache tag may contain after the "_pynext_path_" prefix
+# (see cache.validate_cache_tag). Used by _implicit_path_tag (M-21).
+_IMPLICIT_PATH_TAG_SAFE = re.compile(r"[A-Za-z0-9_./:-]*\Z")
+
+
+def _implicit_path_tag(path):
+    """The implicit ISR tag for one concrete path.
+
+    Readable ``_pynext_path_<path>`` when the path only uses tag-safe
+    characters (letters, digits, ``_``, ``.``, ``/``, ``:``, ``-``) and
+    stays within the 256-character tag limit; a
+    ``_pynext_path_h_<sha256>`` hash otherwise. A decoded path can
+    contain anything else — ``%3F`` decodes to ``?``, ``%23`` to ``#``
+    — and the old code built the tag verbatim, so tag validation
+    rejected it and every ISR request for such a path 500'd (M-21).
+    ``revalidate(path)`` builds its tags through this same function,
+    so invalidation still matches the stored entry.
+    """
+    tag = "_pynext_path_" + path
+    if len(tag) <= 256 and _IMPLICIT_PATH_TAG_SAFE.fullmatch(path):
+        return tag
+    return "_pynext_path_h_" + hashlib.sha256(path.encode("utf-8")).hexdigest()
+
+
 def _implicit_path_tags(path):
     """The implicit tag(s) an ISR entry for a concrete path carries.
 
@@ -579,11 +603,11 @@ def _implicit_path_tags(path):
     ``/index`` are aliases of each other (Next.js ``revalidatePath``),
     so invalidating either invalidates both.
     """
-    tags = ["_pynext_path_" + path]
+    tags = [_implicit_path_tag(path)]
     if path == "/":
-        tags.append("_pynext_path_/index")
+        tags.append(_implicit_path_tag("/index"))
     elif path == "/index":
-        tags.append("_pynext_path_/")
+        tags.append(_implicit_path_tag("/"))
     return tags
 
 
@@ -2368,9 +2392,18 @@ class App:
 
         try:
             allowed, retry_after = await self._asgi_admission.check(decide)
+        except DecisionUnavailable:
+            # H-2: no decision could be produced — the decision gate was
+            # full or its deadline expired while the loop was saturated.
+            # A protection that cannot decide must not become a rejection
+            # device: fail open and count it, instead of 503ing requests
+            # the limiter would have allowed.
+            self.metrics.observe_rate_limit_fail_open()
+            return None
         except Exception:
-            # Match native admission: callback failures and overload fail
-            # closed regardless of a backend's own failure-policy choice.
+            # A decision was produced but was invalid, or the limiter's
+            # own backend failed (RateLimitUnavailable honours that
+            # limiter's failure_policy): fail closed, as before.
             return Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
         return None if allowed else rate_limited_response(max(1, retry_after or 1))
 

@@ -21,7 +21,7 @@ use pyo3::types::{PyBytes, PyList};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -459,9 +459,62 @@ struct ServerState {
     ws_rate_limit_callback: Option<Py<PyAny>>,
     http_rate_limit_callback: Option<Py<PyAny>>,
     rate_limit_capacity: Arc<Semaphore>,
+    // H-2: rate-limit decisions that could not be produced (decision
+    // gate full or the 2s deadline expired) and failed open instead of
+    // 503. Read through `NativeServer::rate_limit_fail_open_count`.
+    rate_limit_fail_open: Arc<AtomicU64>,
+    // Per-IP execution quota (H-5): how many execution slots one client
+    // IP may hold at once, and the live per-IP counts. The global pool
+    // is `capacity`; without a per-IP cap one IP could take every slot
+    // with slow requests and 503 all other users.
+    per_ip_executions: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    max_concurrent_per_ip: usize,
     ws_origin_capacity: Arc<Semaphore>,
     ws_auth_callback: Option<Py<PyAny>>,
     ws_auth_capacity: Arc<Semaphore>,
+}
+
+/// One held per-IP execution slot (H-5); releases the IP's count on drop,
+/// so the quota is freed even when the request ends early (body error,
+/// timeout, client disconnect) and for streaming responses, whose guard
+/// travels with the stream until it ends.
+struct IpExecutionGuard {
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl Drop for IpExecutionGuard {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+impl ServerState {
+    /// Try to take one execution slot for `ip` (H-5). Returns `None`
+    /// when the IP already holds `max_concurrent_per_ip` slots; the
+    /// caller answers 503 without touching the global pool or its wait
+    /// queue, so one IP cannot starve the others' queue access either.
+    fn try_acquire_ip_execution(&self, ip: IpAddr) -> Option<IpExecutionGuard> {
+        let mut counts = self
+            .per_ip_executions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let count = counts.entry(ip).or_insert(0);
+        if *count >= self.max_concurrent_per_ip {
+            return None;
+        }
+        *count += 1;
+        Some(IpExecutionGuard {
+            counts: Arc::clone(&self.per_ip_executions),
+            ip,
+        })
+    }
 }
 
 #[pyclass(name = "_RequestCancellation")]
@@ -497,13 +550,20 @@ fn close_stream(stream: Arc<Py<PyAny>>) {
     });
 }
 
-fn streaming_body(stream: Py<PyAny>, permit: OwnedSemaphorePermit) -> Body {
+fn streaming_body(
+    stream: Py<PyAny>,
+    permit: Option<OwnedSemaphorePermit>,
+    ip_guard: Option<IpExecutionGuard>,
+) -> Body {
     let stream = Arc::new(stream);
     let (sender, receiver) = tokio_mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     let failed = Arc::new(AtomicBool::new(false));
     let producer_failed = Arc::clone(&failed);
     tokio::spawn(async move {
         let _permit = permit;
+        // The per-IP slot stays held until the stream ends, like the
+        // global execution slot (H-5).
+        let _ip_guard = ip_guard;
         loop {
             let slot = match tokio::time::timeout(Duration::from_secs(30), sender.reserve()).await {
                 Ok(Ok(slot)) => slot,
@@ -1284,10 +1344,12 @@ async fn rate_limit_denial(
         response
     };
     let Ok(permit) = Arc::clone(&state.rate_limit_capacity).try_acquire_owned() else {
-        return Some(apply_merged_path_headers(
-            unavailable(),
-            &merged_path_headers,
-        ));
+        // H-2: no decision capacity is left. Failing closed here turns
+        // the protection into a rejection device under load, so fail
+        // open and count it instead of 503ing a request the limiter
+        // would have allowed.
+        state.rate_limit_fail_open.fetch_add(1, Ordering::Relaxed);
+        return None;
     };
     let headers: Vec<(Vec<u8>, Vec<u8>)> = parts
         .headers
@@ -1336,6 +1398,16 @@ async fn rate_limit_denial(
                 response.headers_mut().insert(header::RETRY_AFTER, value);
             }
             Some(apply_merged_path_headers(response, &merged_path_headers))
+        }
+        // H-2: the 2s decision deadline expired (Err) or the blocking
+        // task failed to spawn (Ok(Err)), so no decision exists. Fail
+        // open and count it. A callback that raised — including a
+        // limiter backend reporting itself unavailable, whose own
+        // failure policy decides — or a malformed decision still fails
+        // closed below.
+        Ok(Err(_)) | Err(_) => {
+            state.rate_limit_fail_open.fetch_add(1, Ordering::Relaxed);
+            None
         }
         _ => Some(apply_merged_path_headers(
             unavailable(),
@@ -1572,6 +1644,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     // Decide admission from headers before polling the body. In particular,
     // an over-limit Expect: 100-continue request must never be told to upload.
     let decoded_path = static_path(parts.uri.path());
+    // Health probes are reserved framework paths (H-3): they never take
+    // an execution slot (see the slot acquisition below).
+    let is_health = matches!(decoded_path.as_deref(), Some("/healthz" | "/readyz"));
     if state.http_rate_limit_callback.is_some() {
         let Some(path) = decoded_path.as_ref() else {
             return close_with_unread_body(
@@ -1771,43 +1846,74 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     // shedding would drop requests that would have succeeded within the
     // timeout. The queue size is configurable via `max_waiting`; the
     // default stays `min(max_concurrent, 64)`.
-    let permit = match state.capacity.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let waiting = match state.waiting_capacity.clone().try_acquire_owned() {
-                Ok(permit) => permit,
-                // No waiting slot: the earliest a slot could free is
-                // unknown, so the advisory retry delay stays 1 second.
-                Err(_) => {
+    // H-3: health probes never take an execution slot. A probe flood
+    // could otherwise fill the queue and 503 real requests, and a probe
+    // queued behind 64 slow requests could 503 the probe itself.
+    // Readiness is still decided by the Python bridge below.
+    // H-5: one IP may hold at most max_concurrent_per_ip execution
+    // slots. The quota is taken before the global pool, so a single IP
+    // cannot fill the wait queue either; the guard releases the IP's
+    // count when the request finishes (streaming included).
+    let ip_guard = if is_health {
+        None
+    } else {
+        match parts.extensions.get::<PeerAddr>().map(|peer| peer.0.ip()) {
+            Some(ip) => match state.try_acquire_ip_execution(ip) {
+                Some(guard) => Some(guard),
+                None => {
                     return apply_path_headers_for_raw_path(
                         busy_response(1, &state.security_headers),
                         parts.uri.path(),
                         &state.path_headers,
                     )
                 }
-            };
-            match tokio::time::timeout(
-                state.acquire_timeout,
-                state.capacity.clone().acquire_owned(),
-            )
-            .await
-            {
-                Ok(Ok(permit)) => {
-                    drop(waiting);
-                    permit
-                }
-                _ => {
-                    return apply_path_headers_for_raw_path(
-                        busy_response(
-                            retry_after_for_timeout(state.acquire_timeout),
-                            &state.security_headers,
-                        ),
-                        parts.uri.path(),
-                        &state.path_headers,
-                    )
+            },
+            // No peer address (for example a Unix listener): nothing to
+            // quota against.
+            None => None,
+        }
+    };
+    let permit = if is_health {
+        None
+    } else {
+        Some(match state.capacity.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let waiting = match state.waiting_capacity.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    // No waiting slot: the earliest a slot could free is
+                    // unknown, so the advisory retry delay stays 1 second.
+                    Err(_) => {
+                        return apply_path_headers_for_raw_path(
+                            busy_response(1, &state.security_headers),
+                            parts.uri.path(),
+                            &state.path_headers,
+                        )
+                    }
+                };
+                match tokio::time::timeout(
+                    state.acquire_timeout,
+                    state.capacity.clone().acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => {
+                        drop(waiting);
+                        permit
+                    }
+                    _ => {
+                        return apply_path_headers_for_raw_path(
+                            busy_response(
+                                retry_after_for_timeout(state.acquire_timeout),
+                                &state.security_headers,
+                            ),
+                            parts.uri.path(),
+                            &state.path_headers,
+                        )
+                    }
                 }
             }
-        }
+        })
     };
     let method = parts.method.to_string();
     let path = parts.uri.path().to_string();
@@ -1857,11 +1963,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             };
             Ok::<_, PyErr>((status, headers, body))
         });
-        (result, permit)
+        (result, permit, ip_guard)
     })
     .await;
     match result {
-        Ok((Ok((status, headers, body)), permit)) => {
+        Ok((Ok((status, headers, body)), permit, ip_guard)) => {
             let Ok(status) = StatusCode::from_u16(status) else {
                 if let BridgeBody::Streaming(stream) = body {
                     close_stream(Arc::new(stream));
@@ -1899,9 +2005,10 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             *response.body_mut() = match body {
                 BridgeBody::Buffered(body) => {
                     drop(permit);
+                    drop(ip_guard);
                     Body::from(body)
                 }
-                BridgeBody::Streaming(stream) => streaming_body(stream, permit),
+                BridgeBody::Streaming(stream) => streaming_body(stream, permit, ip_guard),
             };
             response
         }
@@ -2053,12 +2160,15 @@ struct NativeServer {
     thread: Option<JoinHandle<()>>,
     #[pyo3(get)]
     address: String,
+    // H-2: shared with ServerState so the fail-open count stays readable
+    // after the state moves into the server thread.
+    rate_limit_fail_open: Arc<AtomicU64>,
 }
 
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, max_concurrent_per_ip=16))]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn new(
@@ -2096,6 +2206,7 @@ impl NativeServer {
         websocket_auth_callback: Option<Py<PyAny>>,
         http_rate_limit_callback: Option<Py<PyAny>>,
         path_headers: Option<Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>>,
+        max_concurrent_per_ip: usize,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -2141,6 +2252,11 @@ impl NativeServer {
         if max_connections_per_ip == 0 || max_connections_per_ip > Semaphore::MAX_PERMITS {
             return Err(PyValueError::new_err(
                 "max_connections_per_ip is outside the supported range",
+            ));
+        }
+        if max_concurrent_per_ip == 0 || max_concurrent_per_ip > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "max_concurrent_per_ip is outside the supported range",
             ));
         }
         if static_pages
@@ -2223,6 +2339,10 @@ impl NativeServer {
             .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?
             .to_string();
         let (shutdown, rx) = oneshot::channel();
+        // H-2: created here so both the server thread's state and this
+        // handle share one fail-open counter.
+        let rate_limit_fail_open = Arc::new(AtomicU64::new(0));
+        let rate_limit_fail_open_state = Arc::clone(&rate_limit_fail_open);
         // The spawned thread reports its startup result back: previously a
         // panic in `.expect` here only killed the thread while `new()` had
         // already returned Ok with an address, leaving a dead server behind.
@@ -2295,6 +2415,9 @@ impl NativeServer {
                     ws_rate_limit_callback: websocket_rate_limit_callback,
                     http_rate_limit_callback,
                     rate_limit_capacity: Arc::new(Semaphore::new(64)),
+                    rate_limit_fail_open: rate_limit_fail_open_state,
+                    per_ip_executions: Arc::new(Mutex::new(HashMap::new())),
+                    max_concurrent_per_ip,
                     ws_origin_capacity: Arc::new(Semaphore::new(64)),
                     ws_auth_callback: websocket_auth_callback,
                     ws_auth_capacity: Arc::new(Semaphore::new(64)),
@@ -2439,6 +2562,7 @@ impl NativeServer {
             shutdown: Some(shutdown),
             thread: Some(thread),
             address,
+            rate_limit_fail_open,
         })
     }
 
@@ -2451,6 +2575,12 @@ impl NativeServer {
                 let _ = thread.join();
             });
         }
+    }
+
+    /// H-2: how many rate-limit decisions failed open (no decision
+    /// could be produced) since this server started.
+    fn rate_limit_fail_open_count(&self) -> u64 {
+        self.rate_limit_fail_open.load(Ordering::Relaxed)
     }
 }
 
