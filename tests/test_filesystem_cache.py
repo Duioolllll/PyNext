@@ -42,18 +42,75 @@ def test_entry_name_is_safe_and_collision_free():
     assert "news_hello" in _fs_entry_name("build:abc:/news/hello")
 
 
+def test_key_collision_never_serves_another_path_body(tmp_path, monkeypatch):
+    """Two keys on one file stem must never serve each other's body.
+
+    The stem is ``{slug}-{digest[:16]}`` (64-bit digest), so a collision
+    is possible in principle. The stored meta ``key`` is the tie-breaker:
+    a lookup for a key whose meta names another key is a miss, and a
+    write for the colliding key starts fresh instead of inheriting the
+    other key's version.
+    """
+    backend = FileSystemCacheBackend(tmp_path)
+    monkeypatch.setattr("pynext.cache._fs_entry_name", lambda key: "collided-stem")
+    assert backend.insert("/news/a", b"<p>A</p>", 30.0, 60.0) is True
+    # A different key on the same stem must not see A's body.
+    assert backend.lookup("/news/b") == ("miss", None)
+    assert backend.lookup_entry("/news/b") is None
+    assert backend.lookup("/news/a") == ("fresh", b"<p>A</p>")
+    # A fenced write for B with version 0 (no entry) must succeed even
+    # though the file holds A's version-1 entry.
+    assert backend.insert_fenced("/news/b", b"<p>B</p>", 30.0, 60.0, 0) is True
+    assert backend.lookup("/news/b") == ("fresh", b"<p>B</p>")
+    # Now A must miss — B's write replaced the shared slot — and must
+    # never read B's body.
+    assert backend.lookup("/news/a") == ("miss", None)
+    assert backend.lookup_entry("/news/a") is None
+
+
+def test_key_collision_remove_keeps_other_key(tmp_path, monkeypatch):
+    backend = FileSystemCacheBackend(tmp_path)
+    monkeypatch.setattr("pynext.cache._fs_entry_name", lambda key: "collided-stem")
+    assert backend.insert("/news/a", b"<p>A</p>", 30.0, 60.0) is True
+    # Removing a different key on the same stem must not delete A's entry.
+    assert backend.remove("/news/b") is False
+    assert backend.lookup("/news/a") == ("fresh", b"<p>A</p>")
+    # Removing the owning key still works.
+    assert backend.remove("/news/a") is True
+    assert backend.lookup("/news/a") == ("miss", None)
+
+
+def test_key_collision_lease_is_per_key(tmp_path, monkeypatch):
+    backend = FileSystemCacheBackend(tmp_path)
+    monkeypatch.setattr("pynext.cache._fs_entry_name", lambda key: "collided-stem")
+    assert backend.acquire_lease("/news/a", "worker-a") == 0
+    # A different key on the same stem must not see A's lease.
+    assert backend.owns_lease("/news/b", "worker-a") is False
+    assert backend.acquire_lease("/news/b", "worker-b") == 0
+    assert backend.owns_lease("/news/b", "worker-b") is True
+    # B's lease replaced the shared slot, so A no longer holds one.
+    assert backend.owns_lease("/news/a", "worker-a") is False
+    # And B cannot release a lease it does not own.
+    assert backend.release_lease("/news/b", "worker-a") is False
+    assert backend.release_lease("/news/b", "worker-b") is True
+
+
 def test_insert_lookup_fresh_stale_expired(tmp_path):
     backend = FileSystemCacheBackend(tmp_path)
     assert backend.lookup("/page") == ("miss", None)
     assert backend.lookup_entry("/page") is None
-    assert backend.insert("/page", b"<p>hi</p>", 0.2, 0.2) is True
+    # Generous TTLs: the old 0.2s values were flaky on loaded CI/VM
+    # runners, where scheduling delay between insert and lookup could
+    # already push the entry past fresh (same pattern as the SQLite
+    # TTL test). Stale window is 1.0–3.0s, expired after 3.0s.
+    assert backend.insert("/page", b"<p>hi</p>", 1.0, 2.0) is True
     assert backend.lookup("/page") == ("fresh", b"<p>hi</p>")
     entry = backend.lookup_entry("/page")
     assert entry.status == "fresh" and entry.version == 1
-    assert 0.0 < entry.fresh_remaining <= 0.2
-    time.sleep(0.25)
+    assert 0.0 < entry.fresh_remaining <= 1.0
+    time.sleep(1.5)
     assert backend.lookup("/page") == ("stale", b"<p>hi</p>")
-    time.sleep(0.25)
+    time.sleep(2.0)
     assert backend.lookup("/page") == ("expired", None)
     # An expired lookup deletes the entry files.
     assert not (Path(backend.path) / "entries").exists() or not list(
@@ -137,9 +194,11 @@ def test_lease_excludes_other_workers_and_fences_writes(tmp_path):
 
 def test_expired_lease_can_be_taken_over(tmp_path):
     backend = FileSystemCacheBackend(tmp_path)
-    assert backend.acquire_lease("/page", "worker-a", ttl=0.1) == 0
+    # Generous TTL: the old 0.1s TTL with a 0.15s sleep was flaky on
+    # loaded runners (same pattern as the TTL tests above).
+    assert backend.acquire_lease("/page", "worker-a", ttl=1.0) == 0
     assert backend.acquire_lease("/page", "worker-b") is None
-    time.sleep(0.15)
+    time.sleep(1.5)
     assert backend.acquire_lease("/page", "worker-b") == 0
     assert backend.owns_lease("/page", "worker-b") is True
 
@@ -148,8 +207,10 @@ def test_expired_entry_survives_while_leased(tmp_path):
     backend = FileSystemCacheBackend(tmp_path)
     owner = "worker-a"
     assert backend.acquire_lease("/page", owner, ttl=30.0) == 0
-    assert backend.insert_fenced("/page", b"x", 0.1, 0.1, 0, owner=owner) is True
-    time.sleep(0.25)
+    # Generous TTLs: the old 0.1s/0.1s with a 0.25s sleep left only a
+    # 0.05s margin past expiry — flaky on loaded runners.
+    assert backend.insert_fenced("/page", b"x", 1.0, 1.0, 0, owner=owner) is True
+    time.sleep(2.5)
     # The lease is live, so the expired entry is reported but not deleted.
     assert backend.lookup("/page") == ("expired", None)
     assert (Path(backend.path) / "entries" / (_fs_entry_name("/page") + ".meta")).exists()

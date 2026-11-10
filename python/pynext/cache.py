@@ -2249,6 +2249,14 @@ class FileSystemCacheBackend(CacheBackend):
     unlike Next.js, which falls back to the file mtime, because PyNext
     needs the durations and version that only the meta carries.
 
+    The file stem is ``{slug}-{digest[:16]}`` (a 64-bit digest prefix),
+    so two keys can in principle map to the same stem. Every keyed
+    read, write, lease, and removal therefore verifies the stored
+    ``key`` against the requested one: a meta, lease, or variant naming
+    another key is treated as absent, so a collision can never serve,
+    fence, or delete another path's body — it only costs a re-render.
+    Leases and variants store the key for the same reason.
+
     Age is the smaller of the monotonic and wall-clock ages, ignoring
     any negative candidate. A wall-clock jump forward is masked by the
     monotonic age, a jump backward is masked by the wall age, and after
@@ -2390,6 +2398,21 @@ class FileSystemCacheBackend(CacheBackend):
         except (KeyError, TypeError, ValueError):
             return None
 
+    def _read_meta_for_key(self, name, key):
+        """Read the meta for ``name``, but only when it belongs to ``key``.
+
+        The file stem is ``{slug}-{digest[:16]}`` (64-bit digest), so two
+        different keys can map to the same stem. The stored ``key`` is the
+        tie-breaker: a meta naming another key is treated as no entry at
+        all, so a collision can never serve — or fence, or delete —
+        another path's body. Returns None when the meta is missing,
+        corrupt, or names a different key.
+        """
+        meta = self._read_meta(name)
+        if meta is not None and meta["key"] != key:
+            return None
+        return meta
+
     def _entry_age(self, meta, now, now_mono):
         """Dual-clock age; see the class docstring for the rationale."""
         candidates = [
@@ -2403,26 +2426,35 @@ class FileSystemCacheBackend(CacheBackend):
 
     def _read_entry(self, key, now, now_mono):
         name = _fs_entry_name(key)
-        meta = self._read_meta(name)
-        if meta is None:
+        raw_meta = self._read_meta(name)
+        if raw_meta is None:
             body_path = self._body_path(name)
             if os.path.exists(body_path):
                 # A body without a readable meta is a torn or corrupt
                 # write: drop it so it can never be served.
                 self._remove_quietly(body_path)
             return None
+        if raw_meta["key"] != key:
+            # The file holds a different key's entry (file-name
+            # collision). Never serve it — and never delete it either,
+            # it belongs to the other key. A miss makes the caller
+            # re-render and store under its own key.
+            return None
+        meta = raw_meta
         age = self._entry_age(meta, now, now_mono)
         fresh_for = meta["fresh_for"]
         stale_for = meta["stale_for"]
         if age >= fresh_for + stale_for:
-            lease = self._read_lease(name, now, now_mono)
+            lease = self._read_lease(name, now, now_mono, key)
             if lease is not None:
                 return SharedEntry("expired", None, meta["version"], 0.0, 0.0)
             # Delete only the exact expired version seen, and only if
             # no live generation owns it (re-checked under the lock by
             # the caller-visible remove path; here the meta match is
-            # the fence against a concurrent replacement).
-            current = self._read_meta(name)
+            # the fence against a concurrent replacement). The
+            # key-aware read also fences against a concurrent write
+            # for a colliding key.
+            current = self._read_meta_for_key(name, key)
             if current is not None and current["version"] == meta["version"] \
                     and current["generated_at"] == meta["generated_at"]:
                 self._remove_quietly(self._body_path(name), self._meta_path(name))
@@ -2457,7 +2489,15 @@ class FileSystemCacheBackend(CacheBackend):
 
     # -- leases ----------------------------------------------------------
 
-    def _read_lease(self, name, now, now_mono):
+    def _read_lease(self, name, now, now_mono, key=None):
+        """Read a live lease, optionally only when it names ``key``.
+
+        Like entries, leases live in a file named by the key stem, so a
+        file-name collision could let one key see another's lease. When
+        ``key`` is given, a lease naming a different key is treated as
+        no lease. Callers that only need "is anything leased here"
+        (capacity eviction) pass no key.
+        """
         try:
             with open(self._lease_path(name), "rb") as handle:
                 lease = json.loads(handle.read().decode("utf-8"))
@@ -2473,6 +2513,8 @@ class FileSystemCacheBackend(CacheBackend):
             expires_mono = float(lease["expires_mono"])
             version = int(lease["version"])
         except (KeyError, TypeError, ValueError):
+            return None
+        if key is not None and lease.get("key") is not None and lease["key"] != key:
             return None
         # Live only while both clocks agree: a wall jump or a reboot
         # (monotonic reset) on its own cannot resurrect a dead lease.
@@ -2493,11 +2535,12 @@ class FileSystemCacheBackend(CacheBackend):
             try:
                 now = time.time()
                 now_mono = time.monotonic()
-                if self._read_lease(name, now, now_mono) is not None:
+                if self._read_lease(name, now, now_mono, key) is not None:
                     return None
-                meta = self._read_meta(name)
+                meta = self._read_meta_for_key(name, key)
                 version = meta["version"] if meta is not None else 0
                 lease = {
+                    "key": key,
                     "owner": owner,
                     "expires_at": now + ttl,
                     "expires_mono": now_mono + ttl,
@@ -2516,17 +2559,19 @@ class FileSystemCacheBackend(CacheBackend):
         name = _fs_entry_name(key)
         with self._locked():
             try:
-                lease = self._read_lease(name, time.time(), time.monotonic())
+                lease = self._read_lease(name, time.time(), time.monotonic(), key)
                 if lease is not None and lease["owner"] == owner:
                     self._remove_quietly(self._lease_path(name))
                     return True
                 # An expired lease file is already dead; remove it only
                 # when it names this owner, so a successor's lease is
-                # never clobbered.
+                # never clobbered. The key must match too, so a
+                # colliding key cannot release another key's lease.
                 try:
                     with open(self._lease_path(name), "rb") as handle:
                         raw = json.loads(handle.read().decode("utf-8"))
-                    if isinstance(raw, dict) and raw.get("owner") == owner:
+                    if isinstance(raw, dict) and raw.get("owner") == owner \
+                            and (raw.get("key") is None or raw.get("key") == key):
                         self._remove_quietly(self._lease_path(name))
                         return True
                 except (FileNotFoundError, OSError, ValueError, UnicodeDecodeError):
@@ -2539,7 +2584,7 @@ class FileSystemCacheBackend(CacheBackend):
     def owns_lease(self, key, owner):
         try:
             lease = self._read_lease(
-                _fs_entry_name(key), time.time(), time.monotonic())
+                _fs_entry_name(key), time.time(), time.monotonic(), key)
         except OSError as exc:
             raise SharedCacheUnavailable("Filesystem cache lease lookup failed") from exc
         return lease is not None and lease["owner"] == owner
@@ -2564,10 +2609,13 @@ class FileSystemCacheBackend(CacheBackend):
                 now = time.time()
                 now_mono = time.monotonic()
                 if owner is not None:
-                    lease = self._read_lease(name, now, now_mono)
+                    lease = self._read_lease(name, now, now_mono, key)
                     if lease is None or lease["owner"] != owner:
                         return False
-                meta = self._read_meta(name)
+                # A meta naming another key is treated as no entry:
+                # the write starts fresh (version 1) instead of
+                # inheriting — or fencing on — another key's version.
+                meta = self._read_meta_for_key(name, key)
                 if expected_version is None:
                     version = (meta["version"] + 1) if meta is not None else 1
                 elif meta is None:
@@ -2645,6 +2693,13 @@ class FileSystemCacheBackend(CacheBackend):
     def remove(self, key):
         name = _fs_entry_name(key)
         with self._locked():
+            # Never delete another key's entry: a file-name collision
+            # must not let one key's invalidation wipe another path.
+            # When the meta names a different key, leave everything
+            # (entry and lease) alone.
+            meta = self._read_meta(name)
+            if meta is not None and meta["key"] != key:
+                return False
             removed = False
             for path in (self._body_path(name), self._meta_path(name), self._lease_path(name)):
                 try:
@@ -2668,7 +2723,10 @@ class FileSystemCacheBackend(CacheBackend):
                 try:
                     with open(self._variant_path(name), "rb") as handle:
                         raw = json.loads(handle.read().decode("utf-8"))
-                    if isinstance(raw, dict) and float(raw["expires_at"]) > now:
+                    # A variant naming another key is a file-name
+                    # collision, not this key's generation.
+                    if isinstance(raw, dict) and float(raw["expires_at"]) > now \
+                            and (raw.get("key") is None or raw.get("key") == key):
                         token = raw["token"]
                         existed = True
                 except (FileNotFoundError, OSError, ValueError, UnicodeDecodeError, KeyError, TypeError):
@@ -2678,7 +2736,7 @@ class FileSystemCacheBackend(CacheBackend):
                     self._atomic_write(
                         self._variant_path(name),
                         json.dumps(
-                            {"token": token, "expires_at": now + _VARIANT_GENERATION_TTL},
+                            {"key": key, "token": token, "expires_at": now + _VARIANT_GENERATION_TTL},
                             sort_keys=True,
                         ).encode("utf-8"),
                     )
