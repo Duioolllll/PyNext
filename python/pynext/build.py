@@ -1555,7 +1555,7 @@ async def _render_static_pages(app):
                                 index += 1
                                 if len(body) + len(chunk) > MAX_STREAMED_STATIC_BYTES:
                                     raise ValueError(_config_error(
-                                        f"Streamed static page {path} exceeds the build size limit "
+                                        f"Streamed static page {path} exceeds build size limit "
                                         f"({MAX_STREAMED_STATIC_BYTES} bytes)",
                                         [("file", entry), ("pattern", pattern)],
                                         ["Split the page or reduce its content"]))
@@ -1586,7 +1586,7 @@ async def _render_static_pages(app):
                 else:
                     if len(response.body) > MAX_STATIC_PAGE_BYTES:
                         raise ValueError(_config_error(
-                            f"Static page {path} exceeds the build size limit "
+                            f"Static page {path} exceeds build size limit "
                             f"({MAX_STATIC_PAGE_BYTES} bytes)",
                             [("file", entry), ("pattern", pattern)],
                             ["Split the page or reduce its content"]))

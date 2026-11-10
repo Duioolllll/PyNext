@@ -29,12 +29,14 @@ def test_concurrent_shared_sets_coalesce_into_one_write(tmp_path):
             release = threading.Event()
             real_insert = cache.shared.insert_fenced
 
-            def slow_insert(key, body, fresh, stale, expected_version, owner=None):
+            def slow_insert(key, body, fresh, stale, expected_version, owner=None,
+                            tags=(), generated_at=None, generated_mono=None):
                 writes.append(body)
                 if len(writes) == 1:
                     started.set()
                     assert release.wait(timeout=10)
-                return real_insert(key, body, fresh, stale, expected_version, owner)
+                return real_insert(key, body, fresh, stale, expected_version, owner,
+                                   tags, generated_at, generated_mono)
 
             cache.shared.insert_fenced = slow_insert
             version = await asyncio.to_thread(cache.shared.acquire_lease, "/page", "owner-1")
