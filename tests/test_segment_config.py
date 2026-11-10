@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from pynext import create_app, layout, page
-from pynext.build import write_manifest
+from pynext.build import build_id_for, write_manifest
 from pynext.components import reduce_segment_config
 
 
@@ -204,7 +204,11 @@ def test_layout_policy_change_requires_rebuild(tmp_path):
     saved = tmp_path / ".pynext" / "manifest.json"
     data = json.loads(saved.read_text(encoding="utf-8"))
     data["layout_policies"]["/blog"][0]["revalidate"] = 30.0
-    saved.write_text(json.dumps(data), encoding="utf-8")
+    raw = json.dumps(data).encode("utf-8")
+    saved.write_bytes(raw)
+    # Re-sign the edited manifest so the BUILD_ID integrity check passes
+    # and the layout-policy check is the one that fires.
+    (tmp_path / ".pynext" / "BUILD_ID").write_text(build_id_for(raw), encoding="utf-8")
     with pytest.raises(ValueError, match="Layout policies changed since build"):
         create_app(tmp_path, production=True)
 
