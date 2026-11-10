@@ -2239,6 +2239,7 @@ class FileSystemCacheBackend(CacheBackend):
                               (monotonic seconds), fresh_for, stale_for
         leases/<stem>.lease   JSON: owner, expires_at (wall), expires_mono
         variants/<stem>.variant  JSON: token, expires_at (wall)
+        tags/<stem>.tag       JSON: tag, stale_at, expired_at (shared tag manifest)
         .lock                 cross-process mutation lock
 
     The ``.meta`` sidecar is the publish marker, mirroring Next.js's
@@ -2286,12 +2287,14 @@ class FileSystemCacheBackend(CacheBackend):
         self._entries_dir = os.path.join(self.path, "entries")
         self._leases_dir = os.path.join(self.path, "leases")
         self._variants_dir = os.path.join(self.path, "variants")
+        self._tags_dir = os.path.join(self.path, "tags")
         self._lock_path = os.path.join(self.path, ".lock")
         self._lock = threading.RLock()
         try:
             os.makedirs(self._entries_dir, exist_ok=True)
             os.makedirs(self._leases_dir, exist_ok=True)
             os.makedirs(self._variants_dir, exist_ok=True)
+            os.makedirs(self._tags_dir, exist_ok=True)
             with open(self._lock_path, "ab"):
                 pass
         except OSError as exc:
@@ -2310,6 +2313,9 @@ class FileSystemCacheBackend(CacheBackend):
 
     def _variant_path(self, name):
         return os.path.join(self._variants_dir, name + ".variant")
+
+    def _tag_path(self, name):
+        return os.path.join(self._tags_dir, name + ".tag")
 
     # -- locking -------------------------------------------------------
 
@@ -2387,6 +2393,9 @@ class FileSystemCacheBackend(CacheBackend):
         if not isinstance(meta, dict):
             return None
         try:
+            tags = meta.get("tags", ())
+            if not isinstance(tags, list) or not all(isinstance(item, str) for item in tags):
+                raise ValueError("bad tags")
             return {
                 "key": meta["key"],
                 "version": int(meta["version"]),
@@ -2394,6 +2403,7 @@ class FileSystemCacheBackend(CacheBackend):
                 "generated_mono": float(meta["generated_mono"]),
                 "fresh_for": float(meta["fresh_for"]),
                 "stale_for": float(meta["stale_for"]),
+                "tags": tuple(tags),
             }
         except (KeyError, TypeError, ValueError):
             return None
@@ -2465,8 +2475,22 @@ class FileSystemCacheBackend(CacheBackend):
         except FileNotFoundError:
             return None
         if age < fresh_for:
-            return SharedEntry("fresh", body, meta["version"], fresh_for - age, stale_for)
-        return SharedEntry("stale", body, meta["version"], 0.0, fresh_for + stale_for - age)
+            status, fresh_left, stale_left = "fresh", fresh_for - age, stale_for
+        else:
+            status, fresh_left, stale_left = "stale", 0.0, fresh_for + stale_for - age
+        # Tag invalidation is judged by the render-start time, like the
+        # SQLite backend: a generation that started before the invalidation
+        # but landed after it is stale/expired, never fresh. A tag-expired
+        # entry is a miss but stays stored (a later read may still serve
+        # it stale); only age expiry deletes.
+        tags = meta.get("tags", ())
+        if tags:
+            tag_state = _tag_status(tags, self._tag_times(tags), meta["generated_at"], now)
+            if tag_state == "expired":
+                return SharedEntry("expired", None, meta["version"], 0.0, 0.0)
+            if tag_state == "stale":
+                status, fresh_left, stale_left = "stale", 0.0, fresh_for + stale_for - age
+        return SharedEntry(status, body, meta["version"], fresh_left, stale_left)
 
     def lookup(self, key):
         try:
@@ -2591,23 +2615,38 @@ class FileSystemCacheBackend(CacheBackend):
 
     # -- writes ----------------------------------------------------------
 
-    def insert(self, key, body, fresh_seconds, stale_seconds):
-        return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None)
+    def insert(self, key, body, fresh_seconds, stale_seconds, tags=()):
+        return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None, tags=tags)
 
-    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
         """Store ``body`` only if the entry version still equals
         ``expected_version`` (``0`` when no entry existed, ``None`` for an
         unfenced write). When an owner is given, its lease must still be live
-        in the same lock hold. Returns False when either fence has moved."""
+        in the same lock hold. Returns False when either fence has moved.
+
+        ``generated_at`` / ``generated_mono`` stamp the entry with the
+        render *start* time instead of the insert time (same role as in
+        :meth:`SQLiteCacheBackend.insert_fenced`): a generation that
+        started before a tag invalidation but stored after it is judged
+        by when its content was produced. ``tags`` are stored in the meta
+        sidecar so other workers can judge them on lookup.
+        """
         if len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES or len(body) > MAX_CACHE_BODY_BYTES:
             return False
         if not _valid_durations(fresh_seconds, stale_seconds):
+            return False
+        try:
+            tags = _validate_entry_tags(tags)
+        except ValueError:
             return False
         name = _fs_entry_name(key)
         with self._locked():
             try:
                 now = time.time()
                 now_mono = time.monotonic()
+                gen_at = generated_at if generated_at is not None else now
+                gen_mono = generated_mono if generated_mono is not None else now_mono
                 if owner is not None:
                     lease = self._read_lease(name, now, now_mono, key)
                     if lease is None or lease["owner"] != owner:
@@ -2629,10 +2668,11 @@ class FileSystemCacheBackend(CacheBackend):
                 new_meta = {
                     "key": key,
                     "version": version,
-                    "generated_at": now,
-                    "generated_mono": now_mono,
+                    "generated_at": gen_at,
+                    "generated_mono": gen_mono,
                     "fresh_for": float(fresh_seconds),
                     "stale_for": float(stale_seconds),
+                    "tags": list(tags),
                 }
                 # Body first, meta last: the meta is the publish marker.
                 self._atomic_write(self._body_path(name), bytes(body))

@@ -4381,6 +4381,7 @@ class App:
                     response = await self._render_ssg_blocking(pattern, path, params, request)
                 else:
                     response = await self._render_ssg_prerender(pattern, path, params)
+            elif self.render_modes[pattern] == "isr" and (self.production or self.debug):
                 query = self._page_query(pattern, request)
                 private = any(name.lower() in {b"authorization", b"cookie"} for name, _ in request.headers)
                 if private:

@@ -167,7 +167,9 @@ def test_invalid_durations_and_sizes_are_rejected(tmp_path):
     assert backend.insert("/page", b"x", -1.0, 60.0) is False
     assert backend.insert("/page", b"x", 30.0, -1.0) is False
     assert backend.insert("/page", b"x", float("nan"), 60.0) is False
-    assert backend.insert("/page", b"x", 30.0, 999_999.0) is False
+    # Over the one-year lifetime cap (HEAD MAX_CACHE_SECONDS); the branch
+    # was written against the old 7-day cap, so 999_999s used to be over it.
+    assert backend.insert("/page", b"x", 30.0, 40_000_000.0) is False
     assert backend.lookup("/page") == ("miss", None)
 
 
