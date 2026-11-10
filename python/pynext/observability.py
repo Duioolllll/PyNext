@@ -322,6 +322,30 @@ def _env_float(name, default=None):
     return parsed if parsed >= 0 else default
 
 
+def _env_tristate(name):
+    """Parse an env var as True/False, or None when unset/unrecognized (auto)."""
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _env_int(name, default, minimum=None):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip(), 10)
+    except ValueError:
+        return default
+    return max(minimum, value) if minimum is not None else value
+
+
 @dataclass
 class ObservabilityConfig:
     """Flags controlling structured logs, metrics and tracing.
