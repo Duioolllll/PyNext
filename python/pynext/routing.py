@@ -12,6 +12,21 @@ def route(method):
     return decorate
 
 
+def state_changing_get(fn):
+    """Mark a GET handler as knowingly state-changing (S-P1-23 acknowledgement).
+
+    GET, HEAD and OPTIONS are exempt from CSRF checks, so a handler that
+    changes state on GET is unprotected by construction. This marker
+    only silences the development startup warning from
+    :func:`pynext.app.check_get_idempotency` — it adds no CSRF
+    protection whatsoever. Prefer moving the mutation to POST/PUT/PATCH/
+    DELETE; use this only when the GET mutation is deliberate and the
+    exposure has been reviewed.
+    """
+    fn.__pynext_state_changing_get__ = True
+    return fn
+
+
 def websocket(fn=None, *, protocols=()):
     """Mark an async function as the WebSocket handler for a route.py module.
 

@@ -28,7 +28,7 @@ from urllib.parse import quote, unquote, unquote_to_bytes
 from . import _native
 from .admission import DecisionGate
 from .assets import read_public_artifacts, read_public_sources
-from .auth import check_authorization
+from .auth import authorization_policy, check_authorization
 from .cache import (MAX_CACHE_SECONDS, CacheBusy, ISRCache, SharedCacheUnavailable,
                     dev_retention_policy, validate_cache_tag)
 from .client import compile_client, read_client_artifacts
@@ -43,7 +43,8 @@ from .errors import SignalError, digest_for_error, error_count
 from .http import (SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_path_headers, apply_security_headers, compile_path_headers,
-                   cors_preflight_response, filter_internal_headers, new_csp_nonce, validate_csrf)
+                   cors_preflight_response, csrf_token_response, filter_internal_headers, new_csp_nonce,
+                   validate_csrf)
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .middleware import ScopedMiddleware
 from .observability import (
@@ -594,6 +595,64 @@ def _module_key(root, relative):
     return str((root / relative).resolve()).casefold()
 
 
+#: Source patterns that mark a GET handler as (probably) state-changing
+#: (S-P1-23 lint). A GET handler is exempt from CSRF checks, so any of
+#: these in its source means the route is likely unprotected against
+#: cross-site requests. The list is deliberately short and high-signal —
+#: session writes, cache invalidation and transaction commits — so a
+#: lint hit is worth reading; it is a heuristic, not a proof, and a
+#: handler can always acknowledge the pattern with
+#: :func:`pynext.routing.state_changing_get`.
+_STATE_CHANGING_GET_PATTERNS = (
+    # `session["key"] = ...` (local alias) or
+    # `request.state["session"]["key"] = ...` (inline access).
+    (re.compile(r"(\bsession\s*\[[^\]]*\]\s*=|\[['\"]session['\"]\]\s*\[[^\]]*\]\s*=)"),
+     "writes to the session"),
+    (re.compile(r"\brevalidate_tag\s*\("), "calls revalidate_tag()"),
+    (re.compile(r"\brevalidate\s*\("), "calls revalidate()"),
+    (re.compile(r"\.commit\s*\("), "commits a database transaction"),
+)
+
+
+def check_get_idempotency(app):
+    """Warn about GET handlers that look state-changing (S-P1-23).
+
+    GET, HEAD and OPTIONS are exempt from CSRF checks, so a GET handler
+    that mutates state is unprotected by construction. This lint reads
+    each registered GET handler's source (pages and API routes alike)
+    for the patterns in :data:`_STATE_CHANGING_GET_PATTERNS` and logs
+    one warning per hit, naming the route pattern and the reason.
+    Handlers marked with :func:`pynext.routing.state_changing_get` are
+    skipped — the marker is an explicit acknowledgement, not a fix.
+    Handlers whose source cannot be read (built-ins, C extensions) are
+    skipped silently. Returns the list of ``(pattern, reason)`` findings
+    so callers (and tests) can inspect them without parsing logs.
+    Development apps run this at startup; production apps do not, so a
+    warning never costs a request.
+    """
+    findings = []
+    for pattern, spec in app.manifest["routes"].items():
+        entry = app.entries.get(pattern)
+        if entry is None:
+            continue
+        handlers = {"GET": entry[0]} if spec["kind"] == "page" else entry
+        for method, fn in handlers.items():
+            if method != "GET" or getattr(fn, "__pynext_state_changing_get__", False):
+                continue
+            try:
+                source = inspect.getsource(fn)
+            except (OSError, TypeError):
+                continue
+            for regex, reason in _STATE_CHANGING_GET_PATTERNS:
+                if regex.search(source):
+                    findings.append((pattern, reason))
+                    log.warning("GET handler for %s %s; GET requests are exempt from CSRF checks, "
+                                "so move the mutation to POST (or mark the handler with "
+                                "state_changing_get to acknowledge the exposure)", pattern, reason)
+                    break
+    return findings
+
+
 class App:
     def __init__(self, root, manifest, *, production=False, security=None,
                  cache_backend=DEFAULT_CONFIG.cache_backend,
@@ -784,6 +843,13 @@ class App:
         self.production = production
         self.router = _native.Router(list(manifest["routes"]))
         self.entries = {}
+        # Authorization policies snapshotted at registration (S-P1-33):
+        # pattern -> {method: AuthorizationPolicy} for HTTP routes, and
+        # pattern -> AuthorizationPolicy for WebSocket handlers. Dispatch
+        # enforces from these snapshots, never from the handler's live
+        # attributes, so a lost decorator cannot silently drop the check.
+        self.route_auth = {}
+        self.websocket_auth = {}
         self._layout_shells = {}
         self._layout_shell_locks = {}
         self._layout_shell_dynamic = {}
@@ -967,6 +1033,7 @@ class App:
                     getattr(layout_fn, "__pynext_layout_dynamic__", False) for layout_fn in layouts
                 )
                 self.entries[pattern] = (fn, layouts)
+                self.route_auth[pattern] = {"GET": authorization_policy(fn)}
                 self.entry_layouts[pattern] = tuple(layout_relatives)
             else:
                 handlers = {}
@@ -987,7 +1054,10 @@ class App:
                     raise ValueError(f"{spec['entry']} has no @route handlers")
                 if ws_handler is not None:
                     self.websocket_entries[pattern] = ws_handler
+                    self.websocket_auth[pattern] = authorization_policy(ws_handler)
                 self.entries[pattern] = handlers
+                self.route_auth[pattern] = {method: authorization_policy(fn)
+                                            for method, fn in handlers.items()}
         if production:
             from .build import read_static_pages
             if manifest.get("render_modes") != self.render_modes:
@@ -1014,6 +1084,11 @@ class App:
                   **{path: body for path, (body, _) in self.public_assets.items()}}
         self.asset_etags = {path: f'"{hashlib.sha256(body).hexdigest()}"' for path, body in assets.items()}
         self._dev_client_history = [self.client_assets] if self.hot_reload else []
+        if not production:
+            # S-P1-23: a GET handler that mutates state is exempt from
+            # CSRF checks, so warn at startup (development only) instead
+            # of letting the exposure stay silent until review.
+            check_get_idempotency(self)
 
     def update_dev_client(self, manifest, assets):
         """Atomically replace development bundles, keeping two prior versions."""
@@ -2141,6 +2216,13 @@ class App:
             return asset_response(request, body, "image/webp", etag,
                                   cache_control=b"public, max-age=0, must-revalidate",
                                   extra_headers=[(b"x-content-type-options", b"nosniff")])
+        if path == "/_pynext/csrf-token":
+            route_var.set("__csrf_token__")
+            if request.method == "OPTIONS":
+                return Response(b"", status=204, headers=[(b"allow", b"GET, HEAD, OPTIONS")], media_type=None)
+            if request.method not in {"GET", "HEAD"}:
+                return Response("Method Not Allowed", status=405, headers=[(b"allow", b"GET, HEAD, OPTIONS")])
+            return csrf_token_response(request, config=self.security)
         if path == "/_pynext/revalidate":
             route_var.set("__revalidate__")
             return await self._revalidate_webhook(request)
@@ -2212,7 +2294,14 @@ class App:
         handler = entry[0] if spec["kind"] == "page" else entry.get(
             "GET" if request.method == "HEAD" and "HEAD" not in entry else request.method)
         if handler is not None:
-            denied = check_authorization(request, handler)
+            # S-P1-33: enforce from the policy snapshotted at
+            # registration, keyed by the router-matched pattern (the
+            # normalized path routing already decided on) — never from
+            # the handler's live attributes.
+            method_key = "GET" if spec["kind"] == "page" else (
+                "GET" if request.method == "HEAD" and "HEAD" not in entry else request.method)
+            denied = check_authorization(request, handler,
+                                         policy=self.route_auth.get(pattern, {}).get(method_key))
             if denied is not None:
                 return denied
         if spec["kind"] == "page":
@@ -2443,7 +2532,10 @@ class App:
             # A middleware answered the upgrade itself: its response is
             # the denial (for example 403 from an auth middleware).
             return response
-        denied = check_authorization(seen.get("request", request), handler)
+        # S-P1-33: enforce from the policy snapshotted at registration
+        # for this pattern, as HTTP dispatch does.
+        denied = check_authorization(seen.get("request", request), handler,
+                                     policy=self.websocket_auth.get(pattern))
         if denied is not None:
             return denied
         return None
