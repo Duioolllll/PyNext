@@ -376,6 +376,58 @@ def _header_values(request, name):
     return [value for key, value in request.headers if key.lower() == wanted]
 
 
+# Headers that are only ever set by the framework or its middleware, never
+# by a client. Next.js `INTERNAL_HEADERS`
+# (packages/next/src/server/lib/server-ipc/utils.ts:42-65) plus
+# `x-middleware-refresh`, the framework-set middleware signal read back in
+# `resolve-routes.ts:739-845` — 13 names in total. A client that sends one
+# of these must not be able to steer routing, middleware, or any security
+# decision that reads it, so both entry points
+# (`App.__call__` for ASGI, `create_server` for the native transport)
+# strip them before anything else sees the request. PyNext middleware
+# communicates through ``Request``/``Response`` objects, so there is no
+# `x-middleware-*` protocol to preserve — stripping is purely defensive,
+# and a future internal signal belongs in this list first.
+#
+# Deliberately NOT stripped: `x-request-id` (echoed by design,
+# `observability.begin_request_context`), `traceparent` (W3C tracing),
+# and `x-forwarded-*` (only honored from trusted proxies,
+# `proxy.ProxyTrust`).
+INTERNAL_HEADERS = frozenset((
+    b"x-middleware-rewrite",
+    b"x-middleware-redirect",
+    b"x-middleware-set-cookie",
+    b"x-middleware-skip",
+    b"x-middleware-override-headers",
+    b"x-middleware-next",
+    b"x-middleware-refresh",
+    b"x-now-route-matches",
+    b"x-matched-path",
+    b"x-nextjs-data",
+    b"x-next-internal-go-token",
+    b"x-next-resume-state-length",
+    b"next-resume",
+))
+
+
+def filter_internal_headers(headers):
+    """Return ``headers`` without internal-only headers.
+
+    Accepts the transport form — an iterable of ``(name, value)`` byte
+    pairs (ASGI scope headers or the native transport's header list) —
+    and returns a new tuple in the original order. Matching is
+    case-insensitive; anything that is not an internal header (including
+    duplicates) is preserved untouched.
+    """
+    return tuple(
+        (name, value)
+        for name, value in headers
+        if (name.lower() if isinstance(name, bytes)
+            else name.lower().encode("ascii", "ignore") if isinstance(name, str)
+            else None) not in INTERNAL_HEADERS
+    )
+
+
 def _cookie_value(request, name):
     for value in _header_values(request, "cookie"):
         for part in value.split(b";"):

@@ -14,7 +14,7 @@ from .config import DEFAULT_CONFIG
 from .errors import SignalError, digest_for_error
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
                    WebSocketDisconnect, _RequestCancellation, apply_path_headers,
-                   apply_security_headers, security_headers)
+                   apply_security_headers, filter_internal_headers, security_headers)
 from .observability import begin_request_context, get_request_id, queue_wait_var
 from .ratelimit import _is_exempt_path
 from .standalone import log_bundle_info
@@ -379,6 +379,10 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
 
     async def call(method, raw_path, query, headers, body, submitted_at=None, client_ip=None, cancel_event=None):
         started = time.monotonic()
+        # Boundary hygiene, same as the ASGI entry point: internal-only
+        # headers never reach the request context, the middleware chain,
+        # or any security decision.
+        headers = filter_internal_headers(headers)
         request_id, reset_context = begin_request_context(headers)
         if submitted_at is not None:
             queue_wait_var.set((started - submitted_at) * 1000)
@@ -500,10 +504,11 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
         return response.status, response.headers, body
 
     def ws_callback(path, query, headers, subprotocol):
-        return _websocket_callback(app, loop, path, query, headers, subprotocol)
+        return _websocket_callback(app, loop, path, query, filter_internal_headers(headers), subprotocol)
 
     def ws_origin_callback(headers, peer_ip):
-        return websocket_origin_allowed(headers, peer_ip, "http", app.proxy_trust, app.security)
+        return websocket_origin_allowed(filter_internal_headers(headers), peer_ip, "http",
+                                        app.proxy_trust, app.security)
 
     # One charge per request, including WebSocket handshakes. Rust runs
     # this before polling HTTP bodies or accepting upgrades. Health
@@ -512,6 +517,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     rate_limit_callback = None
     if limiter is not None:
         def rate_limit_callback(path, headers, peer_ip):
+            headers = filter_internal_headers(headers)
             if _is_exempt_path(limiter, path):
                 return True, None
             key = limiter.key_for(peer_ip, headers)
@@ -534,6 +540,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
         # Runs on a Rust blocking thread, so it must not await: schedule
         # the async pre-flight on the app's event loop and wait with a
         # timeout, mirroring the Origin callback above.
+        headers = filter_internal_headers(headers)
         try:
             future = _submit(loop, _ws_auth_decision(path, query, headers))
         except RuntimeError:
