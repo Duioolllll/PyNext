@@ -46,7 +46,8 @@ class App:
                  render_workers: int | None = ..., session_workers: int | None = ...,
                  strict_ssg: bool = ...,
                  revalidate_secret: str | None = ..., base_path: str = ...,
-                 trailing_slash: Literal["redirect", "ignore"] = ..., body_timeout_ms: int = ...,
+                 trailing_slash: Literal["redirect", "ignore"] = ..., reuse_client: tuple[dict[str, Any], dict[str, bytes]] | None = ...,
+                 body_timeout_ms: int = ...,
                  handler_timeout_ms: int = ..., response_timeout_ms: int = ...,
                  custom_routes: dict[str, Any] | None = ...) -> None: ...
     def configure_observability(self, config: ObservabilityConfig) -> App: ...

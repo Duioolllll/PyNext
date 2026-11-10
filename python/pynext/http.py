@@ -1218,6 +1218,12 @@ class PathHeaderRule:
         return self._regex.fullmatch(path) is not None
 
 
+# A per-path header rule, either compiled or as a plain ``(source, headers)``
+# tuple (see :func:`compile_path_headers`). Mirrors the ``PathHeaderRuleInput``
+# alias in ``http.pyi`` so stubtest sees the name at runtime.
+PathHeaderRuleInput = PathHeaderRule | tuple[str, Mapping[str, str] | Iterable[tuple[str, str]]]
+
+
 class PathHeaders:
     """Compiled per-path response headers for an app.
 

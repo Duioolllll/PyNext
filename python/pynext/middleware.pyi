@@ -4,6 +4,26 @@ from typing import Any, Literal
 from .http import Request, Response
 from .types import Middleware, NextHandler
 
+MiddlewareKind = Literal["next", "rewrite", "redirect", "response"]
+
+@dataclass(frozen=True)
+class MiddlewareResult:
+    kind: MiddlewareKind
+    request: Request | None = ...
+    response: Response | None = ...
+    @property
+    def is_terminal(self) -> bool: ...
+    @property
+    def is_continue(self) -> bool: ...
+    @classmethod
+    def next(cls, request: Request) -> MiddlewareResult: ...
+    @classmethod
+    def rewrite(cls, request: Request) -> MiddlewareResult: ...
+    @classmethod
+    def redirect(cls, location: str, status: int = ...) -> MiddlewareResult: ...
+    @classmethod
+    def response(cls, response: Response) -> MiddlewareResult: ...
+
 @dataclass(frozen=True)
 class RouteHas:
     type: Literal["header", "query", "cookie", "host"]
