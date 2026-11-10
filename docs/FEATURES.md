@@ -28,6 +28,7 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `Database` | `pynext.database` |
 | `DjangoBusyError` | `pynext.django` |
 | `DjangoResource` | `pynext.django` |
+| `CACHE_LIFE_PROFILES` | `pynext.components` |
 | `BadRequest` | `pynext.http` |
 | `Request` | `pynext.http` |
 | `RequestCancelled` | `pynext.http` |
@@ -35,6 +36,21 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `JSONResponse` | `pynext.http` |
 | `StreamingResponse` | `pynext.http` |
 | `SecurityConfig` | `pynext.http` |
+| `SignalError` | `pynext.errors` |
+| `NotFoundError` | `pynext.errors` |
+| `ForbiddenError` | `pynext.errors` |
+| `UnauthorizedError` | `pynext.errors` |
+| `RedirectError` | `pynext.errors` |
+| `not_found` | `pynext.errors` |
+| `forbidden` | `pynext.errors` |
+| `unauthorized` | `pynext.errors` |
+| `redirect` | `pynext.errors` |
+| `is_signal_error` | `pynext.errors` |
+| `get_digest_for_well_known_error` | `pynext.errors` |
+| `compute_digest` | `pynext.errors` |
+| `digest_for_error` | `pynext.errors` |
+| `error_count` | `pynext.errors` |
+| `lookup_error` | `pynext.errors` |
 | `csrf_protect` | `pynext.http` |
 | `new_csrf_token` | `pynext.http` |
 | `new_csp_nonce` | `pynext.http` |
@@ -44,6 +60,10 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `content_security_policy` | `pynext.http` |
 | `security_headers` | `pynext.http` |
 | `apply_security_headers` | `pynext.http` |
+| `PathHeaderRule` | `pynext.http` |
+| `PathHeaders` | `pynext.http` |
+| `apply_path_headers` | `pynext.http` |
+| `compile_path_headers` | `pynext.http` |
 | `ObservabilityConfig` | `pynext.observability` |
 | `MetricsCollector` | `pynext.observability` |
 | `WebSocket` | `pynext.http` |
@@ -67,6 +87,25 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `parse_trusted_proxies` | `pynext.proxy` |
 | `FAIL_OPEN` | `pynext.failure_policy` |
 | `FAIL_CLOSED` | `pynext.failure_policy` |
+| `LoadedEnv` | `pynext.env` |
+| `env_file_names` | `pynext.env` |
+| `load_env` | `pynext.env` |
+| `public_env_defines` | `pynext.env` |
+| `public_env_vars` | `pynext.env` |
+| `no_store` | `pynext.dynamic` |
+| `mark_dynamic_access` | `pynext.dynamic` |
+| `StaticGenBailoutError` | `pynext.dynamic` |
+| `is_prerender_bailout` | `pynext.dynamic` |
+| `FetchCacheDecision` | `pynext.fetch_cache` |
+| `apply_fetch_revalidate` | `pynext.fetch_cache` |
+| `decide_fetch_cache` | `pynext.fetch_cache` |
+| `fetch_cache_store_key` | `pynext.fetch_cache` |
+| `generate_fetch_cache_key` | `pynext.fetch_cache` |
+| `generate_simple_fetch_cache_key` | `pynext.fetch_cache` |
+| `MiddlewareScope` | `pynext.middleware` |
+| `RouteHas` | `pynext.middleware` |
+| `ScopedMiddleware` | `pynext.middleware` |
+| `scoped` | `pynext.middleware` |
 
 ## Security defaults (`SecurityConfig`)
 
@@ -130,7 +169,7 @@ CLI defaults of `None` defer to server defaults; see the manual for scope and un
 | `--max-connections` | `None` |
 | `--max-connections-per-ip` | `None` |
 | `--max-waiting` | `None` |
-| `--shutdown-timeout` | `30` |
+| `--shutdown-timeout` | `30.0` |
 
 ## Health endpoints
 

@@ -46,7 +46,10 @@ async def check_responses(client):
         assert (await client.get("/what%3F.bin")).content == b"\x00\xff"
     assert (await client.get("/logo.txt")).content == b"public asset"
     assert (await client.get("/something-else")).text == page_html("<p>something-else</p>")
-    assert (await client.get("/styles%2Fsite.css")).status_code == 400
+    # The decoded path names a public asset, so it is served like the
+    # already-decoded "%23"/"%3F"/non-ASCII asset names above.
+    response = await client.get("/styles%2Fsite.css")
+    assert response.status_code == 200 and response.content == b"body { color: navy; }"
     assert (await client.post("/logo.txt")).status_code == 405
     assert (await client.options("/logo.txt")).status_code == 204
     assert (await client.request("GET", "/logo.txt", content=b"x" * 1_048_577)).status_code == 413

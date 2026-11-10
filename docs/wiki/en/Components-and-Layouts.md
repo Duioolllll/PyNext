@@ -45,6 +45,8 @@ def Layout(children):
 
 Layouts in ancestor directories wrap page output, including nested route layouts. A root HTML layout results in a full HTML document with a doctype.
 
+Layouts receive only `children`, so the layout shell — the layouts applied to the page — is rendered once per route and cached for later requests: streaming pages reuse the cached shell prefix/suffix, and buffered pages substitute the page into the cached shell. Treat `children` as opaque and render it exactly once: the shell is built with a placeholder where the page goes. A layout that reads mutable state (a clock, a database, a global) must opt out with `@layout(dynamic=True)` so its shell is rendered on every request. Layouts must render their children exactly once.
+
 ## Rendering rules
 
 Pages use `@page()`, `@page(render="ssg")` or `@page(render="isr", revalidate=30, stale=120)`. Shared layouts use `@layout`. A valid `Page` function returns one node dictionary; returning arbitrary text or raw HTML is not supported.

@@ -9,11 +9,15 @@ import threading
 import time
 
 from . import _native
-from .app import _decode_path, _invoke
+from .app import _decode_path, _invoke, _split_request_path, _typed_params
+from .config import DEFAULT_CONFIG
+from .errors import SignalError, digest_for_error
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
-                   WebSocketDisconnect, _RequestCancellation, apply_security_headers, security_headers)
-from .observability import begin_request_context, queue_wait_var
+                   WebSocketDisconnect, _RequestCancellation, apply_path_headers,
+                   apply_security_headers, filter_internal_headers, security_headers)
+from .observability import begin_request_context, get_request_id, queue_wait_var
 from .ratelimit import _is_exempt_path
+from .standalone import log_bundle_info
 from .ws_origin import websocket_origin_allowed
 
 log = logging.getLogger("pynext")
@@ -21,14 +25,16 @@ REQUEST_TIMEOUT = 30
 STREAM_CHUNK_TIMEOUT = 30
 # Connection limits (A4). These are the native server defaults; the Rust
 # accept loop enforces them, so a client that never completes a request
-# cannot hold a Python worker thread or an execution slot.
-DEFAULT_MAX_CONNECTIONS = 1024
-DEFAULT_MAX_CONNECTIONS_PER_IP = 128
-DEFAULT_HEADER_READ_TIMEOUT_MS = 10_000
+# cannot hold a Python worker thread or an execution slot. The values live
+# in config.DEFAULT_CONFIG (the single default source); these names stay
+# as the public aliases other modules import.
+DEFAULT_MAX_CONNECTIONS = DEFAULT_CONFIG.max_connections
+DEFAULT_MAX_CONNECTIONS_PER_IP = DEFAULT_CONFIG.max_connections_per_ip
+DEFAULT_HEADER_READ_TIMEOUT_MS = DEFAULT_CONFIG.header_read_timeout_ms
 # Minimum average body receive rate in bytes/second, enforced after a
 # 2-second grace window (see read_limited_body in the native crate). 0
 # disables the rate check; the whole-body timeout still applies.
-DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC = 1024
+DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC = DEFAULT_CONFIG.body_min_rate_bytes_per_sec
 # Upper bounds for the server limits (review #4 #5). The CLI enforces
 # these at parse time; start_native enforces them again so a direct
 # Python caller cannot smuggle a value past the CLI that overflows the
@@ -148,11 +154,11 @@ def _websocket_callback(app, loop, path, query, headers, subprotocol=None):
     match = app.router.matches(path)
     if match is None:
         raise RuntimeError(f"No WebSocket route for {path}")
-    pattern, raw_params = match
+    pattern, raw_params, kinds = match
     handler = app.websocket_entries.get(pattern)
     if handler is None:
         raise RuntimeError(f"No WebSocket handler for {path}")
-    params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
+    params = _typed_params(raw_params, kinds)
     session = _WsSession(loop, app.websocket_max_message)
 
     async def receive():
@@ -373,6 +379,10 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
 
     async def call(method, raw_path, query, headers, body, submitted_at=None, client_ip=None, cancel_event=None):
         started = time.monotonic()
+        # Boundary hygiene, same as the ASGI entry point: internal-only
+        # headers never reach the request context, the middleware chain,
+        # or any security decision.
+        headers = filter_internal_headers(headers)
         request_id, reset_context = begin_request_context(headers)
         if submitted_at is not None:
             queue_wait_var.set((started - submitted_at) * 1000)
@@ -390,14 +400,15 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
 
     async def _call_inner(method, raw_path, query, headers, body, client_ip=None, cancel_event=None):
         try:
-            path = _decode_path(raw_path, raw_path.encode("ascii"))
+            path, encoded_path = _split_request_path(raw_path, raw_path.encode("ascii"))
         except (ValueError, UnicodeError):
             response = Response("Bad Request", status=400)
         else:
             try:
                 request = Request(method.upper(), path, bytes(query),
                                   tuple((bytes(k), bytes(v)) for k, v in headers), bytes(body), _app=app,
-                                  _cancel_event=cancel_event if cancel_event is not None else _RequestCancellation())
+                                  _cancel_event=cancel_event if cancel_event is not None else _RequestCancellation(),
+                                  raw_path=encoded_path)
                 # Trust-resolved client identity (A6, pynext.proxy), same
                 # values as on ASGI: without trusted proxies these are just
                 # the direct connection values. The native listener is plain
@@ -411,12 +422,23 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                 request.state["client_scheme"] = info.scheme
                 request.state["client_host"] = info.host
                 response = await app.dispatch(request)
+            except SignalError as exc:
+                # Defensive: the timed dispatcher converts signals first.
+                # A signal escaping dispatch still answers without an error log.
+                response = exc.to_response()
+                request_id = get_request_id()
+                if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
+                    response.headers.append((b"x-request-id", request_id.encode("ascii")))
             except BadRequest as exc:
                 log.info("Bad request: %s", exc)
                 response = Response("Bad Request", status=400)
             except Exception as exc:
-                log.exception("Request failed")
-                response = app.error_response(exc)
+                digest, _count = digest_for_error(exc)
+                log.exception("Request failed", extra={"error_digest": digest})
+                response = app.error_response(exc, digest=digest)
+                # error_response results bypass dispatch, so path headers
+                # are applied here; routed responses already have them.
+                apply_path_headers(response, path, path_headers=app.path_headers)
         if method.upper() == "HEAD":
             response.body = b""
         if isinstance(response, StreamingResponse) and not response._head_only:
@@ -469,16 +491,24 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                     break
         # Timeout/unavailable responses built here bypass dispatch, so apply
         # the headers here; routed responses already have them (idempotent).
+        # The raw path may not decode; then no rule can match it anyway.
+        try:
+            bridge_path = _decode_path(raw_path, raw_path.encode("ascii"))
+        except (ValueError, UnicodeError):
+            bridge_path = None
+        if bridge_path is not None:
+            apply_path_headers(response, bridge_path, path_headers=app.path_headers)
         apply_security_headers(response, config=app.security, production=app.production)
         body = (_NativeStream(response, loop, app) if isinstance(response, StreamingResponse) and not response._head_only
                 else response.body)
         return response.status, response.headers, body
 
     def ws_callback(path, query, headers, subprotocol):
-        return _websocket_callback(app, loop, path, query, headers, subprotocol)
+        return _websocket_callback(app, loop, path, query, filter_internal_headers(headers), subprotocol)
 
     def ws_origin_callback(headers, peer_ip):
-        return websocket_origin_allowed(headers, peer_ip, "http", app.proxy_trust, app.security)
+        return websocket_origin_allowed(filter_internal_headers(headers), peer_ip, "http",
+                                        app.proxy_trust, app.security)
 
     # One charge per request, including WebSocket handshakes. Rust runs
     # this before polling HTTP bodies or accepting upgrades. Health
@@ -487,6 +517,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     rate_limit_callback = None
     if limiter is not None:
         def rate_limit_callback(path, headers, peer_ip):
+            headers = filter_internal_headers(headers)
             if _is_exempt_path(limiter, path):
                 return True, None
             key = limiter.key_for(peer_ip, headers)
@@ -509,6 +540,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
         # Runs on a Rust blocking thread, so it must not await: schedule
         # the async pre-flight on the app's event loop and wait with a
         # timeout, mirroring the Origin callback above.
+        headers = filter_internal_headers(headers)
         try:
             future = _submit(loop, _ws_auth_decision(path, query, headers))
         except RuntimeError:
@@ -541,17 +573,21 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 websocket_max_message=app.websocket_max_message, listener=listener,
                                 security_headers=security_headers(config=app.security,
                                                                   production=app.production),
+                                path_headers=app.path_headers.for_native(),
                                 drain_timeout_secs=shutdown_timeout)
 
 
-async def serve(app, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,
-                body_capacity=16, body_timeout_ms=10000, stop_event=None, observability=None, *,
+async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
+                max_concurrent=DEFAULT_CONFIG.max_concurrent,
+                acquire_timeout_ms=DEFAULT_CONFIG.acquire_timeout_ms,
+                body_capacity=DEFAULT_CONFIG.body_capacity,
+                body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms, stop_event=None, observability=None, *,
                 reuse_port=False, on_ready=None, listener=None,
                 max_connections=DEFAULT_MAX_CONNECTIONS,
                 max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                 header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                 body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
-                shutdown_timeout=30.0, max_waiting=None):
+                shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
@@ -603,6 +639,11 @@ async def serve(app, host="127.0.0.1", port=3000, max_concurrent=64, acquire_tim
                               body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
                               shutdown_timeout=shutdown_timeout, max_waiting=max_waiting)
         print(f"PyNext listening on http://{server.address}", flush=True)
+        # A standalone bundle records its provenance in
+        # bundle-manifest.json next to the app dir; log it (and warn on
+        # a Python/PyNext version mismatch) after the listening line so
+        # the first line stays the address.
+        log_bundle_info(getattr(app, "root", None))
         if on_ready is not None:
             on_ready(server.address)
         await stop_event.wait()

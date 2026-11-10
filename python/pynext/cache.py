@@ -23,8 +23,10 @@ a Cookie or Authorization header bypass the cache entirely in
 """
 import asyncio
 import contextvars
+import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -32,6 +34,7 @@ import uuid
 from collections import OrderedDict
 
 from . import _native
+from .components import MAX_CACHE_SECONDS, _validate_tag, _validate_tag_expire, _validate_tags
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
 
 log = logging.getLogger("pynext")
@@ -44,10 +47,136 @@ LEASE_TTL = GENERATION_TIMEOUT + 5.0
 LEASE_WAIT_INTERVAL = 0.05
 MAX_CACHE_KEY_BYTES = 4096
 MAX_CACHE_BODY_BYTES = 2_097_152
-MAX_CACHE_SECONDS = 604_800.0
+# MAX_CACHE_SECONDS is defined in components.py (imported above) to avoid a
+# cache <-> components circular import; it is re-exported from this module.
+# The SQLite backend keeps at most this many rows; older entries are
+# evicted on insert so an idle cache file cannot grow without bound.
+MAX_SQLITE_ENTRIES = 10_000
+#: Minimum total ISR lifetime (``revalidate + stale`` seconds) for a page to
+#: be treated as prerenderable/static. Mirrors Next.js
+#: ``MIN_PRERENDERABLE_EXPIRE = 300`` (``use-cache/constants.ts``). A page
+#: whose total lifetime is below this floor is dynamic: it is excluded from
+#: prerender/static treatment (see :func:`is_prerenderable_policy`). This is
+#: a classification rule, not a production enforcement — production keeps
+#: serving such pages through the ISR cache with their declared policy. In
+#: development the floor instead extends retention (see
+#: :func:`dev_retention_policy`), so reloads still hit the cache.
+MIN_PRERENDERABLE_EXPIRE = 300.0
 _SHARED_UNAVAILABLE = object()
 _VARIANT_GENERATION_TTL = 86400
 _MAX_LOCAL_VARIANT_PATHS = 1024
+# Concrete paths this process has rendered or served through the ISR
+# cache, so a scoped revalidation can find them without asking the
+# backend to enumerate keys. Entries are evicted oldest-first; a path
+# dropped here is still found through a shared backend's own key list,
+# and a stale path only costs one no-op invalidation.
+_MAX_CACHED_PATHS = 4096
+
+
+def is_prerenderable_policy(policy):
+    """Return whether an ISR policy's total lifetime reaches the floor.
+
+    ``policy`` is the ``{"revalidate": seconds, "stale": seconds}`` mapping
+    produced by :func:`pynext.components._isr_policy`. Below
+    :data:`MIN_PRERENDERABLE_EXPIRE` the page is dynamic and is excluded
+    from prerender/static treatment. The classification is a documented
+    rule; production still serves such pages through the ISR cache with
+    their declared policy.
+    """
+    return (float(policy["revalidate"]) + float(policy["stale"])
+            >= MIN_PRERENDERABLE_EXPIRE)
+
+
+def dev_retention_policy(policy):
+    """Return the effective ISR policy for ``pynext dev``.
+
+    Dev serves stale entries until ``expire`` and retains entries for at
+    least :data:`MIN_PRERENDERABLE_EXPIRE` so a reload hits the cache
+    (the Next.js ``default.ts`` dev relaxation). Only the stale window is
+    extended to reach the floor; ``revalidate`` keeps its real value, so
+    staging decisions are unchanged.
+    """
+    revalidate = float(policy["revalidate"])
+    stale = float(policy["stale"])
+    if revalidate + stale >= MIN_PRERENDERABLE_EXPIRE:
+        return {"revalidate": revalidate, "stale": stale}
+    return {"revalidate": revalidate, "stale": MIN_PRERENDERABLE_EXPIRE - revalidate}
+
+
+# Tag invalidation (on-demand revalidation) follows Next.js's timestamp
+# manifest: a tag maps to the wall-clock seconds when it was last marked
+# stale and when it was last expired. Entries generated before a tag's
+# timestamp are affected; entries generated after it are not, so an
+# invalidation never applies retroactively. A tag row only needs to
+# outlive the entries it can affect (at most two max lifetimes).
+MAX_ISR_TAGS_PER_PAGE = 32
+_TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./:-]{0,255}\Z")
+
+
+def validate_cache_tag(tag):
+    """Validate one cache tag name (``page(tags=...)`` / ``revalidate_tag``).
+
+    Tags are 1-256 characters of letters, digits, ``_``, ``.``, ``/``,
+    ``:`` or ``-``. Names starting with ``_pynext_`` are reserved for the
+    framework's implicit path/layout tags; using the prefix yourself
+    aliases those tags.
+    """
+    if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
+        raise ValueError(
+            f"Invalid cache tag {tag!r}: use 1-256 characters of letters, digits,"
+            " '_', '.', '/', ':' or '-'")
+    return tag
+
+
+def validate_cache_tags(tags):
+    """Validate a page's ``tags`` argument and return a sorted deduped list."""
+    if isinstance(tags, (str, bytes)) or not isinstance(tags, (tuple, list)):
+        raise ValueError("tags must be a list or tuple of tag names")
+    if len(tags) > MAX_ISR_TAGS_PER_PAGE:
+        raise ValueError(f"At most {MAX_ISR_TAGS_PER_PAGE} tags per page")
+    return sorted({validate_cache_tag(tag) for tag in tags})
+
+
+def _validate_entry_tags(tags):
+    """Validate the tags attached to a stored ISR entry; return a sorted tuple.
+
+    User tags follow :func:`pynext.components._validate_tags` (at most 64,
+    duplicates rejected, same error messages). Framework-reserved
+    ``_pynext_*`` tags — the implicit path/layout tags the app attaches
+    at request time (``_pynext_path_/blog``, ``_pynext_layout_...``) —
+    start with an underscore, which the user-tag validator rejects, so
+    they are validated with :func:`validate_cache_tag` instead, whose
+    charset allows the leading underscore. ``None`` means no tags.
+    """
+    if tags is None:
+        return ()
+    if isinstance(tags, str) or not isinstance(tags, (tuple, list)):
+        raise ValueError("tags must be a list or tuple of at most 64 ISR tags")
+    validated = []
+    for tag in tags:
+        if isinstance(tag, str) and tag.startswith("_pynext_"):
+            validated.append(validate_cache_tag(tag))
+        else:
+            validated.append(_validate_tag(tag))
+    if len(validated) > 64:
+        raise ValueError("tags must be a list or tuple of at most 64 ISR tags")
+    if len(set(validated)) != len(validated):
+        raise ValueError("Duplicate ISR tag")
+    return tuple(sorted(validated))
+
+
+def _validate_invalidation_tag(tag):
+    """Validate a tag passed to ``revalidate_tag`` / ``invalidate_tag``.
+
+    User tags follow :func:`pynext.components._validate_tag`; the
+    framework's own ``_pynext_*`` path/layout tags (attached by the app
+    at request time) start with an underscore, which that validator
+    rejects, so they go through :func:`validate_cache_tag` instead.
+    Same split as :func:`_validate_entry_tags`.
+    """
+    if isinstance(tag, str) and tag.startswith("_pynext_"):
+        return validate_cache_tag(tag)
+    return _validate_tag(tag)
 
 
 class CacheBusy(Exception):
@@ -70,11 +199,62 @@ class CacheBackend:
     def lookup(self, key):
         raise NotImplementedError
 
-    def insert(self, key, body, fresh_seconds, stale_seconds):
+    def insert(self, key, body, fresh_seconds, stale_seconds, tags=()):
+        raise NotImplementedError
+
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
+        """Store ``body`` only if the entry version still equals
+        ``expected_version`` (``0`` when no entry existed, ``None`` for an
+        unfenced write). When an owner is given, its lease must still be live.
+
+        ``generated_at`` / ``generated_mono`` stamp the entry with the
+        render *start* time instead of the insert time, so a generation
+        that started before a tag invalidation but stored after it is
+        judged by when its content was produced. Backends that cannot use
+        a worker-local monotonic clock (Redis) accept ``generated_mono``
+        and ignore it. Every backend used as a shared store must accept
+        this full signature: :class:`ISRCache` passes both stamps
+        positionally, so a backend missing one raises TypeError on every
+        shared write.
+        """
         raise NotImplementedError
 
     def remove(self, key):
         raise NotImplementedError
+
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation. Returns True when the record was stored.
+
+        ``expire=None`` marks entries carrying the tag expired immediately;
+        ``expire`` seconds marks them stale now and expired after that delay.
+        Backends without a shared store may keep the record process-local.
+        """
+        raise NotImplementedError
+
+    def get_tag_times(self, tags):
+        """Return ``{tag: (stale_at, expired_at)}`` in wall-clock seconds.
+
+        A missing tag maps to ``(None, None)``. Backends that cannot
+        reach their store raise :class:`SharedCacheUnavailable`.
+        """
+        raise NotImplementedError
+
+    def update_tag(self, tag, stale_at=None, expired_at=None):
+        """Record a tag invalidation: ``stale_at``/``expired_at`` are
+        wall-clock seconds, or ``None`` to leave that field unchanged."""
+        raise NotImplementedError
+
+    def keys(self):
+        """Return the raw keys this backend currently stores.
+
+        Backends that cannot enumerate their keys (or have none) return
+        an empty list. Keys are returned exactly as stored, including any
+        namespace prefix the caller added and any internal key form
+        (for example the ``\\0isr:`` hashed key of a query-variant page);
+        callers that need concrete paths filter those out.
+        """
+        return []
 
     def close(self):
         pass
@@ -90,11 +270,91 @@ def _valid_durations(fresh_seconds, stale_seconds):
             and fresh == fresh and stale == stale)
 
 
+def normalize_isr_policy(policy):
+    """Return a 3-axis policy ``{"revalidate", "stale", "expire"}``.
+
+    ``expire`` is the absolute hard cap measured from generation: after
+    ``revalidate`` the entry is served stale while one regeneration runs,
+    and after ``expire`` it is never served again. Policies written before
+    ``expire`` existed (``{"revalidate", "stale"}`` only) keep their old
+    meaning with ``expire = revalidate + stale``. The effective
+    stale-while-revalidate window handed to backends is therefore
+    ``expire - revalidate`` (see :func:`policy_windows`).
+
+    ``revalidate=False`` is on-demand-only: the entry never revalidates
+    by time and is regenerated only by an explicit ``revalidate()`` /
+    ``revalidate_tag()`` call. It normalizes to the longest lifetime a
+    backend accepts on every axis, so the stored stale window is zero
+    (``expire - revalidate == 0``); ``stale`` is validated and kept for
+    the record, and any ``expire`` is meaningless here.
+    """
+    if not isinstance(policy, dict):
+        raise ValueError("ISR policy must be a dict")
+    revalidate = policy.get("revalidate")
+    stale = policy.get("stale")
+    expire = policy.get("expire", None)
+    if revalidate is False:
+        if (isinstance(stale, bool) or not isinstance(stale, (int, float))
+                or stale != stale or stale < 0 or stale > MAX_CACHE_SECONDS):
+            raise ValueError(
+                f"stale must be a finite non-negative number of seconds,"
+                f" at most {int(MAX_CACHE_SECONDS)}")
+        return {"revalidate": MAX_CACHE_SECONDS, "stale": float(stale),
+                "expire": MAX_CACHE_SECONDS}
+    for name, value, allow_zero in (("revalidate", revalidate, False), ("stale", stale, True)):
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or value != value or value < 0 or (not allow_zero and value == 0)
+                or value > MAX_CACHE_SECONDS):
+            raise ValueError(
+                f"{name} must be a finite {'non-negative' if allow_zero else 'positive'}"
+                f" number of seconds, at most {int(MAX_CACHE_SECONDS)}")
+    if expire is None:
+        expire = float(revalidate) + float(stale)
+    elif (isinstance(expire, bool) or not isinstance(expire, (int, float)) or expire != expire
+          or expire <= 0 or (expire != float("inf") and expire > MAX_CACHE_SECONDS)):
+        raise ValueError(
+            f"expire must be a positive number of seconds (or Infinity), at most {int(MAX_CACHE_SECONDS)}")
+    elif expire == float("inf"):
+        # Next.js serializes Infinity as the INFINITE_CACHE sentinel; here
+        # the 1-year bound is the largest expressible hard cap.
+        expire = MAX_CACHE_SECONDS
+    if float(revalidate) == MAX_CACHE_SECONDS and float(expire) == MAX_CACHE_SECONDS:
+        # On-demand-only encoding (from ``revalidate=False``): fresh for
+        # the longest lifetime, never stale by time (stale window 0).
+        return {"revalidate": float(revalidate), "stale": float(stale),
+                "expire": float(expire)}
+    if expire <= float(revalidate):
+        raise ValueError("expire must be greater than revalidate")
+    return {"revalidate": float(revalidate), "stale": float(stale), "expire": float(expire)}
+
+
+def policy_windows(policy):
+    """Map a 3-axis policy to the ``(fresh_for, stale_for)`` backend windows.
+
+    ``fresh_for`` is ``revalidate``; ``stale_for`` is ``expire - revalidate``,
+    so the SWR window runs right up to the hard cap and the backend schema
+    (fresh/stale durations) needs no third column.
+    """
+    normalized = normalize_isr_policy(policy)
+    return normalized["revalidate"], normalized["expire"] - normalized["revalidate"]
+
+
+_MAX_L1_SECONDS = 604_800.0
+"""Longest single window the native L1 PageCache accepts.
+
+Must match the ``fresh_seconds > 604_800.0`` guard in
+``crates/pynext-native/src/lib.rs``; ISR policies run to
+``MAX_CACHE_SECONDS``, so longer entries are clamped here rather
+than rejected.
+"""
+
+
 class MemoryCacheBackend(CacheBackend):
     """The original process-local backend, backed by the Rust PageCache."""
 
     def __init__(self, store=None):
         self._store = store if store is not None else _native.PageCache()
+        self._tags = {}
 
     @property
     def store(self):
@@ -103,11 +363,34 @@ class MemoryCacheBackend(CacheBackend):
     def lookup(self, key):
         return self._store.lookup(key)
 
-    def insert(self, key, body, fresh_seconds, stale_seconds):
-        return self._store.insert(key, body, fresh_seconds, stale_seconds)
+    def insert(self, key, body, fresh_seconds, stale_seconds, tags=()):
+        # Tags are tracked by ISRCache for this process-local backend; the
+        # Rust store holds only the entry itself.
+        # The native PageCache accepts at most _MAX_L1_SECONDS per window
+        # while ISR policies run to MAX_CACHE_SECONDS; clamp so a
+        # long-lived entry still caches locally for a week instead of
+        # raising (the shared backend, when one is configured, keeps the
+        # full lifetime). A non-numeric duration is not storable.
+        try:
+            fresh = min(float(fresh_seconds), _MAX_L1_SECONDS)
+            stale = min(float(stale_seconds), _MAX_L1_SECONDS)
+        except (TypeError, ValueError):
+            return False
+        try:
+            return self._store.insert(key, body, fresh, stale)
+        except ValueError:
+            return False
 
     def remove(self, key):
         return self._store.remove(key)
+
+    def get_tag_times(self, tags):
+        return {tag: self._tags.get(tag, (None, None)) for tag in tags}
+
+    def update_tag(self, tag, stale_at=None, expired_at=None):
+        old_stale, old_expired = self._tags.get(tag, (None, None))
+        self._tags[tag] = (stale_at if stale_at is not None else old_stale,
+                           expired_at if expired_at is not None else old_expired)
 
 
 class SharedEntry:
@@ -130,12 +413,50 @@ class SQLiteCacheBackend(CacheBackend):
     can share a cache with only the standard library. All statements run
     under one connection guarded by a lock, with ``BEGIN IMMEDIATE`` for
     lease and fenced-write transactions so two processes cannot both win
-    the same lease or the same version check. Timestamps use wall-clock
-    seconds; a clock jump may age entries early or late, but versions
-    still fence every write.
+    the same lease or the same version check.
+
+    Entry lifetimes are measured on the monotonic clock
+    (``time.monotonic()``, system-wide since boot, so it is shared by all
+    processes on the machine and immune to NTP/wall-clock jumps). The
+    wall-clock ``generated_at`` is kept alongside as a fallback: after a
+    reboot the monotonic epoch restarts, so a stored monotonic timestamp
+    from before the reboot is meaningless and the lookup falls back to
+    the wall-clock age. A monotonic age is only trusted when it is
+    non-negative; a negative one (reboot, or a database file copied from
+    another machine) means "fall back". Leases and generations use a
+    monotonic-anchor clock instead (``_now()``: a wall reading taken once
+    at open, advanced by ``time.monotonic()``), so a wall-clock jump in
+    either direction neither ends nor extends them — only real elapsed
+    time does — and a reboot re-anchors the clock so pre-reboot leases
+    still expire on schedule. The table
+    is bounded: expired rows are purged on insert and the oldest rows go
+    once ``MAX_SQLITE_ENTRIES`` is exceeded.
+
+    The table is bounded: at most ``max_entries`` rows and
+    ``max_bytes`` of key+body bytes (defaults 10,000 entries / 128 MiB,
+    tunable via ``SQLiteCacheBackend`` / ``ISRCache``). Every insert
+    first drops expired rows (never one a live lease is regenerating)
+    and expired leases, then evicts the oldest entries until the caps
+    hold, so keys that are never read again cannot grow the file
+    without bound. ``None`` selects the default cap.
     """
 
-    def __init__(self, path):
+    DEFAULT_MAX_ENTRIES = MAX_SQLITE_ENTRIES
+    DEFAULT_MAX_BYTES = 128 * 1024 * 1024
+
+    def __init__(self, path, max_entries=None, max_bytes=None):
+        for name, value in (("max_entries", max_entries), ("max_bytes", max_bytes)):
+            if value is not None and (not isinstance(value, int)
+                                      or isinstance(value, bool) or value <= 0):
+                raise ValueError(
+                    f"SQLite cache {name} must be a positive integer or None, got {value!r}")
+        self.max_entries = MAX_SQLITE_ENTRIES if max_entries is None else max_entries
+        self.max_bytes = self.DEFAULT_MAX_BYTES if max_bytes is None else max_bytes
+        # Monotonic-clock anchor (see class docstring): the decision
+        # clock for leases and generations. Wall jumps do not move it;
+        # a reboot re-anchors it on the post-reboot wall clock.
+        self._wall_anchor = time.time()
+        self._mono_anchor = time.monotonic()
         path = os.fspath(path)
         if os.path.isdir(path):
             raise ValueError(f"SQLite cache path is a directory: {path}")
@@ -155,56 +476,236 @@ class SQLiteCacheBackend(CacheBackend):
                 "CREATE TABLE IF NOT EXISTS entries ("
                 "  key TEXT PRIMARY KEY, body BLOB NOT NULL,"
                 "  generated_at REAL NOT NULL, fresh_for REAL NOT NULL,"
-                "  stale_for REAL NOT NULL, version INTEGER NOT NULL);"
+                "  stale_for REAL NOT NULL, version INTEGER NOT NULL,"
+                "  tags TEXT NOT NULL DEFAULT '[]');"
                 "CREATE TABLE IF NOT EXISTS leases ("
                 "  key TEXT PRIMARY KEY, owner TEXT NOT NULL,"
                 "  expires_at REAL NOT NULL, version INTEGER NOT NULL);"
                 "CREATE TABLE IF NOT EXISTS variant_generations ("
                 "  key TEXT PRIMARY KEY, token TEXT NOT NULL, expires_at REAL NOT NULL);"
+                "CREATE TABLE IF NOT EXISTS tags ("
+                "  tag TEXT PRIMARY KEY, stale_at REAL NOT NULL,"
+                "  expired_at REAL NOT NULL);"
             )
+            # Monotonic-clock columns, added to databases created before
+            # them (CREATE TABLE IF NOT EXISTS leaves old files untouched).
+            self._ensure_column("entries", "generated_mono", "REAL")
+            self._ensure_column("leases", "expires_mono", "REAL")
+            # Tag column, for databases created before tag invalidation
+            # (entries written by them carry no tags).
+            self._ensure_column("entries", "tags", "TEXT NOT NULL DEFAULT '[]'")
             self._conn.commit()
         except sqlite3.Error as exc:
             raise ValueError(f"Cannot open SQLite cache at {path}: {exc}") from exc
 
-    def _read_entry(self, key, now):
+    def _ensure_column(self, table, column, definition):
+        columns = [row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")]
+        if column not in columns:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    @staticmethod
+    def _age(generated_at, generated_mono, now_wall, now_mono):
+        """Age of an entry in seconds, monotonic-first with wall fallback.
+
+        A non-negative monotonic age is authoritative (immune to clock
+        jumps). A negative one means the monotonic epoch restarted (reboot)
+        or the file came from another machine, so the wall-clock age —
+        clamped at zero, since a backwards jump must not resurrect an
+        expired entry as fresh — is used instead.
+        """
+        if generated_mono is not None:
+            age_mono = now_mono - generated_mono
+            if age_mono >= 0:
+                return age_mono
+        return max(0.0, now_wall - generated_at)
+
+    def _lease_is_live(self, expires_at):
+        """A lease is live while the monotonic-anchor clock says so.
+
+        The decision clock is ``_now()`` (a wall-clock reading taken
+        once at open, advanced by ``time.monotonic()``), so a wall-clock
+        jump in either direction neither ends nor extends a lease: only
+        real elapsed time does. A reboot re-anchors the clock on the
+        post-reboot wall time, so a lease written before the reboot
+        expires on schedule instead of looking live forever.
+        """
+        return expires_at > self._now()
+
+    def _now(self):
+        """Wall-clock seconds advanced by the monotonic clock.
+
+        The anchor is a wall-clock reading taken once when the backend
+        opens; every later decision advances it with
+        ``time.monotonic()``. Stored timestamps stay real wall-clock
+        seconds so rows remain comparable across processes and
+        restarts.
+        """
+        return self._wall_anchor + (time.monotonic() - self._mono_anchor)
+
+    def _tag_status(self, tags, generated_at, now):
+        """Classify an entry by its tags against the tag manifest.
+
+        Returns ``"expired"`` when any tag was invalidated after the entry
+        was generated and that invalidation has fully expired, ``"stale"``
+        when any tag was invalidated after generation but the entry is
+        still inside the stale window, and ``"fresh"`` otherwise. An
+        invalidation never applies retroactively to entries generated
+        after it was recorded.
+        """
+        if not tags:
+            return "fresh"
+        placeholders = ",".join("?" for _ in tags)
+        rows = self._conn.execute(
+            f"SELECT stale_at, expired_at FROM tags WHERE tag IN ({placeholders})", tuple(tags)
+        ).fetchall()
+        expired = False
+        stale = False
+        for stale_at, expired_at in rows:
+            if generated_at < expired_at <= now:
+                expired = True
+                break
+            if stale_at > generated_at:
+                stale = True
+        if expired:
+            return "expired"
+        return "stale" if stale else "fresh"
+
+    def _read_entry(self, key, now_wall, now_mono):
         for _ in range(3):
             row = self._conn.execute(
-                "SELECT body, generated_at, fresh_for, stale_for, version"
+                "SELECT body, generated_at, generated_mono, fresh_for, stale_for, version, tags"
                 " FROM entries WHERE key = ?", (key,)
             ).fetchone()
             if row is None:
                 return None
-            body, generated_at, fresh_for, stale_for, version = row
-            age = now - generated_at
-            if age >= fresh_for + stale_for:
+            body, generated_at, generated_mono, fresh_for, stale_for, version, tags_json = row
+            try:
+                tags = json.loads(tags_json) if tags_json else []
+            except (ValueError, TypeError):
+                tags = []
+            if not isinstance(tags, list):
+                tags = []
+            age = self._age(generated_at, generated_mono, now_wall, now_mono)
+            tag_status = self._tag_status(tags, generated_at, now_wall)
+            if age >= fresh_for + stale_for or tag_status == "expired":
                 lease = self._conn.execute(
-                    "SELECT 1 FROM leases WHERE key = ? AND expires_at > ?", (key, now)
+                    "SELECT expires_at, expires_mono FROM leases WHERE key = ?", (key,)
                 ).fetchone()
-                if lease is not None:
+                if lease is not None and self._lease_is_live(lease[0]):
                     return SharedEntry("expired", None, version, 0.0, 0.0)
                 # Another connection can replace the row between the read
                 # and delete, or take a lease. Delete only the exact expired
                 # version seen, and only if no live generation owns it.
                 deleted = self._conn.execute(
                     "DELETE FROM entries WHERE key = ? AND version = ? AND generated_at = ?"
-                    " AND NOT EXISTS (SELECT 1 FROM leases WHERE key = ? AND expires_at > ?)",
-                    (key, version, generated_at, key, now),
+                    " AND NOT EXISTS (SELECT 1 FROM leases WHERE key = ?"
+                    "   AND expires_at > ? AND (expires_mono IS NULL OR expires_mono > ?))",
+                    (key, version, generated_at, key, now_wall, now_mono),
                 ).rowcount
                 self._conn.commit()
                 if deleted:
                     return SharedEntry("expired", None, version, 0.0, 0.0)
-                now = time.time()
+                now_wall = time.time()
+                now_mono = time.monotonic()
                 continue
-            if age < fresh_for:
+            if age < fresh_for and tag_status == "fresh":
                 return SharedEntry("fresh", body, version, fresh_for - age, stale_for)
             return SharedEntry("stale", body, version, 0.0, fresh_for + stale_for - age)
         # A heavily contended key is retried on the next lookup.
         return None
 
+    def _enforce_capacity(self, exclude_key=None):
+        """Drop expired rows/leases, then evict the oldest entries
+        until the entry-count and byte caps hold.
+
+        Called after an insert, with the lock held and no transaction
+        open; also backing :meth:`prune`. Best-effort: a failure is
+        logged and never fails the insert that triggered the cleanup.
+        The key just inserted is never evicted by its own insert, and
+        an expired entry under a live lease is kept so the regenerating
+        worker's fenced write still finds its version. Expiry needs
+        both clocks to agree (see the class docstring), so a wall-clock
+        jump cannot purge live entries.
+        """
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = self._now()
+                now_wall = time.time()
+                now_mono = time.monotonic()
+                self._conn.execute(
+                    "DELETE FROM leases WHERE expires_at <= ?", (now,))
+                self._conn.execute(
+                    "DELETE FROM entries WHERE rowid IN ("
+                    " SELECT rowid FROM entries"
+                    " WHERE generated_at + fresh_for + stale_for <= ?"
+                    " AND (generated_mono IS NULL"
+                    " OR generated_mono + fresh_for + stale_for <= ?)"
+                    " AND (? IS NULL OR key != ?)"
+                    " AND NOT EXISTS (SELECT 1 FROM leases WHERE leases.key = entries.key"
+                    " AND leases.expires_at > ?) LIMIT 512)",
+                    (now_wall, now_mono, exclude_key, exclude_key, now))
+                count, total = self._conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(body) + LENGTH(key)), 0)"
+                    " FROM entries").fetchone()
+                if count > self.max_entries:
+                    # Delete exactly the surplus oldest rows: a bare
+                    # LIMIT would overshoot and evict fresh entries too.
+                    if exclude_key is None:
+                        params: tuple = (count - self.max_entries,)
+                        exclusion = ""
+                    else:
+                        params = (exclude_key, count - self.max_entries)
+                        exclusion = "WHERE key != ?"
+                    self._conn.execute(
+                        "DELETE FROM entries WHERE key IN ("
+                        " SELECT key FROM entries " + exclusion +
+                        " ORDER BY generated_at ASC, key ASC LIMIT ?)",
+                        params)
+                    total = self._conn.execute(
+                        "SELECT COALESCE(SUM(LENGTH(body) + LENGTH(key)), 0)"
+                        " FROM entries").fetchone()[0]
+                if total > self.max_bytes:
+                    # Delete the oldest prefix whose combined size covers
+                    # the byte surplus: a row goes while the bytes older
+                    # than it are still below the surplus, which is the
+                    # smallest prefix that brings the total under the cap.
+                    if exclude_key is None:
+                        params = (total - self.max_bytes,)
+                        exclusion = ""
+                    else:
+                        params = (exclude_key, total - self.max_bytes)
+                        exclusion = "WHERE key != ?"
+                    self._conn.execute(
+                        "DELETE FROM entries WHERE key IN ("
+                        " SELECT key FROM ("
+                        "  SELECT key, SUM(LENGTH(body) + LENGTH(key)) OVER ("
+                        "   ORDER BY generated_at ASC, key ASC)"
+                        "   - (LENGTH(body) + LENGTH(key)) AS older_bytes"
+                        "  FROM entries " + exclusion +
+                        " ) WHERE older_bytes < ?)",
+                        params)
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+        except sqlite3.Error:
+            log.warning("Shared cache capacity enforcement failed", exc_info=True)
+            return False
+        return True
+
+    def prune(self):
+        """Delete expired rows/leases and evict oldest entries until the
+        caps hold. Returns True when the cleanup ran without error."""
+        with self._lock:
+            return self._enforce_capacity()
+
+
     def lookup(self, key):
         with self._lock:
             try:
-                entry = self._read_entry(key, time.time())
+                entry = self._read_entry(key, time.time(), time.monotonic())
             except sqlite3.Error:
                 log.warning("Shared cache lookup failed for %s", key, exc_info=True)
                 return ("miss", None)
@@ -218,32 +719,52 @@ class SQLiteCacheBackend(CacheBackend):
         for repopulating the process-local cache."""
         with self._lock:
             try:
-                return self._read_entry(key, time.time())
+                return self._read_entry(key, time.time(), time.monotonic())
             except sqlite3.Error as exc:
                 raise SharedCacheUnavailable("Shared cache lookup failed") from exc
 
-    def insert(self, key, body, fresh_seconds, stale_seconds):
-        return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None)
+    def insert(self, key, body, fresh_seconds, stale_seconds, tags=()):
+        return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None, tags=tags)
 
-    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
         """Store ``body`` only if the entry version still equals
         ``expected_version`` (``0`` when no entry existed, ``None`` for an
         unfenced write). When an owner is given, its lease must still be live
-        in the same transaction. Returns False when either fence has moved."""
+        in the same transaction. Returns False when either fence has moved.
+
+        ``generated_at`` / ``generated_mono`` stamp the entry with the
+        render *start* time instead of the insert time. A generation
+        that started before a tag invalidation but stored after it
+        must be judged by when its content was produced, not when it
+        landed — otherwise the tag check (which compares
+        ``generated_at`` against the invalidation time) classifies
+        pre-invalidation content as fresh. When omitted they default
+        to the insert time. The lease liveness check always uses the
+        current time, never the render-start time.
+        """
         if len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES or len(body) > MAX_CACHE_BODY_BYTES:
             return False
         if not _valid_durations(fresh_seconds, stale_seconds):
+            return False
+        try:
+            tags = _validate_entry_tags(tags)
+        except ValueError:
             return False
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
                     now = time.time()
+                    now_mono = time.monotonic()
+                    gen_at = generated_at if generated_at is not None else now
+                    gen_mono = generated_mono if generated_mono is not None else now_mono
                     if owner is not None:
                         lease = self._conn.execute(
-                            "SELECT owner, expires_at FROM leases WHERE key = ?", (key,)
+                            "SELECT owner, expires_at, expires_mono FROM leases WHERE key = ?", (key,)
                         ).fetchone()
-                        if lease is None or lease[0] != owner or lease[1] <= now:
+                        if (lease is None or lease[0] != owner
+                                or not self._lease_is_live(lease[1])):
                             self._conn.execute("ROLLBACK")
                             return False
                     row = self._conn.execute(
@@ -262,22 +783,40 @@ class SQLiteCacheBackend(CacheBackend):
                     else:
                         version = row[0] + 1
                     self._conn.execute(
-                        "INSERT INTO entries (key, body, generated_at, fresh_for, stale_for, version)"
-                        " VALUES (?, ?, ?, ?, ?, ?)"
+                        "INSERT INTO entries (key, body, generated_at, generated_mono,"
+                        " fresh_for, stale_for, version, tags)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                         " ON CONFLICT(key) DO UPDATE SET body=excluded.body,"
-                        " generated_at=excluded.generated_at, fresh_for=excluded.fresh_for,"
-                        " stale_for=excluded.stale_for, version=excluded.version",
-                        (key, bytes(body), now, float(fresh_seconds), float(stale_seconds), version),
+                        " generated_at=excluded.generated_at, generated_mono=excluded.generated_mono,"
+                        " fresh_for=excluded.fresh_for,"
+                        " stale_for=excluded.stale_for, version=excluded.version, tags=excluded.tags",
+                        (key, bytes(body), gen_at, gen_mono, float(fresh_seconds), float(stale_seconds), version,
+                         json.dumps(list(tags))),
                     )
                     self._conn.execute("COMMIT")
                 except BaseException:
                     if self._conn.in_transaction:
                         self._conn.execute("ROLLBACK")
                     raise
+                self._prune(exclude=key)
                 return True
             except sqlite3.Error:
                 log.warning("Shared cache insert failed for %s", key, exc_info=True)
                 return False
+
+    def _prune(self, exclude=None):
+        """Best-effort bounded cleanup after an insert.
+
+        Delegates to :meth:`_enforce_capacity`: drop rows both clocks
+        agree are expired (and expired leases), then evict the oldest
+        rows past the row cap and the byte cap. The key this insert
+        just wrote is excluded: with a very short TTL a scheduling
+        stall between the insert's timestamp and this prune could
+        otherwise make the prune delete the row it just wrote, so a
+        lookup right after a successful insert would see a miss
+        instead of the entry (fresh, or expired once its TTL elapsed).
+        """
+        return self._enforce_capacity(exclude_key=exclude)
 
     def remove(self, key):
         with self._lock:
@@ -296,11 +835,116 @@ class SQLiteCacheBackend(CacheBackend):
                 log.warning("Shared cache remove failed for %s", key, exc_info=True)
                 return False
 
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation in the shared manifest.
+
+        ``expire=None`` marks entries carrying the tag expired
+        immediately; ``expire`` seconds keeps them merely stale until
+        that delay passes. Entries generated after this call are
+        unaffected. Returns True when the record was stored.
+        """
+        tag = _validate_tag(tag)
+        expire = _validate_tag_expire(expire)
+        with self._lock:
+            try:
+                now = time.time()
+                stale_at = now
+                expired_at = now if expire is None else now + expire
+                self._conn.execute(
+                    "INSERT INTO tags (tag, stale_at, expired_at) VALUES (?, ?, ?)"
+                    " ON CONFLICT(tag) DO UPDATE SET stale_at=excluded.stale_at,"
+                    " expired_at=excluded.expired_at",
+                    (tag, stale_at, expired_at),
+                )
+                # A manifest row can only affect entries generated before
+                # its expired_at, and no entry lives longer than
+                # fresh+stale (2 * MAX_CACHE_SECONDS), so older rows are
+                # dead weight. Prune them opportunistically.
+                self._conn.execute(
+                    "DELETE FROM tags WHERE expired_at < ?", (now - 2 * MAX_CACHE_SECONDS,)
+                )
+                self._conn.commit()
+                return True
+            except sqlite3.Error:
+                log.warning("Shared cache tag invalidation failed for %s", tag, exc_info=True)
+                return False
+
+    def get_tag_times(self, tags):
+        """Return ``{tag: (stale_at, expired_at)}`` in wall-clock seconds.
+
+        A missing tag maps to ``(None, None)``.
+        """
+        with self._lock:
+            try:
+                out = {}
+                for tag in tags:
+                    row = self._conn.execute(
+                        "SELECT stale_at, expired_at FROM tags WHERE tag = ?", (tag,)
+                    ).fetchone()
+                    out[tag] = (row[0], row[1]) if row is not None else (None, None)
+                return out
+            except sqlite3.Error as exc:
+                raise SharedCacheUnavailable("Shared cache tag lookup failed") from exc
+
+    def update_tag(self, tag, stale_at=None, expired_at=None):
+        """Record a tag invalidation: ``stale_at``/``expired_at`` are
+        wall-clock seconds, or ``None`` to leave that field unchanged.
+
+        The tags table stores NOT NULL timestamps, so a brand-new row
+        fills a missing field from the other given timestamp; when
+        neither is given there is nothing to record. Older rows are
+        pruned like in :meth:`revalidate_tag`.
+        """
+        if stale_at is None and expired_at is None:
+            return
+        with self._lock:
+            try:
+                now = time.time()
+                row = self._conn.execute(
+                    "SELECT stale_at, expired_at FROM tags WHERE tag = ?", (tag,)
+                ).fetchone()
+                if row is None:
+                    new_stale = stale_at if stale_at is not None else expired_at
+                    new_expired = expired_at if expired_at is not None else stale_at
+                else:
+                    new_stale = stale_at if stale_at is not None else row[0]
+                    new_expired = expired_at if expired_at is not None else row[1]
+                self._conn.execute(
+                    "INSERT INTO tags (tag, stale_at, expired_at) VALUES (?, ?, ?)"
+                    " ON CONFLICT(tag) DO UPDATE SET stale_at=excluded.stale_at,"
+                    " expired_at=excluded.expired_at",
+                    (tag, new_stale, new_expired),
+                )
+                self._conn.execute(
+                    "DELETE FROM tags WHERE expired_at < ?", (now - 2 * MAX_CACHE_SECONDS,)
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                raise SharedCacheUnavailable("Shared cache tag update failed") from exc
+
+    def keys(self):
+        """Return every stored entry key plus every variant-generation key.
+
+        Entry keys are cache keys (a plain path, or the ``\\0isr:`` hashed
+        key of a query-variant page); variant-generation keys are the
+        concrete paths those hashed entries belong to. Callers that need
+        concrete paths keep the plain keys and drop the ``\\0isr:`` ones.
+        """
+        with self._lock:
+            try:
+                rows = self._conn.execute("SELECT key FROM entries").fetchall()
+                rows += self._conn.execute("SELECT key FROM variant_generations").fetchall()
+                return [row[0] for row in rows]
+            except sqlite3.Error as exc:
+                raise SharedCacheUnavailable("Shared cache key listing failed") from exc
+
     def variant_generation(self, key, *, invalidate=False):
         """Get or replace a path generation atomically across workers."""
         with self._lock:
             try:
-                now = time.time()
+                # Expiry checks read the monotonic clock; the stored
+                # timestamp stays real wall-clock (see class docstring).
+                now = self._now()
                 if not invalidate:
                     row = self._conn.execute(
                         "SELECT token FROM variant_generations WHERE key=? AND expires_at>?",
@@ -319,7 +963,7 @@ class SQLiteCacheBackend(CacheBackend):
                         self._conn.execute(
                             "INSERT INTO variant_generations(key, token, expires_at) VALUES(?,?,?) "
                             "ON CONFLICT(key) DO UPDATE SET token=excluded.token, expires_at=excluded.expires_at",
-                            (key, token, now + _VARIANT_GENERATION_TTL))
+                            (key, token, self._now() + _VARIANT_GENERATION_TTL))
                         self._conn.execute(
                             "DELETE FROM variant_generations WHERE key IN "
                             "(SELECT key FROM variant_generations WHERE expires_at<=? LIMIT 128)", (now,))
@@ -344,11 +988,11 @@ class SQLiteCacheBackend(CacheBackend):
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
-                    now = time.time()
+                    now_mono = time.monotonic()
                     row = self._conn.execute(
-                        "SELECT owner, expires_at FROM leases WHERE key = ?", (key,)
+                        "SELECT owner, expires_at, expires_mono FROM leases WHERE key = ?", (key,)
                     ).fetchone()
-                    if row is not None and row[1] > now:
+                    if row is not None and self._lease_is_live(row[1]):
                         self._conn.execute("ROLLBACK")
                         return None
                     version_row = self._conn.execute(
@@ -356,10 +1000,16 @@ class SQLiteCacheBackend(CacheBackend):
                     ).fetchone()
                     version = version_row[0] if version_row else 0
                     self._conn.execute(
-                        "INSERT INTO leases (key, owner, expires_at, version) VALUES (?, ?, ?, ?)"
+                        "INSERT INTO leases (key, owner, expires_at, expires_mono, version) VALUES (?, ?, ?, ?, ?)"
                         " ON CONFLICT(key) DO UPDATE SET owner=excluded.owner,"
-                        " expires_at=excluded.expires_at, version=excluded.version",
-                        (key, owner, now + ttl, version),
+                        " expires_at=excluded.expires_at, expires_mono=excluded.expires_mono,"
+                        " version=excluded.version",
+                        # expires_at is written on the anchor clock (the
+                        # same clock _lease_is_live reads), so a wall jump
+                        # between acquire and owns_lease cannot make a
+                        # just-taken lease look dead; expires_mono stays
+                        # as the monotonic companion for old readers.
+                        (key, owner, self._now() + ttl, now_mono + ttl, version),
                     )
                     self._conn.execute("COMMIT")
                 except BaseException:
@@ -386,9 +1036,10 @@ class SQLiteCacheBackend(CacheBackend):
     def owns_lease(self, key, owner):
         with self._lock:
             try:
-                row = self._conn.execute("SELECT 1 FROM leases WHERE key=? AND owner=? AND expires_at>?",
-                                         (key, owner, time.time())).fetchone()
-                return row is not None
+                row = self._conn.execute(
+                    "SELECT expires_at, expires_mono FROM leases WHERE key=? AND owner=?",
+                    (key, owner)).fetchone()
+                return row is not None and self._lease_is_live(row[0])
             except sqlite3.Error as exc:
                 raise SharedCacheUnavailable("Shared cache lease lookup failed") from exc
 
@@ -416,7 +1067,7 @@ def _is_storable(response):
 
 class ISRCache:
     def __init__(self, cache_backend="memory", cache_path=None, namespace="", cache_url=None,
-                 failure_policy=None):
+                 failure_policy=None, sqlite_max_entries=None, sqlite_max_bytes=None):
         """Create an ISR cache.
 
         ``failure_policy`` (roadmap item B4) decides what happens when
@@ -428,6 +1079,11 @@ class ISRCache:
         for the ``memory`` backend, which has no shared store. It
         governs the read/decision path (lookup, lease, generation);
         best-effort writes stay best-effort — see ``failure_policy``.
+
+        ``sqlite_max_entries`` / ``sqlite_max_bytes`` tune the SQLite
+        backend's capacity caps (``None`` selects the backend defaults,
+        currently 10,000 entries / 128 MiB); they are ignored for the
+        other backends.
         """
         if cache_backend not in ("memory", "sqlite", "redis"):
             raise ValueError(
@@ -435,6 +1091,8 @@ class ISRCache:
             )
         self.backend_name = cache_backend
         self._cache_path = cache_path
+        self._sqlite_max_entries = sqlite_max_entries
+        self._sqlite_max_bytes = sqlite_max_bytes
         if cache_backend == "sqlite" and cache_path is not None:
             path = os.fspath(cache_path)
             uri_prefix = b"file:" if isinstance(path, bytes) else "file:"
@@ -450,7 +1108,8 @@ class ISRCache:
         if cache_backend == "sqlite":
             if cache_path is None:
                 raise ValueError("cache_path is required when cache_backend is 'sqlite'")
-            self.shared = SQLiteCacheBackend(self._cache_path)
+            self.shared = SQLiteCacheBackend(
+                self._cache_path, max_entries=sqlite_max_entries, max_bytes=sqlite_max_bytes)
         elif cache_backend == "redis":
             from .redis_cache import RedisCacheBackend
             self.shared = RedisCacheBackend(self._cache_url)
@@ -458,6 +1117,17 @@ class ISRCache:
         self._task_leases = {}
         self._tasks = set()
         self._variant_paths = OrderedDict()
+        # Tag invalidation state. ``_tag_manifest`` is the process-local
+        # copy of the tag manifest (authoritative for the memory backend;
+        # shared backends keep their own copy in the shared store).
+        # ``_key_tags`` / ``_key_generated_at`` record which tags each
+        # cached key carries and when its current entry was generated,
+        # so a tag invalidation can retire in-flight generations and
+        # reclassify process-local hits without consulting the backend.
+        self._tag_manifest = {}
+        self._key_tags = OrderedDict()
+        self._key_generated_at = OrderedDict()
+        self._cached_paths = OrderedDict()
         self._loop = None
         self._closed = False
         self.namespace = namespace
@@ -466,7 +1136,9 @@ class ISRCache:
         # A previous shutdown or failed app startup closes the shared store.
         # Reopening must restore it rather than silently falling back to L1.
         if self.shared is None and self.backend_name == "sqlite":
-            self.shared = SQLiteCacheBackend(self._cache_path)
+            self.shared = SQLiteCacheBackend(
+                self._cache_path, max_entries=self._sqlite_max_entries,
+                max_bytes=self._sqlite_max_bytes)
         elif self.shared is None and self.backend_name == "redis":
             from .redis_cache import RedisCacheBackend
             self.shared = RedisCacheBackend(self._cache_url)
@@ -483,6 +1155,9 @@ class ISRCache:
         self._task_leases.clear()
         self._tasks.clear()
         self._variant_paths.clear()
+        self._key_tags.clear()
+        self._key_generated_at.clear()
+        self._cached_paths.clear()
         self._loop = None
         if self.shared is not None:
             await asyncio.to_thread(self.shared.close)
@@ -511,14 +1186,27 @@ class ISRCache:
             log.warning("Shared cache lookup failed for %s", key, exc_info=True)
             return _SHARED_UNAVAILABLE
 
-    async def _shared_store(self, key, body, policy, expected_version, owner):
+    async def _shared_store(self, key, body, policy, expected_version, owner, tags=(),
+                            generated_at=None, generated_mono=None):
         # Best-effort in both policies: the page was already rendered
         # correctly, so a failed write only loses caching, never the
         # response. See failure_policy.
+        #
+        # ``generated_at`` / ``generated_mono`` stamp the entry with the
+        # render *start* time (see :meth:`_generate`): a generation that
+        # started before a tag invalidation but stored after it must be
+        # judged by when its content was produced, not when it landed.
         try:
+            # Entry tags are namespaced like keys: the tag manifest
+            # records invalidations under ``namespace + tag`` (see
+            # :meth:`revalidate_tag`), so stored tags must carry the
+            # same prefix or a cross-worker invalidation never matches
+            # them on lookup.
+            namespaced_tags = [self.namespace + tag for tag in tags]
             return await asyncio.to_thread(
                 self.shared.insert_fenced, self.namespace + key, body,
                 policy["revalidate"], policy["stale"], expected_version, owner,
+                namespaced_tags, generated_at, generated_mono,
             )
         except Exception:
             log.warning("Shared cache insert failed for %s", key, exc_info=True)
@@ -552,6 +1240,159 @@ class ISRCache:
             log.warning("Shared cache remove failed for %s", key, exc_info=True)
             return False
 
+
+    def _store_insert(self, key, body, fresh_seconds, stale_seconds):
+        """Insert into the process-local L1, clamping to its native cap.
+
+        The native PageCache accepts at most ``_MAX_L1_SECONDS`` per
+        window (see ``crates/pynext-native/src/lib.rs``) and raises
+        ValueError beyond it, while ISR policies run to
+        ``MAX_CACHE_SECONDS``; clamp so a long-lived entry still caches
+        locally for a week instead of failing the request. Returns False
+        when the entry cannot be stored.
+        """
+        try:
+            fresh = min(float(fresh_seconds), _MAX_L1_SECONDS)
+            stale = min(float(stale_seconds), _MAX_L1_SECONDS)
+        except (TypeError, ValueError):
+            return False
+        try:
+            return self.store.insert(key, body, fresh, stale)
+        except ValueError:
+            return False
+
+    def _remember_key_tags(self, key, tags):
+        self._key_tags[key] = tuple(tags)
+        self._key_tags.move_to_end(key)
+        while len(self._key_tags) > _MAX_LOCAL_VARIANT_PATHS:
+            old_key, _ = self._key_tags.popitem(last=False)
+            self._key_generated_at.pop(old_key, None)
+
+    def _local_tag_status(self, key):
+        """Classify a process-local entry by its tags.
+
+        Mirrors the shared backends' manifest check: ``"expired"``
+        when any tag was invalidated after the entry was generated and
+        that invalidation has fully expired, ``"stale"`` when any tag
+        was invalidated after generation but the entry is still inside
+        the stale window, ``"fresh"`` otherwise. Entries with no
+        recorded tags or generation time are unaffected.
+        """
+        tags = self._key_tags.get(key)
+        generated_at = self._key_generated_at.get(key)
+        if not tags or generated_at is None:
+            return "fresh"
+        now = time.time()
+        stale = False
+        for tag in tags:
+            record = self._tag_manifest.get(tag)
+            if record is None:
+                continue
+            stale_at, expired_at = record
+            if generated_at < expired_at <= now:
+                return "expired"
+            if stale_at > generated_at:
+                stale = True
+        return "stale" if stale else "fresh"
+
+    def _apply_tag_invalidation(self, tag, expire):
+        """Record ``tag`` in the process-local manifest and evict or
+        retire matching local entries.
+
+        Returns the number of local entries evicted plus in-flight
+        generations retired. A deferred ``expire`` (greater than zero)
+        demotes entries to stale instead of evicting them, so it retires
+        only in-flight generations. ``expire=None`` and ``expire=0`` both
+        expire entries immediately — they record the identical manifest
+        row — so both evict matching entries from the local store; the
+        native (Axum) fast path serves the local store directly without
+        a tag check, so leaving an immediately-expired entry there
+        would keep serving it as fresh. Shared backends record the same
+        invalidation in their own manifest; this only touches
+        process-local state.
+        """
+        now = time.time()
+        self._tag_manifest[tag] = (now, now if expire is None else now + expire)
+        # The process-local manifest is the memory backend's copy of the
+        # tag manifest; without pruning it grows with every distinct tag
+        # (for example per-user tags) and is never cleaned. Mirror the
+        # SQLite backend's opportunistic prune: a record can only affect
+        # entries generated before its expired_at, and no entry lives
+        # longer than fresh+stale (2 * MAX_CACHE_SECONDS), so older rows
+        # are dead weight.
+        cutoff = now - 2 * MAX_CACHE_SECONDS
+        for old_tag in [t for t, (_, expired_at) in self._tag_manifest.items()
+                        if expired_at < cutoff]:
+            del self._tag_manifest[old_tag]
+        evicted = 0
+        for key, tags in list(self._key_tags.items()):
+            if tag in tags:
+                if self._inflight.pop(key, None) is not None:
+                    evicted += 1
+                if (expire is None or expire == 0) and self.store.remove(key):
+                    evicted += 1
+        return evicted
+
+    async def revalidate_tag(self, tag, expire=None):
+        """Invalidate every cached entry carrying ``tag``.
+
+        ``expire=None`` (or ``0``) expires matching entries immediately;
+        a positive ``expire`` keeps them merely stale (served once more
+        while a regeneration runs in the background) until that delay
+        passes.
+        Entries generated after this call are unaffected. Generations
+        already in flight for a matching key are retired so they cannot
+        refill the cache with pre-invalidation content. With a shared
+        backend the record is stored there, so other workers see it;
+        with the memory backend it is process-local. Returns True when
+        the invalidation was recorded.
+        """
+        tag = _validate_invalidation_tag(tag)
+        expire = _validate_tag_expire(expire)
+        if self._closed:
+            raise CacheBusy("ISR cache is shutting down")
+        self._check_loop()
+        self._apply_tag_invalidation(tag, expire)
+        if self.shared is None:
+            return True
+        try:
+            return await asyncio.to_thread(
+                self.shared.revalidate_tag, self.namespace + tag, expire)
+        except Exception as exc:
+            if self.failure_policy == FAIL_CLOSED:
+                raise SharedCacheUnavailable("Shared cache tag invalidation failed") from exc
+            log.warning("Shared cache tag invalidation failed for %s", tag, exc_info=True)
+            return False
+
+    async def invalidate_tag(self, tag, *, expire=None):
+        """Invalidate every cached entry carrying ``tag`` (on-demand).
+
+        Same recording as :meth:`revalidate_tag`, but returns the number
+        of entries evicted from this worker's local cache (stored entries
+        plus generations retired mid-render) instead of a boolean.
+        Entries held by other workers are caught by the shared tag
+        manifest on their next lookup, so the count is a local lower
+        bound, not a global total. A deferred ``expire`` (greater than
+        zero) demotes entries to stale instead of evicting them, so it
+        returns 0 for stored entries (in-flight generations are still
+        retired).
+        """
+        tag = _validate_invalidation_tag(tag)
+        expire = _validate_tag_expire(expire)
+        if self._closed:
+            raise CacheBusy("ISR cache is shutting down")
+        self._check_loop()
+        evicted = self._apply_tag_invalidation(tag, expire)
+        if self.shared is not None:
+            try:
+                await asyncio.to_thread(
+                    self.shared.revalidate_tag, self.namespace + tag, expire)
+            except Exception as exc:
+                if self.failure_policy == FAIL_CLOSED:
+                    raise SharedCacheUnavailable("Shared cache tag invalidation failed") from exc
+                log.warning("Shared cache tag invalidation failed for %s", tag, exc_info=True)
+        return evicted
+
     async def invalidate(self, key):
         """Remove ``key`` from the local cache and, when configured, the shared store.
 
@@ -572,10 +1413,53 @@ class ISRCache:
             raise CacheBusy("ISR cache is shutting down")
         self._check_loop()
         retired = self._inflight.pop(key, None)
+        self._cached_paths.pop(key, None)
         removed = self.store.remove(key)
+        self._key_tags.pop(key, None)
+        self._key_generated_at.pop(key, None)
         if self.shared is not None:
             removed = await self._shared_remove(key) or removed
         return removed or retired is not None
+
+    def _remember_cached_path(self, key):
+        self._cached_paths[key] = None
+        self._cached_paths.move_to_end(key)
+        while len(self._cached_paths) > _MAX_CACHED_PATHS:
+            self._cached_paths.popitem(last=False)
+
+    async def cached_keys(self):
+        """Return the concrete ISR paths this cache knows about, sorted.
+
+        The union of this process's rendered paths (including the
+        variant-generation paths of query-variant pages, whose cache keys
+        are hashed) and the shared backend's stored keys, with the
+        namespace prefix stripped and internal ``\\0isr:`` hashed keys
+        dropped. Under ``fail_open`` a shared-backend listing failure
+        falls back to the process-local paths (and logs); under
+        ``fail_closed`` it raises :class:`SharedCacheUnavailable`, so a
+        scoped revalidation never reports success it did not check.
+        """
+        if self._closed:
+            raise CacheBusy("ISR cache is shutting down")
+        self._check_loop()
+        keys = set(self._cached_paths) | set(self._variant_paths)
+        if self.shared is not None:
+            try:
+                shared = await asyncio.to_thread(self.shared.keys)
+            except Exception as exc:
+                if self.failure_policy == FAIL_CLOSED:
+                    raise SharedCacheUnavailable("Shared cache key listing failed") from exc
+                log.warning("Shared cache key listing failed for scoped revalidation;"
+                            " using process-local paths only", exc_info=True)
+                shared = []
+            for raw in shared:
+                if not isinstance(raw, str):
+                    continue
+                key = raw[len(self.namespace):] if self.namespace and raw.startswith(self.namespace) else raw
+                if key.startswith("\0isr:"):
+                    continue
+                keys.add(key)
+        return sorted(keys)
 
     def _remember_variant_generation(self, path, token):
         self._variant_paths[path] = token
@@ -650,7 +1534,24 @@ class ISRCache:
                 return ("lease", (version, owner))
             await asyncio.sleep(LEASE_WAIT_INTERVAL)
 
-    async def get_or_render(self, key, policy, render):
+    def _remember_key_generated(self, key, generated_at=None):
+        # ``generated_at`` is the render *start* time when the caller
+        # knows it (see :meth:`_generate`): the local tag check compares
+        # this against invalidation times, so a generation that started
+        # before a ``revalidate_tag`` must not look fresh afterwards.
+        self._key_generated_at[key] = time.time() if generated_at is None else generated_at
+        self._key_generated_at.move_to_end(key)
+        while len(self._key_generated_at) > _MAX_LOCAL_VARIANT_PATHS:
+            self._key_generated_at.popitem(last=False)
+
+    async def get_or_render(self, key, policy, render, *, tags=None):
+        """Serve ``key`` from cache or render it once.
+
+        ``tags`` are the cache tags the generated entry is stored with;
+        when omitted they default to ``policy["tags"]`` (page tags
+        passed through the policy dict). Tag invalidation judges the
+        entry against these tags.
+        """
         loop = asyncio.get_running_loop()
         if self._closed:
             raise CacheBusy("ISR cache is shutting down")
@@ -658,14 +1559,45 @@ class ISRCache:
             self._loop = loop
         elif self._loop is not loop:
             raise RuntimeError("An ISR app instance must use a single event loop")
+        if tags is None:
+            # Tags may ride in the policy dict (page tags); an explicit
+            # argument wins.
+            tags = policy.get("tags", ())
+        tags = _validate_entry_tags(tags)
+        self._remember_key_tags(key, tags)
+        # Normalize to the 3-axis policy, then hand the backends the two
+        # windows they store: fresh_for = revalidate, stale_for =
+        # expire - revalidate, so the SWR window runs up to the hard cap.
+        # A pre-expire 2-key policy keeps its old meaning
+        # (expire = revalidate + stale). A revalidate=False policy
+        # normalizes to the longest lifetime (see normalize_isr_policy).
+        fresh_for, stale_for = policy_windows(policy)
+        policy = {"revalidate": fresh_for, "stale": stale_for}
+        if not key.startswith("\0isr:"):
+            # Plain cache keys are concrete paths; remember them so a
+            # scoped revalidation can find this entry later. Hashed
+            # query-variant keys are covered by _variant_paths instead.
+            self._remember_cached_path(key)
         status, body = self.store.lookup(key)
+        if status == "fresh":
+            # A tag invalidation recorded locally reclassifies a
+            # process-local hit before the shared store is consulted,
+            # so the memory backend and shared-outage fallbacks honour
+            # it too. The shared lookup below stays authoritative
+            # whenever the shared store answers.
+            tag_status = self._local_tag_status(key)
+            if tag_status == "expired":
+                self.store.remove(key)
+                status, body = "miss", None
+            elif tag_status == "stale":
+                status = "stale"
         if status == "fresh" and self.shared is None:
             return body
         if self.shared is None:
-            return await self._get_or_render_local(key, policy, render, status, body)
-        return await self._get_or_render_shared(key, policy, render, status, body)
+            return await self._get_or_render_local(key, policy, render, status, body, tags)
+        return await self._get_or_render_shared(key, policy, render, status, body, tags)
 
-    async def _generate(self, key, policy, render, lease=None):
+    async def _generate(self, key, policy, render, lease=None, tags=()):
         """Render once and store the result, fenced by the lease version.
 
         ``lease`` is ``(expected_version, owner)`` for a shared-cache
@@ -675,6 +1607,15 @@ class ISRCache:
         """
         owner = lease[1] if lease is not None else None
         expected_version = lease[0] if lease is not None else None
+        # Stamp the render start time now: the entry's ``generated_at``
+        # must reflect when its content was produced, not when the
+        # (possibly slow) render finished and stored it. Otherwise a
+        # generation that started before a ``revalidate_tag`` but stored
+        # after it looks "fresh" to the tag check even though its content
+        # predates the invalidation. The same start time is recorded for
+        # the process-local tag check (``_remember_key_generated``).
+        started_at = time.time()
+        started_mono = time.monotonic()
         try:
             async with asyncio.timeout(GENERATION_TIMEOUT):
                 if lease is not None:
@@ -684,7 +1625,7 @@ class ISRCache:
                     entry = await self._shared_entry(key)
                     if entry is not _SHARED_UNAVAILABLE and entry is not None and entry.status == "fresh":
                         if self._inflight.get(key) is asyncio.current_task():
-                            self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                            self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
                         return entry.body
                 response = await render()
                 if response.status != 200:
@@ -695,14 +1636,18 @@ class ISRCache:
                     if _is_storable(response):
                         shared_stored = True
                         if self.shared is not None and owner is not None:
-                            shared_stored = await self._shared_store(key, response.body, policy, expected_version, owner)
+                            shared_stored = await self._shared_store(
+                                key, response.body, policy, expected_version, owner, tags,
+                                generated_at=started_at, generated_mono=started_mono)
                             if not shared_stored:
                                 log.warning("Shared ISR insert for %s failed or was fenced out;"
                                             " page was served but not cached", key)
                         # Do not populate L1 after a shared write was rejected
                         # or after this app invalidated the running task.
                         if shared_stored and self._inflight.get(key) is asyncio.current_task():
-                            if not self.store.insert(key, response.body, policy["revalidate"], policy["stale"]):
+                            if self._store_insert(key, response.body, policy["revalidate"], policy["stale"]):
+                                self._remember_key_generated(key, started_at)
+                            else:
                                 log.warning("ISR cache insert failed for %s; page was served but not cached", key)
                     else:
                         log.info("ISR response for %s is private; served but not cached", key)
@@ -711,11 +1656,11 @@ class ISRCache:
             if owner is not None and self.shared is not None:
                 await self._shared_release(key, owner)
 
-    async def _get_or_render_local(self, key, policy, render, status, body):
+    async def _get_or_render_local(self, key, policy, render, status, body, tags=()):
         task = self._inflight.get(key)
         if task is None and len(self._tasks) < MAX_INFLIGHT:
             task = self._register(key, asyncio.create_task(
-                self._generate(key, policy, render), context=contextvars.Context()))
+                self._generate(key, policy, render, tags=tags), context=contextvars.Context()))
         if status == "stale":
             return body
         if task is None:
@@ -723,16 +1668,16 @@ class ISRCache:
         # A cancelled request must not cancel the shared render for other callers.
         return await asyncio.shield(task)
 
-    async def _get_or_render_shared(self, key, policy, render, status, body):
+    async def _get_or_render_shared(self, key, policy, render, status, body, tags=()):
         entry = await self._shared_entry(key)
         if entry is _SHARED_UNAVAILABLE:
             if status == "fresh":
                 return body
-            return await self._get_or_render_local(key, policy, render, status, body)
+            return await self._get_or_render_local(key, policy, render, status, body, tags)
         if entry is not None and entry.status == "fresh":
             # Keep a local fallback for shared-store outages. Shared mode
             # still validates each hit against the authoritative store.
-            self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+            self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
             return entry.body
         task = self._inflight.get(key)
         if task is not None:
@@ -745,7 +1690,7 @@ class ISRCache:
                     raise SharedCacheUnavailable("Shared cache lease lookup failed") from exc
                 if status == "fresh":
                     return body
-                return await self._get_or_render_local(key, policy, render, status, body)
+                return await self._get_or_render_local(key, policy, render, status, body, tags)
             if not valid:
                 if self._inflight.get(key) is task:
                     self._inflight.pop(key, None)
@@ -759,10 +1704,10 @@ class ISRCache:
                 owner = f"{os.getpid()}:{uuid.uuid4().hex}"
                 version = await self._shared_acquire(key, owner)
                 if version is _SHARED_UNAVAILABLE:
-                    return await self._get_or_render_local(key, policy, render, "stale", entry.body)
+                    return await self._get_or_render_local(key, policy, render, "stale", entry.body, tags)
                 if version is not None:
                     task = self._register(key, asyncio.create_task(
-                        self._generate(key, policy, render, lease=(version, owner)),
+                        self._generate(key, policy, render, lease=(version, owner), tags=tags),
                         context=contextvars.Context()), owner)
                 return entry.body
             # First generation (or expired): become the generator if the
@@ -770,21 +1715,21 @@ class ISRCache:
             owner = f"{os.getpid()}:{uuid.uuid4().hex}"
             version = await self._shared_acquire(key, owner)
             if version is _SHARED_UNAVAILABLE:
-                return await self._get_or_render_local(key, policy, render, status, body)
+                return await self._get_or_render_local(key, policy, render, status, body, tags)
             if version is not None:
                 task = self._register(key, asyncio.create_task(
-                    self._generate(key, policy, render, lease=(version, owner)),
+                    self._generate(key, policy, render, lease=(version, owner), tags=tags),
                     context=contextvars.Context()), owner)
             else:
                 outcome, payload = await self._wait_for_shared(key, GENERATION_TIMEOUT)
                 if outcome == "fresh":
                     entry = payload
-                    self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                    self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
                     return entry.body
                 if outcome == "lease":
                     version, owner = payload
                     task = self._register(key, asyncio.create_task(
-                        self._generate(key, policy, render, lease=(version, owner)),
+                        self._generate(key, policy, render, lease=(version, owner), tags=tags),
                         context=contextvars.Context()), owner)
                 else:
                     # The other worker is still generating after the wait.
@@ -794,7 +1739,7 @@ class ISRCache:
                         log.warning("ISR first generation for %s is still running in another worker;"
                                     " rendering locally", key)
                     task = self._register(key, asyncio.create_task(
-                        self._generate(key, policy, render),
+                        self._generate(key, policy, render, tags=tags),
                         context=contextvars.Context()))
         if entry is not None and entry.status == "stale":
             return entry.body

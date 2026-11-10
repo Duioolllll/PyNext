@@ -21,6 +21,7 @@
   실행기 대기 중 취소·만료된 작업은 limiter를 호출하지 않는다.
 - 잘못된 ASGI HTTP 경로는 토큰 소비 전에 400으로 거부해 네이티브 동작과 맞춘다.
 - 공개 `RateLimiter.is_exempt_path()`의 타입 시그니처를 포함한다.
+- SQLite ISR 백엔드가 단조 시계로 수명을 판정해 wall-clock 점프에 만료·fresh 판정이 흔들리지 않으며, `entries` 테이블을 기본 4096개·128MiB로 묶고 삽입 시 만료 행 정리와 가장 오래된 항목부터의 축출을 한다.
 
 ```bash
 pip install pynext-framework==0.1.2

@@ -32,7 +32,11 @@ async def exercise(client):
     response = await client.head("/")
     assert response.status_code == 200 and response.content == b""
     assert int(response.headers["content-length"]) > 0
-    assert (await client.get("/blog/a%2Fb")).status_code == 400
+    # An encoded slash inside a parameter value is one segment: the blog
+    # slug is "a/b", re-encoded as "a%2Fb" so it cannot act as a separator.
+    response = await client.get("/blog/a%2Fb")
+    assert response.status_code == 200
+    assert "<p>a%2Fb</p>" in response.text
     assert (await client.post("/api/users", content=b"x" * 1_048_577)).status_code == 413
 
 

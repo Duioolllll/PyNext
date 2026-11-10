@@ -15,6 +15,10 @@ uv run pynext start --dir examples/basic --host 127.0.0.1 --port 3000
 
 운영 모드 시작에도 앱 소스의 `public/` 및 `islands/` 디렉터리가 필요합니다. 단, Linux standalone 디렉터리(`pynext build --dir <app> --standalone`)로 배포하면 인터프리터·설치된 의존성·빌드된 앱이 `<app>/.pynext/standalone`에 묶여 제공됩니다(호환 시스템 라이브러리는 별도로 필요합니다).
 
+### Standalone 번들 내용
+
+번들 루트에는 번들의 출처를 기록한 `bundle-manifest.json`이 있습니다. 매니페스트 스키마 `version`, `pynext_version`, `python_version`, 결정적 `build_id`(빌드 매니페스트에 없을 때는 소스 해시에서 유도), `esbuild_version`, 버전이 포함된 복사된 서드파티 패키지 목록(`copied_packages`), `--standalone-exclude`로 제외한 패키지(`excluded_packages`), 복사 중 버려진 심볼릭링크 파일(번들 상대 경로, `dropped_symlinks`), 함께 복사된 환경 파일(`env_files`), 전체 파일 수와 바이트 수가 기록됩니다. 번들은 프로젝트 루트의 `.env`와 `.env.production`도 묶인 앱 디렉터리에 복사합니다. `.env.local`과 `.env.*.local`은 절대 복사하지 않습니다. 묶인 서버가 시작될 때 번들의 PyNext/Python 버전, 빌드 ID, 패키지 수와 크기를 로그로 남기고, 빌드 때와 다른 Python이나 PyNext 버전으로 실행 중이면 경고합니다. `--standalone-exclude <이름>`(반복 가능)은 site-packages 최상위 항목을 번들에서 제외합니다. `pynext` 자체는 제외할 수 없습니다.
+
 ## 외부 ASGI 서버
 
 ~~~bash

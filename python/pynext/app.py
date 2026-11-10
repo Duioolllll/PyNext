@@ -1,6 +1,8 @@
 import asyncio
+import copy
 import dataclasses
 import hashlib
+import hmac
 import html
 import importlib.machinery
 import importlib.util
@@ -8,29 +10,42 @@ import inspect
 import json
 import keyword
 import logging
+import math
+import os
 import re
 import sys
 import threading
 import time
 import traceback
 import uuid
+import warnings
 import weakref
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from urllib.parse import quote, unquote_to_bytes
+from urllib.parse import quote, unquote, unquote_to_bytes
 
 from . import _native
 from .admission import DecisionGate
 from .assets import read_public_artifacts, read_public_sources
 from .auth import check_authorization
-from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
+from .cache import (MAX_CACHE_SECONDS, CacheBusy, ISRCache, SharedCacheUnavailable,
+                    dev_retention_policy, validate_cache_tag)
 from .client import compile_client, read_client_artifacts
-from .components import _isr_policy, _isr_query_keys, _node, bind_islands
-from .build import discover, load_manifest
-from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
+from .components import (_isr_policy, _isr_query_keys, _node, _partial_isr_policy, _validate_tags,
+                        bind_islands, reduce_segment_config)
+from .env import load_env
+from .build import _materialize, discover, load_manifest
+from .config import DEFAULT_CONFIG
+from .dynamic import (DYNAMIC_MODES, MAX_DYNAMIC_ACCESSES, format_dynamic_accesses,
+                      suppress_dynamic_tracking, track_prerender)
+from .errors import SignalError, digest_for_error, error_count
+from .http import (SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
-                   apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
+                   apply_path_headers, apply_security_headers, compile_path_headers,
+                   cors_preflight_response, filter_internal_headers, new_csp_nonce, validate_csrf)
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
+from .middleware import ScopedMiddleware
 from .observability import (
     MetricsCollector,
     ObservabilityConfig,
@@ -52,6 +67,62 @@ log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
 ASGI_DECISION_CAPACITY = 64
 ASGI_DECISION_TIMEOUT = 2.0
+
+# Development error page (P1-3): how much of a traceback the dev page keeps.
+# The tail is kept so the frames nearest the failure survive; anything cut
+# off the front is announced on the page instead of silently disappearing.
+_DEV_TRACEBACK_MAX_CHARS = 16384
+_DEV_EDITOR_URL_TEMPLATE = "vscode://file/{path}:{line}"
+_DEV_ERROR_COUNT_LIMIT = 512
+_FRAME_RE = re.compile(r'^(?P<indent>[ \t]*)File "(?P<path>[^"]+)", line (?P<line>\d+), in (?P<func>.*)$')
+
+
+def _editor_url_template():
+    """Editor link template for dev traceback frames.
+
+    ``PYNEXT_EDITOR_URL`` overrides the default ``vscode://`` template; it
+    must contain ``{path}`` and ``{line}`` placeholders (e.g.
+    ``idea://open?file={path}&line={line}``). A malformed value falls back
+    to the default instead of breaking the error page.
+    """
+    template = os.environ.get("PYNEXT_EDITOR_URL") or _DEV_EDITOR_URL_TEMPLATE
+    if "{path}" not in template or "{line}" not in template:
+        return _DEV_EDITOR_URL_TEMPLATE
+    return template
+
+
+def _dev_error_digest(exc):
+    """Short stable digest for a dev error page: type + message + origin frame."""
+    origin = ""
+    tb = exc.__traceback__
+    while tb is not None:
+        origin = f"{tb.tb_frame.f_code.co_filename}:{tb.tb_lineno}"
+        tb = tb.tb_next
+    raw = f"{type(exc).__module__}.{type(exc).__qualname__}:{exc}\n{origin}"
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _render_dev_traceback(text):
+    """HTML-escape traceback text, linking ``File "...", line N`` frames.
+
+    The link opens the frame in the editor (see :func:`_editor_url_template`).
+    Lines that do not match a frame are escaped verbatim, so chained
+    exceptions (``During handling of the above exception ...``) survive.
+    """
+    template = _editor_url_template()
+    rendered = []
+    for line in text.splitlines():
+        match = _FRAME_RE.match(line)
+        if match is None:
+            rendered.append(html.escape(line))
+            continue
+        href = template.format(path=quote(match.group("path"), safe="/:"),
+                               line=match.group("line"))
+        rendered.append(
+            f"{html.escape(match.group('indent'))}File &quot;<a href=\"{html.escape(href, quote=True)}\">"
+            f"{html.escape(match.group('path'))}</a>&quot;, line {match.group('line')}, "
+            f"in {html.escape(match.group('func'))}")
+    return "\n".join(rendered)
 
 
 class _SyncHandlerBusy(Exception):
@@ -256,6 +327,35 @@ class _ISRStreamingResponse(StreamingResponse):
         await super().aclose()
 
 
+def _substitute_shell_marker(node, marker, page_tree):
+    """Return ``(tree, count)`` with the marker text node swapped for ``page_tree``.
+
+    The input tree is never mutated: every dict and list on the path is
+    rebuilt, so a cached shell template stays pristine for the next
+    request. ``count`` is the number of marker nodes replaced; a valid
+    shell renders its children exactly once, so callers require 1.
+    """
+    if isinstance(node, dict):
+        if node.get("kind") == "text" and node.get("value") == marker:
+            return page_tree, 1
+        result = {}
+        count = 0
+        for key, value in node.items():
+            new_value, found = _substitute_shell_marker(value, marker, page_tree)
+            result[key] = new_value
+            count += found
+        return result, count
+    if isinstance(node, list):
+        result = []
+        count = 0
+        for child in node:
+            new_child, found = _substitute_shell_marker(child, marker, page_tree)
+            result.append(new_child)
+            count += found
+        return result, count
+    return node, 0
+
+
 async def _send_response(response, send, *, config=None, production=True):
     """Send ``response`` over ASGI, adding the A1 security headers first.
 
@@ -307,16 +407,184 @@ async def _run_while_connected(work, receive):
         await asyncio.gather(task, disconnect, return_exceptions=True)
 
 
-def _decode_path(path, raw_path=None):
-    if raw_path is not None:
-        if re.search(br"%(?![0-9a-fA-F]{2})|%(?:2[fF]|5[cC]|00)", raw_path):
-            raise ValueError("Invalid or encoded path separator")
-        path = unquote_to_bytes(raw_path).decode("utf-8", errors="strict")
+def _typed_params(raw_params, kinds):
+    """Collapse matched parameter values to the handler's types.
+
+    ``raw_params`` maps each name to its list of matched segments and
+    ``kinds`` maps the same names to the kind the router recorded for
+    them (``"dynamic"``, ``"catch_all"`` or ``"optional"`` — see
+    ``Router.matches``). Catch-all and optional catch-all parameters stay
+    lists; a dynamic parameter becomes its single segment. The kinds
+    must come from the router, never from a substring test on the
+    pattern: ``"[...a]"`` is a substring of ``"/[a]/[...a2]"`` and would
+    misclassify the dynamic ``a`` as a list.
+    """
+    return {k: v if kinds.get(k) in ("catch_all", "optional") else v[0]
+            for k, v in raw_params.items()}
+
+
+# Matches Next.js `escapePathDelimiters(segment, true)`: re-encode any path
+# delimiter a decoded value produced, plus encoded delimiters that were
+# already present, so a decoded value can never be mistaken for a
+# separator or decoded a second time.
+_DELIMITER_RE = re.compile(r"([/#?\\]|%(?:2f|23|3f|5c))", re.IGNORECASE)
+
+
+def _escape_path_delimiters(segment):
+    """Re-encode path delimiters in a decoded parameter value."""
+    return _DELIMITER_RE.sub(lambda match: quote(match.group(0), safe=""), segment)
+
+
+def _validate_path(path):
+    """Reject a path that is not a normalized absolute path."""
     if (not path.startswith("/") or "//" in path or "\\" in path or
             any(ord(c) < 32 or ord(c) == 127 for c in path) or
             any(part in (".", "..") for part in path.split("/"))):
         raise ValueError("Invalid request path")
-    return path
+
+
+def _validate_encoded_path(raw):
+    """Validate a still-encoded request path; return it as a string.
+
+    Only the encoded form is checked here: ``%00`` and malformed ``%``
+    sequences are rejected, as are literal ``//``, backslashes, control
+    characters and ``.``/``..`` segments. Encoded delimiters (``%2F``,
+    ``%5C``, ``%23``, ``%3F``) are allowed through — they are decoded
+    per segment before matching, with delimiters re-encoded, so they
+    never act as separators.
+    """
+    if isinstance(raw, str):
+        raw = raw.encode("ascii")
+    if re.search(br"%(?![0-9a-fA-F]{2})|%00", raw):
+        raise ValueError("Invalid or NUL-encoded path")
+    encoded = raw.decode("ascii")
+    _validate_path(encoded)
+    return encoded
+
+
+def _split_request_path(path, raw_path=None):
+    """Return ``(decoded_path, encoded_path)`` for a request.
+
+    Route matching runs on the per-segment decoded form produced by
+    :func:`_normalize_path_for_matching` (``/files/a%2Fb`` matches
+    ``[name]`` with the value ``a%2Fb``; ``/in%70ut`` matches the
+    static segment ``input``). The decoded path is kept for
+    asset/static/ISR lookups and handler visibility. When no raw path
+    is available (for example ``revalidate()``), both are the validated
+    path. The decoded form is validated too, so a ``%2F`` that would
+    create an empty segment (``/%2finput`` → ``//input``) or a ``..``
+    segment is still rejected before any rate-limit charge.
+    """
+    if raw_path is None:
+        _validate_path(path)
+        return path, path
+    encoded = _validate_encoded_path(raw_path)
+    decoded = unquote_to_bytes(encoded).decode("utf-8", errors="strict")
+    _validate_path(decoded)
+    return decoded, encoded
+
+
+def _decode_path(path, raw_path=None):
+    """Return the decoded request path (see :func:`_split_request_path`)."""
+    return _split_request_path(path, raw_path)[0]
+
+
+def _decode_param(name, raw):
+    """Decode one matched parameter value (Next.js ``decodePathParams``).
+
+    Raises :class:`BadRequest` naming the parameter when the value
+    cannot be decoded. Delimiters produced by decoding are re-encoded
+    so the value cannot be mistaken for a separator.
+    """
+    try:
+        value = unquote(raw, errors="strict")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise BadRequest(f"Failed to decode path param '{name}'") from exc
+    return _escape_path_delimiters(value)
+
+
+def _normalize_path_for_matching(encoded_path):
+    """Decode each segment and re-escape delimiters (Next.js ``decodePathParams``).
+
+    Matching runs on this form: a static segment compares decoded (so
+    ``/in%70ut`` matches ``/input``), while an encoded delimiter stays
+    one segment (so ``/files/a%2Fb`` matches ``[name]`` with the value
+    ``a%2Fb``). The values the router returns are already the decoded,
+    delimiter-safe values the handler receives, so no second decode is
+    needed. Raises :class:`BadRequest` naming the offending segment when
+    a value cannot be decoded.
+    """
+    segments = encoded_path.split("/")
+    return "/".join(
+        _decode_param(segment, segment) for segment in segments
+    )
+
+
+def _is_dynamic_pattern(path):
+    """True when ``path`` is a route pattern (``[slug]``, ``[...rest]``)
+    rather than a concrete path."""
+    return any(segment.startswith("[") for segment in path.split("/"))
+
+
+def _posix_path(path):
+    """A project-relative path with forward slashes.
+
+    The build manifest records paths with the OS separator, so on
+    Windows a layout arrives as ``app\\blog\\layout.py`` while the
+    URL-derived lookups build ``app/blog/layout.py``. Normalise to
+    forward slashes so comparisons, ``source`` fields and log lines
+    are identical on every platform. (``Path.as_posix()`` alone would
+    not do this for a Windows-style string on POSIX, where a
+    backslash is a legal filename character, so the separator is
+    replaced directly.)
+    """
+    return str(path).replace("\\", "/")
+
+
+def _layout_url_dir(module):
+    """The URL directory a layout module applies to.
+
+    ``app/news/layout.py`` applies to ``/news``; a layout inside a route
+    group (``app/(marketing)/layout.py``) applies to ``/`` because groups
+    do not appear in URLs.
+    """
+    parts = _posix_path(module).split("/")[1:-1]
+    url_parts = [part for part in parts if not (part.startswith("(") and part.endswith(")"))]
+    return "/" + "/".join(url_parts)
+
+
+_ROUTE_GROUP_RE = re.compile(r"\([A-Za-z0-9_-]+\)")
+
+
+def _layout_scope(relative):
+    """Map a layout file (``app/blog/layout.py``) to its URL scope (``/blog``).
+
+    Route groups do not appear in the URL, so a layout inside ``(group)``
+    takes the scope of the directory the group sits in; the root layout
+    scopes to ``/``.
+    """
+    parts = Path(relative).parts[1:-1]
+    visible = [part for part in parts if not _ROUTE_GROUP_RE.fullmatch(part)]
+    return "/" + "/".join(visible) if visible else "/"
+
+
+def _layout_tag(scope):
+    return "_pynext_layout_" + scope
+
+
+def _implicit_path_tags(path):
+    """The implicit tag(s) an ISR entry for a concrete path carries.
+
+    ``revalidate(path)`` is tag invalidation for these tags. ``/`` and
+    ``/index`` are aliases of each other (Next.js ``revalidatePath``),
+    so invalidating either invalidates both.
+    """
+    tags = ["_pynext_path_" + path]
+    if path == "/":
+        tags.append("_pynext_path_/index")
+    elif path == "/index":
+        tags.append("_pynext_path_/")
+    return tags
 
 
 def _module_key(root, relative):
@@ -327,22 +595,40 @@ def _module_key(root, relative):
 
 
 class App:
-    def __init__(self, root, manifest, *, production=False, security=None, cache_backend="memory",
+    def __init__(self, root, manifest, *, production=False, security=None,
+                 cache_backend=DEFAULT_CONFIG.cache_backend,
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
                  resources=None, cache_url=None, cache_failure_policy=None,
-                 websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
-                 trusted_proxies=None, sync_workers=32):
+                 websocket_max_message=DEFAULT_CONFIG.websocket_max_message, hot_reload=False,
+                 trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None,
+                 revalidate_secret=None):
         if isinstance(sync_workers, bool) or not isinstance(sync_workers, int) or not 1 <= sync_workers <= 1024:
             raise ValueError("sync_workers must be an integer from 1 to 1024")
         self.sync_workers = sync_workers
+        # Secret for the POST /_pynext/revalidate webhook. None disables
+        # the endpoint (it answers 404). create_app() also reads
+        # PYNEXT_REVALIDATE_SECRET when no explicit secret is given.
+        if revalidate_secret is not None and (
+                not isinstance(revalidate_secret, str) or not revalidate_secret):
+            raise ValueError("revalidate_secret must be a non-empty string")
+        self.revalidate_secret = revalidate_secret
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
+        if not isinstance(strict_ssg, bool):
+            raise TypeError("strict_ssg must be a bool")
+        # Dev-only: with strict_ssg, an SSG path that generate_static_params
+        # would not produce is a 404 in development too, instead of merely
+        # warning that it will 404 in production (see _dispatch).
+        self.strict_ssg = strict_ssg
         if production and debug:
             raise ValueError("debug cannot be enabled in production")
         if not isinstance(hot_reload, bool) or (hot_reload and (production or not debug)):
             raise ValueError("hot_reload requires development debug mode")
         self.debug = debug
         self.hot_reload = hot_reload
+        # Dev error page occurrence counts, keyed by _dev_error_digest().
+        # Bounded so a crash loop cannot grow memory without limit.
+        self._dev_error_counts = {}
         self._dev_id = uuid.uuid4().hex if hot_reload else None
         if (isinstance(websocket_max_message, bool) or not isinstance(websocket_max_message, int) or
                 not 1 <= websocket_max_message <= 16 * 1024 * 1024):
@@ -355,6 +641,10 @@ class App:
         if not isinstance(security, SecurityConfig):
             raise TypeError("security must be a SecurityConfig")
         self.security = security
+        # Per-path response headers (Next.js headers() equivalent): compiled
+        # and validated here, so a bad rule fails at startup. See
+        # http.compile_path_headers for the accepted shapes.
+        self.path_headers = compile_path_headers(headers)
         self.observability_config = observability or ObservabilityConfig.from_env()
         self.metrics = MetricsCollector(enabled=self.observability_config.metrics)
         configure_logging(self.observability_config)
@@ -407,9 +697,12 @@ class App:
                 # SecurityConfig(csrf_enabled=False). Without sessions the
                 # default stays off (opt in with csrf_enabled=True or
                 # @csrf_protect) so token-less API clients keep working.
+                # A scoped SessionMiddleware still counts: unwrap the scope
+                # so CSRF auto-enable sees the middleware inside.
                 security = dataclasses.replace(
                     security,
-                    csrf_enabled=any(isinstance(item, SessionMiddleware)
+                    csrf_enabled=any(isinstance(item.middleware if isinstance(item, ScopedMiddleware)
+                                                 else item, SessionMiddleware)
                                      for item in self.middleware))
                 self.security = security
             if resources is None:
@@ -491,10 +784,22 @@ class App:
         self.production = production
         self.router = _native.Router(list(manifest["routes"]))
         self.entries = {}
+        self._layout_shells = {}
+        self._layout_shell_locks = {}
+        self._layout_shell_dynamic = {}
         self.websocket_entries = {}
         self.render_modes = {}
+        self.dynamic_modes = {}
+        # Per-pattern dynamic accesses recorded during SSG/ISR prerenders
+        # (see _merge_dynamic_accesses); written to the build manifest.
+        self.dynamic_accesses = {}
+        self._dev_static_paths = {}
         self.isr_policies = {}
+        self.layout_policies = {}
+        self.isr_policy_overrides = {}
         self.isr_queries = {}
+        self.isr_tags = {}
+        self.entry_layouts = {}
         if cache_backend == "sqlite" and cache_path is None:
             cache_path = self.root / ".pynext" / "isr-cache.sqlite3"
         build_id = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"),
@@ -522,36 +827,16 @@ class App:
                 if mode in {"ssg", "isr"} and getattr(fn, "__pynext_auth__", False):
                     raise ValueError(f"{mode.upper()} page {spec['entry']} cannot require authentication")
                 self.render_modes[pattern] = mode
-                if mode == "isr":
-                    policy = getattr(fn, "__pynext_cache_policy__", None)
-                    if not isinstance(policy, dict) or set(policy) != {"revalidate", "stale"}:
-                        raise ValueError(f"Invalid ISR policy in {spec['entry']}")
-                    try:
-                        policy = _isr_policy(policy["revalidate"], policy["stale"])
-                    except ValueError as exc:
-                        raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
-                    if getattr(module, "generate_static_params", None) is not None:
-                        raise ValueError(f"ISR page {spec['entry']} cannot export generate_static_params yet")
-                    self.isr_policies[pattern] = policy
-                    try:
-                        query_keys = _isr_query_keys(getattr(fn, "__pynext_cache_query__", ()))
-                    except ValueError as exc:
-                        raise ValueError(f"Invalid ISR query keys in {spec['entry']}: {exc}") from exc
-                    self.isr_queries[pattern] = query_keys
-                else:
-                    query_keys = []
-                if "query" in inspect.signature(fn).parameters and not query_keys:
-                    raise ValueError(f"Page {spec['entry']} needs ISR query_keys to accept query")
-                if mode == "ssg":
-                    dynamic = any(segment.startswith("[") for segment in pattern.split("/"))
-                    generator = getattr(module, "generate_static_params", None)
-                    if dynamic and (not callable(generator) or inspect.signature(generator).parameters):
-                        raise ValueError(f"Dynamic SSG page {spec['entry']} must export generate_static_params() with no arguments")
-                    if not dynamic and generator is not None:
-                        raise ValueError(f"Static SSG page {spec['entry']} cannot export generate_static_params")
-                    self.static_generators[pattern] = generator
+                # The manifest records paths with the OS separator, so on
+                # Windows ``spec["layouts"]`` holds ``app\\blog\\layout.py``.
+                # Normalise once here: layout lookups, ``layout_policies``
+                # sources and the override warning all compare against
+                # slash-built paths (see _posix_path).
+                entry = _posix_path(spec["entry"])
+                layout_relatives = [_posix_path(relative) for relative in spec["layouts"]]
                 layouts = []
-                for relative in spec["layouts"]:
+                layout_policies = []
+                for relative in layout_relatives:
                     layout_fn = getattr(self._module(relative), "Layout", None)
                     if not callable(layout_fn) or not getattr(layout_fn, "__pynext_layout__", False):
                         raise ValueError(f"{relative} must export a @layout Layout function")
@@ -559,7 +844,130 @@ class App:
                     if "children" not in inspect.signature(layout_fn).parameters:
                         raise ValueError(f"{relative} must accept children")
                     layouts.append(layout_fn)
+                    raw_layout_policy = getattr(layout_fn, "__pynext_layout_policy__", None)
+                    if raw_layout_policy is not None:
+                        if not isinstance(raw_layout_policy, dict) or set(raw_layout_policy) != {"revalidate", "stale", "expire"}:
+                            raise ValueError(f"Invalid layout policy in {relative}")
+                        try:
+                            layout_policy = _partial_isr_policy(raw_layout_policy["revalidate"],
+                                                                raw_layout_policy["stale"],
+                                                                raw_layout_policy["expire"])
+                        except ValueError as exc:
+                            raise ValueError(f"Invalid layout policy in {relative}: {exc}") from exc
+                        if (layout_policy["revalidate"] is not None or layout_policy["stale"] is not None
+                                or layout_policy["expire"] is not None):
+                            layout_policies.append((relative, layout_policy))
+                dynamic = getattr(fn, "__pynext_dynamic__", "auto")
+                if dynamic not in DYNAMIC_MODES:
+                    raise ValueError(f"Unsupported dynamic mode in {spec['entry']}")
+                if mode == "ssr" and dynamic != "auto":
+                    raise ValueError(f"SSR page {spec['entry']} cannot set dynamic={dynamic!r}")
+                if dynamic == "force-dynamic" and mode != "ssg":
+                    raise ValueError(f"Only SSG pages can use dynamic='force-dynamic' in {spec['entry']}")
+                self.dynamic_modes[pattern] = dynamic
+                if mode == "isr":
+                    raw_policy = getattr(fn, "__pynext_cache_policy__", None)
+                    if not isinstance(raw_policy, dict) or set(raw_policy) != {"revalidate", "stale", "expire"}:
+                        raise ValueError(f"Invalid ISR policy in {spec['entry']}")
+                    try:
+                        page_policy = _partial_isr_policy(raw_policy["revalidate"],
+                                                          raw_policy["stale"],
+                                                          raw_policy["expire"])
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
+                    if layout_policies:
+                        self.layout_policies[pattern] = [
+                            {"source": source, "revalidate": policy["revalidate"],
+                             "stale": policy["stale"], "expire": policy["expire"]}
+                            for source, policy in layout_policies]
+                    # Segment config inheritance (Next.js reduceAppConfig):
+                    # layouts set the section policy, a page only wins with a
+                    # shorter revalidate / smaller stale / smaller expire. Warn
+                    # when the page explicitly asked for a value it does not
+                    # get, naming both files so the override is never silent.
+                    effective, winners = reduce_segment_config(
+                        [*layout_policies, (entry, page_policy)])
+                    for key in ("revalidate", "stale", "expire"):
+                        page_value = page_policy[key]
+                        if (page_value is not None and page_value is not False and
+                                effective[key] != page_value):
+                            winner_source, winner_value = winners[key]
+                            log.warning(
+                                "ISR %s=%s in %s is overridden by %s=%s from %s for route %s; "
+                                "a child segment only wins with a shorter %s",
+                                key, page_value, entry, key, winner_value,
+                                winner_source, pattern, key)
+                    if effective["revalidate"] is None:
+                        raise ValueError(
+                            f"ISR page {spec['entry']} must set revalidate or inherit it from a layout")
+                    if effective["revalidate"] is False:
+                        # On-demand-only ISR: never regenerates on a timer,
+                        # only explicit revalidate()/revalidate_tag() does.
+                        # _isr_policy normalizes it to the longest lifetime
+                        # (expire ignored, stale window 0).
+                        stale = 60.0 if effective["stale"] is None else effective["stale"]
+                        try:
+                            policy = _isr_policy(False, stale, None)
+                        except ValueError as exc:
+                            raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
+                    else:
+                        # Reconcile stale/expire: they are two spellings of the
+                        # same window. A set expire is the hard cap and wins;
+                        # stale is derived from it. Without an expire, stale
+                        # (default 60) defines the window and expire follows.
+                        revalidate = effective["revalidate"]
+                        if effective["expire"] is not None:
+                            expire = effective["expire"]
+                            stale = expire - revalidate
+                        else:
+                            stale = 60.0 if effective["stale"] is None else effective["stale"]
+                            expire = revalidate + stale
+                        try:
+                            policy = _isr_policy(revalidate, stale, expire)
+                        except ValueError as exc:
+                            raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
+                    self.isr_policies[pattern] = policy
+                    if getattr(module, "generate_static_params", None) is not None:
+                        raise ValueError(f"ISR page {spec['entry']} cannot export generate_static_params yet")
+                    try:
+                        query_keys = _isr_query_keys(getattr(fn, "__pynext_cache_query__", ()))
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid ISR query keys in {spec['entry']}: {exc}") from exc
+                    self.isr_queries[pattern] = query_keys
+                    try:
+                        # Lists, not tuples: the manifest round-trips
+                        # through JSON, like isr_queries.
+                        self.isr_tags[pattern] = list(_validate_tags(
+                            getattr(fn, "__pynext_cache_tags__", ())))
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid ISR tags in {spec['entry']}: {exc}") from exc
+                    # Layout tags: an ISR page also carries one tag per
+                    # ancestor layout (scopes recorded in entry_layouts),
+                    # so invalidating a layout tag evicts the whole
+                    # subtree (webhook type="layout" via _layout_tag).
+                    self.isr_tags[pattern] = sorted(set(self.isr_tags[pattern]) |
+                        {_layout_tag(_layout_scope(relative)) for relative in layout_relatives})
+                else:
+                    query_keys = []
+                if "query" in inspect.signature(fn).parameters and not query_keys:
+                    raise ValueError(f"Page {spec['entry']} needs ISR query_keys to accept query")
+                if mode == "ssg":
+                    is_dynamic = any(segment.startswith("[") for segment in pattern.split("/"))
+                    generator = getattr(module, "generate_static_params", None)
+                    if dynamic == "force-dynamic":
+                        # Served dynamically in production, so no generator
+                        # is needed and any exported one is ignored at build.
+                        pass
+                    elif is_dynamic and (not callable(generator) or inspect.signature(generator).parameters):
+                        raise ValueError(f"Dynamic SSG page {spec['entry']} must export generate_static_params() with no arguments")
+                    elif not is_dynamic and generator is not None:
+                        raise ValueError(f"Static SSG page {spec['entry']} cannot export generate_static_params")
+                    self.static_generators[pattern] = generator
+                self._layout_shell_dynamic[pattern] = any(
+                    getattr(layout_fn, "__pynext_layout_dynamic__", False) for layout_fn in layouts
+                )
                 self.entries[pattern] = (fn, layouts)
+                self.entry_layouts[pattern] = tuple(layout_relatives)
             else:
                 handlers = {}
                 ws_handler = None
@@ -586,8 +994,14 @@ class App:
                 raise ValueError("Render modes changed since build; run `pynext build` again")
             if manifest.get("isr_policies") != self.isr_policies:
                 raise ValueError("ISR policies changed since build; run `pynext build` again")
+            if manifest.get("layout_policies") != self.layout_policies:
+                raise ValueError("Layout policies changed since build; run `pynext build` again")
             if manifest.get("isr_queries") != self.isr_queries:
                 raise ValueError("ISR query keys changed since build; run `pynext build` again")
+            if manifest.get("dynamic_modes") != self.dynamic_modes:
+                raise ValueError("Dynamic modes changed since build; run `pynext build` again")
+            if manifest.get("isr_tags") != self.isr_tags:
+                raise ValueError("ISR tags changed since build; run `pynext build` again")
             self.client_manifest, self.client_assets = read_client_artifacts(self.root, manifest)
             self.static_pages = read_static_pages(self.root, manifest, self.router)
             self.public_assets = read_public_artifacts(self.root, manifest)
@@ -617,6 +1031,21 @@ class App:
             self.asset_etags[path] = f'"{hashlib.sha256(body).hexdigest()}"'
         for path, body in self.client_assets.items():
             self.metrics.observe_island_bundle(path, len(body))
+        # Cached shells embed island module URLs from the old manifest.
+        self.invalidate_layout_shell()
+
+    def invalidate_layout_shell(self, pattern=None):
+        """Drop cached layout shells for one ``pattern`` or for all routes.
+
+        Layout source changes create a new app, so the cache is normally
+        fresh; this is for the cases where a running app outlives its
+        inputs — :meth:`update_dev_client` calls it when hot reload swaps
+        the client manifest. Dynamic layouts are never cached.
+        """
+        if pattern is None:
+            self._layout_shells.clear()
+        else:
+            self._layout_shells.pop(pattern, None)
 
     def _module(self, path):
         key = _module_key(self.root, path)
@@ -624,12 +1053,65 @@ class App:
             self.modules[key] = _load(self.root, path, self._namespace)
         return self.modules[key]
 
-    def error_response(self, exc):
+    def error_response(self, exc, digest=None):
+        """Render a 500 for an unexpected failure.
+
+        The production body never leaks the exception — it carries the
+        ``request_id`` and the error ``digest`` instead, so a user reporting
+        "500" can be matched to the log line (which records the same
+        digest) and the registry entry :func:`errors.lookup_error` restores.
+        The ``x-request-id`` response header carries the same id. In
+        development the page also shows the digest, how many times this
+        error has been seen, and whether the traceback was truncated.
+        Signal errors never reach this method: the dispatcher converts them
+        to their response before an error log is written.
+        """
+        if digest is None:
+            digest, count = digest_for_error(exc)
+        else:
+            count = error_count(digest)
+        request_id = get_request_id()
         if not self.debug:
-            return Response("Internal Server Error", status=500)
-        details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-16384:]
+            detail = "Internal Server Error"
+            parts = []
+            if request_id:
+                parts.append(f"request_id: {request_id}")
+            if digest:
+                parts.append(f"digest: {digest}")
+            if parts:
+                detail += " (" + ", ".join(parts) + ")"
+            return Response(detail, status=500)
+        digest = _dev_error_digest(exc)
+        if digest not in self._dev_error_counts and len(self._dev_error_counts) >= _DEV_ERROR_COUNT_LIMIT:
+            self._dev_error_counts.clear()
+        count = self._dev_error_counts.get(digest, 0) + 1
+        self._dev_error_counts[digest] = count
+        full = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        truncated = len(full) > _DEV_TRACEBACK_MAX_CHARS
+        omitted = len(full) - _DEV_TRACEBACK_MAX_CHARS if truncated else 0
+        details = full[-_DEV_TRACEBACK_MAX_CHARS:] if truncated else full
+        request_id = get_request_id() or "unknown"
+        route = route_var.get() or "unknown"
+        occurred = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        header = (
+            "<dl>"
+            f"<dt>Exception</dt><dd>{html.escape(type(exc).__qualname__ + ': ' + str(exc))}</dd>"
+            f"<dt>Request ID</dt><dd>{html.escape(request_id)}</dd>"
+            f"<dt>Route</dt><dd>{html.escape(route)}</dd>"
+            f"<dt>Digest</dt><dd>{digest}</dd>"
+            f"<dt>Time</dt><dd>{occurred}</dd>"
+            f"<dt>Occurrences</dt><dd>Seen {count} time{'s' if count != 1 else ''} in this process</dd>"
+            "</dl>"
+        )
+        notice = ""
+        if truncated:
+            notice = (
+                f"<p>Traceback truncated: showing the last {_DEV_TRACEBACK_MAX_CHARS:,} of "
+                f"{len(full):,} characters ({omitted:,} characters omitted from the start).</p>"
+            )
         body = ("<!DOCTYPE html><html><head><title>PyNext development error</title></head>"
-                "<body><h1>Development error</h1><pre>" + html.escape(details) + "</pre></body></html>")
+                "<body><h1>Development error</h1>"
+                + header + notice + "<pre>" + _render_dev_traceback(details) + "</pre></body></html>")
         return Response(body, status=500, media_type="text/html; charset=utf-8",
                         headers=[(b"cache-control", b"no-store")])
 
@@ -765,21 +1247,354 @@ class App:
                 return False
             await asyncio.sleep(0.05)
 
-    async def revalidate(self, path):
-        """Invalidate one decoded ISR path for this app instance."""
+    async def revalidate(self, path, type=None):
+        """Invalidate ISR entries for ``path``, optionally scoped by ``type``.
+
+        With no ``type`` this invalidates one concrete ISR path, as
+        before. ``type="page"`` with a dynamic route pattern (``"/news/[slug]"``)
+        invalidates every cached entry for that pattern, and ``type="layout"``
+        invalidates every ISR page that uses the layout defined at ``path``
+        (``"/"`` is the root layout, so it covers all pages). A dynamic
+        pattern without ``type`` only warns and invalidates nothing, like
+        Next.js ``revalidatePath``. ``"/"`` and ``"/index"`` are aliases.
+        Returns True when at least one entry (or query-variant generation)
+        was invalidated.
+        """
+        if type is not None and type not in ("page", "layout"):
+            raise ValueError("revalidate type must be 'page' or 'layout'")
         if not isinstance(path, str):
             raise TypeError("ISR path must be a string")
         path = _decode_path(path)
         if path != "/" and path.endswith("/"):
             raise ValueError("ISR path must not have a trailing slash")
+        if _is_dynamic_pattern(path):
+            if type is None:
+                warnings.warn(
+                    f"revalidate({path!r}) is a dynamic route pattern; pass "
+                    "type='page' to invalidate its cached entries or "
+                    "type='layout' to invalidate its layout's pages",
+                    UserWarning, stacklevel=2)
+                return False
+            if type == "page":
+                return await self._revalidate_pattern(path)
+            return await self._revalidate_layout(path)
+        if type == "layout":
+            return await self._revalidate_layout(path)
+        # Concrete page scope. "/" and "/index" name the same page, unless
+        # the app defines a real /index route of its own.
+        if self.router.matches("/index") is None:
+            primary = "/" if path == "/index" else path
+            removed = await self._revalidate_one(primary)
+            if primary == "/":
+                removed = await self.isr.invalidate("/index") or removed
+            return removed
+        return await self._revalidate_one(path)
+
+    async def _revalidate_one(self, path):
+        """Invalidate one concrete ISR path. Raises ValueError when the
+        path does not name an ISR page (or is shadowed by an asset)."""
         match = self.router.matches(path)
         if (match is None or self.render_modes.get(match[0]) != "isr" or
                 path in self.public_assets or path in self.static_pages or path in self.client_assets):
             raise ValueError("Path does not match an ISR page")
-        if self.isr_queries.get(match[0]):
+        # _revalidate_decoded also invalidates the implicit path tags,
+        # so "/" reaches its "/index" alias (and vice versa).
+        return await self._revalidate_decoded(path, "page")
+
+    async def _invalidate_cached_path(self, path, pattern):
+        """Invalidate one concrete cached path of ``pattern``.
+
+        Pages with ISR query keys store entries under a hashed key, so
+        rotating their variant generation is what makes the old entries
+        unreachable; other pages are removed directly.
+        """
+        if self.isr_queries.get(pattern):
             _, existed = await self.isr.variant_generation(path, invalidate=True)
             return existed
         return await self.isr.invalidate(path)
+
+    def _check_revalidate_path(self, path, type):
+        """Validate a revalidation target without changing any cache.
+
+        Returns the decoded path. Raises ``TypeError``/``ValueError`` for
+        a bad path, a non-ISR page (``type="page"``), or an unknown layout
+        (``type="layout"``).
+        """
+        if type not in ("page", "layout"):
+            raise ValueError('revalidate type must be "page" or "layout"')
+        if not isinstance(path, str):
+            raise TypeError("ISR path must be a string")
+        path = _decode_path(path)
+        if path != "/" and path.endswith("/"):
+            raise ValueError("ISR path must not have a trailing slash")
+        if type == "layout":
+            try:
+                self._layout_module_for_path(path)
+            except ValueError:
+                raise ValueError("Path does not match a layout") from None
+            return path
+        match = self.router.matches(path)
+        if (match is None or self.render_modes.get(match[0]) != "isr" or
+                path in self.public_assets or path in self.static_pages or path in self.client_assets):
+            raise ValueError("Path does not match an ISR page")
+        return path
+
+    async def _revalidate_decoded(self, path, type):
+        """Invalidate an already-decoded, already-validated path."""
+        if type == "layout":
+            return await self.isr.invalidate_tag(_layout_tag(path)) > 0
+        match = self.router.matches(path)
+        if self.isr_queries.get(match[0]):
+            _, existed = await self.isr.variant_generation(path, invalidate=True)
+            return existed
+        evicted = 0
+        for tag in _implicit_path_tags(path):
+            evicted += await self.isr.invalidate_tag(tag)
+        removed = await self.isr.invalidate(path)
+        return removed or evicted > 0
+
+    async def _revalidate_webhook(self, request):
+        """Serve ``POST /_pynext/revalidate`` (on-demand revalidation).
+
+        Disabled (404) while no ``revalidate_secret`` is configured.
+        Otherwise the caller must present it as ``Authorization: Bearer
+        <secret>`` (constant-time comparison). The JSON body takes
+        ``paths`` (list of ISR paths, ``type`` ``"page"`` or ``"layout"``)
+        and/or ``tags`` (list of cache tags, with optional ``expire``
+        seconds for deferred tag expiry). Every target is validated
+        before anything is invalidated, so a bad request changes nothing.
+        """
+        if request.method != "POST":
+            return Response("Method Not Allowed", status=405, headers=[(b"allow", b"POST")])
+        if self.revalidate_secret is None:
+            return Response("Not Found", status=404)
+        auth = next((value for name, value in request.headers
+                     if name.lower() == b"authorization"), None)
+        token = auth.decode("ascii", errors="ignore") if auth is not None else ""
+        if not token.startswith("Bearer ") or not hmac.compare_digest(
+                token[len("Bearer "):], self.revalidate_secret):
+            return Response("Unauthorized", status=401,
+                            headers=[(b"www-authenticate", b"Bearer")])
+        try:
+            payload = json.loads(request.body)
+        except (ValueError, UnicodeDecodeError):
+            return Response("Bad Request", status=400)
+        if not isinstance(payload, dict) or set(payload) - {"paths", "tags", "type", "expire"}:
+            return Response("Bad Request", status=400)
+        paths = payload.get("paths", [])
+        tags = payload.get("tags", [])
+        revalidate_type = payload.get("type", "page")
+        expire = payload.get("expire")
+        if (not isinstance(paths, list) or not all(isinstance(item, str) for item in paths) or
+                not isinstance(tags, list) or not all(isinstance(item, str) for item in tags) or
+                revalidate_type not in ("page", "layout") or
+                (expire is not None and
+                 (isinstance(expire, bool) or not isinstance(expire, (int, float)))) or
+                (not paths and not tags) or (expire is not None and not tags)):
+            return Response("Bad Request", status=400)
+        try:
+            decoded_paths = [self._check_revalidate_path(path, revalidate_type) for path in paths]
+            for tag in tags:
+                validate_cache_tag(tag)
+            if expire is not None and (
+                    not math.isfinite(expire) or expire < 0 or expire > MAX_CACHE_SECONDS):
+                raise ValueError(
+                    "expire must be a finite number of seconds from 0 to "
+                    f"{int(MAX_CACHE_SECONDS)}")
+        except (TypeError, ValueError) as exc:
+            return Response(f"Bad Request: {exc}", status=400)
+        results = {}
+        evicted = 0
+        for path in decoded_paths:
+            invalidated = await self._revalidate_decoded(path, revalidate_type)
+            results[path] = invalidated
+            if invalidated:
+                evicted += 1
+        tag_counts = {}
+        for tag in tags:
+            count = await self.isr.invalidate_tag(tag, expire=expire)
+            tag_counts[tag] = count
+            evicted += count
+        return JSONResponse({"paths": results, "tags": tag_counts, "evicted_entries": evicted})
+
+    async def revalidate_tag(self, tag, expire=None):
+        """Invalidate every ISR entry carrying ``tag`` for this app instance.
+
+        ``expire=None`` expires matching entries immediately; ``expire``
+        seconds keeps them merely stale until that delay passes. With a
+        shared cache backend the invalidation is visible to other
+        workers; with the memory backend it is process-local. Returns
+        True when the invalidation was recorded.
+        """
+        return await self.isr.revalidate_tag(tag, expire)
+
+    def _merge_dynamic_accesses(self, pattern, state):
+        """Fold one prerender's recorded accesses into the app report.
+
+        Only newly seen expressions are logged, so a dev SSG page rendered
+        on every request (or a regenerating ISR page) warns once per
+        expression instead of once per render. The report is written to
+        the build manifest as ``dynamic_accesses``.
+        """
+        if not state.accesses:
+            return
+        known = self.dynamic_accesses.setdefault(pattern, [])
+        seen = {entry["expression"] for entry in known}
+        fresh = [access for access in state.accesses if access.expression not in seen]
+        for access in fresh:
+            seen.add(access.expression)
+            known.append(access.to_dict())
+        if len(known) > MAX_DYNAMIC_ACCESSES:
+            del known[MAX_DYNAMIC_ACCESSES:]
+        if fresh:
+            log.warning("Static page %s read dynamic data during render:\n%s",
+                        pattern, format_dynamic_accesses(fresh))
+
+    async def _dev_generated_paths(self, pattern):
+        """Paths a dynamic SSG pattern would generate, cached per process.
+
+        Returns None when the generator cannot run in development, in
+        which case the dev/prod consistency check is skipped rather than
+        guessed at.
+        """
+        if pattern in self._dev_static_paths:
+            return self._dev_static_paths[pattern]
+        generator = self.static_generators.get(pattern)
+        if generator is None:
+            paths = {pattern}
+        else:
+            try:
+                params_list = await _invoke(generator)
+                paths = {_materialize(pattern, params) for params in params_list}
+            except Exception:
+                log.warning("Cannot determine generated SSG paths for %s; "
+                            "skipping the dev/prod consistency check", pattern, exc_info=True)
+                paths = None
+        self._dev_static_paths[pattern] = paths
+        return paths
+    async def _revalidate_pattern(self, pattern):
+        """Invalidate every cached entry for one ISR route pattern."""
+        if self.render_modes.get(pattern) != "isr":
+            raise ValueError("Path does not match an ISR page")
+        if not _is_dynamic_pattern(pattern):
+            return await self._revalidate_one(pattern)
+        removed = False
+        for key in await self.isr.cached_keys():
+            match = self.router.matches(key)
+            if match is not None and match[0] == pattern:
+                removed = await self._invalidate_cached_path(key, pattern) or removed
+        return removed
+
+    def _layout_module_for_path(self, path):
+        """The layout module defined at ``path`` (``app/<path>/layout.py``).
+
+        Route groups do not appear in URLs, so a layout inside a group is
+        also found by its URL directory. Raises ValueError when no layout
+        is defined there, or when several group layouts share the URL.
+        """
+        known = {_posix_path(module) for layouts in self.entry_layouts.values() for module in layouts}
+        direct = "app/layout.py" if path == "/" else f"app{path}/layout.py"
+        if direct in known:
+            return direct
+        matches = sorted(module for module in known if _layout_url_dir(module) == path)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"Ambiguous layout for {path}: {', '.join(matches)}")
+        raise ValueError(f"No layout at {path}")
+
+    async def _revalidate_layout(self, path):
+        """Invalidate every ISR page that uses the layout at ``path``."""
+        module = self._layout_module_for_path(path)
+        targets = [pattern for pattern, layouts in self.entry_layouts.items()
+                   if module in layouts and self.render_modes.get(pattern) == "isr"]
+        removed = False
+        cached = None
+        for pattern in targets:
+            if _is_dynamic_pattern(pattern):
+                if cached is None:
+                    cached = await self.isr.cached_keys()
+                for key in cached:
+                    match = self.router.matches(key)
+                    if match is not None and match[0] == pattern:
+                        removed = await self._invalidate_cached_path(key, pattern) or removed
+            else:
+                removed = await self._revalidate_one(pattern) or removed
+        return removed
+
+
+    def get_isr_policy(self, pattern):
+        """Return the effective ISR policy for a route pattern.
+
+        Lookup order is "runtime override, then the build manifest"
+        (copy-on-write, mirroring Next.js ``SharedCacheControls``):
+        an override set with :meth:`set_isr_policy` wins, otherwise the
+        policy the page declared at build time is returned. The result
+        is a copy, so mutating it cannot change the stored policy.
+        Raises :class:`ValueError` when ``pattern`` is not an ISR route.
+        """
+        if not isinstance(pattern, str):
+            raise TypeError("ISR pattern must be a string")
+        override = self.isr_policy_overrides.get(pattern)
+        if override is not None:
+            return dict(override)
+        policy = self.isr_policies.get(pattern)
+        if policy is None:
+            raise ValueError(f"No ISR policy for route pattern {pattern!r}")
+        return dict(policy)
+
+    def set_isr_policy(self, pattern, *, revalidate=None, stale=None):
+        """Override an ISR policy at runtime, without rewriting the manifest.
+
+        ``pattern`` is a route pattern such as ``"/blog/[slug]"``. At
+        least one of ``revalidate``/``stale`` must be given; an omitted
+        value inherits the currently effective policy. Both values are
+        validated exactly like :func:`pynext.components.page` enforces
+        them (``revalidate`` positive, ``stale`` non-negative, both at
+        most 31536000 seconds). Raises :class:`ValueError` for a
+        non-ISR pattern or an invalid value.
+
+        The override is process-local copy-on-write state: the build
+        manifest file and the base :attr:`isr_policies` are untouched,
+        so no rebuild is needed and production startup still passes
+        its manifest check. Each worker process needs its own call.
+        The override applies to generations started after the call;
+        entries already cached keep the lifetimes they were stored
+        with, and in-flight generations keep the policy snapshot they
+        started with. Pair with :meth:`revalidate` when an already
+        cached entry must pick the new policy up immediately. Returns
+        a copy of the new effective policy.
+        """
+        if not isinstance(pattern, str):
+            raise TypeError("ISR pattern must be a string")
+        if revalidate is None and stale is None:
+            raise ValueError("set_isr_policy requires revalidate or stale")
+        current = self.get_isr_policy(pattern)
+        policy = _isr_policy(
+            current["revalidate"] if revalidate is None else revalidate,
+            current["stale"] if stale is None else stale,
+        )
+        self.isr_policy_overrides[pattern] = policy
+        return dict(policy)
+
+    def clear_isr_policy(self, pattern):
+        """Drop the runtime override for one ISR route pattern.
+
+        Returns True when an override existed, False otherwise. The
+        route then falls back to its build-time policy. Raises
+        :class:`ValueError` for a non-ISR pattern.
+        """
+        if not isinstance(pattern, str):
+            raise TypeError("ISR pattern must be a string")
+        if pattern not in self.isr_policies:
+            raise ValueError(f"No ISR policy for route pattern {pattern!r}")
+        return self.isr_policy_overrides.pop(pattern, None) is not None
+
+    def clear_isr_policies(self):
+        """Drop every runtime ISR policy override. Returns how many were removed."""
+        count = len(self.isr_policy_overrides)
+        self.isr_policy_overrides.clear()
+        return count
 
     async def _render_stream_chunk(self, node):
         """Serialize one streamed UI node to HTML on a worker thread."""
@@ -787,37 +1602,135 @@ class App:
         payload = json.dumps(bound, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         return await asyncio.to_thread(_native.render, payload)
 
-    async def _streaming_page_response(self, pattern, chunks, layouts):
-        """Wrap an async iterable of UI nodes in a StreamingResponse.
 
-        The layout shell is rendered once with a marker in place of the page
-        children, then split into a prefix and a suffix around the marker.
-        The prefix is sent first, each page chunk is serialized and sent as
-        it arrives, and the suffix closes the document. Layouts must render
-        their children exactly once; anything else fails before headers are
-        sent. SSG consumes the stream during the build. ISR streams its first
-        generation while retaining a bounded copy for the cache.
+    async def _layout_shell(self, pattern, layouts, request=None):
+        """Return the cached layout shell entry for ``pattern``.
+
+        The entry holds the layouts applied once to a marker text node
+        (the unbound shell tree, plus a rendered prefix/suffix split
+        once a streaming page needs it). Layouts only receive
+        ``children``, so the shell cannot depend on the request or the
+        route params; a layout that reads other mutable state must opt
+        out with ``@layout(dynamic=True)``, in which case this returns
+        None and the caller renders the shell on every request. Returns
+        the entry dict, or None for dynamic layouts.
+
+        ``request`` is threaded through to the layout invocations so a
+        sync layout runs under the sync-worker limit (``_invoke_sync``)
+        exactly as it did before shell caching; without it the layout
+        would run on a bare worker thread, bypassing the limit and its
+        tracking counter. Prerenders pass None and keep the old bypass,
+        as they did before caching existed.
         """
-        marker = "__pynext_stream_" + uuid.uuid4().hex + "__"
-        shell = {"kind": "text", "value": marker}
-        for layout_fn in reversed(layouts):
-            shell = await _invoke(layout_fn, children=shell)
-            if not isinstance(shell, dict):
-                raise TypeError(
-                    f"Layout for {pattern} must return a render node dict, "
-                    f"got {type(shell).__name__}"
-                )
-        shell = bind_islands(shell, self.client_manifest, dev_id=self._dev_id)
-        payload = json.dumps(shell, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        if self._layout_shell_dynamic.get(pattern, False):
+            return None
+        entry = self._layout_shells.get(pattern)
+        if entry is not None:
+            return entry
+        lock = self._layout_shell_locks.get(pattern)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._layout_shell_locks[pattern] = lock
+        async with lock:
+            entry = self._layout_shells.get(pattern)
+            if entry is not None:
+                return entry
+            # The marker is framework-generated, not a page read: suppress
+            # it so it is never misreported as the page being dynamic.
+            with suppress_dynamic_tracking():
+                marker = "__pynext_shell_" + uuid.uuid4().hex + "__"
+            shell = {"kind": "text", "value": marker}
+            for layout_fn in reversed(layouts):
+                shell = await _invoke(layout_fn, children=shell, request=request)
+                if not isinstance(shell, dict):
+                    raise TypeError(
+                        f"Layout for {pattern} must return a render node dict, "
+                        f"got {type(shell).__name__}"
+                    )
+            entry = {"tree": shell, "marker": marker, "prefix": None, "suffix": None}
+            self._layout_shells[pattern] = entry
+            return entry
+
+    async def _render_shell_split(self, pattern, shell, marker):
+        """Bind and render a shell tree, splitting it around its marker.
+
+        Returns ``(prefix, suffix)``. Raises ValueError unless the
+        marker renders exactly once — the same "children exactly once"
+        invariant the streaming path has always enforced.
+        """
+        bound = bind_islands(shell, self.client_manifest, dev_id=self._dev_id)
+        payload = json.dumps(bound, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         html = await asyncio.to_thread(_native.render, payload)
         parts = html.split(marker)
         if len(parts) != 2:
             raise ValueError(
-                f"Layout for streaming page {pattern} must render its children exactly once"
+                f"Layout for {pattern} must render its children exactly once"
             )
         prefix, suffix = parts
         if shell.get("tag", "").lower() == "html":
             prefix = "<!DOCTYPE html>" + prefix
+        return prefix, suffix
+
+    async def _layout_shell_html(self, pattern, entry):
+        """Return the cached ``(prefix, suffix)`` HTML split for a shell entry.
+
+        The split is derived lazily: binding the shell alone can fail
+        for shapes that only become valid once the page is substituted
+        (for example a layout without a ``<body>`` whose page provides
+        one), so buffered pages never pay for it — they substitute into
+        the tree and bind the composed tree instead.
+        """
+        if entry["prefix"] is not None:
+            return entry["prefix"], entry["suffix"]
+        lock = self._layout_shell_locks.get(pattern)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._layout_shell_locks[pattern] = lock
+        async with lock:
+            if entry["prefix"] is not None:
+                return entry["prefix"], entry["suffix"]
+            prefix, suffix = await self._render_shell_split(
+                pattern, copy.deepcopy(entry["tree"]), entry["marker"])
+            entry["prefix"], entry["suffix"] = prefix, suffix
+            return prefix, suffix
+
+    async def _streaming_page_response(self, pattern, chunks, layouts, tracker=None, request=None):
+        """Wrap an async iterable of UI nodes in a StreamingResponse.
+
+        The layout shell is rendered once per route and cached; the
+        cached prefix is sent first, each page chunk is serialized and
+        sent as it arrives, and the cached suffix closes the document.
+        Layouts that opted out with ``@layout(dynamic=True)`` are still
+        rendered on every request, exactly as before. Layouts must render
+        their children exactly once; anything else fails before headers
+        are sent. SSG consumes the stream during the build. ISR streams
+        its first generation while retaining a bounded copy for the cache.
+
+        When ``tracker`` is given, the stream owns it: ``page_stream()``
+        exits it when the body is fully consumed or the stream is closed,
+        so dynamic accesses in later chunks are still recorded.
+
+        ``request`` is threaded through to the layout invocations (see
+        :meth:`_layout_shell`) so sync layouts stay under the
+        sync-worker limit; prerenders pass None.
+        """
+        entry = await self._layout_shell(pattern, layouts, request)
+        if entry is None:
+            # The marker is framework-generated, not a page read: suppress
+            # it so it is never misreported as the page being dynamic.
+            with suppress_dynamic_tracking():
+                marker = "__pynext_stream_" + uuid.uuid4().hex + "__"
+            shell = {"kind": "text", "value": marker}
+            for layout_fn in reversed(layouts):
+                shell = await _invoke(layout_fn, children=shell, request=request)
+                if not isinstance(shell, dict):
+                    raise TypeError(
+                        f"Layout for {pattern} must return a render node dict, "
+                        f"got {type(shell).__name__}"
+                    )
+            prefix, suffix = await self._render_shell_split(pattern, shell, marker)
+        else:
+            prefix, suffix = await self._layout_shell_html(pattern, entry)
 
         async def page_stream():
             try:
@@ -833,6 +1746,8 @@ class App:
                 close = getattr(chunks, "aclose", None)
                 if close is not None:
                     await close()
+                if tracker is not None:
+                    tracker.__exit__(None, None, None)
 
         return StreamingResponse(page_stream(), media_type="text/html; charset=utf-8")
 
@@ -847,7 +1762,7 @@ class App:
             raise BadRequest("ISR query values are too large")
         return selected
 
-    async def _render_isr_cached(self, pattern, params, query, key):
+    async def _render_isr_cached(self, pattern, params, query, key, policy=None, tags=None):
         feed = _ISRStreamFeed()
 
         async def render():
@@ -870,7 +1785,12 @@ class App:
             finally:
                 await response.aclose()
 
-        task = asyncio.create_task(self.isr.get_or_render(key, self.isr_policies[pattern], render))
+        if policy is None:
+            policy = self.get_isr_policy(pattern)
+        if tags is None:
+            tags = tuple(self.isr_tags.get(pattern, ()))
+        task = asyncio.create_task(self.isr.get_or_render(
+            key, policy, render, tags=tags))
 
         def observe(done):
             # A streamed request stops awaiting this task before generation
@@ -892,9 +1812,44 @@ class App:
             raise
 
     async def render_page(self, pattern, request, params, *, csp_nonce=True, query=None):
+        """Render one page, tracking dynamic accesses for SSG/ISR pages.
+
+        Static renders run under a :class:`PrerenderTracker`: dynamic reads
+        are recorded, and in ``dynamic="error"`` mode the first one raises
+        :class:`StaticGenBailoutError`. A streamed body keeps the tracker
+        alive until the stream ends, so accesses in later chunks count too.
+        ``force-dynamic`` SSG pages render untracked: they are dynamic by
+        design, so tracking them would only produce false warnings.
+        """
         fn, layouts = self.entries[pattern]
         if query is None:
             query = self._page_query(pattern, request)
+        mode = self.render_modes.get(pattern)
+        dynamic_mode = self.dynamic_modes.get(pattern, "auto")
+        if mode not in {"ssg", "isr"} or dynamic_mode == "force-dynamic":
+            # SSR pages and force-dynamic pages are dynamic by design: there
+            # is nothing static to protect, so no tracker is installed and
+            # no "static page read dynamic data" warning is produced.
+            return await self._render_page_inner(pattern, fn, layouts, request, params,
+                                                 query, csp_nonce)
+        tracker = track_prerender(pattern, dynamic_mode,
+                                  on_finish=lambda state: self._merge_dynamic_accesses(pattern, state))
+        tracker.__enter__()
+        try:
+            response = await self._render_page_inner(pattern, fn, layouts, request, params,
+                                                     query, csp_nonce, tracker=tracker)
+        except BaseException:
+            tracker.__exit__(None, None, None)
+            raise
+        if isinstance(response, StreamingResponse):
+            # The stream owns the tracker now: page_stream() exits it when
+            # the body is fully consumed or the stream is closed.
+            return response
+        tracker.__exit__(None, None, None)
+        return response
+
+    async def _render_page_inner(self, pattern, fn, layouts, request, params, query, csp_nonce,
+                                 tracker=None):
         if inspect.isasyncgenfunction(fn):
             # Calling an async generator function only creates the iterator;
             # its body runs when the stream is first pulled. Call it directly
@@ -905,14 +1860,29 @@ class App:
         else:
             result = await _invoke(fn, request=request, params=params, query=query)
         if hasattr(result, "__aiter__"):
-            return await self._streaming_page_response(pattern, result, layouts)
+            return await self._streaming_page_response(pattern, result, layouts, tracker=tracker,
+                                                       request=request)
         tree = result
         if not isinstance(tree, dict):
             raise TypeError(f"Page {pattern} must return a render node dict, got {type(tree).__name__}")
-        for layout_fn in reversed(layouts):
-            tree = await _invoke(layout_fn, children=tree, request=request)
-            if not isinstance(tree, dict):
-                raise TypeError(f"Layout for {pattern} must return a render node dict, got {type(tree).__name__}")
+        entry = await self._layout_shell(pattern, layouts, request)
+        if entry is None:
+            # Dynamic layouts: render the shell on every request.
+            for layout_fn in reversed(layouts):
+                tree = await _invoke(layout_fn, children=tree, request=request)
+                if not isinstance(tree, dict):
+                    raise TypeError(f"Layout for {pattern} must return a render node dict, got {type(tree).__name__}")
+        else:
+            # Substitute the page into the cached shell instead of
+            # re-invoking the layouts, then bind the composed tree as
+            # before so island binding and the client runtime land in
+            # exactly the same places (and the per-request CSP nonce
+            # still covers the runtime script).
+            tree, replaced = _substitute_shell_marker(entry["tree"], entry["marker"], tree)
+            if replaced != 1:
+                raise ValueError(
+                    f"Layout for {pattern} must render its children exactly once"
+                )
         tree = bind_islands(tree, self.client_manifest, dev_id=self._dev_id)
         payload = json.dumps(tree, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         # One fresh nonce per rendered response. Cached renders must not get
@@ -965,6 +1935,7 @@ class App:
             return await self._dispatch_response(request)
         except _SyncHandlerBusy:
             response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
+            apply_path_headers(response, request.path, path_headers=self.path_headers)
             apply_cors_headers(request, response, config=self.security)
             apply_security_headers(response, config=self.security, production=self.production)
             if request.method == "HEAD":
@@ -993,17 +1964,21 @@ class App:
         if request.path in ("/healthz", "/readyz"):
             route_var.set("__health__")
             if request.method not in {"GET", "HEAD"}:
-                return Response("Method Not Allowed", status=405,
-                                headers=[(b"allow", b"GET, HEAD")])
-            if request.path == "/healthz":
+                response = Response("Method Not Allowed", status=405,
+                                    headers=[(b"allow", b"GET, HEAD")])
+            elif request.path == "/healthz":
                 body = b"" if request.method == "HEAD" else b"ok"
-                return Response(body, media_type="text/plain; charset=utf-8")
-            if self.is_ready:
+                response = Response(body, media_type="text/plain; charset=utf-8")
+            elif self.is_ready:
                 body = b"" if request.method == "HEAD" else b"ready"
-                return Response(body, media_type="text/plain; charset=utf-8")
-            return Response(b"" if request.method == "HEAD" else b"not ready", status=503,
-                            media_type="text/plain; charset=utf-8",
-                            headers=[(b"retry-after", b"1")])
+                response = Response(body, media_type="text/plain; charset=utf-8")
+            else:
+                response = Response(b"" if request.method == "HEAD" else b"not ready", status=503,
+                                    media_type="text/plain; charset=utf-8",
+                                    headers=[(b"retry-after", b"1")])
+            # Health responses skip the security-header step here (the
+            # transport applies it); path headers still apply, before it.
+            return apply_path_headers(response, request.path, path_headers=self.path_headers)
         preflight = cors_preflight_response(request, config=self.security)
         if self.middleware:
             async def terminal(current):
@@ -1015,6 +1990,7 @@ class App:
             response = await self._dispatch_timed(request, lambda: self._run_middleware(request, terminal))
             if preflight is None:
                 apply_cors_headers(request, response, config=self.security)
+            apply_path_headers(response, request.path, path_headers=self.path_headers)
             apply_security_headers(response, config=self.security, production=self.production)
             if request.method == "HEAD":
                 if isinstance(response, StreamingResponse):
@@ -1023,10 +1999,12 @@ class App:
                 response.body = b""
             return response
         if preflight is not None:
+            apply_path_headers(preflight, request.path, path_headers=self.path_headers)
             apply_security_headers(preflight, config=self.security, production=self.production)
             return preflight
         response = await self._dispatch_timed(request)
         apply_cors_headers(request, response, config=self.security)
+        apply_path_headers(response, request.path, path_headers=self.path_headers)
         apply_security_headers(response, config=self.security, production=self.production)
         return response
 
@@ -1049,8 +2027,22 @@ class App:
                 if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
                     response.headers.append((b"x-request-id", request_id.encode("ascii")))
                 return response
-            except BadRequest:
+            except SignalError as exc:
+                # Control-flow signal (notFound/forbidden/redirect): answer
+                # with its response and count it, but write no error log.
+                # The access log line in the finally block still records it.
+                status = exc.status
+                response = exc.to_response()
+                self.metrics.observe_error(route_var.get() or "__unmatched__",
+                                           type(exc).__name__, exc.label_digest)
+                request_id = get_request_id()
+                if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
+                    response.headers.append((b"x-request-id", request_id.encode("ascii")))
+                return response
+            except BadRequest as exc:
                 status = 400
+                self.metrics.observe_error(route_var.get() or "__unmatched__",
+                                           type(exc).__name__)
                 raise
             except _SyncHandlerBusy:
                 status = 503
@@ -1060,8 +2052,11 @@ class App:
                     status = getattr(request._cancel_event, "status", 499)
                     request_span.set_attribute("pynext.cancelled", True)
                 raise
-            except Exception:
+            except Exception as exc:
                 status = 500
+                digest, _count = digest_for_error(exc)
+                self.metrics.observe_error(route_var.get() or "__unmatched__",
+                                           type(exc).__name__, digest)
                 raise
             finally:
                 request_span.set_attribute("http.status_code", status)
@@ -1089,6 +2084,12 @@ class App:
     async def _dispatch(self, request):
         """Return a response. Streaming pages return a StreamingResponse."""
         path = request.path
+        # Matching runs on the per-segment decoded form (Next.js
+        # decodePathParams): static segments compare decoded, while an
+        # encoded delimiter stays one segment. The encoded path is kept
+        # for the trailing-slash redirect so the encoding is preserved.
+        encoded_path = request.raw_path or request.path
+        match_path = _normalize_path_for_matching(encoded_path)
         if self.hot_reload and path == "/_pynext/dev/client":
             route_var.set("__dev__")
             if request.method not in {"GET", "HEAD"}:
@@ -1098,9 +2099,14 @@ class App:
             if request.method == "HEAD":
                 response.body = b""
             return response
-        if path != "/" and path.endswith("/"):
+        if match_path != "/" and match_path.endswith("/"):
             route_var.set("__redirect__")
-            location = quote(path.rstrip("/"), safe="/!$&'()*+,;=:@-._~").encode("ascii")
+            # Redirect to the encoded form so an encoded delimiter in a
+            # parameter value is preserved instead of becoming a separator.
+            if request.raw_path:
+                location = encoded_path.rstrip("/").encode("ascii")
+            else:
+                location = quote(encoded_path.rstrip("/"), safe="/!$&'()*+,;=:@-._~").encode("ascii")
             if request.query_string:
                 if any(c < 32 or c == 127 for c in request.query_string):
                     return Response("Bad Request", status=400)
@@ -1135,6 +2141,9 @@ class App:
             return asset_response(request, body, "image/webp", etag,
                                   cache_control=b"public, max-age=0, must-revalidate",
                                   extra_headers=[(b"x-content-type-options", b"nosniff")])
+        if path == "/_pynext/revalidate":
+            route_var.set("__revalidate__")
+            return await self._revalidate_webhook(request)
         if path == "/_pynext" or path.startswith("/_pynext/"):
             route_var.set("__client__")
             if path not in self.client_assets:
@@ -1158,19 +2167,36 @@ class App:
             return asset_response(request, body, media_type, self.asset_etags[path],
                                   cache_control=b"public, max-age=0, must-revalidate",
                                   extra_headers=[(b"x-content-type-options", b"nosniff")])
-        match = self.router.matches(path)
+        match = self.router.matches(match_path)
         if match is None:
             route_var.set("__not_found__")
             return Response("Not Found", status=404)
-        pattern, raw_params = match
+        pattern, raw_params, kinds = match
         route_var.set(pattern)
-        params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
+        # The matched values are already decoded and delimiter-safe
+        # (see _normalize_path_for_matching); collapse them by the
+        # router-reported kinds, never by a substring test on the pattern.
+        params = _typed_params(raw_params, kinds)
         request = Request(request.method, request.path, request.query_string, request.headers, request.body,
-                          params, self, request.state, request._cancel_event)
+                          params, self, request.state, request._cancel_event, raw_path=request.raw_path)
         spec = self.manifest["routes"][pattern]
         entry = self.entries[pattern]
-        if self.production and self.render_modes.get(pattern) == "ssg" and path not in self.static_pages:
+        if (self.production and self.render_modes.get(pattern) == "ssg"
+                and self.dynamic_modes.get(pattern) != "force-dynamic"
+                and path not in self.static_pages):
             return Response("Not Found", status=404)
+        if (not self.production and self.render_modes.get(pattern) == "ssg"
+                and self.dynamic_modes.get(pattern) != "force-dynamic"):
+            # Dev/prod consistency (§3.2 #4): development renders SSG pages
+            # on request, so a path generate_static_params would never
+            # produce silently works in dev and 404s in production. Warn
+            # here; --strict-ssg makes dev answer 404 as well.
+            generated = await self._dev_generated_paths(pattern)
+            if generated is not None and path not in generated:
+                log.warning("SSG path %s for %s is not generated by generate_static_params; "
+                            "it will 404 in production", path, pattern)
+                if self.strict_ssg:
+                    return Response("Not Found", status=404)
         if spec["kind"] == "page":
             allowed = {"GET", "HEAD", "OPTIONS"}
         else:
@@ -1190,11 +2216,12 @@ class App:
             if denied is not None:
                 return denied
         if spec["kind"] == "page":
-            if self.production and self.render_modes[pattern] == "ssg":
+            if (self.production and self.render_modes[pattern] == "ssg"
+                    and self.dynamic_modes.get(pattern) != "force-dynamic"):
                 response = asset_response(request, self.static_pages[path], "text/html; charset=utf-8",
                                           self.asset_etags[path], cache_control=b"public, max-age=0, must-revalidate",
                                           extra_headers=[(b"vary", b"Cookie, Authorization")])
-            elif self.production and self.render_modes[pattern] == "isr":
+            elif self.render_modes[pattern] == "isr" and (self.production or self.debug):
                 query = self._page_query(pattern, request)
                 private = any(name.lower() in {b"authorization", b"cookie"} for name, _ in request.headers)
                 if private:
@@ -1207,21 +2234,43 @@ class App:
                     # Classify the outcome before rendering: a fresh entry is
                     # a hit, a stale entry is served while one regeneration
                     # runs in the background, a miss renders synchronously.
-                    cache_key = path
+                    # The cache key is the routing-normalized path, not
+                    # the fully decoded one: "/files/a%2Fb" and
+                    # "/files/a/b" are different routes (different
+                    # patterns and params) and must not share an entry.
+                    # The normalized form is also what revalidate() sees
+                    # for an encoded URL, so invalidation still matches.
+                    cache_key = match_path
                     if self.isr_queries[pattern]:
                         try:
-                            generation, _ = await self.isr.variant_generation(path)
+                            generation, _ = await self.isr.variant_generation(match_path)
                         except SharedCacheUnavailable:
                             self.metrics.observe_regeneration("failure")
                             return Response("Service Unavailable", status=503,
                                             headers=[(b"retry-after", b"1")])
                         encoded = json.dumps(query, ensure_ascii=True, separators=(",", ":")).encode("ascii")
-                        cache_key = ("\0isr:" + hashlib.sha256(path.encode("utf-8")).hexdigest() + ":" +
+                        cache_key = ("\0isr:" + hashlib.sha256(match_path.encode("utf-8")).hexdigest() + ":" +
                                      generation + ":" + hashlib.sha256(encoded).hexdigest())
                     cache_before = self.isr.store.lookup(cache_key)[0]
                     self.metrics.observe_cache(cache_before)
+                    policy = self.get_isr_policy(pattern)
+                    if self.debug:
+                        # Dev relaxation: serve stale entries until expire
+                        # and retain them for at least the floor, so a
+                        # reload hits the cache. Production keeps the
+                        # declared policy.
+                        policy = dev_retention_policy(policy)
                     try:
-                        body = await self._render_isr_cached(pattern, params, query, cache_key)
+                        # Implicit path tags stay on the decoded path:
+                        # the tag charset (letters, digits, "_", ".",
+                        # "/", ":", "-") rejects "%", so a normalized
+                        # tag such as "_pynext_path_/files/a%2Fb" would
+                        # fail validation and 500 the request. Key
+                        # invalidation above still reaches the entry
+                        # because the key itself is the normalized path.
+                        tags = (tuple(self.isr_tags.get(pattern, ())) +
+                                tuple(_implicit_path_tags(path)))
+                        body = await self._render_isr_cached(pattern, params, query, cache_key, policy, tags)
                     except CacheBusy:
                         self.metrics.observe_cache("busy")
                         self.metrics.observe_regeneration("failure")
@@ -1327,7 +2376,7 @@ class App:
         """
         return await self._rate_limit_denied(scope, path)
 
-    async def _authorize_websocket(self, path, query_string=b"", headers=()):
+    async def _authorize_websocket(self, path, query_string=b"", headers=(), raw_path=None):
         """Pre-handshake authorization for a WebSocket upgrade.
 
         Returns ``None`` when the upgrade may proceed, else a ``Response``
@@ -1354,17 +2403,27 @@ class App:
         token's ``set-cookie`` would never reach the client while the
         old token is already gone from the store.
         """
-        match = self.router.matches(path)
+        # Match on the per-segment decoded form (Next.js
+        # decodePathParams) so the pre-flight checks the same route the
+        # handler will run; when no encoded path is available (native
+        # transport, where Rust already decoded it) the decoded path
+        # normalizes to the same form.
+        try:
+            match_path = _normalize_path_for_matching(raw_path or path)
+        except BadRequest:
+            return Response("Bad Request", status=400)
+        match = self.router.matches(match_path)
         if match is None:
             return Response("Not Found", status=404)
-        pattern, raw_params = match
+        pattern, raw_params, kinds = match
         handler = self.websocket_entries.get(pattern)
         if handler is None:
             return Response("Not Found", status=404)
-        params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
+        # The matched values are already decoded and delimiter-safe.
+        params = _typed_params(raw_params, kinds)
         request = Request("GET", path, bytes(query_string),
                           tuple((bytes(name), bytes(value)) for name, value in headers),
-                          b"", params, self, {})
+                          b"", params, self, {}, raw_path=raw_path or "")
         terminal_reached = False
         seen = {}
 
@@ -1391,18 +2450,26 @@ class App:
 
     async def _handle_websocket(self, scope, receive, send):
         try:
-            path = _decode_path(scope["path"], scope.get("raw_path"))
+            path, encoded_path = _split_request_path(scope["path"], scope.get("raw_path"))
         except (ValueError, UnicodeError):
             await send({"type": "websocket.close", "code": 1008})
             return
+        # Route lookup runs on the decoded path (unlike HTTP dispatch,
+        # which matches on the normalized encoded form): the router
+        # rejects a literal '?' in the path, so an encoded '%3F' that
+        # decodes to '?' is refused here with a policy-violation close
+        # before any rate-limit charge (B-1 / review #7). Matching on
+        # the normalized form would hide the '?' and let the handshake
+        # reach the rate limiter instead.
         match = self.router.matches(path)
         handler = None
         params = {}
         if match is not None:
-            pattern, raw_params = match
+            pattern, raw_params, kinds = match
             handler = self.websocket_entries.get(pattern)
             if handler is not None:
-                params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
+                # The matched values are already decoded and delimiter-safe.
+                params = _typed_params(raw_params, kinds)
         if handler is None:
             # No route, or a route with no WebSocket handler: refuse the
             # handshake with a policy-violation close instead of hanging.
@@ -1418,6 +2485,7 @@ class App:
         # read, so the socket is never accepted and then closed.
         denied = await self._websocket_rate_limit_denied(scope, path)
         if denied is not None:
+            apply_path_headers(denied, path, path_headers=self.path_headers)
             apply_security_headers(denied, config=self.security, production=self.production)
             await send({"type": "websocket.http.response.start", "status": denied.status,
                         "headers": denied.headers})
@@ -1442,7 +2510,7 @@ class App:
         # upgrade is refused with a close instead of an accept, so the
         # handler never runs and no data is sent.
         denied = await self._authorize_websocket(path, scope.get("query_string", b""),
-                                                 scope.get("headers", []))
+                                                 scope.get("headers", []), raw_path=encoded_path)
         if denied is not None:
             await send({"type": "websocket.close", "code": 1008})
             return
@@ -1543,6 +2611,13 @@ class App:
                         return
                     await send({"type": "lifespan.shutdown.complete"})
                     return
+        # Boundary hygiene (Next.js `filterInternalHeaders` at the
+        # router-server entry point): strip internal-only headers before
+        # any handler sees them — the request context, rate-limit and
+        # proxy-trust decisions, the middleware chain, and the WebSocket
+        # pre-flight all read from this same scope.
+        if scope["type"] in ("http", "websocket"):
+            scope["headers"] = filter_internal_headers(scope.get("headers", []))
         if scope["type"] == "websocket":
             if "path" not in scope:
                 # A websocket scope without a path cannot be routed; reject
@@ -1563,16 +2638,24 @@ class App:
         # paths never consume a token, even when the client's bucket is empty.
         request = None
         try:
-            path = _decode_path(scope["path"], scope.get("raw_path"))
-        except (ValueError, UnicodeError):
+            path, encoded_path = _split_request_path(scope["path"], scope.get("raw_path"))
+            # Admission uses the routing-normalized path (Next.js
+            # decodePathParams): an encoded delimiter stays one segment,
+            # so "/free%2Fblocked" is not under "/free" even though its
+            # fully decoded form "/free/blocked" is. Exemption must agree
+            # with the handler routing actually serves, or an encoded
+            # path escapes the limiter while reaching another handler.
+            match_path = _normalize_path_for_matching(encoded_path)
+        except (ValueError, UnicodeError, BadRequest):
             response = Response("Bad Request", status=400)
         else:
             # Liveness/readiness remain available when decision slots are full.
-            denied = (None if path in ("/healthz", "/readyz") else
-                      await self._rate_limit_denied(scope, path))
+            denied = (None if match_path in ("/healthz", "/readyz") else
+                      await self._rate_limit_denied(scope, match_path))
             if denied is not None:
                 if scope["method"].upper() == "HEAD":
                     denied.body = b""
+                apply_path_headers(denied, path, path_headers=self.path_headers)
                 await _send_response(denied, send, config=self.security, production=self.production)
                 return
             chunks, total = [], 0
@@ -1591,14 +2674,17 @@ class App:
                     chunks.append(chunk)
                     if not message.get("more_body", False):
                         request = Request(scope["method"].upper(), path, scope.get("query_string", b""),
-                                          tuple(scope.get("headers", [])), b"".join(chunks), _app=self)
+                                          tuple(scope.get("headers", [])), b"".join(chunks), _app=self,
+                                          raw_path=encoded_path)
                         break
             except BadRequest as exc:
                 log.info("Bad request: %s", exc)
                 response = Response("Bad Request", status=400)
             except Exception as exc:
-                log.exception("Request failed")
-                response = self.error_response(exc)
+                digest, _count = digest_for_error(exc)
+                self.metrics.observe_error("__unmatched__", type(exc).__name__, digest)
+                log.exception("Request failed", extra={"error_digest": digest})
+                response = self.error_response(exc, digest=digest)
         if request is not None:
             # Trust-resolved client identity (A6, pynext.proxy): the peer
             # address, scheme and Host header, unless a trusted proxy
@@ -1621,12 +2707,28 @@ class App:
             async def dispatch_and_send():
                 try:
                     result = await self.dispatch(request)
+                except SignalError as exc:
+                    # A signal that escaped dispatch (defensive: the timed
+                    # dispatcher converts these first) still answers without
+                    # an error log.
+                    result = exc.to_response()
+                    request_id = get_request_id()
+                    if request_id and not any(k == b"x-request-id" for k, _ in result.headers):
+                        result.headers.append((b"x-request-id", request_id.encode("ascii")))
                 except BadRequest as exc:
                     log.info("Bad request: %s", exc)
                     result = Response("Bad Request", status=400)
                 except Exception as exc:
-                    log.exception("Request failed")
-                    result = self.error_response(exc)
+                    digest, _count = digest_for_error(exc)
+                    log.exception("Request failed", extra={"error_digest": digest})
+                    result = self.error_response(exc, digest=digest)
+                    request_id = get_request_id()
+                    if request_id and not any(k == b"x-request-id" for k, _ in result.headers):
+                        result.headers.append((b"x-request-id", request_id.encode("ascii")))
+                # error_response results bypass dispatch, so path headers
+                # are applied here; routed responses already have them
+                # (apply_path_headers is idempotent).
+                apply_path_headers(result, path, path_headers=self.path_headers)
                 if scope["method"].upper() == "HEAD":
                     result.body = b""
                 try:
@@ -1645,14 +2747,23 @@ class App:
         await _send_response(response, send, config=self.security, production=self.production)
 
 
-def create_app(root=".", *, production=False, security=None, cache_backend="memory", cache_path=None,
+def create_app(root=".", *, production=False, security=None, cache_backend=DEFAULT_CONFIG.cache_backend,
+               cache_path=None,
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
-               cache_failure_policy=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
-               trusted_proxies=None, sync_workers=32):
+               cache_failure_policy=None, websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
+               hot_reload=False,
+               trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None,
+               revalidate_secret=None):
     root = Path(root).resolve()
+    # .env files are loaded before the manifest is read or user code runs,
+    # so server code, middleware and island bundling all see them.
+    load_env(root, mode="production" if production else "development")
+    if revalidate_secret is None:
+        revalidate_secret = os.environ.get("PYNEXT_REVALIDATE_SECRET") or None
     return App(root, load_manifest(root) if production else discover(root), production=production,
                security=security, cache_backend=cache_backend, cache_path=cache_path,
                observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
                resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
                websocket_max_message=websocket_max_message, hot_reload=hot_reload,
-               trusted_proxies=trusted_proxies, sync_workers=sync_workers)
+               trusted_proxies=trusted_proxies, sync_workers=sync_workers, strict_ssg=strict_ssg,
+               headers=headers, revalidate_secret=revalidate_secret)

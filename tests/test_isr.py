@@ -38,7 +38,7 @@ async def until(condition, timeout=5):
 def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
     make_project(tmp_path)
     manifest = write_manifest(tmp_path)
-    assert manifest["isr_policies"]["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0}
+    assert manifest["isr_policies"]["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0, "expire": 31.0}
 
     async def run():
         app = create_app(tmp_path, production=True)
@@ -106,13 +106,13 @@ def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
                 module.started, module.gate = asyncio.Event(), asyncio.Event()
                 original_get = app.isr.get_or_render
                 both_arrived, count = asyncio.Event(), 0
-                async def record_arrival(key, policy, render):
+                async def record_arrival(key, policy, render, tags=()):
                     nonlocal count
                     if key == "/blog/cancel":
                         count += 1
                         if count == 2:
                             both_arrived.set()
-                    return await original_get(key, policy, render)
+                    return await original_get(key, policy, render, tags=tags)
                 app.isr.get_or_render = record_arrival
                 first = asyncio.create_task(client.get("/blog/cancel"))
                 await asyncio.wait_for(module.started.wait(), 3)
@@ -222,8 +222,10 @@ def test_isr_shared_render_does_not_inherit_request_context(tmp_path):
 
 
 def test_rust_cache_bounds_and_isolation():
-    cache = _native.PageCache(2, 6, 3)
-    other = _native.PageCache(2, 6, 3)
+    # Entry size is key length + body length, so "a"/"one" and "b"/"two"
+    # are 4 bytes each and fit together in max_bytes=8.
+    cache = _native.PageCache(2, 8, 3)
+    other = _native.PageCache(2, 8, 3)
     assert cache.insert("a", b"one", 10, 0)
     assert other.lookup("a")[0] == "miss"
     assert cache.insert("b", b"two", 10, 0)
@@ -234,8 +236,30 @@ def test_rust_cache_bounds_and_isolation():
     assert cache.lookup("a") == ("fresh", b"one")
 
 
+def test_rust_cache_evicts_least_recently_used():
+    cache = _native.PageCache(2, 100, 100)
+    assert cache.insert("a", b"one", 10, 0)
+    assert cache.insert("b", b"two", 10, 0)
+    # Touching "a" makes it most recently used; "b" is evicted next.
+    assert cache.lookup("a") == ("fresh", b"one")
+    assert cache.insert("c", b"tri", 10, 0)
+    assert cache.lookup("b")[0] == "miss"
+    assert cache.lookup("a") == ("fresh", b"one")
+    assert cache.lookup("c") == ("fresh", b"tri")
+
+
+def test_rust_cache_size_accounts_for_key_length():
+    # Sizes are key + body: "aa"+4 = 6, "bbbb"+4 = 8. Bodies alone
+    # (4 + 4 = 8) would fit in max_bytes=10; with keys they do not.
+    cache = _native.PageCache(100, 10, 100)
+    assert cache.insert("aa", b"1234", 10, 0)
+    assert cache.insert("bbbb", b"1234", 10, 0)
+    assert cache.lookup("aa")[0] == "miss"
+    assert cache.lookup("bbbb") == ("fresh", b"1234")
+
+
 @pytest.mark.parametrize("kwargs", [
-    {"render": "isr"}, {"render": "isr", "revalidate": 0},
+    {"render": "isr", "revalidate": 0},
     {"render": "isr", "revalidate": math.nan}, {"render": "isr", "revalidate": True},
     {"render": "isr", "revalidate": 1, "stale": -1}, {"render": "ssg", "revalidate": 1},
 ])
@@ -262,7 +286,7 @@ def test_loaded_isr_policy_does_not_alias_page_metadata(tmp_path):
     make_project(tmp_path)
     app = create_app(tmp_path)
     app._module("app/blog/[slug]/page.py").Page.__pynext_cache_policy__["revalidate"] = 0
-    assert app.isr_policies["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0}
+    assert app.isr_policies["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0, "expire": 31.0}
 
 
 def test_isr_rejects_request_access_and_static_generator(tmp_path):
@@ -274,3 +298,47 @@ def test_isr_rejects_request_access_and_static_generator(tmp_path):
     source.write_text(original + '\ndef generate_static_params(): return []\n')
     with pytest.raises(ValueError, match="cannot export generate_static_params"):
         write_manifest(tmp_path)
+
+
+def test_isr_encoded_delimiter_and_plain_path_have_separate_entries(tmp_path):
+    """``/files/a%2Fb`` and ``/files/a/b`` are different routes.
+
+    The cache key is the routing-normalized path, so the encoded
+    single-segment param and the two-segment static path never share
+    an entry (and never serve each other's body).
+    """
+    directory = tmp_path / "app" / "files" / "[name]"
+    directory.mkdir(parents=True)
+    (directory / "page.py").write_text(
+        'from pynext import h, page\n'
+        '@page(render="isr", revalidate=60)\n'
+        'def Page(params): return h("p", {}, f"dyn:{params[\'name\']}")\n',
+        encoding="utf-8",
+    )
+    static = tmp_path / "app" / "files" / "a" / "b"
+    static.mkdir(parents=True)
+    (static / "page.py").write_text(
+        'from pynext import h, page\n'
+        '@page(render="isr", revalidate=60)\n'
+        'def Page(): return h("p", {}, "static-ab")\n',
+        encoding="utf-8",
+    )
+    write_manifest(tmp_path)
+
+    async def run():
+        app = create_app(tmp_path, production=True)
+        try:
+            async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                first = await client.get("/files/a%2Fb")
+                assert first.status_code == 200
+                assert "dyn:a%2Fb" in first.text
+                second = await client.get("/files/a/b")
+                assert second.status_code == 200
+                assert "static-ab" in second.text
+                # The cached entries stay separate on repeat requests.
+                assert "dyn:a%2Fb" in (await client.get("/files/a%2Fb")).text
+                assert "static-ab" in (await client.get("/files/a/b")).text
+        finally:
+            await app.isr.close()
+    asyncio.run(run())

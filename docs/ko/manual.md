@@ -56,6 +56,53 @@ async def Page(params):
 
 `h(tag, attrs, *children)`는 HTML 트리를 만들며 문자열을 이스케이프합니다. SSR은 기본적으로 전체 응답을 모아 반환하며, 페이지는 UI 청크를 스트리밍할 수도 있습니다(아래 스트리밍 SSR 참고). 임의의 raw HTML 삽입 API는 제공하지 않습니다.
 
+## 설정 파일 (`pynext.config.py`)
+
+지금까지 명령줄에서만 주던 설정을 프로젝트 루트의 `pynext.config.py`
+파일에도 쓸 수 있습니다. 파일은 `config` 딕셔너리 하나만 정의합니다:
+
+~~~python
+# pynext.config.py
+config = {
+    "port": 4000,
+    "max_concurrent": 128,
+    "cache_backend": "sqlite",
+    "cors_allowed_origins": ["https://example.com"],
+}
+~~~
+
+우선순위는 명시적 CLI 옵션 > 환경변수(`PYNEXT_*`) > 설정 파일 > 내장
+기본값이므로, CLI 플래그는 항상 파일을 이깁니다. 반복 가능한 옵션
+(`--trusted-proxy`, `--cors-origin`, `--ws-allowed-origin`,
+`--rate-limit-exempt-path`)은 파일의 목록에 덧붙이지 않고 교체합니다.
+
+파일은 `pynext dev`·`pynext build`·`pynext start` 실행 시 로드되고
+검증됩니다. 알 수 없는 키는 경고만 하고 무시합니다(비슷한 키가 있으면
+"did you mean …?" 힌트를 함께 냅니다). 타입이 틀리거나, 범위를 벗어나거나,
+보안 값이 잘못된 경우(예: 너무 짧은 `csrf_signing_key`)는 종료 코드 2로
+시작에 실패하고 설정 이름을 적은 메시지를 냅니다 — 설정이 깨진 상태로
+서버가 뜨지 않습니다. 두 가지 조합은 경고합니다: `cache_path`는
+`cache_backend`가 `"sqlite"`일 때만 쓰고, `workers`가 1보다 크면서
+`memory` 캐시 백엔드이면 워커마다 ISR 캐시가 따로 유지됩니다. 개발
+모드에서는 파일을 감시합니다. 파일을 고치면 서버가 다시 시작되고,
+깨진 수정은 다른 변경을 기다리지 않고 설정 오류로 개발 루프를
+종료합니다(앱 파일을 고쳐서는 깨진 설정을 고칠 수 없기 때문입니다).
+
+모든 설정과 기본값은 코드 한곳(`pynext.config.DEFAULT_CONFIG`)에
+있습니다. 필드가 곧 전체 키 목록입니다: host, port, max_concurrent,
+acquire_timeout_ms, max_waiting, body_capacity, body_timeout_ms,
+max_connections, max_connections_per_ip, header_read_timeout_ms,
+body_min_rate_bytes_per_sec, shutdown_timeout, workers, cache_backend,
+cache_path, cache_failure_policy, rate_limit, rate_limit_window,
+rate_limit_backend, rate_limit_ipv6_prefix_len,
+rate_limit_failure_policy, rate_limit_exempt_paths, trusted_proxies,
+csrf_enabled, csrf_signing_key, csrf_cookie_secure, cors_allowed_origins,
+cors_allow_credentials, csp_nonce_enabled, websocket_max_message,
+websocket_allowed_origins, websocket_allow_missing_origin,
+structured_logs, metrics, tracing, log_level. 읽는 환경변수는
+`PYNEXT_STRUCTURED_LOGS`, `PYNEXT_METRICS`, `PYNEXT_TRACING`,
+`PYNEXT_LOG_LEVEL`, `PYNEXT_CSRF_SIGNING_KEY`입니다.
+
 ## 앱 import와 이전 버전에서의 변경
 
 페이지·레이아웃·API 모듈에서 `from .helpers import title`처럼 상대 import를 사용할 수 있습니다. 앱마다 모듈 공간이 분리되며 프로젝트 루트를 전역 `sys.path`에 자동 추가하지 않습니다. v0.5에서 사용하던 루트 기준 절대 import가 실패하면 상대 import로 바꾸거나 프로젝트를 Python 패키지로 설치하세요. 외부 패키지는 실행 환경에 설치해야 합니다.
@@ -218,9 +265,11 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG와 ISR 페이지는 `request`를 받을 수 없고 공개 콘텐츠에 사용해야 합니다. ISR은 기본적으로 쿼리를 무시합니다. `@page(render="isr", revalidate=30, query_keys=("lang",))`와 페이지 함수의 `query` 인자를 사용하면 허용한 키와 문자열 목록만 전달하고 값별로 캐시합니다. 경로 무효화는 모든 쿼리 변형에 적용됩니다. Cookie 또는 Authorization 요청은 공유 캐시를 우회하고 `private, no-store`로 응답합니다. 기본 캐시는 프로세스별이며 SQLite 또는 선택적 Redis(`pynext-framework[redis]`, `PYNEXT_REDIS_URL`)로 워커 간 공유할 수 있습니다. 공유 조회는 저장소를 확인하고 lease와 fencing으로 쓰기를 보호합니다. 저장소 장애 시 장애 정책에 따릅니다. 기본값(`fail_open`, `--cache-failure-policy fail_open`)은 오래된 로컬 캐시로 대체하고, `fail_closed`는 503으로 응답합니다. `Set-Cookie`와 private/no-store 응답은 캐시하지 않습니다. SSG 비동기 생성기는 빌드 중 소비되어 정적 파일로 제공됩니다. 내용을 바꾸려면 재빌드하세요.
+SSG와 ISR 페이지는 `request`를 받을 수 없고 공개 콘텐츠에 사용해야 합니다. ISR은 기본적으로 쿼리를 무시합니다. `@page(render="isr", revalidate=30, query_keys=("lang",))`와 페이지 함수의 `query` 인자를 사용하면 허용한 키와 문자열 목록만 전달하고 값별로 캐시합니다. 경로 무효화는 모든 쿼리 변형에 적용됩니다. Cookie 또는 Authorization 요청은 공유 캐시를 우회하고 `private, no-store`로 응답합니다. 기본 캐시는 프로세스별이며 SQLite 또는 선택적 Redis(`pynext-framework[redis]`, `PYNEXT_REDIS_URL`)로 워커 간 공유할 수 있습니다. 공유 조회는 저장소를 확인하고 lease와 fencing으로 쓰기를 보호합니다. 저장소 장애 시 장애 정책에 따릅니다. 기본값(`fail_open`, `--cache-failure-policy fail_open`)은 오래된 로컬 캐시로 대체하고, `fail_closed`는 503으로 응답합니다. `Set-Cookie`와 private/no-store 응답은 캐시하지 않습니다. SSG 비동기 생성기는 빌드 중 소비되어 정적 파일로 제공됩니다. 내용을 바꾸려면 재빌드하세요. 여러 호스트에서 Redis 백엔드를 쓰면 태그 무효화는 각 항목의 렌더 시작 시각(워커 시계)과 무효화 시각(Redis 서버 시계)을 비교하므로, 워커와 서버 시계를 동기화(NTP)해 두세요. 서버보다 시계가 빠른 워커는 무효화 이전 내용을 신선한 것으로 제공할 수 있습니다.
 
 SSG 빌드는 최대 10,000페이지를 생성하며 개발 모드에서는 요청마다 SSG 페이지를 렌더링합니다. ISR 페이지는 `generate_static_params()`를 내보낼 수 없고 프로세스별 동시 생성 작업은 최대 128개입니다.
+
+정적 렌더링은 동적 접근을 추적합니다. SSG 페이지가 빌드 중 렌더링되거나 ISR 페이지가 생성되는 동안 `time.time()`, `datetime.now()`, `random.*`, `uuid.uuid4()`, `Database.session()` 같은 읽기는 읽은 페이지 위치와 함께 기록됩니다. `no_store()`는 스코프를 의도적으로 동적으로 표시하고, `mark_dynamic_access("...")`은 자동 후크가 볼 수 없는 나머지(외부 fetch나, 프리렌더 패치를 피해 가는 `from datetime import datetime` 바인딩)를 기록합니다. 기본값 `@page(dynamic="auto")`은 빌드를 계속하고 접근 내역을 빌드 매니페스트의 `dynamic_accesses` 리포트에 경고와 함께 남깁니다. `@page(dynamic="error")`는 처음 기록된 접근에서 빌드(또는 ISR 생성)를 실패시키고, 에러에 표현식과 사용자 코드 위치를 포함합니다. 운영 환경의 ISR/SSG 페이지에는 `dynamic="error"`를 권장합니다. 자동 탐지는 환경변수, 파일, 네트워크 호출, 프레임워크 밖의 데이터베이스를 볼 수 없고, 기본값 `auto`는 경고만 하고 값을 그대로 굽기 때문입니다. `@page(render="ssg", dynamic="force-dynamic")`는 빌드 시 생성을 건너뛰고 운영에서는 페이지를 동적으로 제공합니다. 개발 모드에서 `generate_static_params()`가 만들지 않을 SSG 경로를 요청하면 운영에서 404가 될 것이라는 경고를 남깁니다. `pynext dev --strict-ssg`(또는 `create_app(..., strict_ssg=True)`)를 쓰면 개발 모드에서도 404로 응답합니다.
 
 권한을 확인한 API 핸들러에서는 `await request.revalidate("/news/example")`, 앱 인스턴스를 가진 코드에서는 `await app.revalidate(path)`를 사용할 수 있습니다. 쿼리 문자열이 없는 디코딩된 ISR 경로를 전달합니다. 로컬 또는 공유 캐시 항목을 제거하거나 진행 중인 생성을 무효화했다면 `True`를 반환합니다. 공유 백엔드가 있는 경우 저장소에 닿을 수 있을 때는 공유 항목도 함께 제거되지만, `fail_open` 모드에서는 공유 저장소에 닿지 않을 때 `True`여도 공유 항목이 제거됐다고 보장하지 않습니다(공유 제거는 최선 노력 방식이라 다른 워커는 만료될 때까지 오래된 항목을 계속 제공할 수 있습니다) — 적용되지 않은 무효화를 성공으로 보고하지 않으려면 `fail_closed`를 사용하세요. 기존 요청은 이전 생성 결과를 받을 수 있지만 그 결과가 캐시를 다시 덮어쓰지는 않습니다. 메모리 백엔드에서는 무효화가 프로세스별이며 다른 워커에 전파되지 않고, SQLite 백엔드에서는 공유 항목도 제거되며 정상 상태의 다른 워커는 다음 조회에서 이를 확인합니다. 외부에 노출하는 엔드포인트는 인증·권한 검사가 필요합니다.
 
@@ -298,6 +347,12 @@ CLI 플래그 `--structured-logs` / `--no-structured-logs`, `--metrics` / `--no-
 전달된 주소는 오른쪽부터 신뢰하는 프록시를 거슬러 가장 가까운 비신뢰 주소를 사용합니다. 모든 중간 프록시를 정확히 등록해야 합니다. 프로세스당 버킷은 최대 10,000개이며, 모두 사용 중이면 새 주소가 가장 오래된 버킷을 내보내고 들어갑니다(기존 주소가 429를 받지는 않습니다). 신규 주소 생성은 윈도우당 최대 10,000개까지의 전역 슬라이딩 윈도우로 제한합니다. 버킷 점수는 Redis `TIME`에서 가져온 정수 마이크로초입니다. 두 스크립트가 같은 마이크로초를 읽을 수 있는데, 그 경우 동점인 버킷은 똑같이 오래된 것이므로 버킷 키 기준으로 결정적으로 내보낼 버킷을 정합니다. 내보내진 소유자는 거부되지 않고 다음 요청에서 새 버킷을 받습니다. 점수는 최대 1년 윈도우를 훨씬 넘어서도 정확한 정수로 유지됩니다(현재 epoch 기준 마지막 자리 단위는 0.25 µs). 따라서 수 분에서 수 시간의 현실적인 윈도우는 배정밀도 한계의 영향을 받지 않습니다. IPv6 주소는 /64 접두사별로 버킷을 공유합니다. 이 묶음은 트레이드오프입니다. /48 전체를 가진 공격자는 서로 다른 /64를 65,536개 만들어 테이블과 신규 주소 윈도우를 채울 수 있고, 그러면 진짜 신규 주소는 윈도우가 지날 때까지 거부됩니다(내보내진 기존 주소는 거부되지 않습니다). `--rate-limit-ipv6-prefix-len 48`은 /48 전체를 하나의 버킷으로 묶어 이 공격을 막지만, 해당 접두사를 공유하는 모든 호스트가 하나의 버킷을 공유하므로 붐비는 /48에서는 무고한 사용자까지 함께 제한됩니다. 기본값은 64로 유지됩니다. `--rate-limit-exempt-path`(예: `/healthz`)로 지정한 경로는 속도 제한을 건너뜁니다.
 
 여러 워커: `pynext start --workers 4`는 하나의 리스너를 공유하는 워커 수퍼바이저를 실행합니다. `--port 0`으로 시작하면 할당된 포트를 워커 재시작 시에도 유지합니다. 워커의 인터프리터와 이벤트 루프는 독립적이며 메모리 캐시와 기본 요청 제한은 워커별입니다. SQLite·Redis ISR과 Redis 요청 제한은 공유할 수 있습니다. 수퍼바이저가 실패한 워커를 재시작하고 종료를 조정합니다. 처리 중 중단된 요청은 실패하므로 재시도해야 합니다. 공유 리스너 워커의 실행과 재시작은 Linux·macOS·Windows CI에서 검사하며, 신호 기반 수퍼바이저 검사는 Linux·macOS에서 수행합니다.
+
+## 환경 파일(`.env`)
+
+`pynext dev`, `pynext build`, `pynext start`는 사용자 코드가 실행되기 전에 프로젝트 루트의 `.env` 파일을 읽습니다. 우선순위는 높은 것부터 `.env.{mode}.local`, `.env.local`, `.env.{mode}`, `.env`이며, 모드는 `dev`에서 `development`, `build`/`start`에서 `production`입니다. `test` 모드에서는 `.env.local`을 읽지 않습니다(`.env.test.local`은 읽습니다). 프로세스 환경에 이미 있는 변수가 파일보다 항상 우선합니다. `.env` 파일을 고치면 개발 서버가 재시작되고 값이 다시 읽힙니다.
+
+`PYNEXT_PUBLIC_` 접두사가 붙은 변수만 island 번들에 인라인됩니다(esbuild `--define`으로 `process.env.PYNEXT_PUBLIC_<이름>` 형태). 그 외 변수는 서버 전용이라 비밀값이 클라이언트 자바스크립트로 새는 일이 없습니다. `PYNEXT_REDIS_URL`, `PYNEXT_CSRF_SIGNING_KEY` 같은 비밀은 `.env.local` / `.env.production.local`에만 두세요. standalone 번들은 `.env`와 `.env.production`만 복사하고 `.env*.local` 파일은 절대 복사하지 않습니다. 읽은 파일 이름과 공개 변수 키(값은 기록하지 않음)는 `.pynext/manifest.json`의 `env_files`, `public_env_keys`에 기록됩니다. 코드에서는 `pynext.env`의 `load_env(root, mode="production")`을 쓰세요.
 
 ## 테스트와 문제 해결
 

@@ -60,6 +60,56 @@ async def Page(params):
 
 `h(tag, attrs, *children)` builds an HTML tree; strings are escaped. It is buffered SSR by default; a page may also stream UI chunks (see Streaming SSR below). It is not an arbitrary raw-HTML API.
 
+## Configuration file (`pynext.config.py`)
+
+Settings that used to live only on the command line can also be set in a
+`pynext.config.py` file at the project root. The file defines one `config`
+dict of plain data:
+
+~~~python
+# pynext.config.py
+config = {
+    "port": 4000,
+    "max_concurrent": 128,
+    "cache_backend": "sqlite",
+    "cors_allowed_origins": ["https://example.com"],
+}
+~~~
+
+Precedence is explicit CLI options > environment variables (`PYNEXT_*`) >
+config file > built-in defaults, so a CLI flag always wins over the file.
+Repeatable options (`--trusted-proxy`, `--cors-origin`,
+`--ws-allowed-origin`, `--rate-limit-exempt-path`) replace the file's
+list instead of adding to it.
+
+The file is loaded and validated when `pynext dev`, `pynext build` or
+`pynext start` runs. Unknown keys only warn (with a "did you mean …?"
+hint for near misses) and are ignored; a wrong type, an out-of-range
+value or an invalid security value (for example a too-short
+`csrf_signing_key`) fails startup with exit code 2 and a message naming
+the setting — the server never starts with a broken config. Two
+combinations warn: `cache_path` is only used with `cache_backend`
+`"sqlite"`, and `workers` above 1 with the `memory` cache backend keeps
+a separate ISR cache per worker. In dev mode the file is watched:
+editing it reloads the server, and a broken edit ends the dev loop with
+a config error instead of waiting for another change (editing app files
+cannot fix a broken config).
+
+All settings and their defaults live in one place in code,
+`pynext.config.DEFAULT_CONFIG`. Its fields are the full key list: host,
+port, max_concurrent, acquire_timeout_ms, max_waiting, body_capacity,
+body_timeout_ms, max_connections, max_connections_per_ip,
+header_read_timeout_ms, body_min_rate_bytes_per_sec, shutdown_timeout,
+workers, cache_backend, cache_path, cache_failure_policy, rate_limit,
+rate_limit_window, rate_limit_backend, rate_limit_ipv6_prefix_len,
+rate_limit_failure_policy, rate_limit_exempt_paths, trusted_proxies,
+csrf_enabled, csrf_signing_key, csrf_cookie_secure, cors_allowed_origins,
+cors_allow_credentials, csp_nonce_enabled, websocket_max_message,
+websocket_allowed_origins, websocket_allow_missing_origin,
+structured_logs, metrics, tracing, log_level. The environment variables
+read are `PYNEXT_STRUCTURED_LOGS`, `PYNEXT_METRICS`, `PYNEXT_TRACING`,
+`PYNEXT_LOG_LEVEL` and `PYNEXT_CSRF_SIGNING_KEY`.
+
 ## Application imports and migration
 
 Page, layout and API modules may use package-relative imports, such as `from .helpers import title`. Each app receives its own module namespace; the framework no longer prepends the project root to process-wide `sys.path`. If a root-based absolute import stops working after upgrading from v0.5, change it to a relative import or install your project as a Python package. Third-party packages must be installed in the environment.
@@ -144,13 +194,39 @@ Static files, SSG pages and cached ISR responses are served directly by the nati
 
 The default CSP is `script-src 'self'; object-src 'none'`. With `SecurityConfig(csp_nonce_enabled=True)`, each dynamically rendered page gets a fresh per-request nonce: the header becomes `script-src 'self' 'nonce-<value>'; object-src 'none'`, and the same nonce is added to the island runtime `<script>` tag. The nonce differs on every response, so do not cache a nonce-bearing page yourself. Pre-rendered SSG pages, cached ISR responses and static files keep the static policy without a nonce: a nonce baked into shared HTML would be reused across responses, which defeats its purpose. ISR pages requested with a Cookie or Authorization header are rendered fresh per request, so they do get a nonce.
 
+## Middleware scopes
+
+Middleware runs as one global chain by default: every registered middleware runs for every request. Wrap one middleware with `pynext.scoped` to run it only when a condition holds (Next.js-style `has`/`missing` matchers):
+
+~~~python
+from pynext import Response, scoped
+
+async def require_token(request, call_next):
+    token = next((value for key, value in request.headers
+                  if key.lower() == b"x-token"), None)
+    if token != b"secret":
+        return Response("forbidden", status=403)
+    return await call_next(request)
+
+MIDDLEWARE = [
+    scoped(require_token, source="/api/[...rest]"),
+    scoped(require_token, source="/admin/[section]",
+           has=[{"type": "cookie", "key": "admin"}],
+           missing=[{"type": "query", "key": "preview"}]),
+]
+~~~
+
+`source` is a path pattern in PyNext route syntax (`/api/[...rest]`, `/admin/[id]`, `/docs/[[...path]]`). `has` conditions must all hold and `missing` conditions must all fail for the middleware to run. Each condition is `{"type": "header" | "query" | "cookie" | "host", "key": ..., "value": ...}` (`host` takes a `value` and no `key`). With no `value` the condition is an existence check; with a `value` it is a full-match regular expression. Out of scope, the middleware is skipped transparently: it never runs, and the rest of the chain proceeds as if it were not registered. The same scope gates the WebSocket pre-flight, so a scoped middleware applies to upgrades exactly as it does to HTTP.
+
+Scopes are compiled once at registration: an invalid pattern, key or regex raises `ValueError` when the app starts, not per request. Value regexes are capped at 1024 characters. The source is matched against the decoded path and, when the transport recorded one, the raw request target, so an encoded path cannot dodge a scoped middleware; a scope that cannot be evaluated (for example a malformed query string) runs the middleware rather than skipping it.
+
 ## Streaming API responses
 
 Return `StreamingResponse` from an API handler with an asynchronous iterable of strings or bytes. ASGI and Axum send chunks incrementally and close the iterator on completion, disconnect, or error. Each chunk is limited to 1 MiB. Do not set `Content-Length` or `Transfer-Encoding`; the server selects protocol framing. Axum allows one queued chunk and stops a stalled chunk or backpressure wait after 30 seconds. Once response headers are sent, an error ends the stream rather than changing its status. HEAD does not iterate the stream. This is not React/RSC streaming.
 
 ## Streaming SSR
 
-A page function may return an asynchronous iterable of UI nodes. SSR sends the layout shell and each serialized chunk as they are produced. SSG consumes the chunks during the build and serves the resulting static file. For a public ISR miss, the first request streams and concurrent requests wait for the completed result; stale content is served immediately. Only a complete result is cached. SSG pages are limited to 8 MiB, and SSG and ISR streams are additionally limited to 30 seconds; the ISR cache stores bodies up to 2 MiB. An ISR generation can continue after its initiating client disconnects. Layouts must render children exactly once; errors after headers terminate the stream. See the [example page](../../examples/basic/app/stream/page.py).
+A page function may return an asynchronous iterable of UI nodes. SSR sends the layout shell and each serialized chunk as they are produced. The layout shell is rendered once per route and cached: layouts only receive `children`, so the shell cannot depend on the request. A layout that reads other mutable state (a clock, a database, a global) must opt out with `@layout(dynamic=True)` so its shell is rendered on every request. SSG consumes the chunks during the build and serves the resulting static file. For a public ISR miss, the first request streams and concurrent requests wait for the completed result; stale content is served immediately. Only a complete result is cached. SSG pages are limited to 8 MiB, and SSG and ISR streams are additionally limited to 30 seconds; the ISR cache stores bodies up to 2 MiB. An ISR generation can continue after its initiating client disconnects. Layouts must render children exactly once; errors after headers terminate the stream. See the [example page](../../examples/basic/app/stream/page.py).
 
 ~~~python
 from pynext import h, page
@@ -222,9 +298,11 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-SSG and ISR pages cannot accept `request` and must contain public content. ISR ignores query strings by default. To vary a page by selected keys, declare `@page(render="isr", revalidate=30, query_keys=("lang",))` and accept a `query` parameter; only listed keys and their string lists are passed to the page and included in the cache key. Revalidating a path invalidates all its query variants. Cookie or Authorization requests bypass the shared cache and return `private, no-store`. The default cache is process-local; SQLite and optional Redis (`pynext-framework[redis]`, `PYNEXT_REDIS_URL`) share entries across workers. Shared lookups consult the backend, leases and fencing protect writes, and a backend failure follows the configured failure policy: by default (`fail_open`, `--cache-failure-policy fail_open`) it falls back to a possibly stale local cache, while `fail_closed` answers 503 instead. `Set-Cookie` and private/no-store responses are not cached. SSG async generators are consumed during the build and served as static files. Rebuild SSG pages to update them.
+SSG and ISR pages cannot accept `request` and must contain public content. ISR ignores query strings by default. To vary a page by selected keys, declare `@page(render="isr", revalidate=30, query_keys=("lang",))` and accept a `query` parameter; only listed keys and their string lists are passed to the page and included in the cache key. Revalidating a path invalidates all its query variants. Cookie or Authorization requests bypass the shared cache and return `private, no-store`. The default cache is process-local; SQLite and optional Redis (`pynext-framework[redis]`, `PYNEXT_REDIS_URL`) share entries across workers. Shared lookups consult the backend, leases and fencing protect writes, and a backend failure follows the configured failure policy: by default (`fail_open`, `--cache-failure-policy fail_open`) it falls back to a possibly stale local cache, while `fail_closed` answers 503 instead. `Set-Cookie` and private/no-store responses are not cached. SSG async generators are consumed during the build and served as static files. Rebuild SSG pages to update them. With a Redis backend on multiple hosts, tag invalidation compares each entry's render-start time (the worker's clock) against the invalidation time (the Redis server clock), so keep worker and server clocks synchronised (NTP): a worker whose clock runs ahead of the server can serve pre-invalidation content as fresh.
 
 A build produces at most 10,000 SSG pages. Development mode renders SSG pages for each request. ISR pages cannot export `generate_static_params()` and permit at most 128 concurrent generation tasks per process.
+
+Static renders are tracked for dynamic accesses. While an SSG page renders at build time (or an ISR page generates), reads such as `time.time()`, `datetime.now()`, `random.*`, `uuid.uuid4()`, and `Database.session()` are recorded with the page position that read them; `no_store()` marks a scope dynamic on purpose, and `mark_dynamic_access("...")` records anything else the automatic hooks cannot see (an external fetch, or a `from datetime import datetime` binding, which escapes the prerender patch). The default `@page(dynamic="auto")` keeps building and records the accesses in the build manifest's `dynamic_accesses` report with a warning. `@page(dynamic="error")` fails the build — or the ISR generation — on the first recorded access, with the expression and the user-code position in the error. For ISR/SSG pages in production, prefer `dynamic="error"`: the automatic hooks cannot see environment variables, files, network calls, or databases outside the framework, and `auto` only warns and bakes the value anyway. `@page(render="ssg", dynamic="force-dynamic")` skips build-time generation and serves the page dynamically in production instead. In development, requesting an SSG path that `generate_static_params()` would not produce logs a warning that it will 404 in production; `pynext dev --strict-ssg` (or `create_app(..., strict_ssg=True)`) answers 404 in development as well.
 
 An authorized API handler can call `await request.revalidate("/news/example")`; code holding an app instance can call `await app.revalidate(path)`. Pass a decoded ISR path without a query string. The result is `True` if a local or shared cached entry was removed, or an in-flight generation was retired. With a shared backend the shared entry is removed too while the store is reachable; in `fail_open` mode a `True` result does not guarantee the shared entry is gone when the shared store is unreachable (shared removal is best-effort there), so other workers may keep serving the stale entry until it expires — use `fail_closed` if an unapplied invalidation must raise instead of reporting success. Existing requests may still receive an older in-flight result, but that result cannot repopulate the cache. With the memory backend, invalidation is process-local and is not sent to other workers; with the SQLite backend it removes the shared entry and other workers observe that on their next lookup while the store is available. Authenticate and authorize any endpoint that exposes it.
 
@@ -302,6 +380,12 @@ The development version checks HTTP admission from headers before receiving the 
 The forwarded chain is walked from right to left through trusted proxies; the nearest untrusted address is used. Configure every intermediate proxy accurately. Each process keeps at most 10,000 buckets; when all are active, a new key evicts the stalest bucket instead of getting 429, and new-key admissions are bounded by a global sliding window (at most 10,000 new keys per window). Bucket scores are integer microseconds from Redis `TIME`; two scripts can read the same microsecond, in which case the tied buckets are equally stale and eviction picks deterministically by bucket key — the evicted owner is never denied, it gets a fresh bucket on its next request. Scores stay exact integers well beyond the maximum one-year window (the unit in the last place is 0.25 µs at the current epoch), so realistic windows of minutes to hours are unaffected by double-precision limits. IPv6 addresses share the bucket of their /64 prefix. That grouping is a tradeoff: a holder of a whole /48 can mint 65,536 distinct /64s and fill the table and the new-key window, which still denies genuinely brand-new keys until the window slides (evicted existing keys are never denied). `--rate-limit-ipv6-prefix-len 48` groups a whole /48 into one bucket, which stops that attack, but every host sharing the prefix then shares one bucket, so a busy /48 throttles its innocent users together; the default stays 64. Paths listed with `--rate-limit-exempt-path` (for example `/healthz`) skip rate limiting.
 
 Multiple workers: `pynext start --workers 4` runs a supervisor whose worker processes share one listener. With `--port 0`, the assigned port remains stable across worker restarts. Workers have independent interpreters and event loops; memory caches and rate limits are per worker, while SQLite/Redis ISR and Redis rate limiting can be shared. The supervisor restarts failed workers and coordinates shutdown. An interrupted in-flight request fails and must be retried. CI tests shared-listener worker startup and restart on Linux, macOS, and Windows; signal-based supervisor tests run on Linux and macOS.
+
+## Environment files (`.env`)
+
+`pynext dev`, `pynext build` and `pynext start` load `.env` files from the project root before any user code runs. Priority, highest first: `.env.{mode}.local`, `.env.local`, `.env.{mode}`, `.env` — where mode is `development` for `dev` and `production` for `build`/`start`. In `test` mode `.env.local` is skipped (`.env.test.local` still loads). A variable already set in the process environment always wins over the files. Editing a `.env` file restarts the dev server and reloads its values.
+
+Only variables prefixed `PYNEXT_PUBLIC_` are inlined into island bundles (via esbuild `--define`, as `process.env.PYNEXT_PUBLIC_<NAME>`); every other variable stays server-only, so a secret can never leak into client JavaScript. Put secrets such as `PYNEXT_REDIS_URL` or `PYNEXT_CSRF_SIGNING_KEY` in `.env.local` / `.env.production.local` only. A standalone bundle copies `.env` and `.env.production` and never any `.env*.local` file. The loaded file names and the public-variable keys (never values) are recorded in `.pynext/manifest.json` as `env_files` and `public_env_keys`. Programmatic use: `load_env(root, mode="production")` from `pynext.env`.
 
 ## Tests and troubleshooting
 

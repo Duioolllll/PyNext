@@ -344,6 +344,38 @@ def test_exempt_paths_skip_rate_limit(tmp_path, mode):
     asyncio.run(run())
 
 
+def test_encoded_delimiter_does_not_inherit_exemption(tmp_path):
+    """An encoded delimiter stays one segment for exemption matching.
+
+    ``/free%2Fblocked`` decodes to ``/free/blocked``, which would fall
+    under the ``/free`` exemption, but routing serves it as the single
+    segment ``free%2Fblocked`` (a different handler), so it must still
+    consume a token. ASGI-only: the native adapter rejects ``%2F`` with
+    400 before the rate-limit check.
+    """
+    route = tmp_path / "app" / "[name]"
+    route.mkdir(parents=True)
+    (route / "page.py").write_text(
+        'from pynext import h, page\n'
+        '@page()\ndef Page(params): return h("p", {}, params["name"])\n',
+        encoding="utf-8",
+    )
+
+    async def run():
+        app = create_app(tmp_path, rate_limit=RateLimiter(1, 60, exempt_paths=("/free",)))
+        try:
+            async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                assert (await client.get("/other")).status_code == 200
+                assert (await client.get("/other")).status_code == 429
+                # The decoded form is under /free, but the routed handler
+                # is not: this must be 429, not an exempt 200.
+                assert (await client.get("/free%2Fblocked")).status_code == 429
+        finally:
+            await app.isr.close()
+    asyncio.run(run())
+
+
 def test_native_rate_limit_returns_429_with_retry_after(tmp_path):
     _write_api_app(tmp_path)
 
