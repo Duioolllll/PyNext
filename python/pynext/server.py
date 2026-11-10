@@ -17,6 +17,7 @@ from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingRespo
                    apply_security_headers, security_headers)
 from .observability import begin_request_context, get_request_id, queue_wait_var
 from .ratelimit import _is_exempt_path
+from .standalone import log_bundle_info
 from .ws_origin import websocket_origin_allowed
 
 log = logging.getLogger("pynext")
@@ -631,6 +632,11 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
                               shutdown_timeout=shutdown_timeout, max_waiting=max_waiting)
         print(f"PyNext listening on http://{server.address}", flush=True)
+        # A standalone bundle records its provenance in
+        # bundle-manifest.json next to the app dir; log it (and warn on
+        # a Python/PyNext version mismatch) after the listening line so
+        # the first line stays the address.
+        log_bundle_info(getattr(app, "root", None))
         if on_ready is not None:
             on_ready(server.address)
         await stop_event.wait()

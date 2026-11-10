@@ -474,6 +474,9 @@ def _build_parser():
             command.add_argument("--lock-timeout", type=_nonnegative_float, default=30.0,
                                  help="seconds to wait for another build to finish before failing "
                                       "(default 30; 0 fails immediately)")
+            command.add_argument("--standalone-exclude", action="append", default=[], metavar="PACKAGE",
+                                 help="omit a top-level site-packages entry from the standalone bundle "
+                                      "(repeatable; recorded in bundle-manifest.json)")
         if name != "build":
             command.add_argument("--host", default=DEFAULT_CONFIG.host)
             command.add_argument("--port", type=_port, default=DEFAULT_CONFIG.port)
@@ -663,7 +666,8 @@ def main():
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
             try:
-                build_standalone(root, output, lock_timeout=args.lock_timeout)
+                build_standalone(root, output, lock_timeout=args.lock_timeout,
+                                 excludes=tuple(args.standalone_exclude))
             except (OSError, ValueError) as exc:
                 parser.error(str(exc))
             print(f"Created standalone directory in {output}")
