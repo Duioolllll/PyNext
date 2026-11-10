@@ -15,6 +15,7 @@ from .errors import SignalError, digest_for_error
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
                    WebSocketDisconnect, _RequestCancellation, apply_path_headers,
                    apply_security_headers, filter_internal_headers, security_headers)
+from .mgmtplane import ManagementPlaneConfig
 from .observability import begin_request_context, get_request_id, queue_wait_var
 from .ratelimit import _is_exempt_path
 from .standalone import log_bundle_info
@@ -346,13 +347,64 @@ def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
         raise ValueError(f"shutdown_timeout must be a number between 0 and {MAX_SHUTDOWN_TIMEOUT} seconds")
 
 
+def _resolve_management_plane(value):
+    """Normalize the ``management_plane`` argument to a validated config.
+
+    ``None`` reads the environment (``PYNEXT_MGMT_ENABLED`` /
+    ``PYNEXT_MGMT_KEY`` / ``PYNEXT_MGMT_GATE_READY``), which is how the
+    CLI enables the plane without a new flag; an explicit config wins.
+    Anything else is a programming error.
+    """
+    if value is None:
+        return ManagementPlaneConfig.from_env()
+    if isinstance(value, ManagementPlaneConfig):
+        return value
+    raise TypeError("management_plane must be a ManagementPlaneConfig or None")
+
+
+def _management_response(mgmt, app, method, path, headers):
+    """Answer a management-plane request, or return None to dispatch normally.
+
+    * ``/metrics`` (``mgmt.metrics_path``) is served only when the plane
+      is enabled, and only with a valid key (constant-time check in
+      :meth:`ManagementPlaneConfig.check_key`). Disabled means "not
+      exposed": the request falls through to the app router, so an app
+      that defines its own ``/metrics`` route still serves it, and
+      anything else gets the router's 404. The framework itself never
+      serves metrics unauthenticated.
+    * ``/readyz`` is gated only when ``readyz_requires_key`` is set: an
+      unauthorized probe gets 401, an authorized one falls through to
+      ``App.dispatch`` so the readiness verdict (200/503) still comes
+      from the app. By default ``/readyz`` stays an open readiness
+      probe, like ``/healthz``.
+    """
+    if path == mgmt.metrics_path:
+        if not mgmt.enabled:
+            return None
+        if method.upper() not in ("GET", "HEAD"):
+            return Response("Method Not Allowed", status=405,
+                            headers=[(b"allow", b"GET, HEAD")])
+        if not mgmt.check_key(headers):
+            return Response("Unauthorized", status=401,
+                            headers=[(b"www-authenticate", b"Bearer")])
+        return Response(app.metrics.prometheus_text(),
+                        media_type="text/plain; charset=utf-8")
+    if path == "/readyz" and mgmt.readyz_requires_key:
+        if method.upper() not in ("GET", "HEAD"):
+            return None  # let App.dispatch answer 405, as it does today
+        if not mgmt.check_key(headers):
+            return Response("Unauthorized", status=401,
+                            headers=[(b"www-authenticate", b"Bearer")])
+    return None
+
+
 def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,
                  body_capacity=16, body_timeout_ms=10000, observability=None, *, reuse_port=False, listener=None,
                  max_connections=DEFAULT_MAX_CONNECTIONS,
                  max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                  header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                  body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
-                 shutdown_timeout=30.0, max_waiting=None):
+                 shutdown_timeout=30.0, max_waiting=None, management_plane=None):
     """Start the native server and return its handle.
 
     Overload policy (roadmap C7): bounded wait, then reject. At most
@@ -372,6 +424,19 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                             body_capacity, body_timeout_ms, max_connections,
                             max_connections_per_ip, header_read_timeout_ms,
                             body_min_rate_bytes_per_sec, shutdown_timeout)
+    # Management plane, fail-closed (S-P1-32): enabling it without a key
+    # refuses to start -- before the socket is bound -- instead of
+    # serving the plane unauthenticated with a warning (Sanic's trap).
+    mgmt = _resolve_management_plane(management_plane)
+    mgmt.validate()
+    if host in ("0.0.0.0", "::"):
+        # The default bind is 127.0.0.1; a wildcard bind makes every
+        # exposed endpoint -- including the management plane, when
+        # enabled -- reachable from the network.
+        log.warning("PyNext is binding to %s (all interfaces): prefer 127.0.0.1 "
+                    "unless this server is behind a trusted reverse proxy", host)
+    if mgmt.enabled:
+        log.info("Management plane enabled: %s requires a key", mgmt.metrics_path)
     if observability is not None:
         app.configure_observability(observability)
     app.metrics.observe_worker_start()
@@ -421,7 +486,16 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                 request.state["client_ip"] = info.client_ip
                 request.state["client_scheme"] = info.scheme
                 request.state["client_host"] = info.host
-                response = await app.dispatch(request)
+                # Management plane (S-P1-32, fail-closed): intercept before
+                # App.dispatch so /metrics is never served by the router
+                # unauthenticated, and a gated /readyz never reaches the
+                # app without a valid key. A None result means "not a
+                # management request (or plane disabled)": dispatch normally.
+                mgmt_response = _management_response(mgmt, app, method, path, headers)
+                if mgmt_response is not None:
+                    response = mgmt_response
+                else:
+                    response = await app.dispatch(request)
             except SignalError as exc:
                 # Defensive: the timed dispatcher converts signals first.
                 # A signal escaping dispatch still answers without an error log.
@@ -587,7 +661,8 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                 max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                 header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                 body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
-                shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None):
+                shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None,
+                management_plane=None):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
@@ -637,7 +712,8 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               max_connections_per_ip=max_connections_per_ip,
                               header_read_timeout_ms=header_read_timeout_ms,
                               body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
-                              shutdown_timeout=shutdown_timeout, max_waiting=max_waiting)
+                              shutdown_timeout=shutdown_timeout, max_waiting=max_waiting,
+                              management_plane=management_plane)
         print(f"PyNext listening on http://{server.address}", flush=True)
         # A standalone bundle records its provenance in
         # bundle-manifest.json next to the app dir; log it (and warn on
