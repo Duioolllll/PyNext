@@ -56,12 +56,14 @@ def test_sqlite_encrypted_roundtrip_stores_no_plaintext(tmp_path):
     assert csrf == "csrf-token" and version == 1
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Requires POSIX file mode bits")
 def test_sqlite_file_permissions_0600(tmp_path):
     path = tmp_path / "sessions.sqlite3"
     SQLiteSessionStore(path, encryption_key=KEY_NEW)
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Requires POSIX file mode bits")
 def test_sqlite_tightens_preexisting_wide_file(tmp_path):
     path = tmp_path / "sessions.sqlite3"
     SQLiteSessionStore(path)

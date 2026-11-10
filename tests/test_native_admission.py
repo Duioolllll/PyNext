@@ -263,38 +263,37 @@ def test_body_stage_503_and_408_carry_retry_after(tmp_path):
 
     async def run():
         app = create_app(tmp_path)
-        # Short body timeout so the 408 arrives without a 10s wait.
-        server = start_native(app, asyncio.get_running_loop(), port=0, body_timeout_ms=1500)
+        server = start_native(app, asyncio.get_running_loop(), port=0,
+                              body_capacity=1, body_capacity_per_ip=2,
+                              body_timeout_ms=1500)
         host, port = server.address.rsplit(":", 1)
-        connections = []
+        writer = None
         try:
-            async def open_partial():
+            async with httpx.AsyncClient(base_url=f"http://{server.address}",
+                                         trust_env=False, timeout=5) as client:
                 reader, writer = await asyncio.open_connection(host, int(port))
-                connections.append((reader, writer))
-                writer.write(b"POST /api/input HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\nx")
+                writer.write(b"POST /api/input HTTP/1.1\r\nHost: localhost\r\n"
+                             b"Content-Length: 100\r\nExpect: 100-continue\r\n\r\n")
                 await writer.drain()
-
-            # Default body_capacity is 16: these fill every body slot.
-            await asyncio.gather(*(open_partial() for _ in range(16)))
-            async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=5) as client:
-                # Connections may be accepted before the server schedules each body read.
-                deadline = asyncio.get_running_loop().time() + 5
-                while True:
-                    response = await client.post("/api/input", content=b"x")
-                    if response.status_code == 503:
-                        break
-                    assert response.status_code == 200 and asyncio.get_running_loop().time() < deadline
-                    await asyncio.sleep(0.05)
+                # Hyper sends Continue when dispatch polls the body, after
+                # acquiring its slot. This is a confirmed global slot holder;
+                # the per-IP limit still has room for the next request.
+                interim = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+                assert interim.startswith(b"HTTP/1.1 100 Continue\r\n"), interim
+                response = await client.post("/api/input", content=b"x")
+                assert response.status_code == 503
                 assert response.headers["retry-after"] == "1"
-            first_line = await asyncio.wait_for(connections[0][0].readline(), timeout=10)
-            assert first_line.startswith(b"HTTP/1.1 408 "), first_line
-            headers = await asyncio.wait_for(connections[0][0].readuntil(b"\r\n\r\n"), timeout=2)
-            assert b"retry-after: 1\r\n" in headers.lower()
-            assert b"connection: close\r\n" in headers.lower()
+                first_line = await asyncio.wait_for(reader.readline(), timeout=5)
+                assert first_line.startswith(b"HTTP/1.1 408 "), first_line
+                headers = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2)
+                assert b"retry-after: 1\r\n" in headers.lower()
+                assert b"connection: close\r\n" in headers.lower()
+                # The timed-out body returned its slot.
+                assert (await client.post("/api/input", content=b"x")).status_code == 200
         finally:
-            for _, writer in connections:
+            if writer is not None:
                 writer.close()
-            await asyncio.gather(*(writer.wait_closed() for _, writer in connections), return_exceptions=True)
+                await writer.wait_closed()
             await asyncio.to_thread(server.stop)
             await app.isr.close()
 
