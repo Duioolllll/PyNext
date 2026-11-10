@@ -762,8 +762,12 @@ def main():
     resolved = None
     cli_overrides = {}
     if command in ("dev", "build", "start", "check", "doctor"):
+        # "auto" is not a config value: it resolves later, in main(),
+        # via decide_auto_workers(), so it must not reach load_config's
+        # integer validation for "workers".
         cli_overrides = {key: explicit[dest] for dest, key in _CLI_CONFIG_MAP.items()
-                         if dest in explicit}
+                         if dest in explicit
+                         and not (key == "workers" and explicit[dest] == "auto")}
         try:
             # A deploy audit reads the production posture ("start" phase):
             # the checks ask what ``pynext start`` would actually run with.
