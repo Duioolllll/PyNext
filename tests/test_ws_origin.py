@@ -43,7 +43,11 @@ def test_origin_config_requires_explicit_valid_values():
     with pytest.raises(TypeError):
         SecurityConfig(websocket_allow_missing_origin=1)
     config = SecurityConfig(None, "pynext_csrf", "X-CSRF-Token", "csrf_token", True, "Lax",
-                            (), ("GET",), ("Content-Type",), False, 600, True)
+                            csrf_cookie_max_age=43200, cors_allowed_origins=(),
+                            cors_allowed_methods=("GET",),
+                            cors_allowed_headers=("Content-Type",),
+                            cors_allow_credentials=False, cors_max_age=600,
+                            csp_nonce_enabled=True)
     assert config.csp_nonce_enabled is True
     assert not config.websocket_allowed_origins and not config.websocket_allow_missing_origin
 

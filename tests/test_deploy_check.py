@@ -509,11 +509,15 @@ def test_cli_check_deploy_exits_zero_on_warnings_only(tmp_path, monkeypatch, cap
 
 
 def test_cli_check_deploy_fails_on_errors(tmp_path, monkeypatch, capsys):
+    # NOTE: wildcard-origin + credentials no longer reaches the deploy
+    # check: S-P1-5 rejects that combination at config load time
+    # (ConfigError, exit 2). Use a catch-all trusted proxy instead —
+    # it loads fine and the deploy check reports it as security.E123.
     (tmp_path / "pynext.config.py").write_text(
-        "config = {'cors_allowed_origins': ['*'], 'cors_allow_credentials': True}\n")
+        "config = {'trusted_proxies': ['*']}\n")
     code = _run_cli(["check", "--deploy", "--dir", str(tmp_path)], monkeypatch)
     assert code == 1
-    assert "security.E115" in capsys.readouterr().out
+    assert "security.E123" in capsys.readouterr().out
 
 
 def test_cli_check_deploy_json(tmp_path, monkeypatch, capsys):

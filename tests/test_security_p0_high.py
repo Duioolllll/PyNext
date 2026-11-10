@@ -278,7 +278,7 @@ def test_health_bypasses_saturated_execution_slots(tmp_path):
 def test_cors_wildcard_credentials_rejected_by_config(tmp_path):
     (tmp_path / "pynext.config.py").write_text(
         "config = {'cors_allowed_origins': ['*'], 'cors_allow_credentials': True}\n")
-    with pytest.raises(ConfigError, match="cors_allowed_origins.*\\*.*credentials"):
+    with pytest.raises(ConfigError, match="cors_allow_credentials.*\\*.*cors_allowed_origins"):
         load_config(tmp_path, "start", env={})
     # The same origins without credentials, and credentials with an
     # explicit origin list, still load.

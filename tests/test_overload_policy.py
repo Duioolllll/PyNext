@@ -3,7 +3,7 @@
 The execution wait queue is configurable via ``max_waiting`` and the
 503 ``Retry-After`` reflects the configured wait. Defaults are unchanged:
 the queue holds ``min(max_concurrent, 64)`` waiters and a 503 after the
-default 1000 ms wait carries ``Retry-After: 1``.
+default 3000 ms wait carries ``Retry-After: 3``.
 
 The concurrency sweep at the end is a measurement, not a pass/fail
 throughput claim: it records success/5xx/p95 per level on this machine
@@ -171,7 +171,9 @@ def test_retry_after_matches_acquire_timeout(tmp_path):
     asyncio.run(run())
 
 
-def test_retry_after_default_is_one(tmp_path):
+def test_retry_after_default_is_three(tmp_path):
+    """Default acquire timeout is 3000 ms (C-P0-2), so a 503 after the full
+    default wait carries ceil(3000/1000) = 3, not the old 1000 ms default's 1."""
     async def run():
         app, module = _blocking_app(tmp_path)
         server = start_native(app, asyncio.get_running_loop(), port=0, max_concurrent=1)
@@ -183,7 +185,7 @@ def test_retry_after_default_is_one(tmp_path):
                 await _wait_started(module, 1)
                 second = await client.get("/api/wait")
                 assert second.status_code == 503
-                assert second.headers["retry-after"] == "1"
+                assert second.headers["retry-after"] == "3"
                 module.release.set()
                 assert (await first).status_code == 200
         finally:

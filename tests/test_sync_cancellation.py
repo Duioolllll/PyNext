@@ -209,7 +209,13 @@ def test_native_client_disconnect_cancels_running_sync_handler(tmp_path, caplog)
 
             def disconnect_mid_request():
                 sock = socket.create_connection((host, int(port)), timeout=5)
-                sock.sendall(b"POST /api/slow HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+                # The Host must be on the native allowlist (S-P1-19
+                # loopback default): the placeholder "x" was answered
+                # 400 by Rust before the handler ever ran, so the sync
+                # handler never started.
+                sock.sendall(
+                    f"POST /api/slow HTTP/1.1\r\nHost: {host}\r\n"
+                    "Content-Length: 0\r\n\r\n".encode("ascii"))
                 assert state["entered"].wait(5), "sync handler never started"
                 try:
                     sock.shutdown(socket.SHUT_RDWR)

@@ -1022,6 +1022,7 @@ class App:
                 max_workers=render_workers, thread_name_prefix="pynext-render")
             self._session_executor = ThreadPoolExecutor(
                 max_workers=session_workers, thread_name_prefix="pynext-session")
+            self._worker_executors_retired = False
             self._bind_session_executor()
             # Dedicated single-thread exit executor (C-P1-3c). Sync teardown
             # work — cache close, shutdown cleanup — runs here through
@@ -1076,6 +1077,40 @@ class App:
             executor = getattr(self, name, None)
             if executor is not None:
                 executor.shutdown(wait=False, cancel_futures=True)
+        self._worker_executors_retired = True
+
+    def _ensure_worker_executors(self):
+        """Recreate the app-owned worker pools after a shutdown (C-P1-1).
+
+        A ``ThreadPoolExecutor`` raises ``RuntimeError`` after
+        shutdown, so a restart (startup → shutdown → startup, as the
+        resources tests exercise) must recreate the pools instead of
+        submitting to dead ones — the same treatment the exit pool
+        gets in :meth:`_ensure_exit_executor`. Before C-P1-1 sync
+        work ran on the loop's default executor, which shutdown
+        never retired, so a restart kept working; the app-owned
+        pools need the recreation to keep that contract. Session
+        stores bound to the retired session pool are rebound to the
+        new one, or SQLite session I/O would keep submitting to it.
+        """
+        if not getattr(self, "_worker_executors_retired", False):
+            return
+        old_session = getattr(self, "_session_executor", None)
+        self._sync_executor = ThreadPoolExecutor(
+            max_workers=self.sync_workers, thread_name_prefix="pynext-sync")
+        self._render_executor = ThreadPoolExecutor(
+            max_workers=self.render_workers, thread_name_prefix="pynext-render")
+        self._session_executor = ThreadPoolExecutor(
+            max_workers=self.session_workers, thread_name_prefix="pynext-session")
+        self._worker_executors_retired = False
+        if old_session is not None:
+            for item in getattr(self, "middleware", ()):
+                inner = item.middleware if isinstance(item, ScopedMiddleware) else item
+                if not isinstance(inner, SessionMiddleware):
+                    continue
+                store = getattr(inner, "store", None)
+                if isinstance(store, SQLiteSessionStore) and store.executor is old_session:
+                    store.executor = self._session_executor
 
     async def _invoke_sync(self, fn, kwargs, request=None):
         """Run a sync handler/layout on a worker thread (C-P1-8).
@@ -1688,8 +1723,11 @@ class App:
             return
         self._draining = False
         # A restart after a shutdown recreates the retired exit pool
-        # before anything can submit teardown work to it.
+        # before anything can submit teardown work to it, and the
+        # retired worker pools before anything can submit sync,
+        # render or session work to them.
         self._ensure_exit_executor()
+        self._ensure_worker_executors()
         self.isr.open()
         try:
             for resource in self.resources.values():

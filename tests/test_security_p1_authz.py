@@ -3,6 +3,7 @@ S-P1-33 (authorization enforced once, at registration, fail-closed)."""
 import asyncio
 import json
 import logging
+import re
 import secrets
 import time
 
@@ -13,7 +14,7 @@ from pynext import (JSONResponse, Request, Response, SecurityConfig, Session,
                     SessionMiddleware, SQLiteSessionStore, authorization_policy,
                     create_app, csrf_input, csrf_protect,
                     csrf_token_response, get_csrf_token, require_permission,
-                    require_scope)
+                    require_scope, unmask_csrf_token)
 from pynext.app import check_get_idempotency
 from pynext.auth import check_authorization
 
@@ -28,8 +29,14 @@ def _run(coro):
 def test_get_csrf_token_uses_session_token():
     session = Session({"user_id": "alice"})
     request = Request("GET", "/api/echo", state={"session": session})
-    assert get_csrf_token(request) == session.csrf_token()
-    assert get_csrf_token(request) == session.csrf_token()
+    # Session.csrf_token() is masked (S-P0-2): every call returns a
+    # different value over the same stored secret, so the issued tokens
+    # are compared after unmasking, not as raw strings.
+    first = get_csrf_token(request)
+    second = get_csrf_token(request)
+    assert first != second
+    assert unmask_csrf_token(first) == session._csrf
+    assert unmask_csrf_token(second) == session._csrf
 
 
 def test_get_csrf_token_without_session_is_fresh():
@@ -55,8 +62,12 @@ def test_csrf_input_renders_hidden_field_and_sets_cookie():
     session = Session({"user_id": "alice"})
     request = Request("GET", "/form", state={"session": session})
     field = csrf_input(request)
-    assert field == (f'<input type="hidden" name="csrf_token" '
-                     f'value="{session.csrf_token()}">')
+    # The field carries a masked session token (S-P0-2): every call
+    # masks with a fresh one-time pad, so compare the unmasked secret.
+    match = re.fullmatch(
+        r'<input type="hidden" name="csrf_token" value="([^"]+)">', field)
+    assert match is not None
+    assert unmask_csrf_token(match.group(1)) == session._csrf
     # Without a session the cookie must travel on the response carrying
     # the form; without that response the helper refuses rather than
     # rendering a form whose POST could never validate.

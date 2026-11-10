@@ -454,9 +454,19 @@ def test_websocket_unanswered_ping_closes_session(tmp_path):
 def test_server_rejects_out_of_range_dos_limits():
     """New limits are validated like the other server limits."""
     base = (64, 1000, None, 16, 10000, 1024, 128, 10000, 1024, 30.0)
+    # Keyword args: the positional tail shifted when C-P1-5/C-P1-7
+    # inserted max_concurrent_per_ip / acquire_timeout_max_ms /
+    # handler_timeout_ms / response_timeout_ms / fast_path_max_concurrent
+    # between shutdown_timeout and these limits.
     with pytest.raises(ValueError, match="body_capacity_per_ip"):
-        _validate_server_limits(*base, 300, 0, 300, 3600, 60)
+        _validate_server_limits(*base, streaming_max_lifetime_secs=300,
+                                body_capacity_per_ip=0, ws_idle_timeout_secs=300,
+                                ws_max_lifetime_secs=3600, ws_ping_interval_secs=60)
     with pytest.raises(ValueError, match="streaming_max_lifetime_secs"):
-        _validate_server_limits(*base, -1, 4, 300, 3600, 60)
+        _validate_server_limits(*base, streaming_max_lifetime_secs=-1,
+                                body_capacity_per_ip=4, ws_idle_timeout_secs=300,
+                                ws_max_lifetime_secs=3600, ws_ping_interval_secs=60)
     with pytest.raises(ValueError, match="ws_idle_timeout_secs"):
-        _validate_server_limits(*base, 300, 4, -1, 3600, 60)
+        _validate_server_limits(*base, streaming_max_lifetime_secs=300,
+                                body_capacity_per_ip=4, ws_idle_timeout_secs=-1,
+                                ws_max_lifetime_secs=3600, ws_ping_interval_secs=60)

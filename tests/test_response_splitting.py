@@ -3,9 +3,16 @@
 The ``Response`` constructor already rejects CR/LF in headers, but headers
 are a mutable list: a handler, middleware, or a set-cookie/CORS/path-header
 helper can append a value afterwards. :func:`pynext.http.sanitize_response_headers`
-is therefore applied exactly once in ``app._send_response`` — the single
-ASGI serialization point — and these tests drive that point (plus the
-helper directly) to prove no CR/LF/NUL can reach the wire.
+(S-P1-30 stripping) is applied in ``app._send_response`` — the single
+ASGI serialization point — but S-P1-7 runs first there
+(:func:`pynext.app._strip_ctl_response_headers`): any header carrying a
+control byte, CR/LF included, is dropped whole instead of being kept in
+stripped form, matching the ASGI drop behaviour locked in by
+``test_header_ctl.py::test_asgi_strips_ctl_response_header``. The helper
+unit tests below still cover the S-P1-30 stripping directly; the
+serialization-point tests assert the integrated behaviour — the tainted
+header is gone, the response itself still goes out with status 200, and
+no CR/LF/NUL can reach the wire.
 """
 
 import asyncio
@@ -99,7 +106,10 @@ def _capture_send():
     return sent, send
 
 
-def test_send_response_strips_crlf_appended_after_construction():
+def test_send_response_drops_crlf_appended_after_construction():
+    # S-P1-7 runs before the S-P1-30 sanitize in _send_response, so a
+    # header appended after construction carrying CR/LF is dropped whole
+    # (not kept in stripped form); the response itself still goes out.
     response = Response("ok")
     response.headers.append((b"x-evil", b"a\r\nInjected: 1"))
     response.headers.append((b"location", b"/x\r\nSet-Cookie: forged=1"))
@@ -107,8 +117,10 @@ def test_send_response_strips_crlf_appended_after_construction():
     asyncio.run(_send_response(response, send, config=None))
     headers = _wire_headers(sent)
     _assert_no_crlf(headers)
-    assert (b"x-evil", b"aInjected: 1") in headers
-    assert (b"location", b"/xSet-Cookie: forged=1") in headers
+    assert (b"x-evil", b"aInjected: 1") not in headers
+    assert not any(name == b"x-evil" for name, _ in headers)
+    assert (b"location", b"/xSet-Cookie: forged=1") not in headers
+    assert not any(name == b"location" for name, _ in headers)
     assert sent[0]["status"] == 200
     assert sent[1] == {"type": "http.response.body", "body": b"ok"}
 
@@ -122,7 +134,7 @@ def test_send_response_keeps_valid_headers_untouched():
     _assert_no_crlf(headers)
 
 
-def test_send_response_streaming_strips_crlf_too():
+def test_send_response_streaming_drops_crlf_too():
     async def chunks():
         yield b"a"
         yield b"b"
@@ -133,7 +145,8 @@ def test_send_response_streaming_strips_crlf_too():
     asyncio.run(_send_response(response, send, config=None))
     headers = _wire_headers(sent)
     _assert_no_crlf(headers)
-    assert (b"x-evil", b"ab") in headers
+    assert (b"x-evil", b"ab") not in headers
+    assert not any(name == b"x-evil" for name, _ in headers)
     assert [m["type"] for m in sent] == [
         "http.response.start",
         "http.response.body",
@@ -166,11 +179,12 @@ def _http_scope(method="GET", path="/"):
             "scheme": "http", "path": path, "query_string": b"", "headers": []}
 
 
-def test_app_serves_mutated_headers_without_crlf(tmp_path):
+def test_app_drops_mutated_headers_without_crlf(tmp_path):
     async def evil_handler():
         response = Response("ok")
         # Attacker-controlled data reaching a header after construction:
         # a Location redirect and a Content-Disposition filename.
+        # S-P1-7 drops both tainted headers whole at the send point.
         response.headers.append((b"location", b"/done\r\nInjected: 1"))
         response.headers.append(
             (b"content-disposition", b'attachment; filename="x\r\nY.txt"'))
@@ -193,7 +207,10 @@ def test_app_serves_mutated_headers_without_crlf(tmp_path):
         sent = asyncio.run(run())
         headers = _wire_headers(sent)
         _assert_no_crlf(headers)
-        assert (b"location", b"/doneInjected: 1") in headers
-        assert (b"content-disposition", b'attachment; filename="xY.txt"') in headers
+        assert sent[0]["status"] == 200
+        assert not any(name == b"location" for name, _ in headers)
+        assert not any(name == b"content-disposition" for name, _ in headers)
+        assert (b"location", b"/doneInjected: 1") not in headers
+        assert (b"content-disposition", b'attachment; filename="xY.txt"') not in headers
     finally:
         asyncio.run(app.isr.close())

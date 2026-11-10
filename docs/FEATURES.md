@@ -63,6 +63,8 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `set_csrf_cookie` | `pynext.http` |
 | `sign_csrf_token` | `pynext.http` |
 | `validate_csrf` | `pynext.http` |
+| `mask_csrf_token` | `pynext.http` |
+| `unmask_csrf_token` | `pynext.http` |
 | `get_csrf_token` | `pynext.http` |
 | `csrf_token_response` | `pynext.http` |
 | `csrf_input` | `pynext.http` |
@@ -86,6 +88,8 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `SessionMiddleware` | `pynext.sessions` |
 | `SQLiteSessionStore` | `pynext.sessions` |
 | `RedisSessionStore` | `pynext.sessions` |
+| `SessionPayloadCipher` | `pynext.sessions` |
+| `SessionRecord` | `pynext.sessions` |
 | `require_auth` | `pynext.auth` |
 | `require_permission` | `pynext.auth` |
 | `require_scope` | `pynext.auth` |
@@ -120,6 +124,9 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `RouteHas` | `pynext.middleware` |
 | `ScopedMiddleware` | `pynext.middleware` |
 | `scoped` | `pynext.middleware` |
+| `StaticPathError` | `pynext.static` |
+| `resolve_static_path` | `pynext.static` |
+| `validate_static_request_path` | `pynext.static` |
 | `Field` | `pynext.validation` |
 | `Schema` | `pynext.validation` |
 | `ValidationError` | `pynext.validation` |
@@ -151,6 +158,7 @@ Fields of `pynext.http.SecurityConfig` with their defaults.
 | `csp_nonce_enabled` | `False` |
 | `csrf_signing_key` | `field(default=None, repr=False)` |
 | `csrf_origin_check` | `True` |
+| `csrf_trusted_origins` | `()` |
 | `hsts_enabled` | `True` |
 | `hsts_max_age` | `31536000` |
 | `hsts_include_subdomains` | `True` |
@@ -220,32 +228,11 @@ Strategies accepted by `island()` / `page()` in `pynext.components`.
 ## Session stores
 
 Store classes in `pynext.sessions` implementing `load` / `save` / `delete`.
-`load` returns a `SessionRecord` — a `(data, csrf, version)` tuple with
-`created_at` / `last_seen` timestamps the middleware uses for the
-absolute lifetime and idle timeout.
 
 | Store |
 | --- |
 | `RedisSessionStore` |
 | `SQLiteSessionStore` |
-
-Session lifetime defaults (`SessionMiddleware`): `max_age` 43200 seconds
-(12 hours, at most 30 days) is the sliding idle timeout and the cookie
-`Max-Age`; `absolute_max_age` 604800 seconds (7 days) is the hard cap
-measured from creation — rotation does not move it. An unchanged session
-is re-saved at most every `touch_interval` seconds (300) while the user
-is active, refreshing the idle deadline and the cookie. The double-submit
-CSRF cookie carries `Max-Age=csrf_cookie_max_age` (43200) and its
-signature embeds the issue time, so a stolen cookie value stops
-validating after that long. For sensitive actions, issue purpose-bound
-single-use tokens with `Session.issue_single_use_token()` and verify them
-with `Session.verify_single_use_token()` (one attempt, then consumed),
-and gate high-value actions on `Session.recently_authenticated()`
-(default 15 minutes; recorded by `rotate_on_login()`). Under
-`fail_open`, a Redis delete/rotation that fails is queued in
-`RedisSessionStore.pending_revocations` and revoked on recovery
-(`flush_pending_revocations()` drains it explicitly); `delete()` reports
-`True` when revoked now and `False` when queued.
 
 ## Explicit non-goals
 

@@ -534,7 +534,12 @@ def test_cors_wildcard_and_credentials(tmp_path):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=credentialed),
                                      base_url="http://test") as client:
             response = await client.get("/api/echo", headers={"origin": "https://any.example"})
-            assert response.headers["access-control-allow-origin"] == "https://any.example"
+            # S-P1-5 defence in depth: a SecurityConfig built directly
+            # bypasses config-file validation, so the middleware never
+            # echoes an arbitrary Origin with credentials — browsers
+            # ignore a wildcard Allow-Origin on a credentialed request,
+            # so no cross-origin page can read the response.
+            assert response.headers["access-control-allow-origin"] == "*"
             assert response.headers["access-control-allow-credentials"] == "true"
     run(exercise())
 

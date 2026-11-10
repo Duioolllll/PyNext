@@ -145,7 +145,10 @@ def test_native_rejects_ctl_response_header(tmp_path, kind):
 
 def test_native_response_bytes_carry_no_ctl(tmp_path):
     # Raw socket: the rejected response must not leak the CTL byte or
-    # the injected header line onto the wire.
+    # the injected header line onto the wire. The Host must be on the
+    # allowlist (S-P1-19 defaults to loopback only): `Host: x` is
+    # rejected with 400 in dispatch before the handler ever runs, so
+    # the test would never reach the bridge's 500 rejection.
     async def run():
         app = make_app(tmp_path)
         server = start_native(app, asyncio.get_running_loop(), port=0)
@@ -154,7 +157,7 @@ def test_native_response_bytes_carry_no_ctl(tmp_path):
             raw = await asyncio.to_thread(
                 _raw_request, host, int(port),
                 b"GET /api/ctl?kind=crlf HTTP/1.1\r\n"
-                b"Host: x\r\nConnection: close\r\n\r\n")
+                b"Host: localhost\r\nConnection: close\r\n\r\n")
             assert raw.startswith(b"HTTP/1.1 500")
             assert b"\x01" not in raw and b"\x00" not in raw
             assert b"Injected" not in raw

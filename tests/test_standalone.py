@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import queue
+import re
 import select
 import shutil
 import subprocess
@@ -215,8 +216,15 @@ def test_standalone_runs_after_relocation_and_refuses_overwrite(tmp_path):
         # under a loaded machine that can take well over 15s.
         assert select.select([process.stdout], [], [], 60)[0], "standalone server did not start"
         line = process.stdout.readline()
-        assert "PyNext listening on http://" in line, line
-        address = line.split("http://", 1)[1].strip()
+        # `pynext start` defaults to 2 workers (C-P0-1), so a standalone
+        # bundle starts under the supervisor: the first line is
+        # "PyNext supervisor listening on http://... with 2 workers".
+        # Accept either line — a worker's own "PyNext listening ..." line
+        # can win the race — and pull the address out with a regex, since
+        # the supervisor line's " with N workers" suffix is not part of it.
+        match = re.search(r"PyNext (?:supervisor )?listening on http://(\S+)", line)
+        assert match is not None, line
+        address = match.group(1)
         with urllib.request.urlopen("http://" + address + "/", timeout=5) as response:
             assert response.status == 200 and b"bundled" in response.read()
     finally:
@@ -402,7 +410,10 @@ def test_standalone_start_logs_bundle_info(tmp_path):
         # A cold standalone start imports the bundled interpreter and app;
         # under a loaded machine that can take well over 15s.
         line = lines.get(timeout=60)
-        assert line is not None and "PyNext listening on http://" in line, line
+        # See the relocation test: the default 2-worker start logs the
+        # supervisor line (a worker's single-process line can also come first).
+        match = re.search(r"PyNext (?:supervisor )?listening on http://(\S+)", line or "")
+        assert match is not None, line
         info = json.loads((relocated / "bundle-manifest.json").read_text(encoding="utf-8"))
         bundle_line = None
         deadline = time.monotonic() + 30
@@ -418,7 +429,7 @@ def test_standalone_start_logs_bundle_info(tmp_path):
                 break
         assert bundle_line is not None, "standalone server did not log its bundle manifest"
         assert info["build_id"] in bundle_line and platform.python_version() in bundle_line
-        address = line.split("http://", 1)[1].strip()
+        address = match.group(1)
         with urllib.request.urlopen("http://" + address + "/", timeout=5) as response:
             assert response.status == 200 and b"bundled" in response.read()
     finally:
