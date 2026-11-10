@@ -171,7 +171,7 @@ def test_cli_forwards_config_allowed_hosts_to_serve(tmp_path, monkeypatch):
         seen.update(kwargs)
 
     monkeypatch.setattr(cli, "serve", serve)
-    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root)])
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--workers", "1"])
     cli.main()
     assert seen.get("allowed_hosts") == ("example.com", ".example.org")
 
@@ -186,7 +186,7 @@ def test_cli_start_without_allowed_hosts_keeps_old_call_shape(tmp_path, monkeypa
         seen.update(kwargs)
 
     monkeypatch.setattr(cli, "serve", serve)
-    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root)])
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--workers", "1"])
     cli.main()
     assert "allowed_hosts" not in seen
 

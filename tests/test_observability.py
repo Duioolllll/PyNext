@@ -443,6 +443,7 @@ def test_cli_observability_flags_reach_create_app(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "create_app", fake_create_app)
     monkeypatch.setattr(cli, "serve", fake_serve)
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path),
+                                      "--workers", "1",
                                       "--no-metrics", "--tracing"])
     cli.main()
     config = seen["create_app"]["observability"]
@@ -466,7 +467,8 @@ def test_cli_without_observability_flags_keeps_old_call_shape(tmp_path, monkeypa
 
     monkeypatch.setattr(cli, "create_app", fake_create_app)
     monkeypatch.setattr(cli, "serve", fake_serve)
-    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path)])
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path),
+                                      "--workers", "1"])
     cli.main()
     # No observability kwarg leaks through when no flags are given; the
     # other kwargs are the merged defaults from the cache (#42) and

@@ -560,6 +560,7 @@ def test_cli_passes_rate_limit_to_app(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "serve", serve)
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root),
+                                      "--workers", "1",
                                       "--rate-limit", "100", "--rate-limit-window", "30",
                                       "--rate-limit-exempt-path", "/healthz",
                                       "--rate-limit-ipv6-prefix-len", "48",

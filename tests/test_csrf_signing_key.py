@@ -287,6 +287,7 @@ def test_cli_csrf_signing_key_hex_form_reaches_app(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "serve", serve)
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path),
+                                      "--workers", "1",
                                       "--csrf-signing-key",
                                       "hex:" + b"a-long-enough-cli-key".hex()])
     cli.main()
