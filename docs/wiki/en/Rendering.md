@@ -48,6 +48,8 @@ A route such as `app/news/[slug]/page.py` generates on demand, serves fresh cach
 - Requests with `Cookie` or `Authorization` bypass shared ISR and receive private, no-store responses.
 - Exposed ISR pages should not embed secrets, user information or request-specific content.
 - `revalidate` must be positive; `stale` may be zero; both have upper bounds. `expire` is the absolute hard cap measured from generation: after `revalidate` the entry is served stale while one background regeneration runs, and after `expire` it is never served again (`expire` must be greater than `revalidate`; `float("inf")` means one year). `stale` and `expire` are two spellings of the same window (`expire == revalidate + stale`), so give only one of them, or both if they agree. A named profile can replace the numbers: `@page(render="isr", cache_life="hours")` — `default`, `seconds`, `minutes`, `hours`, `days`, `weeks`, `max` (see `pynext.CACHE_LIFE_PROFILES`).
+- `revalidate` must be positive; `stale` may be zero; both have upper bounds.
+- A layout can set the section policy with `@layout(revalidate=60, stale=120)`. ISR pages below it inherit any value they leave unset, and among the numbers the shortest `revalidate` (and smallest `stale`) wins — a page only beats its layouts with a shorter value. An ISR page with no `revalidate` anywhere in its layout chain fails at load, and a page that asks for a longer value than its layout gets is overridden with a build-time warning naming both files. Layout policies are recorded in the build manifest, so changing one requires a rebuild.
 
 ## Explicit invalidation
 

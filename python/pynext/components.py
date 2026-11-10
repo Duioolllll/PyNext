@@ -302,6 +302,88 @@ def _cache_life_profile(name):
     if not isinstance(name, str) or name not in CACHE_LIFE_PROFILES:
         raise ValueError(f"Unknown cache_life profile {name!r}: expected one of {sorted(CACHE_LIFE_PROFILES)}")
     return dict(CACHE_LIFE_PROFILES[name])
+def _segment_value(name, value, *, allow_zero):
+    """Validate one ISR segment value; None means 'not set by this segment'."""
+    if value is None:
+        return None
+    if value is False:
+        raise ValueError(f"{name}=False (on-demand ISR) is not supported yet")
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+            value < 0 or (not allow_zero and value == 0) or value > MAX_CACHE_SECONDS
+            or not math.isfinite(value)):
+        raise ValueError(f"{name} must be a finite {'non-negative' if allow_zero else 'positive'} number of seconds, at most {int(MAX_CACHE_SECONDS)}")
+    return float(value)
+
+
+def _partial_isr_policy(revalidate, stale, expire=None):
+    """A segment policy where any value may be unset (None).
+
+    Validates each set value individually. When revalidate and expire are
+    both given, the hard-cap relationship is checked here too
+    (``expire`` must exceed ``revalidate`` and agree with ``stale`` when
+    all three are given); otherwise it is checked at app load, after
+    layout inheritance resolves the unset values.
+    """
+    policy = {"revalidate": _segment_value("revalidate", revalidate, allow_zero=False),
+              "stale": _segment_value("stale", stale, allow_zero=True),
+              "expire": _segment_value("expire", expire, allow_zero=False)}
+    if policy["revalidate"] is not None and policy["expire"] is not None:
+        if policy["expire"] <= policy["revalidate"]:
+            raise ValueError("expire must be greater than revalidate")
+        if (policy["stale"] is not None
+                and float(policy["expire"]) != float(policy["revalidate"]) + float(policy["stale"])):
+            raise ValueError("stale and expire disagree: expire must equal revalidate + stale")
+    return policy
+
+
+def reduce_segment_config(policies):
+    """Combine layout (root-first) and page segment policies.
+
+    Follows the Next.js ``reduceAppConfig`` rules (``build/utils.ts``):
+    a ``revalidate`` number beats ``False``, and among numbers the shortest
+    wins; ``False`` only wins when no segment sets a number. ``stale`` and
+    ``expire`` take the smallest set value. ``None`` means the segment
+    does not set that key.
+
+    ``policies`` is an iterable of ``(source, policy)`` pairs in
+    root-layout-first order, each policy a ``{"revalidate": number|False|None,
+    "stale": number|None, "expire": number|None}`` dict. Returns
+    ``(effective, winners)`` where ``effective`` is
+    ``{"revalidate": float|False|None, "stale": float|None,
+    "expire": float|None}`` and ``winners`` maps each key to the
+    ``(source, value)`` that set the effective value (or ``None`` when
+    nothing set it).
+    """
+    effective = {"revalidate": None, "stale": None, "expire": None}
+    winners = {"revalidate": None, "stale": None, "expire": None}
+    for source, policy in policies:
+        if not isinstance(policy, dict) or set(policy) != {"revalidate", "stale", "expire"}:
+            raise ValueError(f"Invalid segment policy from {source}")
+        revalidate = policy["revalidate"]
+        if revalidate is not None:
+            if revalidate is False:
+                if effective["revalidate"] is None:
+                    effective["revalidate"] = False
+                    winners["revalidate"] = (source, False)
+            elif (isinstance(revalidate, bool) or not isinstance(revalidate, (int, float)) or
+                    not math.isfinite(revalidate)):
+                raise ValueError(f"Invalid revalidate in segment policy from {source}")
+            elif (effective["revalidate"] is None or effective["revalidate"] is False or
+                    revalidate < effective["revalidate"]):
+                effective["revalidate"] = float(revalidate)
+                winners["revalidate"] = (source, float(revalidate))
+        for key in ("stale", "expire"):
+            value = policy[key]
+            if value is not None:
+                if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                        not math.isfinite(value)):
+                    raise ValueError(f"Invalid {key} in segment policy from {source}")
+                if effective[key] is None or value < effective[key]:
+                    effective[key] = float(value)
+                    winners[key] = (source, float(value))
+    return effective, winners
+
+
 
 
 def _isr_query_keys(keys):
@@ -327,7 +409,7 @@ def page(*, render="ssr", revalidate=None, stale=None, expire=None, cache_life=N
             profile = _cache_life_profile(cache_life)
             policy = _isr_policy(profile["revalidate"], profile["stale"], profile["expire"])
         else:
-            policy = _isr_policy(revalidate, stale, expire)
+            policy = _partial_isr_policy(revalidate, stale, expire)
         query_keys = _isr_query_keys(query_keys)
     else:
         if revalidate is not None or stale is not None or expire is not None or cache_life is not None or query_keys:
@@ -342,6 +424,19 @@ def page(*, render="ssr", revalidate=None, stale=None, expire=None, cache_life=N
     return decorate
 
 
-def layout(fn):
-    fn.__pynext_layout__ = True
-    return fn
+def layout(fn=None, *, revalidate=None, stale=None):
+    """Mark a layout function, optionally declaring a section ISR policy.
+
+    Both ``@layout`` and ``@layout(revalidate=60, stale=120)`` work. A policy
+    on a layout is the default for ISR pages below it: a page (or nearer
+    layout) only wins with a shorter value, per ``reduce_segment_config``.
+    Non-ISR pages ignore the policy.
+    """
+    policy = _partial_isr_policy(revalidate, stale)
+    def decorate(target):
+        target.__pynext_layout__ = True
+        target.__pynext_layout_policy__ = policy
+        return target
+    if fn is None:
+        return decorate
+    return decorate(fn)

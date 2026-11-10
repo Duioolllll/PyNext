@@ -235,7 +235,7 @@ def test_rust_cache_bounds_and_isolation():
 
 
 @pytest.mark.parametrize("kwargs", [
-    {"render": "isr"}, {"render": "isr", "revalidate": 0},
+    {"render": "isr", "revalidate": 0},
     {"render": "isr", "revalidate": math.nan}, {"render": "isr", "revalidate": True},
     {"render": "isr", "revalidate": 1, "stale": -1}, {"render": "ssg", "revalidate": 1},
 ])
