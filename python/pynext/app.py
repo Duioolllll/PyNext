@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 import uuid
+import warnings
 import weakref
 from pathlib import Path
 from types import MappingProxyType
@@ -426,6 +427,24 @@ def _normalize_path_for_matching(encoded_path):
     )
 
 
+def _is_dynamic_pattern(path):
+    """True when ``path`` is a route pattern (``[slug]``, ``[...rest]``)
+    rather than a concrete path."""
+    return any(segment.startswith("[") for segment in path.split("/"))
+
+
+def _layout_url_dir(module):
+    """The URL directory a layout module applies to.
+
+    ``app/news/layout.py`` applies to ``/news``; a layout inside a route
+    group (``app/(marketing)/layout.py``) applies to ``/`` because groups
+    do not appear in URLs.
+    """
+    parts = module.split("/")[1:-1]
+    url_parts = [part for part in parts if not (part.startswith("(") and part.endswith(")"))]
+    return "/" + "/".join(url_parts)
+
+
 def _module_key(root, relative):
     # Casefold so the same file reached through a different case (e.g.
     # App/Page.py vs app/page.py on a case-insensitive filesystem) maps to
@@ -615,7 +634,11 @@ class App:
         self.isr_policies = {}
         self.layout_policies = {}
         self.isr_queries = {}
+<<<<<<< HEAD
         self.isr_tags = {}
+=======
+        self.entry_layouts = {}
+>>>>>>> feat/nextjs-p1x-reval
         if cache_backend == "sqlite" and cache_path is None:
             cache_path = self.root / ".pynext" / "isr-cache.sqlite3"
         build_id = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"),
@@ -760,6 +783,7 @@ class App:
                         raise ValueError(f"Static SSG page {spec['entry']} cannot export generate_static_params")
                     self.static_generators[pattern] = generator
                 self.entries[pattern] = (fn, layouts)
+                self.entry_layouts[pattern] = tuple(spec["layouts"])
             else:
                 handlers = {}
                 ws_handler = None
@@ -1006,22 +1030,71 @@ class App:
                 return False
             await asyncio.sleep(0.05)
 
-    async def revalidate(self, path):
-        """Invalidate one decoded ISR path for this app instance."""
+    async def revalidate(self, path, type=None):
+        """Invalidate ISR entries for ``path``, optionally scoped by ``type``.
+
+        With no ``type`` this invalidates one concrete ISR path, as
+        before. ``type="page"`` with a dynamic route pattern (``"/news/[slug]"``)
+        invalidates every cached entry for that pattern, and ``type="layout"``
+        invalidates every ISR page that uses the layout defined at ``path``
+        (``"/"`` is the root layout, so it covers all pages). A dynamic
+        pattern without ``type`` only warns and invalidates nothing, like
+        Next.js ``revalidatePath``. ``"/"`` and ``"/index"`` are aliases.
+        Returns True when at least one entry (or query-variant generation)
+        was invalidated.
+        """
+        if type is not None and type not in ("page", "layout"):
+            raise ValueError("revalidate type must be 'page' or 'layout'")
         if not isinstance(path, str):
             raise TypeError("ISR path must be a string")
         path = _decode_path(path)
         if path != "/" and path.endswith("/"):
             raise ValueError("ISR path must not have a trailing slash")
+        if _is_dynamic_pattern(path):
+            if type is None:
+                warnings.warn(
+                    f"revalidate({path!r}) is a dynamic route pattern; pass "
+                    "type='page' to invalidate its cached entries or "
+                    "type='layout' to invalidate its layout's pages",
+                    UserWarning, stacklevel=2)
+                return False
+            if type == "page":
+                return await self._revalidate_pattern(path)
+            return await self._revalidate_layout(path)
+        if type == "layout":
+            return await self._revalidate_layout(path)
+        # Concrete page scope. "/" and "/index" name the same page, unless
+        # the app defines a real /index route of its own.
+        if self.router.matches("/index") is None:
+            primary = "/" if path == "/index" else path
+            removed = await self._revalidate_one(primary)
+            if primary == "/":
+                removed = await self.isr.invalidate("/index") or removed
+            return removed
+        return await self._revalidate_one(path)
+
+    async def _revalidate_one(self, path):
+        """Invalidate one concrete ISR path. Raises ValueError when the
+        path does not name an ISR page (or is shadowed by an asset)."""
         match = self.router.matches(path)
         if (match is None or self.render_modes.get(match[0]) != "isr" or
                 path in self.public_assets or path in self.static_pages or path in self.client_assets):
             raise ValueError("Path does not match an ISR page")
-        if self.isr_queries.get(match[0]):
+        return await self._invalidate_cached_path(path, match[0])
+
+    async def _invalidate_cached_path(self, path, pattern):
+        """Invalidate one concrete cached path of ``pattern``.
+
+        Pages with ISR query keys store entries under a hashed key, so
+        rotating their variant generation is what makes the old entries
+        unreachable; other pages are removed directly.
+        """
+        if self.isr_queries.get(pattern):
             _, existed = await self.isr.variant_generation(path, invalidate=True)
             return existed
         return await self.isr.invalidate(path)
 
+<<<<<<< HEAD
     async def revalidate_tag(self, tag, expire=None):
         """Invalidate every ISR entry carrying ``tag`` for this app instance.
 
@@ -1077,6 +1150,57 @@ class App:
                 paths = None
         self._dev_static_paths[pattern] = paths
         return paths
+=======
+    async def _revalidate_pattern(self, pattern):
+        """Invalidate every cached entry for one ISR route pattern."""
+        if self.render_modes.get(pattern) != "isr":
+            raise ValueError("Path does not match an ISR page")
+        if not _is_dynamic_pattern(pattern):
+            return await self._revalidate_one(pattern)
+        removed = False
+        for key in await self.isr.cached_keys():
+            match = self.router.matches(key)
+            if match is not None and match[0] == pattern:
+                removed = await self._invalidate_cached_path(key, pattern) or removed
+        return removed
+
+    def _layout_module_for_path(self, path):
+        """The layout module defined at ``path`` (``app/<path>/layout.py``).
+
+        Route groups do not appear in URLs, so a layout inside a group is
+        also found by its URL directory. Raises ValueError when no layout
+        is defined there, or when several group layouts share the URL.
+        """
+        known = {module for layouts in self.entry_layouts.values() for module in layouts}
+        direct = "app/layout.py" if path == "/" else f"app{path}/layout.py"
+        if direct in known:
+            return direct
+        matches = sorted(module for module in known if _layout_url_dir(module) == path)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"Ambiguous layout for {path}: {', '.join(matches)}")
+        raise ValueError(f"No layout at {path}")
+
+    async def _revalidate_layout(self, path):
+        """Invalidate every ISR page that uses the layout at ``path``."""
+        module = self._layout_module_for_path(path)
+        targets = [pattern for pattern, layouts in self.entry_layouts.items()
+                   if module in layouts and self.render_modes.get(pattern) == "isr"]
+        removed = False
+        cached = None
+        for pattern in targets:
+            if _is_dynamic_pattern(pattern):
+                if cached is None:
+                    cached = await self.isr.cached_keys()
+                for key in cached:
+                    match = self.router.matches(key)
+                    if match is not None and match[0] == pattern:
+                        removed = await self._invalidate_cached_path(key, pattern) or removed
+            else:
+                removed = await self._revalidate_one(pattern) or removed
+        return removed
+>>>>>>> feat/nextjs-p1x-reval
 
     async def _render_stream_chunk(self, node):
         """Serialize one streamed UI node to HTML on a worker thread."""

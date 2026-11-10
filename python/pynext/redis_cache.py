@@ -1,11 +1,14 @@
 """Redis ISR storage with atomic leases and fenced writes."""
 import hashlib
+import logging
 import math
 import uuid
 
 from .cache import (LEASE_TTL, MAX_CACHE_BODY_BYTES, MAX_CACHE_KEY_BYTES, MAX_CACHE_SECONDS,
                     _VARIANT_GENERATION_TTL, SharedCacheUnavailable, SharedEntry, _valid_durations)
 from .components import _validate_tag, _validate_tag_expire, _validate_tags
+
+log = logging.getLogger("pynext")
 
 
 _LOOKUP = """
@@ -45,8 +48,7 @@ local now = t[1] * 1000 + math.floor(t[2] / 1000)
 local fresh = tonumber(ARGV[2])
 local stale = tonumber(ARGV[3])
 redis.call('HSET', KEYS[1], 'body', ARGV[1], 'fresh_until', now+fresh,
-           'stale_until', now+fresh+stale, 'version', version+1,
-           'tags', ARGV[7], 'generated_at', now)
+           'tags', ARGV[7], 'generated_at', now, 'path', ARGV[8])
 redis.call('PEXPIRE', KEYS[1], fresh+stale+tonumber(ARGV[6]))
 return 1
 """
@@ -202,7 +204,7 @@ class RedisCacheBackend:
                                          max(0, math.ceil(stale_seconds * 1000)),
                                          -1 if expected_version is None else expected_version,
                                          owner or "", math.ceil(LEASE_TTL * 1000),
-                                         ",".join(tags)))
+                                         ",".join(tags), key))
         except Exception as exc:
             raise SharedCacheUnavailable("Redis cache write failed") from exc
 
@@ -221,9 +223,45 @@ class RedisCacheBackend:
             token, existed = self.client.eval(_GENERATION, 1, f"pynext:isr-generation:{{{digest}}}",
                                                uuid.uuid4().hex, _VARIANT_GENERATION_TTL,
                                                "1" if invalidate else "0")
+            if invalidate or not existed:
+                # The generation key is a hash of the path, so record the
+                # path itself alongside it: scoped revalidation finds
+                # query-variant pages through this companion key.
+                try:
+                    self.client.set(f"pynext:isr-generation-path:{{{digest}}}", key,
+                                    ex=_VARIANT_GENERATION_TTL)
+                except Exception:
+                    log.warning("Redis cache generation-path record failed for %s", key,
+                                exc_info=True)
             return token.decode("ascii"), bool(existed)
         except Exception as exc:
             raise SharedCacheUnavailable("Redis cache generation failed") from exc
+
+    def keys(self):
+        """Return the raw keys this backend currently stores.
+
+        Entry keys are recovered from the ``path`` field each entry
+        carries (entries written before that field existed are skipped;
+        they expire on their own), and query-variant pages contribute
+        their concrete paths through the generation-path companion keys.
+        """
+        try:
+            entry_keys = list(self.client.scan_iter(match="pynext:isr:*:entry"))
+            paths = []
+            if entry_keys:
+                pipe = self.client.pipeline()
+                for entry_key in entry_keys:
+                    pipe.hget(entry_key, "path")
+                for stored in pipe.execute():
+                    if stored:
+                        paths.append(stored.decode("utf-8"))
+            for generation_key in self.client.scan_iter(match="pynext:isr-generation-path:*"):
+                stored = self.client.get(generation_key)
+                if stored:
+                    paths.append(stored.decode("utf-8"))
+            return paths
+        except Exception as exc:
+            raise SharedCacheUnavailable("Redis cache key listing failed") from exc
 
     def close(self):
         self.client.close()
