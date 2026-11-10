@@ -92,6 +92,12 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `mark_dynamic_access` | `pynext.dynamic` |
 | `StaticGenBailoutError` | `pynext.dynamic` |
 | `is_prerender_bailout` | `pynext.dynamic` |
+| `FetchCacheDecision` | `pynext.fetch_cache` |
+| `apply_fetch_revalidate` | `pynext.fetch_cache` |
+| `decide_fetch_cache` | `pynext.fetch_cache` |
+| `fetch_cache_store_key` | `pynext.fetch_cache` |
+| `generate_fetch_cache_key` | `pynext.fetch_cache` |
+| `generate_simple_fetch_cache_key` | `pynext.fetch_cache` |
 
 ## Security defaults (`SecurityConfig`)
 

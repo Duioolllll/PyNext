@@ -13,6 +13,8 @@ from .django import DjangoBusyError, DjangoResource
 from .env import LoadedEnv, env_file_names, load_env, public_env_defines, public_env_vars
 from .dynamic import StaticGenBailoutError, is_prerender_bailout, mark_dynamic_access, no_store
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN
+from .fetch_cache import (FetchCacheDecision, apply_fetch_revalidate, decide_fetch_cache, fetch_cache_store_key,
+                          generate_fetch_cache_key, generate_simple_fetch_cache_key)
 from .forms import UploadFile
 from .errors import (ForbiddenError, NotFoundError, RedirectError, SignalError, UnauthorizedError,
                      compute_digest, digest_for_error, error_count, forbidden, get_digest_for_well_known_error,
@@ -45,4 +47,6 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "RedisRateLimiter", "WebSocketPubSub", "PubSubOverflow",
            "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies", "FAIL_OPEN", "FAIL_CLOSED",
            "LoadedEnv", "env_file_names", "load_env", "public_env_defines", "public_env_vars",
-           "no_store", "mark_dynamic_access", "StaticGenBailoutError", "is_prerender_bailout"]
+           "no_store", "mark_dynamic_access", "StaticGenBailoutError", "is_prerender_bailout",
+           "FetchCacheDecision", "apply_fetch_revalidate", "decide_fetch_cache", "fetch_cache_store_key",
+           "generate_fetch_cache_key", "generate_simple_fetch_cache_key"]
