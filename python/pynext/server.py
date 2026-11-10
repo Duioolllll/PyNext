@@ -346,7 +346,8 @@ def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
         raise ValueError(f"shutdown_timeout must be a number between 0 and {MAX_SHUTDOWN_TIMEOUT} seconds")
 
 
-def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,
+def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_CONFIG.max_concurrent,
+                 acquire_timeout_ms=DEFAULT_CONFIG.acquire_timeout_ms,
                  body_capacity=16, body_timeout_ms=10000, observability=None, *, reuse_port=False, listener=None,
                  max_connections=DEFAULT_MAX_CONNECTIONS,
                  max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,

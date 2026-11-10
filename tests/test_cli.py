@@ -111,6 +111,118 @@ def test_cli_workers_boundary_reaches_supervisor(tmp_path, monkeypatch):
     assert seen == [64]
 
 
+def _simulate_p0_defaults(monkeypatch):
+    """Pretend C-P0-1/C-P0-2 already landed (workers/max_concurrent/
+    acquire-timeout defaults 2/128/3000) so dispatch can be tested
+    against the multi-worker default this fix is written for."""
+    from dataclasses import replace
+
+    from pynext import config as config_module
+
+    p0 = replace(config_module.DEFAULT_CONFIG, workers=2, max_concurrent=128,
+                 acquire_timeout_ms=3000)
+    monkeypatch.setattr(config_module, "DEFAULT_CONFIG", p0)
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG", p0)
+
+
+def test_cli_dev_defaults_to_single_process_run_dev(tmp_path, monkeypatch):
+    """Default `pynext dev` stays single-process even with the
+    multi-worker default: the supervisor never reloads, so the default
+    dev path must be run_dev (file watching + reload)."""
+    _simulate_p0_defaults(monkeypatch)
+    seen = []
+
+    async def run_dev(*args, **kwargs):
+        seen.append("run_dev")
+
+    def never_supervisor(*args, **kwargs):
+        pytest.fail("default pynext dev must not take the supervisor path")
+
+    monkeypatch.setattr(cli, "run_dev", run_dev)
+    monkeypatch.setattr(cli, "run_supervisor", never_supervisor)
+    monkeypatch.setattr(sys, "argv", ["pynext", "dev", "--dir", str(tmp_path)])
+    assert cli.main() is None
+    assert seen == ["run_dev"]
+
+
+def test_cli_dev_with_explicit_workers_two_uses_supervisor(tmp_path, monkeypatch):
+    seen = []
+
+    def run_supervisor(config, workers):
+        seen.append((config, workers))
+        return 0
+
+    async def run_dev(*args, **kwargs):
+        pytest.fail("pynext dev --workers 2 must take the supervisor path")
+
+    monkeypatch.setattr(cli, "run_supervisor", run_supervisor)
+    monkeypatch.setattr(cli, "run_dev", run_dev)
+    monkeypatch.setattr(sys, "argv", ["pynext", "dev", "--dir", str(tmp_path), "--workers", "2"])
+    assert cli.main() == 0
+    assert len(seen) == 1 and seen[0][1] == 2
+    assert seen[0][0].production is False
+
+
+def test_cli_dev_with_config_file_workers_two_uses_supervisor(tmp_path, monkeypatch):
+    """Workers configured in pynext.config.py count as explicit, so dev
+    honours them the same way it honours --workers."""
+    (tmp_path / "pynext.config.py").write_text("config = {'workers': 2}\n", encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(cli, "run_supervisor", lambda config, workers: seen.append(workers) or 0)
+
+    async def run_dev(*args, **kwargs):
+        pytest.fail("pynext dev with workers=2 in the config file must take the supervisor path")
+
+    monkeypatch.setattr(cli, "run_dev", run_dev)
+    monkeypatch.setattr(sys, "argv", ["pynext", "dev", "--dir", str(tmp_path)])
+    assert cli.main() == 0
+    assert seen == [2]
+
+
+def test_cli_start_defaults_to_supervisor(tmp_path, monkeypatch):
+    """Default `pynext start` takes the supervisor path under the
+    multi-worker default."""
+    _simulate_p0_defaults(monkeypatch)
+    seen = []
+    monkeypatch.setattr(cli, "run_supervisor", lambda config, workers: seen.append((config, workers)) or 0)
+    monkeypatch.setattr(cli, "create_app",
+                        lambda *args, **kwargs: pytest.fail("default pynext start must not take the single-process path"))
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path)])
+    assert cli.main() == 0
+    assert len(seen) == 1 and seen[0][1] == 2
+    assert seen[0][0].production is True
+
+
+def test_cli_start_with_explicit_workers_one_uses_single_process(tmp_path, monkeypatch):
+    root = tmp_path.resolve()
+    seen = []
+    app = object()
+    monkeypatch.setattr(cli, "create_app", lambda path, production, cache_backend="memory", cache_path=None,
+                        rate_limit=None, **kwargs:
+                        seen.append(("app", path, production)) or app)
+
+    async def serve(*args, **kwargs):
+        seen.append(("serve", args, kwargs))
+
+    monkeypatch.setattr(cli, "serve", serve)
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--workers", "1"])
+    cli.main()
+    assert seen[0][0] == "app"
+    assert seen[1][0] == "serve"
+
+
+def test_start_native_defaults_follow_default_config():
+    """start_native's admission defaults must track DEFAULT_CONFIG (the
+    single default source) instead of repeating stale literals."""
+    import inspect
+
+    from pynext.config import DEFAULT_CONFIG
+
+    params = inspect.signature(start_native).parameters
+    assert params["max_concurrent"].default == DEFAULT_CONFIG.max_concurrent
+    assert params["acquire_timeout_ms"].default == DEFAULT_CONFIG.acquire_timeout_ms
+
+
 def test_server_limits_rejected_directly_without_overflow(tmp_path):
     # Review #4 #5: a direct serve()/start_native() caller bypasses the
     # CLI, so the same bounds are enforced there with a clear ValueError

@@ -535,8 +535,9 @@ def _build_parser():
                                  help="emit OpenTelemetry spans when the opentelemetry packages are installed (default: off)")
             command.add_argument("--workers", type=_bounded(1, MAX_WORKERS, "--workers"),
                                  default=DEFAULT_CONFIG.workers,
-                                 help="worker processes sharing the port (default 1: single process; max 64); "
-                                      "a supervisor restarts crashed workers")
+                                 help=f"worker processes sharing the port (default "
+                                      f"{DEFAULT_CONFIG.workers} for start, single process for dev; "
+                                      "max 64); a supervisor restarts crashed workers")
             command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"),
                                  default=DEFAULT_CONFIG.rate_limit,
                                  help="requests allowed per client per --rate-limit-window (0 disables)")
@@ -714,7 +715,21 @@ def main():
         value = getattr(args, key)
         if value is not None and value != getattr(DEFAULT_CONFIG, key):
             conn_kwargs[key] = value
-    if args.workers > 1:
+    # `pynext dev` stays on the single-process run_dev path (file watching
+    # and reload) unless workers were configured explicitly — via --workers,
+    # a config file, or the environment. The multi-worker default
+    # (DEFAULT_CONFIG.workers) must not push dev onto the supervisor path:
+    # the supervisor serves but never reloads, so a default `pynext dev`
+    # would silently lose its watch/reload loop. `pynext start` takes the
+    # supervisor whenever the resolved worker count is above one, default
+    # included.
+    if args.command == "dev":
+        workers_explicit = (resolved is not None
+                            and resolved.source_of("workers") != "default")
+        use_supervisor = workers_explicit and args.workers > 1
+    else:
+        use_supervisor = args.workers > 1
+    if use_supervisor:
         config = WorkerConfig(root=str(root), host=args.host, port=args.port,
                               production=args.command == "start",
                               max_concurrent=args.max_concurrent,
