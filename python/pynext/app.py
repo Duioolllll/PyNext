@@ -73,7 +73,7 @@ from .ws_origin import websocket_origin_allowed
 log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
 # Fix hint shared by the ISR policy errors below; the file is appended
-# at the raise site (``ISR_FIX + spec["entry"]``).
+# at the raise site (``ISR_FIX + entry_source``).
 ISR_FIX = ("Use @page(render='isr', revalidate=<positive seconds>, "
            "stale=<non-negative seconds>, expire=<seconds>) in ")
 ASGI_DECISION_CAPACITY = 64
@@ -253,6 +253,7 @@ def _load(root, relative, namespace):
 
 
 def _check_signature(fn, allowed, label):
+    label = _posix_path(label)
     for p in inspect.signature(fn).parameters.values():
         if p.kind in (p.POSITIONAL_ONLY, p.VAR_POSITIONAL, p.VAR_KEYWORD):
             raise ValueError(_config_error(
@@ -752,6 +753,21 @@ def _is_dynamic_pattern(path):
     return any(segment.startswith("[") for segment in path.split("/"))
 
 
+def _posix_path(path):
+    """A project-relative path with forward slashes.
+
+    The build manifest records paths with the OS separator, so on
+    Windows a layout arrives as ``app\\blog\\layout.py`` while the
+    URL-derived lookups build ``app/blog/layout.py``. Normalise to
+    forward slashes so comparisons, ``source`` fields and log lines
+    are identical on every platform. (``Path.as_posix()`` alone would
+    not do this for a Windows-style string on POSIX, where a
+    backslash is a legal filename character, so the separator is
+    replaced directly.)
+    """
+    return str(path).replace("\\", "/")
+
+
 def _layout_url_dir(module):
     """The URL directory a layout module applies to.
 
@@ -759,7 +775,7 @@ def _layout_url_dir(module):
     group (``app/(marketing)/layout.py``) applies to ``/`` because groups
     do not appear in URLs.
     """
-    parts = module.split("/")[1:-1]
+    parts = _posix_path(module).split("/")[1:-1]
     url_parts = [part for part in parts if not (part.startswith("(") and part.endswith(")"))]
     return "/" + "/".join(url_parts)
 
@@ -1087,37 +1103,45 @@ class App:
         self.client_manifest = {}
         for pattern, spec in manifest["routes"].items():
             module = self._module(spec["entry"])
+            entry_source = _posix_path(spec["entry"])
             if spec["kind"] == "page":
                 fn = getattr(module, "Page", None)
                 if not callable(fn) or not getattr(fn, "__pynext_page__", False):
                     raise ValueError(_config_error(
-                        f"{spec['entry']} must export a @page() Page function",
+                        f"{entry_source} must export a @page() Page function",
                         [("route", pattern)],
-                        [f"Add a @page() decorated Page function to {spec['entry']}"]))
-                _check_signature(fn, {"request", "params", "query"}, spec["entry"])
+                        [f"Add a @page() decorated Page function to {entry_source}"]))
+                _check_signature(fn, {"request", "params", "query"}, entry_source)
                 mode = getattr(fn, "__pynext_render__", "ssr")
                 if mode not in {"ssr", "ssg", "isr"}:
                     raise ValueError(_config_error(
-                        f"Unsupported render mode {mode!r} in {spec['entry']}",
+                        f"Unsupported render mode {mode!r} in {entry_source}",
                         [("route", pattern)],
                         ["Change @page(render=...) to 'ssr', 'ssg', or 'isr' in "
-                         f"{spec['entry']}"]))
+                         f"{entry_source}"]))
                 if mode in {"ssg", "isr"} and "request" in inspect.signature(fn).parameters:
                     raise ValueError(_config_error(
-                        f"{mode.upper()} page {spec['entry']} cannot accept request",
+                        f"{mode.upper()} page {entry_source} cannot accept request",
                         [("route", pattern)],
-                        [f"Remove the request parameter from Page in {spec['entry']}",
+                        [f"Remove the request parameter from Page in {entry_source}",
                          "SSG and ISR pages are rendered without a request"]))
                 if mode in {"ssg", "isr"} and getattr(fn, "__pynext_auth__", False):
                     raise ValueError(_config_error(
-                        f"{mode.upper()} page {spec['entry']} cannot require authentication",
+                        f"{mode.upper()} page {entry_source} cannot require authentication",
                         [("route", pattern)],
-                        [f"Remove @require_auth from Page in {spec['entry']}",
+                        [f"Remove @require_auth from Page in {entry_source}",
                          "Change render to 'ssr' if the page needs authentication"]))
                 self.render_modes[pattern] = mode
+                # The manifest records paths with the OS separator, so on
+                # Windows ``spec["layouts"]`` holds ``app\\blog\\layout.py``.
+                # Normalise once here: layout lookups, ``layout_policies``
+                # sources and the override warning all compare against
+                # slash-built paths (see _posix_path).
+                entry = _posix_path(spec["entry"])
+                layout_relatives = [_posix_path(relative) for relative in spec["layouts"]]
                 layouts = []
                 layout_policies = []
-                for relative in spec["layouts"]:
+                for relative in layout_relatives:
                     layout_fn = getattr(self._module(relative), "Layout", None)
                     if not callable(layout_fn) or not getattr(layout_fn, "__pynext_layout__", False):
                         raise ValueError(_config_error(
@@ -1155,38 +1179,38 @@ class App:
                 dynamic = getattr(fn, "__pynext_dynamic__", "auto")
                 if dynamic not in DYNAMIC_MODES:
                     raise ValueError(_config_error(
-                        f"Unsupported dynamic mode in {spec['entry']}",
+                        f"Unsupported dynamic mode in {entry_source}",
                         [("route", pattern), ("got", _short_repr(dynamic))],
-                        [f"Use one of {sorted(DYNAMIC_MODES)} for dynamic= in {spec['entry']}"]))
+                        [f"Use one of {sorted(DYNAMIC_MODES)} for dynamic= in {entry_source}"]))
                 if mode == "ssr" and dynamic != "auto":
                     raise ValueError(_config_error(
-                        f"SSR page {spec['entry']} cannot set dynamic={dynamic!r}",
+                        f"SSR page {entry_source} cannot set dynamic={dynamic!r}",
                         [("route", pattern)],
-                        [f"Remove dynamic= from Page in {spec['entry']}",
+                        [f"Remove dynamic= from Page in {entry_source}",
                          "SSR pages are always dynamic"]))
                 if dynamic == "force-dynamic" and mode != "ssg":
                     raise ValueError(_config_error(
-                        f"Only SSG pages can use dynamic='force-dynamic' in {spec['entry']}",
+                        f"Only SSG pages can use dynamic='force-dynamic' in {entry_source}",
                         [("route", pattern)],
-                        [f"Remove dynamic='force-dynamic' from Page in {spec['entry']}",
+                        [f"Remove dynamic='force-dynamic' from Page in {entry_source}",
                          "Change render to 'ssg' if the page must be force-dynamic"]))
                 self.dynamic_modes[pattern] = dynamic
                 if mode == "isr":
                     raw_policy = getattr(fn, "__pynext_cache_policy__", None)
                     if not isinstance(raw_policy, dict) or set(raw_policy) != {"revalidate", "stale", "expire"}:
                         raise ValueError(_config_error(
-                            f"Invalid ISR policy in {spec['entry']}",
+                            f"Invalid ISR policy in {entry_source}",
                             [("route", pattern), ("got", _short_repr(raw_policy))],
-                            [ISR_FIX + spec["entry"]]))
+                            [ISR_FIX + entry_source]))
                     try:
                         page_policy = _partial_isr_policy(raw_policy["revalidate"],
                                                           raw_policy["stale"],
                                                           raw_policy["expire"])
                     except ValueError as exc:
                         raise ValueError(_config_error(
-                            f"Invalid ISR policy in {spec['entry']}: {exc}",
+                            f"Invalid ISR policy in {entry_source}: {exc}",
                             [("route", pattern), ("got", _short_repr(raw_policy))],
-                            [ISR_FIX + spec["entry"]])) from exc
+                            [ISR_FIX + entry_source])) from exc
                     if layout_policies:
                         self.layout_policies[pattern] = [
                             {"source": source, "revalidate": policy["revalidate"],
@@ -1198,7 +1222,7 @@ class App:
                     # when the page explicitly asked for a value it does not
                     # get, naming both files so the override is never silent.
                     effective, winners = reduce_segment_config(
-                        [*layout_policies, (spec["entry"], page_policy)])
+                        [*layout_policies, (entry, page_policy)])
                     for key in ("revalidate", "stale", "expire"):
                         page_value = page_policy[key]
                         if (page_value is not None and page_value is not False and
@@ -1207,13 +1231,13 @@ class App:
                             log.warning(
                                 "ISR %s=%s in %s is overridden by %s=%s from %s for route %s; "
                                 "a child segment only wins with a shorter %s",
-                                key, page_value, spec["entry"], key, winner_value,
+                                key, page_value, entry, key, winner_value,
                                 winner_source, pattern, key)
                     if effective["revalidate"] is None:
                         raise ValueError(_config_error(
-                            f"ISR page {spec['entry']} must set revalidate or inherit it from a layout",
+                            f"ISR page {entry_source} must set revalidate or inherit it from a layout",
                             [("route", pattern), ("got", _short_repr(effective))],
-                            [ISR_FIX + spec["entry"],
+                            [ISR_FIX + entry_source,
                              "Set revalidate in a parent layout.py instead"]))
                     if effective["revalidate"] is False:
                         # On-demand-only ISR: never regenerates on a timer,
@@ -1225,9 +1249,9 @@ class App:
                             policy = _isr_policy(False, stale, None)
                         except ValueError as exc:
                             raise ValueError(_config_error(
-                                f"Invalid ISR policy in {spec['entry']}: {exc}",
+                                f"Invalid ISR policy in {entry_source}: {exc}",
                                 [("route", pattern), ("got", _short_repr(effective))],
-                                [ISR_FIX + spec["entry"]])) from exc
+                                [ISR_FIX + entry_source])) from exc
                     else:
                         # Reconcile stale/expire: they are two spellings of the
                         # same window. A set expire is the hard cap and wins;
@@ -1249,9 +1273,9 @@ class App:
                             policy = _isr_policy(revalidate, stale, expire)
                         except ValueError as exc:
                             raise ValueError(_config_error(
-                                f"Invalid ISR policy in {spec['entry']}: {exc}",
+                                f"Invalid ISR policy in {entry_source}: {exc}",
                                 [("route", pattern), ("got", _short_repr(effective))],
-                                [ISR_FIX + spec["entry"]])) from exc
+                                [ISR_FIX + entry_source])) from exc
                     self.isr_policies[pattern] = policy
                     # ISR pages may export generate_static_params: the
                     # listed paths are warmed into the cache at startup
@@ -1263,21 +1287,21 @@ class App:
                     if isr_dynamic and generator is not None and (
                             not callable(generator) or inspect.signature(generator).parameters):
                         raise ValueError(_config_error(
-                            f"Dynamic ISR page {spec['entry']} must export generate_static_params() with no arguments",
+                            f"Dynamic ISR page {entry_source} must export generate_static_params() with no arguments",
                             [("route", pattern)],
-                            [f"Define generate_static_params() with no arguments in {spec['entry']}"]))
+                            [f"Define generate_static_params() with no arguments in {entry_source}"]))
                     if not isr_dynamic and generator is not None:
                         raise ValueError(_config_error(
-                            f"Static ISR page {spec['entry']} cannot export generate_static_params",
+                            f"Static ISR page {entry_source} cannot export generate_static_params",
                             [("route", pattern)],
-                            [f"Remove generate_static_params from {spec['entry']}",
+                            [f"Remove generate_static_params from {entry_source}",
                              "Make the route dynamic by adding a [param] segment to its directory name"]))
                     self.isr_generators[pattern] = generator
                     try:
                         query_keys = _isr_query_keys(getattr(fn, "__pynext_cache_query__", ()))
                     except ValueError as exc:
                         raise ValueError(_config_error(
-                            f"Invalid ISR query keys in {spec['entry']}: {exc}",
+                            f"Invalid ISR query keys in {entry_source}: {exc}",
                             [("route", pattern),
                              ("got", _short_repr(getattr(fn, "__pynext_cache_query__", ())))],
                             ["Pass query_keys as a list of up to 16 unique names matching "
@@ -1290,7 +1314,7 @@ class App:
                             getattr(fn, "__pynext_cache_tags__", ())))
                     except ValueError as exc:
                         raise ValueError(_config_error(
-                            f"Invalid ISR tags in {spec['entry']}: {exc}",
+                            f"Invalid ISR tags in {entry_source}: {exc}",
                             [("route", pattern),
                              ("got", _short_repr(getattr(fn, "__pynext_cache_tags__", ())))],
                             ["Pass tags as a list of unique names matching "
@@ -1300,15 +1324,15 @@ class App:
                     # so invalidating a layout tag evicts the whole
                     # subtree (webhook type="layout" via _layout_tag).
                     self.isr_tags[pattern] = sorted(set(self.isr_tags[pattern]) |
-                        {_layout_tag(_layout_scope(relative)) for relative in spec["layouts"]})
+                        {_layout_tag(_layout_scope(relative)) for relative in layout_relatives})
                 else:
                     query_keys = []
                 if "query" in inspect.signature(fn).parameters and not query_keys:
                     raise ValueError(_config_error(
-                        f"Page {spec['entry']} needs ISR query_keys to accept query",
+                        f"Page {entry_source} needs ISR query_keys to accept query",
                         [("route", pattern)],
-                        [f"Add query_keys=(...) to @page(render='isr', ...) in {spec['entry']}",
-                         f"Remove the query parameter from Page in {spec['entry']}"]))
+                        [f"Add query_keys=(...) to @page(render='isr', ...) in {entry_source}",
+                         f"Remove the query parameter from Page in {entry_source}"]))
                 if mode == "ssg":
                     fallback = getattr(fn, "__pynext_ssg_fallback__", None)
                     try:
@@ -1317,10 +1341,10 @@ class App:
                             (fallback or {}).get("dynamic_params", True))
                     except ValueError as exc:
                         raise ValueError(_config_error(
-                            f"Invalid SSG fallback in {spec['entry']}: {exc}",
+                            f"Invalid SSG fallback in {entry_source}: {exc}",
                             [("route", pattern), ("got", _short_repr(fallback))],
                             ["Use fallback='not_found' or 'blocking' with dynamic_params=True/False "
-                             f"in {spec['entry']}"])) from exc
+                             f"in {entry_source}"])) from exc
                     self.ssg_fallback[pattern] = fallback
                     is_dynamic = any("[" in segment for segment in pattern.split("/"))
                     generator = getattr(module, "generate_static_params", None)
@@ -1330,21 +1354,21 @@ class App:
                         pass
                     elif is_dynamic and (not callable(generator) or inspect.signature(generator).parameters):
                         raise ValueError(_config_error(
-                            f"Dynamic SSG page {spec['entry']} must export generate_static_params() with no arguments",
+                            f"Dynamic SSG page {entry_source} must export generate_static_params() with no arguments",
                             [("route", pattern)],
-                            [f"Define generate_static_params() with no arguments in {spec['entry']}"]))
+                            [f"Define generate_static_params() with no arguments in {entry_source}"]))
                     elif not is_dynamic and generator is not None:
                         raise ValueError(_config_error(
-                            f"Static SSG page {spec['entry']} cannot export generate_static_params",
+                            f"Static SSG page {entry_source} cannot export generate_static_params",
                             [("route", pattern)],
-                            [f"Remove generate_static_params from {spec['entry']}",
+                            [f"Remove generate_static_params from {entry_source}",
                              "Make the route dynamic by adding a [param] segment to its directory name"]))
                     self.static_generators[pattern] = generator
                 self._layout_shell_dynamic[pattern] = any(
                     getattr(layout_fn, "__pynext_layout_dynamic__", False) for layout_fn in layouts
                 )
                 self.entries[pattern] = (fn, layouts)
-                self.entry_layouts[pattern] = tuple(spec["layouts"])
+                self.entry_layouts[pattern] = tuple(layout_relatives)
             else:
                 handlers = {}
                 ws_handler = None
@@ -1353,27 +1377,27 @@ class App:
                     if method and fn.__module__ == module.__name__:
                         if method in handlers:
                             raise ValueError(_config_error(
-                                f"Duplicate {method} handler in {spec['entry']}",
+                                f"Duplicate {method} handler in {entry_source}",
                                 [("route", pattern)],
-                                [f"Keep only one @route({method!r}) handler in {spec['entry']}",
+                                [f"Keep only one @route({method!r}) handler in {entry_source}",
                                  "Remove the duplicate handler function"]))
-                        _check_signature(fn, {"request", "params"}, spec["entry"])
+                        _check_signature(fn, {"request", "params"}, entry_source)
                         handlers[method] = fn
                     if getattr(fn, "__pynext_websocket__", False) and fn.__module__ == module.__name__:
                         if ws_handler is not None:
                             raise ValueError(_config_error(
-                                f"Duplicate WebSocket handler in {spec['entry']}",
+                                f"Duplicate WebSocket handler in {entry_source}",
                                 [("route", pattern)],
-                                [f"Keep only one @websocket handler in {spec['entry']}",
+                                [f"Keep only one @websocket handler in {entry_source}",
                                  "Remove the duplicate handler function"]))
-                        _check_signature(fn, {"websocket", "params"}, spec["entry"])
+                        _check_signature(fn, {"websocket", "params"}, entry_source)
                         ws_handler = fn
                 if not handlers and ws_handler is None:
                     raise ValueError(_config_error(
-                        f"{spec['entry']} has no @route handlers",
+                        f"{entry_source} has no @route handlers",
                         [("route", pattern)],
-                        [f"Add at least one @route('GET') handler to {spec['entry']}",
-                         f"Add a @websocket handler to {spec['entry']} to serve WebSocket connections"]))
+                        [f"Add at least one @route('GET') handler to {entry_source}",
+                         f"Add a @websocket handler to {entry_source} to serve WebSocket connections"]))
                 if ws_handler is not None:
                     self.websocket_entries[pattern] = ws_handler
                 self.entries[pattern] = handlers
@@ -2105,7 +2129,7 @@ class App:
         also found by its URL directory. Raises ValueError when no layout
         is defined there, or when several group layouts share the URL.
         """
-        known = {module for layouts in self.entry_layouts.values() for module in layouts}
+        known = {_posix_path(module) for layouts in self.entry_layouts.values() for module in layouts}
         direct = "app/layout.py" if path == "/" else f"app{path}/layout.py"
         if direct in known:
             return direct

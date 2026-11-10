@@ -61,6 +61,14 @@ async def redirecting_middleware(request: Request, call_next: NextHandler) -> Re
 # A middleware returning a MiddlewareResult is a valid Middleware.
 redirecting: Middleware = redirecting_middleware
 
+continued = MiddlewareResult.next(Request("GET", "/"))
+assert_type(continued.request, Request | None)
+assert_type(continued.response, Response | None)
+terminal = MiddlewareResult.response(Response("done"))
+assert_type(terminal, MiddlewareResult)
+assert_type(terminal.response, Response | None)
+assert_type(MiddlewareResult.response(response=Response("done")), MiddlewareResult)
+
 app = create_app(".", security=SecurityConfig(cors_allowed_origins=("https://client.example",)),
                  resources={"db": Database()}, middleware=[SessionMiddleware(SQLiteSessionStore("session.db"))])
 assert_type(app, App)

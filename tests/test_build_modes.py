@@ -65,7 +65,7 @@ def make_app(root, *, island=False, render="ssg", api=False, public=False):
     if public:
         public_dir = root / "public"
         public_dir.mkdir(exist_ok=True)
-        (public_dir / "hello.txt").write_text("hello public\n", encoding="utf-8")
+        (public_dir / "hello.txt").write_bytes(b"hello public\n")
     return root
 
 

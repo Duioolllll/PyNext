@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import threading
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote_to_bytes
 
@@ -869,6 +870,9 @@ class PathHeaders:
                       tuple((name.encode("ascii"), value.encode("ascii"))
                             for name, value in rule.headers))
                      for rule in self.rules)
+
+
+PathHeaderRuleInput = PathHeaderRule | tuple[str, Mapping[str, str] | Iterable[tuple[str, str]]]
 
 
 def compile_path_headers(rules=None):

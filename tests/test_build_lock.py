@@ -6,6 +6,7 @@ build id recorded last so a failed build never looks complete.
 """
 import errno
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -35,10 +36,10 @@ _USAGE = namedtuple("usage", "total used free")
 # "locked" once it owns it. Runs with the test venv's python, where
 # pynext is installed.
 _HOLDER_SCRIPT = (
-    "import sys, time\n"
+    "import os, sys, time\n"
     "from pynext.build import BuildLock\n"
     "with BuildLock(sys.argv[1]):\n"
-    "    print('locked', flush=True)\n"
+    "    print(f'locked {os.getpid()}', flush=True)\n"
     "    time.sleep(float(sys.argv[2]))\n"
 )
 
@@ -106,16 +107,58 @@ def test_cross_process_build_lock_waits_then_succeeds(tmp_path):
         [sys.executable, "-c", _HOLDER_SCRIPT, str(tmp_path), "2"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
-        assert holder.stdout.readline().strip() == "locked"
-        holder_pid = int((tmp_path / ".pynext" / ".build.lock").read_text(encoding="utf-8").strip())
-        assert holder_pid == holder.pid
+        # The holder reports its own pid: on Windows the venv python.exe
+        # is a redirector that spawns the real interpreter as a child, so
+        # holder.pid (the redirector) is not the pid holding the lock.
+        # The lock file records the real holder pid (os.getpid() inside
+        # the holder), so compare against the printed pid, not holder.pid.
+        locked_line = holder.stdout.readline().strip()
+        assert locked_line.startswith("locked ")
+        holder_pid = int(locked_line.split()[1])
+        lock_pid = int((tmp_path / ".pynext" / ".build.lock").read_text(encoding="utf-8").strip())
+        assert lock_pid == holder_pid
         with pytest.raises(BuildLockError) as excinfo:
             write_manifest(tmp_path, lock_timeout=0)
-        assert str(holder.pid) in str(excinfo.value)
+        assert str(holder_pid) in str(excinfo.value)
         manifest = write_manifest(tmp_path, lock_timeout=10)
         assert manifest["static_pages"]
     finally:
         holder.wait(timeout=10)
+
+
+def test_cross_process_build_lock_pid_matches_real_holder_not_launcher(tmp_path):
+    """The lock file must record the real holder pid, not a launcher pid.
+
+    Regression: on Windows the venv python.exe is a redirector that spawns
+    the real interpreter as a child, so Popen(...).pid (the redirector)
+    differs from os.getpid() inside the holder (the real interpreter).
+    The holder reports its own pid in the "locked" line; the lock file
+    must match that pid. This test simulates the redirector on any
+    platform by spawning the holder through a wrapper process, so the
+    failure reproduces on Linux too if the test ever goes back to
+    comparing against the Popen pid.
+    """
+    make_app(tmp_path)
+    launcher_script = tmp_path / "launcher.py"
+    launcher_script.write_text(
+        "import subprocess, sys\n"
+        "child = subprocess.Popen(\n"
+        "    [sys.executable, '-c', " + repr(_HOLDER_SCRIPT) + ", sys.argv[1], sys.argv[2]])\n"
+        "sys.exit(child.wait())\n",
+        encoding="utf-8")
+    launcher = subprocess.Popen(
+        [sys.executable, str(launcher_script), str(tmp_path), "2"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        locked_line = launcher.stdout.readline().strip()
+        assert locked_line.startswith("locked ")
+        holder_pid = int(locked_line.split()[1])
+        # The launcher pid is a different process than the real holder.
+        assert launcher.pid != holder_pid
+        lock_pid = int((tmp_path / ".pynext" / ".build.lock").read_text(encoding="utf-8").strip())
+        assert lock_pid == holder_pid
+    finally:
+        launcher.wait(timeout=10)
 
 
 def test_precheck_rejects_low_disk_space(tmp_path, monkeypatch):
@@ -278,7 +321,7 @@ def test_cli_build_lock_timeout_reaches_subprocess(tmp_path):
         [sys.executable, "-c", _HOLDER_SCRIPT, str(tmp_path), "5"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
-        assert holder.stdout.readline().strip() == "locked"
+        assert holder.stdout.readline().strip().startswith("locked")
         result = subprocess.run(
             [sys.executable, "-m", "pynext.cli", "build", "--dir", str(tmp_path),
              "--lock-timeout", "0"],
@@ -303,7 +346,10 @@ def test_cli_rejects_negative_lock_timeout(monkeypatch, capsys):
 # BuildLock used to take the lock at the "a+" open position (EOF) but
 # release it at the end of the pid it wrote, so on Windows the release
 # raised Permission denied and a second build could take a different,
-# free byte instead of being blocked. The fake below reproduces real
+# free byte instead of being blocked. The lock then moved to a fixed
+# byte past the pid text: Windows locks are mandatory, so a lock byte
+# inside the pid made ``read_text()`` of the lock file raise Permission
+# denied while the lock was held. The fake below reproduces real
 # Windows semantics on any platform, so these tests fail on the old
 # code and pass on the fixed code everywhere.
 
@@ -315,6 +361,12 @@ class _FakeWindowsLocking:
     at the file's current position. Locking an already locked byte and
     unlocking a byte that was never locked both fail with EACCES
     (Permission denied), like the CRT's ``_locking``.
+
+    Windows locks are mandatory: reading a byte locked by another
+    handle fails with EACCES. ``read_blocked(path)`` models that for a
+    fresh-handle read (``Path.read_text()`` opens one): it is True when
+    any byte in the first 8 KiB read chunk is locked, so a lock byte
+    inside the pid text makes the pid unreadable while the lock is held.
     """
 
     LK_NBLCK = 0
@@ -347,12 +399,31 @@ class _FakeWindowsLocking:
         else:  # pragma: no cover - invalid mode
             raise ValueError(mode)
 
+    def read_blocked(self, path):
+        """True when a fresh-handle read of ``path`` would fail on Windows."""
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return False
+        locked = self._locked.get((stat.st_dev, stat.st_ino))
+        if not locked:
+            return False
+        return any(offset < io.DEFAULT_BUFFER_SIZE for offset in locked)
+
 
 @pytest.fixture
 def windows_locking(monkeypatch):
     fake = _FakeWindowsLocking()
     monkeypatch.setattr(build_module, "fcntl", None)
     monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    real_read_text = Path.read_text
+
+    def _checked_read_text(self, *args, **kwargs):
+        if fake.read_blocked(self):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _checked_read_text)
     return fake
 
 
@@ -362,14 +433,15 @@ def test_windows_build_lock_releases_without_permission_denied(tmp_path, windows
     Regression: the lock used to be taken at the "a+" open position
     (EOF, byte 0 for a fresh file) but released at the end of the
     written pid, so Windows raised Permission denied in ``__exit__``.
+    Both are now pinned to the fixed lock byte past the pid text.
     """
     with BuildLock(tmp_path):
         pass
     # Re-acquiring right after release works: the lock is really gone.
     with BuildLock(tmp_path, timeout=0):
         pass
-    assert windows_locking.lock_positions == [0, 0]
-    assert windows_locking.unlock_positions == [0, 0]
+    assert windows_locking.lock_positions == [build_module._LOCK_BYTE_OFFSET] * 2
+    assert windows_locking.unlock_positions == [build_module._LOCK_BYTE_OFFSET] * 2
 
 
 def test_windows_second_build_is_blocked(tmp_path, windows_locking):
@@ -390,7 +462,9 @@ def test_windows_build_lock_with_stale_pid_of_other_length(tmp_path, windows_loc
 
     The stale pid is deliberately longer than this process's pid, so
     the acquire and release positions only coincide when both are
-    pinned to byte 0.
+    pinned to the fixed lock byte. The pid must also stay readable
+    while the lock is held: on Windows a lock byte inside the pid text
+    makes ``read_text()`` raise Permission denied.
     """
     lock_path = tmp_path / ".pynext" / ".build.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -399,5 +473,5 @@ def test_windows_build_lock_with_stale_pid_of_other_length(tmp_path, windows_loc
         assert lock_path.read_text(encoding="utf-8").strip() == str(os.getpid())
     with BuildLock(tmp_path, timeout=0):
         pass
-    assert windows_locking.lock_positions == [0, 0]
-    assert windows_locking.unlock_positions == [0, 0]
+    assert windows_locking.lock_positions == [build_module._LOCK_BYTE_OFFSET] * 2
+    assert windows_locking.unlock_positions == [build_module._LOCK_BYTE_OFFSET] * 2
