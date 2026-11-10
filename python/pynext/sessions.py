@@ -8,8 +8,10 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from collections.abc import MutableMapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
@@ -58,12 +60,33 @@ def _key(token):
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
+# Fallback pool for SQLite session I/O when a store is used without an
+# App (C-P1-1). A dedicated pool — never the shared asyncio default
+# executor — so session reads/writes cannot be starved by sync handlers
+# or renders, and vice versa. Apps pass their own session pool via the
+# store's executor argument (App wires it in at construction).
+_DEFAULT_SESSION_EXECUTOR = None
+_DEFAULT_SESSION_EXECUTOR_LOCK = threading.Lock()
+
+
+def _default_session_executor():
+    global _DEFAULT_SESSION_EXECUTOR
+    with _DEFAULT_SESSION_EXECUTOR_LOCK:
+        if _DEFAULT_SESSION_EXECUTOR is None:
+            _DEFAULT_SESSION_EXECUTOR = ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="pynext-session")
+        return _DEFAULT_SESSION_EXECUTOR
+
+
 class SQLiteSessionStore:
     """SQLite session store; connections are opened per operation for worker safety."""
 
-    def __init__(self, path):
+    def __init__(self, path, executor=None):
         if str(path) == ":memory:":
             raise ValueError("SQLite sessions require a persistent file")
+        # Optional executor for the blocking sqlite calls. When None the
+        # module-level session pool is used; App passes its own pool.
+        self.executor = executor
         self.path = str(Path(path).resolve())
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.path, timeout=5) as db:
@@ -83,7 +106,8 @@ class SQLiteSessionStore:
             if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
                 raise ValueError("invalid session data")
             return payload["data"], payload.get("csrf"), row[1]
-        return await asyncio.to_thread(read)
+        return await asyncio.get_running_loop().run_in_executor(
+            self.executor or _default_session_executor(), read)
 
     async def save(self, token, data, csrf, version, expires, *, previous_token=None):
         for key, value in data.items():
@@ -116,13 +140,15 @@ class SQLiteSessionStore:
                     if cursor.rowcount != 1:
                         raise SessionConflict("session changed or expired")
                 return version_to_save
-        return await asyncio.to_thread(write)
+        return await asyncio.get_running_loop().run_in_executor(
+            self.executor or _default_session_executor(), write)
 
     async def delete(self, token):
         def remove():
             with sqlite3.connect(self.path, timeout=5) as db:
                 db.execute("DELETE FROM pynext_sessions WHERE id=?", (_key(token),))
-        await asyncio.to_thread(remove)
+        await asyncio.get_running_loop().run_in_executor(
+            self.executor or _default_session_executor(), remove)
 
     async def purge_expired(self):
         """Remove expired rows.
@@ -134,7 +160,8 @@ class SQLiteSessionStore:
         def purge():
             with sqlite3.connect(self.path, timeout=5) as db:
                 return db.execute("DELETE FROM pynext_sessions WHERE expires<=?", (time.time(),)).rowcount
-        return await asyncio.to_thread(purge)
+        return await asyncio.get_running_loop().run_in_executor(
+            self.executor or _default_session_executor(), purge)
 
 
 def _session_payload(data, csrf, version):

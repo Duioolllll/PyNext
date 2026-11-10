@@ -13,6 +13,10 @@ class App:
     debug: bool
     hot_reload: bool
     sync_workers: int
+    sync_wait_timeout: float
+    sync_queue_limit: int
+    render_workers: int
+    session_workers: int
     websocket_max_message: int
     security: SecurityConfig
     path_headers: PathHeaders
@@ -27,6 +31,8 @@ class App:
                  cache_failure_policy: Literal["fail_open", "fail_closed"] | None = ...,
                  websocket_max_message: int = ..., hot_reload: bool = ...,
                  trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...,
+                 sync_wait_timeout: float = ..., sync_queue_limit: int | None = ...,
+                 render_workers: int | None = ..., session_workers: int | None = ...,
                  strict_ssg: bool = ..., headers: Iterable[PathHeaderRuleInput] | None = ...,
                  revalidate_secret: str | None = ...) -> None: ...
     def configure_observability(self, config: ObservabilityConfig) -> App: ...
@@ -60,5 +66,7 @@ def create_app(root: str | PathLike[str] = ..., *, production: bool = ...,
                cache_failure_policy: Literal["fail_open", "fail_closed"] | None = ...,
                websocket_max_message: int = ..., hot_reload: bool = ...,
                trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...,
+               sync_wait_timeout: float = ..., sync_queue_limit: int | None = ...,
+               render_workers: int | None = ..., session_workers: int | None = ...,
                strict_ssg: bool = ..., headers: Iterable[PathHeaderRuleInput] | None = ...,
                revalidate_secret: str | None = ...) -> App: ...
