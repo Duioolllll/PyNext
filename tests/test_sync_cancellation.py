@@ -108,7 +108,11 @@ def test_cancelled_sync_work_keeps_capacity_until_thread_finishes(tmp_path, monk
         "        finished.set()\n")
 
     async def exercise():
-        app = create_app(tmp_path, sync_workers=1)
+        # sync_wait_timeout=0.05: the second request must still be
+        # refused fast. With the default 2.0s bounded wait it would
+        # outlast the 0.15s bridge timeout in the native branch and the
+        # client would see 504 instead of 503.
+        app = create_app(tmp_path, sync_workers=1, sync_wait_timeout=0.05)
         handler = app.entries["/api/slow"]["POST"]
         state = handler.__globals__
         server = None
@@ -169,6 +173,10 @@ def test_sync_layouts_share_the_sync_worker_limit(tmp_path):
     counter must show the first layout occupying the slot. Before the
     shell cache threaded the request through, layouts ran on a bare
     worker thread: both executed at once and the counter stayed 0.
+
+    sync_wait_timeout=0 pins the refuse-immediately mode: with the
+    default bounded wait the second request would queue behind the
+    first layout and succeed with 200 once the slot frees instead.
     """
     for route in ("a", "b"):
         folder = tmp_path / "app" / route
@@ -191,7 +199,7 @@ def test_sync_layouts_share_the_sync_worker_limit(tmp_path):
         )
 
     async def run():
-        app = create_app(tmp_path, sync_workers=1)
+        app = create_app(tmp_path, sync_workers=1, sync_wait_timeout=0)
         mod_a = mod_b = None
         try:
             mod_a = app._module("app/a/layout.py")

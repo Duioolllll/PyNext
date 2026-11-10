@@ -1,4 +1,6 @@
 import asyncio
+import collections
+import contextvars
 import copy
 import dataclasses
 import hashlib
@@ -20,6 +22,7 @@ import traceback
 import uuid
 import warnings
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -59,7 +62,7 @@ from .observability import (
 )
 from .proxy import ProxyTrust
 from .ratelimit import _is_exempt_path, rate_limited_response
-from .sessions import SessionMiddleware
+from .sessions import SessionMiddleware, SQLiteSessionStore
 from .static import StaticPathError, asset_response, validate_static_request_path
 from .ws_origin import websocket_origin_allowed
 
@@ -624,11 +627,51 @@ class App:
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
                  resources=None, cache_url=None, cache_failure_policy=None,
                  websocket_max_message=DEFAULT_CONFIG.websocket_max_message, hot_reload=False,
-                 trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None,
+                 trusted_proxies=None, sync_workers=32, sync_wait_timeout=ASGI_DECISION_TIMEOUT,
+                 sync_queue_limit=None, render_workers=None, session_workers=None,
+                 strict_ssg=False, headers=None,
                  revalidate_secret=None):
         if isinstance(sync_workers, bool) or not isinstance(sync_workers, int) or not 1 <= sync_workers <= 1024:
             raise ValueError("sync_workers must be an integer from 1 to 1024")
         self.sync_workers = sync_workers
+        # Bounded wait for a sync-worker slot (C-P1-2): how long a sync
+        # handler may queue when every worker is busy. The default
+        # reuses the ASGI admission gate's 2.0s deadline
+        # (``admission.DecisionGate``). 0 disables waiting entirely and
+        # restores the old refuse-immediately behaviour.
+        if (isinstance(sync_wait_timeout, bool)
+                or not isinstance(sync_wait_timeout, (int, float))
+                or not 0 <= sync_wait_timeout <= 300):
+            raise ValueError("sync_wait_timeout must be a number from 0 to 300")
+        self.sync_wait_timeout = float(sync_wait_timeout)
+        # Cap on queued sync waiters. None means twice the worker count.
+        # A request that arrives when the queue is full is refused
+        # immediately with 503, so a burst cannot grow the queue without
+        # bound ("wait -> timeout -> refuse", three stages).
+        if sync_queue_limit is None:
+            sync_queue_limit = sync_workers * 2
+        if (isinstance(sync_queue_limit, bool) or not isinstance(sync_queue_limit, int)
+                or not 0 <= sync_queue_limit <= 65536):
+            raise ValueError("sync_queue_limit must be an integer from 0 to 65536")
+        self.sync_queue_limit = sync_queue_limit
+        # Dedicated worker pools (C-P1-1). The sync pool is sized by
+        # sync_workers so every admitted handler has a thread of its
+        # own; render and session I/O get their own pools so a burst in
+        # one kind of work cannot starve the others — before this, all
+        # three shared asyncio's default executor (min(32, CPU+4)
+        # threads, 8 on a 4-core machine).
+        if render_workers is None:
+            render_workers = max(2, min(8, os.cpu_count() or 4))
+        if (isinstance(render_workers, bool) or not isinstance(render_workers, int)
+                or not 1 <= render_workers <= 1024):
+            raise ValueError("render_workers must be an integer from 1 to 1024")
+        self.render_workers = render_workers
+        if session_workers is None:
+            session_workers = 4
+        if (isinstance(session_workers, bool) or not isinstance(session_workers, int)
+                or not 1 <= session_workers <= 1024):
+            raise ValueError("session_workers must be an integer from 1 to 1024")
+        self.session_workers = session_workers
         # Secret for the POST /_pynext/revalidate webhook. None disables
         # the endpoint (it answers 404). create_app() also reads
         # PYNEXT_REVALIDATE_SECRET when no explicit secret is given.
@@ -757,30 +800,163 @@ class App:
             self._inflight = 0
             self._inflight_streams = 0
             self._sync_active = 0
+            # FIFO waiters for a sync-worker slot (C-P1-2), oldest first.
+            # Guarded by _inflight_lock together with _sync_active; every
+            # touch happens on the event loop thread.
+            self._sync_waiters = collections.deque()
+            # Deepest the FIFO waiter queue (C-P1-2) has ever grown:
+            # the recorded queue-length metric. Updated on every
+            # enqueue, under the same lock as _sync_waiters.
+            self._sync_queue_max = 0
+            # App-owned pools (C-P1-1). Threads spawn lazily on first
+            # submit, so an app that never renders or runs sync work
+            # holds no threads at all.
+            self._sync_executor = ThreadPoolExecutor(
+                max_workers=sync_workers, thread_name_prefix="pynext-sync")
+            self._render_executor = ThreadPoolExecutor(
+                max_workers=render_workers, thread_name_prefix="pynext-render")
+            self._session_executor = ThreadPoolExecutor(
+                max_workers=session_workers, thread_name_prefix="pynext-session")
+            self._bind_session_executor()
             self._inflight_lock = threading.Lock()
             self._asgi_admission = DecisionGate(ASGI_DECISION_CAPACITY, ASGI_DECISION_TIMEOUT)
         except BaseException:
+            self._shutdown_executors()
             self._release_modules()
             raise
+
+    def _bind_session_executor(self):
+        """Point SQLite session stores at the app's session pool.
+
+        Stores are built by user middleware code before the App sees
+        them, so the App wires the pool in after the middleware list is
+        assembled. A store with an explicit executor is left alone, and
+        a store shared by two apps keeps the first app's pool.
+        """
+        for item in self.middleware:
+            inner = item.middleware if isinstance(item, ScopedMiddleware) else item
+            if not isinstance(inner, SessionMiddleware):
+                continue
+            store = getattr(inner, "store", None)
+            if isinstance(store, SQLiteSessionStore) and store.executor is None:
+                store.executor = self._session_executor
+
+    def _shutdown_executors(self):
+        """Stop the app-owned worker pools without waiting for stuck work.
+
+        A running sync handler cannot be cancelled (Python threads), so
+        shutdown never blocks on one; queued-but-unstarted work is
+        dropped. Safe to call before the pools exist, and safe to call
+        twice.
+        """
+        for name in ("_sync_executor", "_render_executor", "_session_executor"):
+            executor = getattr(self, name, None)
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
 
     async def _invoke_sync(self, fn, kwargs, request):
         # Keep capacity occupied until the actual thread finishes, even if
         # the awaiter timed out. Cancellation cannot stop a Python thread.
+        # Bounded wait (C-P1-2): when every sync worker is busy the
+        # caller joins a FIFO waiter queue instead of being refused at
+        # once. The wait is capped by sync_wait_timeout (default 2.0s,
+        # the DecisionGate deadline) and the queue itself is capped by
+        # sync_queue_limit: "wait -> timeout -> refuse", three stages.
+        # A freed slot goes to the oldest waiter (the slot is
+        # transferred, not released and re-contended), so waiters cannot
+        # be starved by new arrivals.
         request.check_cancelled()
+        waiter = None
         with self._inflight_lock:
-            if self._sync_active >= self.sync_workers:
+            if self._sync_active < self.sync_workers:
+                self._sync_active += 1
+            elif self.sync_wait_timeout <= 0 or len(self._sync_waiters) >= self.sync_queue_limit:
+                # Sync-worker saturation 503, counted for C-P1-6
+                # observability (the dispatch-level conversion cannot
+                # tell this refusal apart from other 503s).
+                self.metrics.observe_worker_timeout("unavailable")
                 raise _SyncHandlerBusy()
-            self._sync_active += 1
+            else:
+                waiter = asyncio.get_running_loop().create_future()
+                self._sync_waiters.append(waiter)
+                self._sync_queue_max = max(self._sync_queue_max, len(self._sync_waiters))
+        if waiter is not None:
+            # Queue-length/wait-time metrics (C-P1-2): the wait is timed
+            # here and added to the request's queue-wait contextvar on
+            # every exit path (woken, deadline, cancelled), so dispatch's
+            # observe_request records it in snapshot queue.waits_ms
+            # (and the C-P1-6 slot-wait histogram once integrated). An
+            # admission wait set by server.py, if any, is kept: the two
+            # waits are sequential, so the total is their sum.
+            wait_started = time.monotonic()
+            try:
+                await asyncio.wait_for(asyncio.shield(waiter), self.sync_wait_timeout)
+            except TimeoutError:
+                with self._inflight_lock:
+                    try:
+                        self._sync_waiters.remove(waiter)
+                    except ValueError:
+                        # Already dequeued by finished(): the slot was
+                        # transferred and the waiter was woken, so the
+                        # wait cannot time out afterwards (same loop
+                        # thread, no interleave). Defensive only.
+                        pass
+                queue_wait_var.set((queue_wait_var.get() or 0.0)
+                                   + (time.monotonic() - wait_started) * 1000)
+                # Waiter deadline expiry: a sync-worker saturation 503
+                # (C-P1-6 observability, same counter as the immediate
+                # refusal above — one refused request counts once).
+                self.metrics.observe_worker_timeout("unavailable")
+                raise _SyncHandlerBusy()
+            except asyncio.CancelledError:
+                with self._inflight_lock:
+                    try:
+                        self._sync_waiters.remove(waiter)
+                    except ValueError:
+                        pass
+                queue_wait_var.set((queue_wait_var.get() or 0.0)
+                                   + (time.monotonic() - wait_started) * 1000)
+                request._cancel_event.set()
+                raise
+            queue_wait_var.set((queue_wait_var.get() or 0.0)
+                               + (time.monotonic() - wait_started) * 1000)
 
         def run():
             request.check_cancelled()  # a cancelled queued job never starts
             return fn(**kwargs)
 
-        task = asyncio.create_task(asyncio.to_thread(run))
+        # App-owned sync pool (C-P1-1), not the shared default executor.
+        # contextvars.copy_context().run keeps the request context
+        # (request_id, tracing) visible in the worker, exactly as
+        # asyncio.to_thread did. The executor future is awaited inside
+        # a real task (not ensure_future on the concurrent future):
+        # with a wrapped future the done-callback below runs *after*
+        # the awaiting coroutine resumes, so _sync_active would still
+        # read busy when the next _invoke_sync acquires. A task runs
+        # its done-callbacks first, as create_task(to_thread(...)) did.
+        loop = asyncio.get_running_loop()
+
+        async def _run_on_pool():
+            return await loop.run_in_executor(
+                self._sync_executor, contextvars.copy_context().run, run)
+
+        task = asyncio.create_task(_run_on_pool())
 
         def finished(done):
             with self._inflight_lock:
-                self._sync_active -= 1
+                waiter = None
+                while self._sync_waiters:
+                    candidate = self._sync_waiters.popleft()
+                    if not candidate.done():
+                        waiter = candidate
+                        break
+                if waiter is None:
+                    self._sync_active -= 1
+                # Otherwise the freed slot transfers to the oldest
+                # waiter and _sync_active stays put until that waiter's
+                # thread finishes.
+            if waiter is not None:
+                waiter.set_result(None)
             # A timed-out awaiter cannot retrieve a late exception/result.
             if not done.cancelled():
                 error = done.exception()
@@ -1190,6 +1366,9 @@ class App:
                 error = exc
             else:
                 log.exception("Cache shutdown failed")
+        # App-owned worker pools (C-P1-1): never block shutdown on a
+        # stuck sync thread; queued-but-unstarted work is dropped.
+        self._shutdown_executors()
         if error is not None:
             raise error
 
@@ -1624,7 +1803,8 @@ class App:
         """Serialize one streamed UI node to HTML on a worker thread."""
         bound = bind_islands(_node(node), self.client_manifest, include_runtime=False)
         payload = json.dumps(bound, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        return await asyncio.to_thread(_native.render, payload)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._render_executor, _native.render, payload)
 
 
     async def _layout_shell(self, pattern, layouts, request=None):
@@ -1684,7 +1864,8 @@ class App:
         """
         bound = bind_islands(shell, self.client_manifest, dev_id=self._dev_id)
         payload = json.dumps(bound, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        html = await asyncio.to_thread(_native.render, payload)
+        html = await asyncio.get_running_loop().run_in_executor(
+            self._render_executor, _native.render, payload)
         parts = html.split(marker)
         if len(parts) != 2:
             raise ValueError(
@@ -1917,7 +2098,8 @@ class App:
         started = time.monotonic()
         with span("pynext.render", {"http.route": pattern},
                   enabled=self.observability_config.tracing):
-            html = await asyncio.to_thread(_native.render, payload, nonce)
+            html = await asyncio.get_running_loop().run_in_executor(
+                self._render_executor, _native.render, payload, nonce)
         render_ms = (time.monotonic() - started) * 1000
         render_ms_var.set((render_ms_var.get() or 0.0) + render_ms)
         if isinstance(tree, dict) and tree.get("tag", "").lower() == "html":
@@ -2826,7 +3008,9 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
                cache_failure_policy=None, websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
                hot_reload=False,
-               trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None,
+               trusted_proxies=None, sync_workers=32, sync_wait_timeout=ASGI_DECISION_TIMEOUT,
+               sync_queue_limit=None, render_workers=None, session_workers=None,
+               strict_ssg=False, headers=None,
                revalidate_secret=None):
     root = Path(root).resolve()
     # .env files are loaded before the manifest is read or user code runs,
@@ -2839,5 +3023,8 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
                resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
                websocket_max_message=websocket_max_message, hot_reload=hot_reload,
-               trusted_proxies=trusted_proxies, sync_workers=sync_workers, strict_ssg=strict_ssg,
+               trusted_proxies=trusted_proxies, sync_workers=sync_workers,
+               sync_wait_timeout=sync_wait_timeout, sync_queue_limit=sync_queue_limit,
+               render_workers=render_workers, session_workers=session_workers,
+               strict_ssg=strict_ssg,
                headers=headers, revalidate_secret=revalidate_secret)
