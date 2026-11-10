@@ -298,3 +298,47 @@ def test_isr_rejects_request_access_and_static_generator(tmp_path):
     source.write_text(original + '\ndef generate_static_params(): return []\n')
     with pytest.raises(ValueError, match="cannot export generate_static_params"):
         write_manifest(tmp_path)
+
+
+def test_isr_encoded_delimiter_and_plain_path_have_separate_entries(tmp_path):
+    """``/files/a%2Fb`` and ``/files/a/b`` are different routes.
+
+    The cache key is the routing-normalized path, so the encoded
+    single-segment param and the two-segment static path never share
+    an entry (and never serve each other's body).
+    """
+    directory = tmp_path / "app" / "files" / "[name]"
+    directory.mkdir(parents=True)
+    (directory / "page.py").write_text(
+        'from pynext import h, page\n'
+        '@page(render="isr", revalidate=60)\n'
+        'def Page(params): return h("p", {}, f"dyn:{params[\'name\']}")\n',
+        encoding="utf-8",
+    )
+    static = tmp_path / "app" / "files" / "a" / "b"
+    static.mkdir(parents=True)
+    (static / "page.py").write_text(
+        'from pynext import h, page\n'
+        '@page(render="isr", revalidate=60)\n'
+        'def Page(): return h("p", {}, "static-ab")\n',
+        encoding="utf-8",
+    )
+    write_manifest(tmp_path)
+
+    async def run():
+        app = create_app(tmp_path, production=True)
+        try:
+            async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                first = await client.get("/files/a%2Fb")
+                assert first.status_code == 200
+                assert "dyn:a%2Fb" in first.text
+                second = await client.get("/files/a/b")
+                assert second.status_code == 200
+                assert "static-ab" in second.text
+                # The cached entries stay separate on repeat requests.
+                assert "dyn:a%2Fb" in (await client.get("/files/a%2Fb")).text
+                assert "static-ab" in (await client.get("/files/a/b")).text
+        finally:
+            await app.isr.close()
+    asyncio.run(run())
