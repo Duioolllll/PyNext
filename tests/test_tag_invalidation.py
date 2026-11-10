@@ -379,12 +379,24 @@ def test_redis_tag_invalidation():
     try:
         assert cache.insert(key, b"one", 60, 60, tags=(tag,))
         assert cache.lookup(key) == ("fresh", b"one")
+        # Redis tag records use millisecond timestamps: without a pause
+        # the insert and this invalidation can land in the same
+        # millisecond, making expired_at == generated_at so the entry
+        # reads "fresh" instead of "expired". The premise here is that
+        # the entry was generated strictly before the invalidation.
+        time.sleep(0.005)
         assert cache.revalidate_tag(tag)
         assert cache.lookup(key) == ("expired", None)
         # Entries generated after the invalidation are unaffected.
         assert cache.insert(key, b"two", 60, 60, tags=(tag,))
         assert cache.lookup(key) == ("fresh", b"two")
         # Stale phase: served once more, then expired.
+        # Redis tag records use millisecond timestamps: without a pause
+        # the insert and this invalidation can land in the same
+        # millisecond, making stale_at == generated_at so the entry
+        # reads "fresh" instead of "stale". The premise here is that
+        # the entry was generated strictly before the invalidation.
+        time.sleep(0.005)
         assert cache.revalidate_tag(tag, expire=3600)
         assert cache.lookup(key) == ("stale", b"two")
         assert cache.revalidate_tag(tag, expire=0)

@@ -202,6 +202,24 @@ class CacheBackend:
     def insert(self, key, body, fresh_seconds, stale_seconds, tags=()):
         raise NotImplementedError
 
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
+        """Store ``body`` only if the entry version still equals
+        ``expected_version`` (``0`` when no entry existed, ``None`` for an
+        unfenced write). When an owner is given, its lease must still be live.
+
+        ``generated_at`` / ``generated_mono`` stamp the entry with the
+        render *start* time instead of the insert time, so a generation
+        that started before a tag invalidation but stored after it is
+        judged by when its content was produced. Backends that cannot use
+        a worker-local monotonic clock (Redis) accept ``generated_mono``
+        and ignore it. Every backend used as a shared store must accept
+        this full signature: :class:`ISRCache` passes both stamps
+        positionally, so a backend missing one raises TypeError on every
+        shared write.
+        """
+        raise NotImplementedError
+
     def remove(self, key):
         raise NotImplementedError
 
@@ -1282,10 +1300,16 @@ class ISRCache:
         retire matching local entries.
 
         Returns the number of local entries evicted plus in-flight
-        generations retired. A deferred ``expire`` demotes entries to
-        stale instead of evicting them, so it retires only in-flight
-        generations. Shared backends record the same invalidation in
-        their own manifest; this only touches process-local state.
+        generations retired. A deferred ``expire`` (greater than zero)
+        demotes entries to stale instead of evicting them, so it retires
+        only in-flight generations. ``expire=None`` and ``expire=0`` both
+        expire entries immediately — they record the identical manifest
+        row — so both evict matching entries from the local store; the
+        native (Axum) fast path serves the local store directly without
+        a tag check, so leaving an immediately-expired entry there
+        would keep serving it as fresh. Shared backends record the same
+        invalidation in their own manifest; this only touches
+        process-local state.
         """
         now = time.time()
         self._tag_manifest[tag] = (now, now if expire is None else now + expire)
@@ -1305,16 +1329,17 @@ class ISRCache:
             if tag in tags:
                 if self._inflight.pop(key, None) is not None:
                     evicted += 1
-                if expire is None and self.store.remove(key):
+                if (expire is None or expire == 0) and self.store.remove(key):
                     evicted += 1
         return evicted
 
     async def revalidate_tag(self, tag, expire=None):
         """Invalidate every cached entry carrying ``tag``.
 
-        ``expire=None`` expires matching entries immediately; ``expire``
-        seconds keeps them merely stale (served once more while a
-        regeneration runs in the background) until that delay passes.
+        ``expire=None`` (or ``0``) expires matching entries immediately;
+        a positive ``expire`` keeps them merely stale (served once more
+        while a regeneration runs in the background) until that delay
+        passes.
         Entries generated after this call are unaffected. Generations
         already in flight for a matching key are retired so they cannot
         refill the cache with pre-invalidation content. With a shared
@@ -1347,9 +1372,10 @@ class ISRCache:
         plus generations retired mid-render) instead of a boolean.
         Entries held by other workers are caught by the shared tag
         manifest on their next lookup, so the count is a local lower
-        bound, not a global total. A deferred ``expire`` demotes entries
-        to stale instead of evicting them, so it returns 0 for stored
-        entries (in-flight generations are still retired).
+        bound, not a global total. A deferred ``expire`` (greater than
+        zero) demotes entries to stale instead of evicting them, so it
+        returns 0 for stored entries (in-flight generations are still
+        retired).
         """
         tag = _validate_invalidation_tag(tag)
         expire = _validate_tag_expire(expire)

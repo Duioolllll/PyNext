@@ -65,6 +65,31 @@ def test_retired_generation_still_counts_toward_inflight_limit(monkeypatch):
     asyncio.run(run())
 
 
+def test_revalidate_tag_expire_zero_evicts_local_entry():
+    """Regression (PR #22 P1): expire=0 records the identical manifest
+    row as expire=None (stale_at == expired_at == now), so it must also
+    evict the entry from the local store. Otherwise the native (Axum)
+    fast path, which serves the local store without a tag check, keeps
+    serving the immediately-expired entry as fresh."""
+    async def run():
+        cache = ISRCache()
+        try:
+            async def old_render():
+                return Response("old")
+
+            async def new_render():
+                return Response("new")
+
+            assert await cache.get_or_render("/item", POLICY, old_render, tags=("post:42",)) == b"old"
+            assert cache.store.lookup("/item")[0] == "fresh"
+            assert await cache.revalidate_tag("post:42", expire=0)
+            assert cache.store.lookup("/item")[0] == "miss"
+            assert await cache.get_or_render("/item", POLICY, new_render, tags=("post:42",)) == b"new"
+        finally:
+            await cache.close()
+    asyncio.run(run())
+
+
 def test_close_cancels_invalidated_generation():
     async def run():
         cache = ISRCache()
@@ -149,4 +174,48 @@ def test_unattached_request_cannot_revalidate():
     async def run():
         with pytest.raises(RuntimeError, match="not attached"):
             await Request("GET", "/").revalidate("/news/a")
+    asyncio.run(run())
+
+
+def make_tagged_project(root):
+    page = root / "app" / "news" / "[slug]"
+    page.mkdir(parents=True)
+    (page / "page.py").write_text(
+        'from pynext import h, page\n'
+        'calls = 0\n'
+        '@page(render="isr", revalidate=30, tags=["post:42"])\n'
+        'async def Page(params):\n'
+        '    global calls\n'
+        '    calls += 1\n'
+        '    return h("p", {}, str(calls))\n', encoding="utf-8"
+    )
+    write_manifest(root)
+    return create_app(root, production=True)
+
+
+@pytest.mark.parametrize("mode", ["asgi", "axum"])
+def test_revalidate_tag_expire_zero_serves_new_content_in_both_modes(tmp_path, mode):
+    """Regression (PR #22 P1): after revalidate_tag(tag, expire=0) both
+    ASGI and Axum must serve regenerated content. Before the fix Axum
+    served the OLD entry from the native L1 fast path (no tag check)
+    because expire=0 left it in the store, while ASGI (which checks the
+    tag manifest) served NEW."""
+    app = make_tagged_project(tmp_path)
+
+    async def run():
+        server = None
+        if mode == "asgi":
+            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+        else:
+            server = start_native(app, asyncio.get_running_loop(), port=0)
+            client = httpx.AsyncClient(base_url=f"http://{server.address}", timeout=10)
+        try:
+            async with client:
+                assert (await client.get("/news/a")).text == page_html("<p>1</p>")
+                assert await app.revalidate_tag("post:42", expire=0)
+                assert (await client.get("/news/a")).text == page_html("<p>2</p>")
+        finally:
+            if server is not None:
+                await asyncio.to_thread(server.stop)
+            await app.isr.close()
     asyncio.run(run())

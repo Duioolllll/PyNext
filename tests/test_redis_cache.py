@@ -48,6 +48,32 @@ def test_redis_lease_fencing_expiry_and_invalidation(backend):
     assert cache.lookup(key) == ("miss", None)
 
 
+def test_redis_insert_fenced_accepts_generated_mono(backend):
+    """Regression (PR #22 P1): ISRCache._shared_store passes both
+    render-start stamps (generated_at, generated_mono) positionally;
+    the Redis backend must accept generated_mono (it only uses the
+    wall-clock stamp) or every Redis ISR save raises TypeError and
+    nothing is ever cached."""
+    cache, key = backend
+    assert cache.acquire_lease(key, "owner", ttl=60) == 0
+    assert cache.insert_fenced(key, b"body", 60, 60, 0, "owner",
+                               ["post:42"], time.time(), time.monotonic())
+    assert cache.lookup(key) == ("fresh", b"body")
+
+
+def test_redis_tag_judgment_uses_render_start_stamp(backend):
+    """The tag check judges an entry by when its content was produced:
+    an entry generated before an invalidation but stored after it is
+    expired by that invalidation."""
+    cache, key = backend
+    assert cache.acquire_lease(key, "owner", ttl=60) == 0
+    assert cache.insert_fenced(key, b"body", 60, 60, 0, "owner",
+                               ["post:42"], time.time() - 10, time.monotonic() - 10)
+    assert cache.lookup(key) == ("fresh", b"body")
+    assert cache.revalidate_tag("post:42", expire=0)
+    assert cache.lookup(key) == ("expired", None)
+
+
 def test_reopening_restores_redis_shared_backend(backend):
     observer, key = backend
 
