@@ -426,6 +426,11 @@ struct ServerState {
     connection_capacity: Arc<Semaphore>,
     per_ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
     max_connections_per_ip: usize,
+    // Trusted proxies (S-P1-18, M-8): the same list Python's ProxyTrust
+    // resolves X-Forwarded-For / Forwarded against. A peer in this list
+    // is exempt from the per-IP connection cap in the accept loop (see
+    // there for why); an empty list is the fail-closed default.
+    trusted_proxies: Vec<TrustedProxyNetwork>,
     // Bounds slow request headers and, because hyper applies it to every
     // header read on the connection, idle keep-alive time between requests.
     // Zero disables the timeout.
@@ -1926,6 +1931,92 @@ impl Drop for PerIpConnectionGuard {
     }
 }
 
+/// One trusted-proxy network (S-P1-18, M-8), parsed from the same
+/// `"IP"` / `"IP/prefix"` strings Python's `ProxyTrust` accepts, so the
+/// Rust accept loop and the Python forwarded-header resolution share one
+/// trust list (the Python side passes `app.proxy_trust` through
+/// `start_native`). No `ipnet` dependency: CIDR matching is a masked
+/// comparison on the address bits, in `std` only.
+struct TrustedProxyNetwork {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedProxyNetwork {
+    fn parse(value: &str) -> Result<Self, String> {
+        let invalid =
+            || format!("Invalid trusted proxy {value:?}: must be an IP address or CIDR network");
+        let (addr_text, prefix_text) = match value.split_once('/') {
+            Some((addr, prefix)) => (addr, Some(prefix)),
+            None => (value, None),
+        };
+        let addr: IpAddr = addr_text.parse().map_err(|_| invalid())?;
+        let addr = normalize_client_ip(addr);
+        let max_prefix = match addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        let prefix_len = match prefix_text {
+            Some(text) => text.parse::<u8>().map_err(|_| invalid())?,
+            None => max_prefix,
+        };
+        if prefix_len > max_prefix {
+            return Err(invalid());
+        }
+        Ok(Self {
+            network: mask_network(addr, prefix_len),
+            prefix_len,
+        })
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        let ip = normalize_client_ip(ip);
+        match (self.network, ip) {
+            (IpAddr::V4(network), IpAddr::V4(addr)) => {
+                mask_network(IpAddr::V4(addr), self.prefix_len) == IpAddr::V4(network)
+            }
+            (IpAddr::V6(network), IpAddr::V6(addr)) => {
+                mask_network(IpAddr::V6(addr), self.prefix_len) == IpAddr::V6(network)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// IPv4-mapped IPv6 (`::ffff:192.0.2.1`) counts as its IPv4 form, matching
+/// `pynext.proxy._normalize_ip`, so the same peer is not two different
+/// keys (and a mapped trusted proxy is recognised as trusted).
+fn normalize_client_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => ip,
+        },
+        ip => ip,
+    }
+}
+
+fn mask_network(ip: IpAddr, prefix_len: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(addr) => {
+            let mask = if prefix_len == 0 {
+                0u32
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            IpAddr::V4(std::net::Ipv4Addr::from(u32::from(addr) & mask))
+        }
+        IpAddr::V6(addr) => {
+            let mask = if prefix_len == 0 {
+                0u128
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
+            IpAddr::V6(std::net::Ipv6Addr::from(u128::from(addr) & mask))
+        }
+    }
+}
+
 /// The peer address of the TCP connection a request arrived on, carried in
 /// request extensions so dispatch can hand the client IP to the Python
 /// bridge. The Python rate limiter keys buckets on it (spec §11); without
@@ -2045,7 +2136,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, trusted_proxies=None))]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn new(
@@ -2083,6 +2174,7 @@ impl NativeServer {
         websocket_auth_callback: Option<Py<PyAny>>,
         http_rate_limit_callback: Option<Py<PyAny>>,
         path_headers: Option<Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>>,
+        trusted_proxies: Option<Vec<String>>,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -2130,6 +2222,14 @@ impl NativeServer {
                 "max_connections_per_ip is outside the supported range",
             ));
         }
+        // Trusted proxies (S-P1-18): invalid entries fail at startup, like
+        // Python's parse_trusted_proxies, instead of silently trusting
+        // nobody — or everybody.
+        let trusted_proxies = trusted_proxies
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| TrustedProxyNetwork::parse(&value).map_err(PyValueError::new_err))
+            .collect::<PyResult<Vec<_>>>()?;
         if static_pages
             .keys()
             .chain(public_assets.keys())
@@ -2256,6 +2356,7 @@ impl NativeServer {
                     connection_capacity: Arc::new(Semaphore::new(max_connections)),
                     per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
                     max_connections_per_ip,
+                    trusted_proxies,
                     header_read_timeout: Duration::from_millis(header_read_timeout_ms),
                     body_min_rate: body_min_rate_bytes_per_sec,
                     static_pages: static_pages
@@ -2316,14 +2417,9 @@ impl NativeServer {
                             // exists to answer yet. Both permits are held
                             // for the lifetime of the connection task.
                             // IPv4-mapped IPv6 addresses count under their
-                            // IPv4 form, matching the Python rate limiter.
-                            let peer_ip = match peer_addr.ip() {
-                                IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                                    Some(v4) => IpAddr::V4(v4),
-                                    None => peer_addr.ip(),
-                                },
-                                ip => ip,
-                            };
+                            // IPv4 form, matching the Python rate limiter
+                            // (pynext.proxy normalizes the same way).
+                            let peer_ip = normalize_client_ip(peer_addr.ip());
                             let total_permit = match limits
                                 .connection_capacity
                                 .clone()
@@ -2332,26 +2428,55 @@ impl NativeServer {
                                 Ok(permit) => permit,
                                 Err(_) => continue,
                             };
-                            let per_ip_admitted = {
-                                let mut counts = limits
-                                    .per_ip_connections
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                let count = counts.entry(peer_ip).or_insert(0);
-                                if *count >= limits.max_connections_per_ip {
-                                    false
-                                } else {
-                                    *count += 1;
-                                    true
+                            // Per-IP cap, trust-aware (S-P1-18, M-8): the
+                            // accept loop runs before any request is read,
+                            // so no X-Forwarded-For / Forwarded header
+                            // exists yet to resolve a client IP from — the
+                            // peer is the only identity available here.
+                            // Keying the cap on the peer is correct for a
+                            // direct client, but behind a trusted proxy
+                            // every user would share the proxy's single
+                            // 128-connection budget. A peer in
+                            // `trusted_proxies` (the same list Python's
+                            // ProxyTrust resolves forwarded headers
+                            // against) is therefore exempt from the per-IP
+                            // cap: the total connection cap still bounds
+                            // it, and per-client limits behind the proxy
+                            // are enforced at request time, where headers
+                            // exist — the Python rate limiter keys buckets
+                            // on the trust-resolved client IP, and an
+                            // untrusted peer's forwarded headers are
+                            // ignored there. Exempting an unlisted peer
+                            // would let any client mint unlimited
+                            // connections, so only a listed peer is exempt.
+                            let per_ip_guard = if limits
+                                .trusted_proxies
+                                .iter()
+                                .any(|network| network.contains(peer_ip))
+                            {
+                                None
+                            } else {
+                                let per_ip_admitted = {
+                                    let mut counts = limits
+                                        .per_ip_connections
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    let count = counts.entry(peer_ip).or_insert(0);
+                                    if *count >= limits.max_connections_per_ip {
+                                        false
+                                    } else {
+                                        *count += 1;
+                                        true
+                                    }
+                                };
+                                if !per_ip_admitted {
+                                    drop(total_permit);
+                                    continue;
                                 }
-                            };
-                            if !per_ip_admitted {
-                                drop(total_permit);
-                                continue;
-                            }
-                            let per_ip_guard = PerIpConnectionGuard {
-                                counts: Arc::clone(&limits.per_ip_connections),
-                                ip: peer_ip,
+                                Some(PerIpConnectionGuard {
+                                    counts: Arc::clone(&limits.per_ip_connections),
+                                    ip: peer_ip,
+                                })
                             };
                             let header_read_timeout = limits.header_read_timeout;
                             let service = HyperService {
@@ -2509,6 +2634,59 @@ mod tests {
                 .unwrap_or(Value::String(value));
             let mut output = String::new();
             let _ = render_node(&node, &mut output, 0, None);
+        }
+    }
+
+    // Trusted-proxy networks (S-P1-18, M-8): the accept loop's trust
+    // decision, mirroring pynext.proxy.parse_trusted_proxies.
+    #[test]
+    fn trusted_proxy_network_matches_host_and_cidr() {
+        let host = TrustedProxyNetwork::parse("127.0.0.1").unwrap();
+        assert!(host.contains("127.0.0.1".parse().unwrap()));
+        assert!(!host.contains("127.0.0.2".parse().unwrap()));
+        let cidr = TrustedProxyNetwork::parse("10.0.0.0/8").unwrap();
+        assert!(cidr.contains("10.1.2.3".parse().unwrap()));
+        assert!(cidr.contains("10.255.255.255".parse().unwrap()));
+        assert!(!cidr.contains("11.0.0.1".parse().unwrap()));
+        assert!(!cidr.contains("192.0.2.9".parse().unwrap()));
+        // A /32 is a single host; a /0 trusts the whole family.
+        assert!(TrustedProxyNetwork::parse("192.0.2.9/32")
+            .unwrap()
+            .contains("192.0.2.9".parse().unwrap()));
+        assert!(TrustedProxyNetwork::parse("0.0.0.0/0")
+            .unwrap()
+            .contains("203.0.113.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxy_network_handles_ipv6_and_mapped_ipv4() {
+        let v6 = TrustedProxyNetwork::parse("2001:db8::/32").unwrap();
+        assert!(v6.contains("2001:db8::1".parse().unwrap()));
+        assert!(!v6.contains("2001:db9::1".parse().unwrap()));
+        // IPv4-mapped IPv6 normalizes to IPv4 on both sides, matching
+        // pynext.proxy: a mapped trusted proxy and a mapped peer match.
+        let mapped = TrustedProxyNetwork::parse("::ffff:10.0.0.0/8").unwrap();
+        assert!(mapped.contains("10.1.2.3".parse().unwrap()));
+        assert!(mapped.contains("::ffff:10.1.2.3".parse().unwrap()));
+        let v4 = TrustedProxyNetwork::parse("10.0.0.0/8").unwrap();
+        assert!(v4.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!v4.contains("::ffff:11.0.0.1".parse().unwrap()));
+        // Families do not cross: an IPv4 network never matches IPv6.
+        assert!(!v4.contains("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxy_network_rejects_bad_entries() {
+        for bad in [
+            "not-an-ip",
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "10.0.0.0/",
+            "/8",
+            "",
+            "10.0.0.0/8/1",
+        ] {
+            assert!(TrustedProxyNetwork::parse(bad).is_err(), "{bad}");
         }
     }
 }

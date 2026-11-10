@@ -346,6 +346,24 @@ def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
         raise ValueError(f"shutdown_timeout must be a number between 0 and {MAX_SHUTDOWN_TIMEOUT} seconds")
 
 
+def _trusted_proxy_strings(app):
+    """Trusted-proxy networks for the native server, as strings (S-P1-18).
+
+    The app's :class:`pynext.proxy.ProxyTrust` is the single source of
+    truth; the native accept loop gets the same list so its per-IP
+    connection cap can exempt trusted peers. An app without a
+    ``proxy_trust`` (e.g. a test double) contributes no trusted proxies,
+    which is the fail-closed default.
+    """
+    trust = getattr(app, "proxy_trust", None)
+    if trust is None:
+        return ()
+    strings = getattr(trust, "trusted_proxy_strings", None)
+    if callable(strings):
+        return tuple(strings())
+    return tuple(str(network) for network in getattr(trust, "networks", ()))
+
+
 def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,
                  body_capacity=16, body_timeout_ms=10000, observability=None, *, reuse_port=False, listener=None,
                  max_connections=DEFAULT_MAX_CONNECTIONS,
@@ -574,7 +592,16 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 security_headers=security_headers(config=app.security,
                                                                   production=app.production),
                                 path_headers=app.path_headers.for_native(),
-                                drain_timeout_secs=shutdown_timeout)
+                                drain_timeout_secs=shutdown_timeout,
+                                # S-P1-18: the Rust accept loop enforces the
+                                # per-IP connection cap on the TCP peer only
+                                # (headers are not read yet), so it needs the
+                                # same trust list Python resolves XFF with.
+                                # A trusted peer is exempt from the per-IP cap
+                                # (total cap still applies); per-client limits
+                                # behind it are enforced at request time by
+                                # the trust-resolved rate limiter.
+                                trusted_proxies=_trusted_proxy_strings(app))
 
 
 async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,

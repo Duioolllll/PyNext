@@ -269,3 +269,165 @@ def test_forwarded_header_changes_rate_limit_bucket(tmp_path):
             # new buckets: covered by test_ratelimit's untrusted-peer tests.
         await app.isr.close()
     asyncio.run(run())
+
+
+async def _read_one_response(reader):
+    """Read one HTTP/1.1 response from a raw connection."""
+    status = await asyncio.wait_for(reader.readline(), timeout=5)
+    headers = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+    length = 0
+    for line in headers.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1].strip())
+    body = await asyncio.wait_for(reader.readexactly(length), timeout=5) if length else b""
+    return status, headers, body
+
+
+async def _open_idle_who(host, port, extra_headers=b""):
+    """Open a keep-alive connection, complete one request, leave it idle."""
+    reader, writer = await asyncio.open_connection(host, int(port))
+    writer.write(b"GET /api/who HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n"
+                 + extra_headers + b"\r\n")
+    await writer.drain()
+    status, _, _ = await _read_one_response(reader)
+    assert status.startswith(b"HTTP/1.1 200 "), status
+    return reader, writer
+
+
+async def _close_all(idle):
+    for _, writer in idle:
+        writer.close()
+    await asyncio.gather(*(w.wait_closed() for _, w in idle), return_exceptions=True)
+
+
+def test_trusted_proxy_peer_exempt_from_native_per_ip_connection_limit(tmp_path):
+    """S-P1-18 (M-8): behind a trusted proxy, all users arrive on the
+    proxy's one TCP peer IP. The native per-IP connection cap must not
+    count those connections against the proxy IP, or every user behind
+    the proxy would share a single 128-connection budget."""
+    _write_echo_app(tmp_path)
+
+    async def run():
+        app = create_app(tmp_path, trusted_proxies=["127.0.0.1"])
+        server = start_native(app, asyncio.get_running_loop(), port=0,
+                              max_connections=1024, max_connections_per_ip=2)
+        host, port = server.address.rsplit(":", 1)
+        idle = []
+        try:
+            # Three idle connections from the trusted loopback proxy,
+            # each for a different forwarded client: over the per-IP cap
+            # of 2 if the proxy IP itself were counted.
+            for client in ("203.0.113.7", "203.0.113.8", "203.0.113.9"):
+                idle.append(await _open_idle_who(
+                    host, port,
+                    f"X-Forwarded-For: {client}\r\n".encode("latin-1")))
+            assert len(idle) == 3
+        finally:
+            await _close_all(idle)
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())
+
+
+def test_untrusted_peer_native_per_ip_connection_limit_still_applies(tmp_path):
+    """S-P1-18: with no trusted proxies configured, the per-IP cap still
+    keys on the TCP peer — the trusted-peer exemption must not leak to
+    unlisted peers, or any client could mint unlimited connections."""
+    _write_echo_app(tmp_path)
+
+    async def run():
+        app = create_app(tmp_path)
+        server = start_native(app, asyncio.get_running_loop(), port=0,
+                              max_connections=1024, max_connections_per_ip=2)
+        host, port = server.address.rsplit(":", 1)
+        idle = []
+        try:
+            for _ in range(2):
+                idle.append(await _open_idle_who(host, port))
+            # Third connection from the same untrusted peer is over the
+            # per-IP cap: the server drops it at accept time (EOF/reset).
+            reader, writer = await asyncio.open_connection(host, int(port))
+            try:
+                writer.write(b"GET /api/who HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                await writer.drain()
+                first = await asyncio.wait_for(reader.readline(), timeout=5)
+                assert first == b"", first
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (ConnectionResetError, BrokenPipeError):
+                    pass
+        finally:
+            await _close_all(idle)
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())
+
+
+def test_native_rate_limit_uses_trusted_forwarded_client_ip(tmp_path):
+    """S-P1-18 (H-5): on the native server, the per-IP rate-limit bucket
+    must key on the trust-resolved client IP, not the proxy IP. With a
+    limit of 1 request, a second request from the same forwarded client
+    is 429 while a different forwarded client behind the same proxy
+    still gets its own bucket."""
+    _write_echo_app(tmp_path)
+
+    async def run():
+        app = create_app(tmp_path, trusted_proxies=["127.0.0.1"],
+                         rate_limit=RateLimiter(1, 60, trusted_proxies=["127.0.0.1"]))
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=5,
+                                         trust_env=False) as client:
+                first = await client.get("/api/who",
+                                         headers={"X-Forwarded-For": "203.0.113.7"})
+                assert first.status_code == 200
+                assert first.json()["ip"] == "203.0.113.7"
+                # Same forwarded client: bucket exhausted.
+                assert (await client.get("/api/who", headers={
+                    "X-Forwarded-For": "203.0.113.7"})).status_code == 429
+                # Different forwarded client behind the same proxy: own bucket.
+                other = await client.get("/api/who",
+                                         headers={"X-Forwarded-For": "203.0.113.8"})
+                assert other.status_code == 200
+                assert other.json()["ip"] == "203.0.113.8"
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())
+
+
+def test_native_rate_limit_ignores_xff_from_untrusted_peer(tmp_path):
+    """S-P1-18: without trusted proxies, a spoofed X-Forwarded-For must
+    not mint a fresh rate-limit bucket on the native server — every
+    request keys on the direct peer, so the second request is 429."""
+    _write_echo_app(tmp_path)
+
+    async def run():
+        app = create_app(tmp_path, rate_limit=RateLimiter(1, 60))
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=5,
+                                         trust_env=False) as client:
+                first = await client.get("/api/who",
+                                         headers={"X-Forwarded-For": "203.0.113.7"})
+                assert first.status_code == 200
+                assert first.json()["ip"] == "127.0.0.1"
+                spoofed = await client.get("/api/who",
+                                           headers={"X-Forwarded-For": "203.0.113.99"})
+                assert spoofed.status_code == 429
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())
+
+
+def test_proxy_trust_strings_round_trip_for_native_server():
+    """S-P1-18: the strings handed to the native server serialize the
+    parsed networks (CIDR kept as CIDR, single host as bare IP)."""
+    trust = ProxyTrust(["127.0.0.1", "10.0.0.0/8"])
+    assert trust.trusted_proxy_strings() == ("127.0.0.1", "10.0.0.0/8")
+    assert ProxyTrust().trusted_proxy_strings() == ()

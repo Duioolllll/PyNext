@@ -239,6 +239,24 @@ class ProxyTrust:
     def __init__(self, trusted_proxies=()):
         self.networks = parse_trusted_proxies(trusted_proxies)
 
+    def trusted_proxy_strings(self):
+        """Trusted networks as ``"IP"`` / ``"IP/prefix"`` strings.
+
+        S-P1-18: the native server's accept loop needs the same trust
+        list to decide whether a TCP peer is a proxy (see
+        ``pynext.server.start_native``). The strings round-trip through
+        the Rust parser, which accepts the same forms; this is only a
+        serialization of the already-parsed list, not a new trust rule.
+        A single host renders as a bare IP (``127.0.0.1``, not
+        ``127.0.0.1/32``); a real network keeps its prefix (``10.0.0.0/8``).
+        """
+        return tuple(
+            str(network.network_address)
+            if network.prefixlen == network.max_prefixlen
+            else str(network)
+            for network in self.networks
+        )
+
     def is_trusted(self, ip):
         """True when ``ip`` is in the trusted-proxy list."""
         if not self.networks or ip is None:
