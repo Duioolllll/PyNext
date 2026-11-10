@@ -66,62 +66,34 @@ def test_slow_request_bodies_do_not_hold_execution_or_static_capacity(tmp_path):
 
     async def run():
         app = create_app(tmp_path)
-        server = start_native(app, asyncio.get_running_loop(), port=0)
+        server = start_native(app, asyncio.get_running_loop(), port=0,
+                              body_capacity=2, body_capacity_per_ip=3,
+                              body_timeout_ms=5000, body_min_rate_bytes_per_sec=0)
         host, port = server.address.rsplit(":", 1)
         connections = []
         try:
             async def open_partial():
                 reader, writer = await asyncio.open_connection(host, int(port))
                 connections.append((reader, writer))
-                writer.write(b"POST /api/input HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\nx")
+                writer.write(b"POST /api/input HTTP/1.1\r\nHost: localhost\r\n"
+                             b"Content-Length: 100\r\nExpect: 100-continue\r\n\r\n")
                 await writer.drain()
+                # Continue is sent only after dispatch acquires a body slot
+                # and polls the body. Each connection is a confirmed holder.
+                interim = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+                assert interim.startswith(b"HTTP/1.1 100 Continue\r\n"), interim
 
-            await asyncio.gather(*(open_partial() for _ in range(64)))
-            async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=5) as client:
-                # Connections may be accepted before the server schedules each body read.
-                deadline = asyncio.get_running_loop().time() + 5
-                while True:
-                    response = await client.post("/api/input", content=b"x")
-                    if response.status_code == 503:
-                        break
-                    assert response.status_code == 200 and asyncio.get_running_loop().time() < deadline
-                    await asyncio.sleep(0.05)
+            await open_partial()
+            await open_partial()
+            async with httpx.AsyncClient(base_url=f"http://{server.address}",
+                                         trust_env=False, timeout=5) as client:
+                assert (await client.post("/api/input", content=b"x")).status_code == 503
                 assert (await client.get("/health.txt")).text == "healthy"
                 response = await client.get("/api/input")
                 assert response.status_code == 200 and response.json() == {"ok": True}
-                # Which partials actually hold a body slot is a scheduling
-                # race: the server dispatches the 64 connections in no
-                # guaranteed order, so connections[0] may have been
-                # rejected with an immediate 503 instead of holding a
-                # slot. A rejected connection already has its 503 status
-                # line buffered; a slot holder has sent nothing yet. Probe
-                # the earliest connections to find two confirmed holders:
-                # one to close (frees its slot) and one to keep open for
-                # the 408 assertion below.
-                async def holds_slot(index):
-                    reader, _ = connections[index]
-                    try:
-                        await asyncio.wait_for(reader.readline(), timeout=0.5)
-                        return False
-                    except asyncio.TimeoutError:
-                        return True
-
-                holders = []
-                probe = 0
-                while len(holders) < 2 and probe < len(connections):
-                    batch = list(range(probe, min(probe + 8, len(connections))))
-                    results = await asyncio.gather(
-                        *(holds_slot(i) for i in batch)
-                    )
-                    holders.extend(
-                        i for i, held in zip(batch, results) if held
-                    )
-                    probe += 8
-                assert len(holders) >= 2, holders
-                close_index, timeout_index = holders[0], holders[1]
                 # Closing a partial upload must promptly return its intake slot.
-                connections[close_index][1].close()
-                await connections[close_index][1].wait_closed()
+                connections[0][1].close()
+                await connections[0][1].wait_closed()
                 deadline = asyncio.get_running_loop().time() + 3
                 while True:
                     response = await client.post("/api/input", content=b"x")
@@ -129,9 +101,9 @@ def test_slow_request_bodies_do_not_hold_execution_or_static_capacity(tmp_path):
                         break
                     assert response.status_code == 503 and asyncio.get_running_loop().time() < deadline
                     await asyncio.sleep(0.05)
-                first_line = await asyncio.wait_for(connections[timeout_index][0].readline(), timeout=15)
+                first_line = await asyncio.wait_for(connections[1][0].readline(), timeout=10)
                 assert first_line.startswith(b"HTTP/1.1 408 "), first_line
-                headers = await asyncio.wait_for(connections[timeout_index][0].readuntil(b"\r\n\r\n"), timeout=2)
+                headers = await asyncio.wait_for(connections[1][0].readuntil(b"\r\n\r\n"), timeout=2)
                 assert b"connection: close\r\n" in headers.lower()
                 assert (await client.post("/api/input", content=b"x" * 1_048_577)).status_code == 413
                 assert (await client.request("GET", "/health.txt", content=b"x" * 1_048_577)).status_code == 413

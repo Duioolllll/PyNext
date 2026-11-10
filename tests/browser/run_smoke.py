@@ -137,8 +137,11 @@ def main():
         if mode == "uvicorn":
             return [server_python, "-m", "uvicorn", "--app-dir", str(ROOT / "tests/browser"),
                     "production_asgi:app", "--host", "127.0.0.1", "--port", str(port), "--no-access-log"]
+        # Keep the server in the Popen process: Windows terminate() cannot
+        # run supervisor cleanup for child workers. Supervisor lifecycle
+        # coverage lives in test_supervisor*.py.
         return [server_python, "-m", "pynext.cli", "start", "--dir", str(ROOT / "examples/basic"),
-                "--host", "127.0.0.1", "--port", str(port)]
+                "--host", "127.0.0.1", "--port", str(port), "--workers", "1"]
 
     with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as log:
         server = None
