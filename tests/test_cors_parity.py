@@ -26,7 +26,11 @@ def test_native_static_cors_matches_asgi(tmp_path, origins, credentials):
     async def exercise():
         app = create_app(tmp_path, production=True, security=SecurityConfig(
             cors_allowed_origins=origins, cors_allow_credentials=credentials))
-        server = start_native(app, asyncio.get_running_loop(), port=0)
+        # S-P1-19: the native server validates Host; this test sends
+        # Host: test, so allow it explicitly (the CORS parity being
+        # tested is orthogonal to host validation).
+        server = start_native(app, asyncio.get_running_loop(), port=0,
+                              allowed_hosts=["test"])
         try:
             async with httpx.AsyncClient(base_url=f"http://{server.address}") as native, \
                     httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as asgi:

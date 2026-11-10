@@ -244,6 +244,11 @@ def test_connection_limits_do_not_slow_normal_traffic(tmp_path):
         app = create_app(_app_dir(tmp_path))
         server = start_native(app, asyncio.get_running_loop(), port=0,
                               max_connections=64, max_connections_per_ip=64,
+                              # H-5/C-P0: the request-level per-IP cap
+                              # defaults to 16; this test fires 20 same-IP
+                              # requests at once and is about the connection
+                              # limits, so lift the request cap to match.
+                              max_concurrent_per_ip=64,
                               header_read_timeout_ms=10000,
                               body_min_rate_bytes_per_sec=1024)
         try:
@@ -270,7 +275,10 @@ def test_cli_connection_limit_flags_reach_serve(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli, "serve", serve)
+    # C-P0: `start` defaults to the supervisor path (workers=2); pin
+    # single-process so the fake serve() is reached at all.
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path),
+                                      "--workers", "1",
                                       "--max-connections", "7",
                                       "--max-connections-per-ip", "3",
                                       "--header-read-timeout-ms", "500",

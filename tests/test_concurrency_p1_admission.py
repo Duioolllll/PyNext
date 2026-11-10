@@ -107,7 +107,10 @@ def test_cli_stage_and_adaptive_timeouts_reach_serve(tmp_path, monkeypatch):
         seen.append(kwargs)
 
     monkeypatch.setattr(cli, "serve", serve)
+    # C-P0: `start` defaults to the supervisor path (workers=2); pin
+    # single-process so the fake serve() is reached at all.
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path),
+                                      "--workers", "1",
                                       "--acquire-timeout-max-ms", "5000",
                                       "--handler-timeout-ms", "5000",
                                       "--response-timeout-ms", "7000"])
@@ -134,9 +137,13 @@ def test_cli_defaults_keep_old_serve_call_shape(tmp_path, monkeypatch):
                      body_capacity, body_timeout_ms, shutdown_timeout, max_waiting))
 
     monkeypatch.setattr(cli, "serve", serve)
-    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path)])
+    # C-P0: `start` defaults to the supervisor path (workers=2); pin
+    # single-process so the fake serve() is reached at all. The expected
+    # values are the C-P0 defaults (128/3000), not the pre-C-P0 64/1000.
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path),
+                                      "--workers", "1"])
     cli.main()
-    assert seen == [(app, "127.0.0.1", 3000, 64, 1000, 16, 10000, 30, None)]
+    assert seen == [(app, "127.0.0.1", 3000, 128, 3000, 16, 10000, 30, None)]
 
 
 # -- DecisionGate stage naming (C-P1-7) -------------------------------------
@@ -307,7 +314,13 @@ def test_asgi_streaming_chunk_timeout_counts_stage(tmp_path):
     asyncio.run(exercise())
 
 
-def test_asgi_rate_limit_decision_failure_counts_admission_stage(tmp_path, monkeypatch):
+def test_asgi_rate_limit_decision_timeout_fails_open(tmp_path, monkeypatch):
+    # H-2 (S-P0-high) supersedes the C-P1-7 expectation that a slow
+    # decision 503s: a decision that cannot be produced must fail OPEN
+    # (a protection that cannot decide must not become a rejection
+    # device), and is counted under rate_limit.fail_open — not under
+    # stage_timeouts["admission"], which is reserved for decisions that
+    # were produced but invalid (or a backend failure).
     (tmp_path / "app" / "input").mkdir(parents=True)
     (tmp_path / "app/input/route.py").write_text(
         'from pynext import Response, route\n@route("POST")\n'
@@ -327,9 +340,9 @@ def test_asgi_rate_limit_decision_failure_counts_admission_stage(tmp_path, monke
         try:
             coro, sent = _asgi_request(app, path="/input", method="POST")
             await asyncio.wait_for(coro, 5)
-            assert sent[0]["status"] == 503
-            assert (b"retry-after", b"1") in sent[0]["headers"]
-            assert app.metrics.snapshot()["stage_timeouts"]["admission"] == 1
+            assert sent[0]["status"] == 200
+            assert app.metrics.snapshot()["rate_limit"]["fail_open"] == 1
+            assert app.metrics.snapshot()["stage_timeouts"]["admission"] == 0
         finally:
             release.set()
             await app.wait_for_inflight(3)

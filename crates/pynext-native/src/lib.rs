@@ -20,6 +20,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -3057,6 +3058,18 @@ fn mark_smuggling_request(buf: &mut Vec<u8>, end: usize, insert_at: usize) -> bo
 /// both headers, so a smuggled request cannot poison a reused
 /// connection; the first-request sniff additionally turns the
 /// still-executed handler run into a 400.
+///
+/// The hold-back is bounded by the same `header_read_timeout` hyper
+/// enforces once it sees bytes: the guard sits in front of hyper, so
+/// without its own deadline a client that never completes its first
+/// header block would starve hyper-util's auto-builder protocol sniff
+/// (`read_version` waits unboundedly for 24 bytes) and hyper's header
+/// read timeout would never get a chance to fire — the connection (and
+/// its accept-loop slot) would be held forever. When the deadline
+/// expires the guard fails closed with a timeout error, which aborts
+/// the connection; the partial block is never delivered uninspected, so
+/// a slow sender cannot bypass the smuggling scan. A zero timeout
+/// disables the bound, matching `header_read_timeout = 0`.
 struct SmugglingGuardIo<S> {
     inner: S,
     /// Bytes read from `inner` but not yet delivered to hyper.
@@ -3064,14 +3077,25 @@ struct SmugglingGuardIo<S> {
     /// The first header block has been inspected (or inspection was
     /// abandoned at EOF / over the size cap).
     inspected: bool,
+    /// Fires when the first header block has not completed within
+    /// `header_read_timeout` of the connection being accepted.
+    /// `None` when the timeout is disabled (zero).
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<S> SmugglingGuardIo<S> {
-    fn new(inner: S) -> Self {
+    fn new(inner: S, header_read_timeout: Duration) -> Self {
         Self {
             inner,
             pending: Vec::new(),
             inspected: false,
+            deadline: if header_read_timeout.is_zero() {
+                None
+            } else {
+                Some(Box::pin(tokio::time::sleep_until(
+                    tokio::time::Instant::now() + header_read_timeout,
+                )))
+            },
         }
     }
 }
@@ -3096,6 +3120,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SmugglingGuardIo<S> {
                     mark_smuggling_request(&mut this.pending, end, insert_at);
                     this.inspected = true;
                     break;
+                }
+                // Bound the hold-back (see the struct docs): a first
+                // header block that never completes must abort the
+                // connection instead of starving hyper's protocol sniff
+                // forever. Polling the sleep registers this task's waker,
+                // so the connection is re-polled at the deadline even if
+                // no more bytes arrive.
+                if let Some(deadline) = this.deadline.as_mut() {
+                    if deadline.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "first header block did not complete within header_read_timeout",
+                        )));
+                    }
                 }
                 let mut chunk = [0u8; 8192];
                 let mut chunk_buf = ReadBuf::new(&mut chunk);
@@ -3681,7 +3719,7 @@ impl NativeServer {
                             // parses it. The wrap happens here, outside the
                             // h2c/auto-builder setup below, and only changes
                             // the byte stream's first header block.
-                            let stream = SmugglingGuardIo::new(stream);
+                            let stream = SmugglingGuardIo::new(stream, header_read_timeout);
                             let mut stop_connection = connection_shutdown.subscribe();
                             // Auto-detect the protocol per connection: a
                             // client that opens with the HTTP/2
