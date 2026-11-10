@@ -84,5 +84,10 @@ def test_client_hydration_manifest_validation(tmp_path, esbuild):
     manifest = json.loads(path.read_text())
     manifest["client"]["hydration"]["counter"] = "yes"
     path.write_text(json.dumps(manifest))
+    # The edited manifest is a new build output, so its BUILD_ID must
+    # be refreshed too — otherwise load_manifest rejects it as an
+    # incomplete build before the client manifest is even checked.
+    from pynext.build import build_id_for
+    (tmp_path / ".pynext" / "BUILD_ID").write_text(build_id_for(path.read_bytes()) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Incompatible client manifest"):
         create_app(tmp_path, production=True)

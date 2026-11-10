@@ -186,7 +186,7 @@ def test_cli_max_waiting_reaches_serve(tmp_path, monkeypatch):
 def test_cli_builds_and_starts_with_requested_settings(tmp_path, monkeypatch, capsys):
     root = tmp_path.resolve()
     seen = []
-    monkeypatch.setattr(cli, "write_manifest", lambda path: seen.append(("build", path)) or {"routes": {"/": {}}})
+    monkeypatch.setattr(cli, "write_manifest", lambda path, **kwargs: seen.append(("build", path)) or {"routes": {"/": {}}})
     monkeypatch.setattr(sys, "argv", ["pynext", "build", "--dir", str(root)])
     cli.main()
     assert seen == [("build", root)]
@@ -232,7 +232,7 @@ def test_cli_shutdown_timeout_reaches_serve(tmp_path, monkeypatch):
 
 
 def test_cli_build_reports_manifest_errors_instead_of_traceback(tmp_path, monkeypatch, capsys):
-    def failing_manifest(path):
+    def failing_manifest(path, **kwargs):
         raise ValueError("Application sources changed during build; retry the build")
 
     monkeypatch.setattr(cli, "write_manifest", failing_manifest)

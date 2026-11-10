@@ -66,7 +66,7 @@ def _copy_site_packages(purelib, packages):
             shutil.copy2(item, target)
 
 
-def build_standalone(root, output):
+def build_standalone(root, output, *, lock_timeout=None):
     """Create a new bundle; existing output is never overwritten.
 
     Linux builds include the current interpreter, stdlib, installed Python
@@ -82,8 +82,15 @@ def build_standalone(root, output):
     manifest = root / ".pynext" / "manifest.json"
     if not manifest.is_file():
         raise ValueError("Build the project before creating a standalone directory")
-    from .build import load_manifest
-    built = load_manifest(root)
+    from .build import LOCK_TIMEOUT_SECONDS, BuildLock, load_manifest
+    # Serialize against concurrent builds: the copy must see one
+    # consistent, completed build, not a manifest mid-rewrite.
+    with BuildLock(root, timeout=LOCK_TIMEOUT_SECONDS if lock_timeout is None else lock_timeout):
+        built = load_manifest(root)
+        return _build_standalone_locked(root, output, built)
+
+
+def _build_standalone_locked(root, output, built):
     purelib = Path(sysconfig.get_path("purelib"))
     if purelib == Path(sysconfig.get_path("stdlib")):
         raise ValueError("Build standalone from an isolated Python environment")
@@ -169,6 +176,12 @@ def _populate_standalone(root, output, built, purelib, package):
     build.mkdir()
     manifest = root / ".pynext" / "manifest.json"
     _project_copy(manifest, build / "manifest.json")
+    # The bundle starts with load_manifest, which requires the BUILD_ID
+    # of a completed build; a bundle without it would never start.
+    build_id = root / ".pynext" / "BUILD_ID"
+    if not build_id.is_file():
+        raise ValueError("Missing BUILD_ID; run `pynext build` again")
+    _project_copy(build_id, build / "BUILD_ID")
     static = root / ".pynext" / "static"
     files = {f"{entry['sha256']}.html" for entry in built["static_pages"].values()}
     files.update(f"{entry['sha256']}.asset" for entry in built["assets"].values())
