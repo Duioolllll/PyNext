@@ -90,7 +90,14 @@ def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
                 assert (await client.get("/blog/alpha")).text == page_html(f"<p>alpha:{previous_calls + 1}</p>")
                 await until(lambda: "/blog/alpha" not in app.isr._inflight)
 
-                # Failure keeps the old response only until the stale window expires.
+                # C-2 (retainPreviousCacheEntry): a failed regeneration
+                # keeps serving the retained previous page even after
+                # the stale window expires, instead of a 500. The
+                # retained value is the last rendered page, not the
+                # directly seeded "<p>old</p>" body (which was never
+                # retained); the exact generation varies with
+                # background regenerations, so only the prefix is
+                # asserted.
                 assert app.isr.store.insert("/blog/alpha", b"<p>old</p>", 0.02, 1)
                 await until(lambda: app.isr.store.lookup("/blog/alpha")[0] == "stale")
                 module.started, module.gate, module.fail = asyncio.Event(), None, True
@@ -99,7 +106,9 @@ def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
                 await until(lambda: "/blog/alpha" not in app.isr._inflight)
                 assert app.isr.store.lookup("/blog/alpha")[0] == "stale"
                 await until(lambda: app.isr.store.lookup("/blog/alpha")[0] == "expired")
-                assert (await client.get("/blog/alpha")).status_code == 500
+                final = await client.get("/blog/alpha")
+                assert final.status_code == 200
+                assert final.text.startswith("<p>alpha:")
 
                 # One cancelled caller cannot cancel a shared generation.
                 module.fail = False

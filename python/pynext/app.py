@@ -2890,7 +2890,7 @@ class App:
                         encoded = json.dumps(query, ensure_ascii=True, separators=(",", ":")).encode("ascii")
                         cache_key = ("\0isr:" + hashlib.sha256(match_path.encode("utf-8")).hexdigest() + ":" +
                                      generation + ":" + hashlib.sha256(encoded).hexdigest())
-                    cache_before = self.isr.store.lookup(cache_key)[0]
+                    cache_before, retained_body = self.isr.store.lookup(cache_key)
                     self.metrics.observe_cache(cache_before)
                     policy = self.get_isr_policy(pattern)
                     if self.debug:
@@ -2913,6 +2913,22 @@ class App:
                     except CacheBusy:
                         self.metrics.observe_cache("busy")
                         self.metrics.observe_regeneration("failure")
+                        if retained_body is None:
+                            # C-2 retention: the store lookup above has
+                            # no body for an expired entry (the native
+                            # cache drops it on lookup), so ask the ISR
+                            # cache for the retained previous value.
+                            retained_body = await self.isr.retained_body(cache_key)
+                        if retained_body is not None:
+                            # C-2 retention: the server is too busy to
+                            # regenerate, not the page broken — serve
+                            # the previous value instead of failing the
+                            # request (stale-while-revalidate).
+                            return Response(
+                                retained_body, media_type="text/html; charset=utf-8", headers=[
+                                    (b"cache-control", b"public, max-age=0, must-revalidate"),
+                                    (b"vary", b"Cookie, Authorization"),
+                                ])
                         return Response("Server Busy", status=503,
                                         headers=[(b"retry-after", b"1")])
                     except SharedCacheUnavailable:
