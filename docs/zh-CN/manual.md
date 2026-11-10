@@ -24,6 +24,10 @@ uv run pynext start --dir examples/basic
 
 `pynext dev --dir examples/basic` 不经构建直接运行源码，并在 `app/`、`islands/`、`public/` 或 `pynext.config.py` 变化时在同一端口重启服务器。`pynext start` 使用构建 manifest；受跟踪的源码发生变化后必须重新构建。不使用 island 的应用不需要 Node 和 esbuild。以上说明通过仓库源码安装，并不表示项目已发布到 PyPI。
 
+### 构建模式
+
+普通的 `pynext build` 会同时执行 island 打包编译与静态页面生成两个阶段。`pynext build --only-islands` 仅编译 island，`pynext build --only-static` 仅使用此前编译结果生成静态页面。构建不完整时 `pynext start` 会指出缺失的阶段并拒绝启动。`pynext build --static-only` 会把 SSG 页面、public 资源和 island 包以普通文件形式导出到 `.pynext/export`（可用 `--export-dir` 更改），无需 PyNext 服务器即可用 `python -m http.server` 提供服务。含动态 SSR、ISR 或 API 路由的应用会被拒绝。详情请参阅英文手册。
+
 开发监视器使用原生文件通知和文件哈希，必要时回退到轮询。修改 JS/TS island 会重新构建并替换受影响的模块，无需刷新整个页面；旧清理函数会执行，该 island 的状态可能重置。修改其他源码会重启服务器并刷新打开的页面。错误修改保留上一个正常版本。`--port 0` 分配的端口在重启后保持不变。
 
 ## 项目结构和路由

@@ -24,6 +24,16 @@ http://127.0.0.1:3000/, /about, /guides/intro, /news/example, /hydrate, /strateg
 
 `pynext dev --dir examples/basic`는 빌드 없이 소스를 제공하며 `app/`·`islands/`·`public/`·`pynext.config.py` 변경 시 같은 포트로 서버를 다시 시작합니다. `pynext start`는 빌드 manifest를 사용하며 추적하는 소스가 바뀌면 재빌드를 요구합니다. island가 없는 앱에는 Node와 esbuild가 필요하지 않습니다. 설치 안내의 기준은 저장소 소스이며 PyPI 배포를 의미하지 않습니다.
 
+### 빌드 모드
+
+일반 `pynext build`는 두 빌드 단계를 모두 수행합니다. island 번들을 esbuild로 묶는 컴파일 단계와 정적 페이지를 렌더링하는 생성 단계입니다. 두 단계는 따로 실행할 수 있습니다(Next.js `experimentalBuildMode`의 `compile`/`generate` 분리 상당).
+
+- `pynext build --only-islands`는 island만 묶어 manifest를 갱신하고 정적 페이지는 렌더링하지 않습니다. 소스가 그대로면 이전 빌드의 정적 페이지를 재사용합니다. island 번들이 바뀌면 이전 페이지는 낡은 번들 digest를 포함하므로 stale이 되어, 페이지를 다시 렌더링할 때까지 manifest에서 생성 단계가 빠집니다.
+- `pynext build --only-static`은 이전 컴파일의 island 번들로 정적 페이지만 렌더링하고 esbuild를 다시 실행하지 않습니다. 이전 컴파일이 없거나 그 뒤 island 소스가 바뀌었으면 실패하므로, 그 경우 `--only-islands`를 먼저 실행합니다.
+- `pynext start`는 부분 빌드를 거부하고 빠진 단계를 알려주므로, 절반만 빌드된 앱이 실수로 서비스되지 않습니다.
+
+`pynext build --static-only`는 정적 전용 사이트를 내보냅니다. 렌더링된 SSG 페이지·public 자산·island 번들을 일반 파일로 배치합니다(페이지마다 `index.html` 하나, 자산은 URL 경로 그대로, 번들은 `_pynext/static/` 아래). 기본 출력은 `.pynext/export`(`--export-dir <dir>`로 변경 가능)이며, PyNext 서버 없이 `python -m http.server --directory <dir>`로 서빙할 수 있습니다. 의도적으로 좁은 모드이며 완전한 정적 내보내기가 아닙니다. 동적 SSR·ISR·API 라우트가 있는 앱은 조용히 빠뜨리는 대신 거부합니다. `--static-only`는 완전한 빌드를 먼저 수행하므로 `--only-islands`·`--only-static`·`--standalone`과 함께 쓸 수 없습니다.
+
 개발 감시기는 네이티브 파일 이벤트와 해시를 사용하고 필요하면 폴링으로 대체합니다. JS/TS island 수정은 영향받은 모듈만 다시 빌드해 문서 새로고침 없이 교체합니다. 이전 정리 함수가 호출되며 해당 island 상태는 초기화될 수 있습니다. 다른 소스 변경은 서버를 재시작하고 열린 문서를 새로고침합니다. 잘못된 수정은 이전 정상 버전을 유지합니다. `--port 0`으로 시작해도 재시작 시 처음 할당된 포트를 재사용합니다.
 
 ## 프로젝트 구조와 라우팅
