@@ -21,7 +21,9 @@ schema validation, in ``server/config.ts``):
 Validation follows the Next.js warning/fatal split (``config-schema.ts``
 + ``normalizeNextConfigZodErrors``): an unknown key is a warning and
 loading continues, while a wrong type, an out-of-range value or a bad
-security value (for example an invalid CSRF signing key) is a fatal
+security value (for example an invalid CSRF signing key, or
+``cors_allow_credentials=True`` together with a wildcard origin — see
+:func:`_check_cors_credentials_wildcard`) is a fatal
 :class:`ConfigError` and startup fails. All schema errors are collected
 and reported together, with the setting name and the source that set it.
 
@@ -349,6 +351,44 @@ def _cross_check(values, *, source):
     return warnings
 
 
+def _check_cors_credentials_wildcard(values, *, source):
+    """Reject the credentialed-wildcard CORS combination (S-P1-5).
+
+    ``cors_allow_credentials=True`` with ``"*"`` in
+    ``cors_allowed_origins`` lets *any* website read credentialed
+    (cookie / ``Authorization``) responses: the CORS middleware echoes
+    the request Origin back with ``Access-Control-Allow-Credentials:
+    true`` for both preflight and actual requests (``http.py:
+    _allow_origin_value``), so the browser accepts the response from
+    every origin. This is the Litestar trap (``litestar-security.md``
+    §2.7 item 1): Litestar performs no such check, and there a simple
+    request is echoed past a preflight that keeps the literal ``*``;
+    in PyNext the preflight echoes too, so the bypass is complete.
+
+    Rejected (a fatal :class:`ConfigError`, so startup fails) rather
+    than warned about, for three reasons:
+
+    1. The combination has no legitimate use: "allow every origin with
+       credentials" cannot be expressed safely. The intent is always
+       either a wildcard *without* credentials, or explicit origins
+       *with* credentials — both keep working.
+    2. A warning is too easy to miss in server logs while the app keeps
+       serving the vulnerable configuration.
+    3. It fits this loader's existing fatal/warning split: like an
+       invalid CSRF signing key, a bad security value fails startup.
+
+    The check runs on the merged config (file → env → CLI) because the
+    two halves of the combination can arrive from different layers —
+    per-value validation cannot see it.
+    """
+    if values.cors_allow_credentials and "*" in values.cors_allowed_origins:
+        raise ConfigError(
+            f"{source}: 'cors_allow_credentials' is True with wildcard origin "
+            f"'*' in 'cors_allowed_origins': any website could read "
+            f"credentialed responses. List explicit origins in "
+            f"'cors_allowed_origins', or set 'cors_allow_credentials' to False.")
+
+
 def find_config_file(root):
     """Return the project's ``pynext.config.py`` path, or ``None``.
 
@@ -433,6 +473,8 @@ def load_config(root, phase, *, cli_overrides=None, env=None):
         sources[key] = "cli"
 
     values = PyNextConfig(**merged)
+    _check_cors_credentials_wildcard(
+        values, source=str(config_file) if config_file else "config")
     warnings.extend(_cross_check(values, source=str(config_file) if config_file else "config"))
     return ResolvedConfig(values=values, warnings=tuple(warnings),
                           config_file=config_file, phase=phase,

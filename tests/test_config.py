@@ -198,6 +198,54 @@ def test_load_config_cross_check_warnings(tmp_path):
     assert "each worker keeps its own ISR cache" in resolved.warnings[1]
 
 
+# -- S-P1-5: CORS credentialed-wildcard combination ----------------------------
+
+def test_load_config_rejects_cors_credentials_with_wildcard_origin(tmp_path):
+    # credentials + "*" lets any website read credentialed responses
+    # (the middleware echoes the request Origin), so startup must fail.
+    write_config(tmp_path,
+                 "config = {'cors_allowed_origins': ['*'], 'cors_allow_credentials': True}\n")
+    with pytest.raises(ConfigError) as error:
+        load_config(tmp_path, "dev", env={})
+    message = str(error.value)
+    assert "'cors_allow_credentials' is True with wildcard origin '*'" in message
+    assert "List explicit origins" in message
+
+
+def test_load_config_rejects_cors_credentials_with_wildcard_among_origins(tmp_path):
+    # "*" anywhere in the list is a wildcard, even next to explicit origins.
+    write_config(tmp_path,
+                 "config = {'cors_allowed_origins': ['https://example.com', '*'], "
+                 "'cors_allow_credentials': True}\n")
+    with pytest.raises(ConfigError):
+        load_config(tmp_path, "dev", env={})
+
+
+def test_load_config_rejects_cors_dangerous_combo_across_layers(tmp_path):
+    # The two halves can arrive from different layers: the file sets the
+    # wildcard, the CLI turns credentials on. Only the merged config shows it.
+    write_config(tmp_path, "config = {'cors_allowed_origins': ['*']}\n")
+    with pytest.raises(ConfigError):
+        load_config(tmp_path, "dev", env={},
+                    cli_overrides={"cors_allow_credentials": True})
+
+
+@pytest.mark.parametrize("raw", [
+    # Wildcard without credentials: a public API, no credentialed reads.
+    "{'cors_allowed_origins': ['*']}",
+    # Credentials with explicit origins only: the safe spelling.
+    "{'cors_allowed_origins': ['https://example.com'], 'cors_allow_credentials': True}",
+    # Credentials with no origins at all: deny-all, nothing to echo.
+    "{'cors_allow_credentials': True}",
+    # Wildcard next to explicit origins, without credentials.
+    "{'cors_allowed_origins': ['*', 'https://example.com']}",
+])
+def test_load_config_accepts_safe_cors_combinations(tmp_path, raw):
+    write_config(tmp_path, f"config = {raw}\n")
+    resolved = load_config(tmp_path, "dev", env={})
+    assert not any("cors" in warning.lower() for warning in resolved.warnings)
+
+
 def test_load_config_rejects_unknown_phase(tmp_path):
     with pytest.raises(ValueError, match="phase must be one of"):
         load_config(tmp_path, "test", env={})
