@@ -100,10 +100,31 @@ def test_header_order_and_case_do_not_change_key():
     assert generate_fetch_cache_key(
         URL, headers=[(b"A", b"1"), (b"B", b"2")]
     ) == first
-    # Duplicate names keep the last value.
+    # Duplicate names are joined with ", " (cookie uses "; "), not
+    # overwritten — see test_duplicate_cookie_headers_produce_distinct_keys.
     assert generate_fetch_cache_key(
         URL, headers=[("A", "stale"), ("A", "1"), ("B", "2")]
-    ) == first
+    ) == generate_fetch_cache_key(URL, headers={"A": "stale, 1", "B": "2"})
+
+
+def test_duplicate_cookie_headers_produce_distinct_keys():
+    """Regression: duplicate header names kept only the last value, so
+    ``cookie: session=A`` + ``cookie: theme=dark`` and ``cookie:
+    session=B`` + ``cookie: theme=dark`` collapsed to the same key.
+    HTTP/2 can split cookies across several headers, so this is a real
+    collision. Duplicates are joined (", " generally, "; " for cookie)."""
+    key_a = generate_fetch_cache_key(
+        URL, headers=[("cookie", "session=A"), ("cookie", "theme=dark")])
+    key_b = generate_fetch_cache_key(
+        URL, headers=[("cookie", "session=B"), ("cookie", "theme=dark")])
+    assert key_a != key_b
+    # The joined form equals the single-header spelling.
+    assert key_a == generate_fetch_cache_key(
+        URL, headers={"cookie": "session=A; theme=dark"})
+    # Non-cookie duplicates join with ", ".
+    assert generate_fetch_cache_key(
+        URL, headers=[("X-A", "1"), ("X-A", "2")]) == generate_fetch_cache_key(
+        URL, headers={"X-A": "1, 2"})
 
 
 def test_body_tagging_keeps_shapes_apart():
@@ -306,6 +327,24 @@ def test_auto_no_cache_from_auth_cookie_or_method_when_route_is_zero():
         assert decision.reason == "auto no cache", kwargs
         # Auto-no-cache never makes the page dynamic by itself.
         assert decision.dynamic is False, kwargs
+
+
+def test_get_is_a_cacheable_method():
+    """Regression: ``method.lower()`` was compared against the
+    upper-case set ``{"GET", "HEAD"}``, so even GET was treated as an
+    uncacheable method. A GET with revalidate=0 and route=0 makes the
+    page dynamic (an explicit revalidate=0, not auto-no-cache)."""
+    decision = decide_fetch_cache(revalidate=0, route_revalidate=0, method="GET")
+    assert decision.revalidate == 0
+    assert decision.dynamic is True
+    assert decide_fetch_cache(
+        revalidate=0, route_revalidate=0, method="HEAD").dynamic is True
+    # POST stays uncacheable: auto-no-cache, never dynamic-making.
+    assert decide_fetch_cache(
+        revalidate=0, route_revalidate=0, method="POST").dynamic is False
+    # Lower-case methods work too (the comparison is case-insensitive).
+    assert decide_fetch_cache(
+        revalidate=0, route_revalidate=0, method="get").dynamic is True
 
 
 def test_no_explicit_config_is_auto_no_cache_unless_build_time():

@@ -309,6 +309,61 @@ def test_sqlite_workers_share_tag_invalidation(tmp_path):
     asyncio.run(run())
 
 
+def test_sqlite_slow_generation_started_before_invalidation_is_not_fresh(tmp_path):
+    """Regression: a generation that started before a ``revalidate_tag``
+    but stored after it must not come back as fresh. Its content
+    predates the invalidation, so the tag check must use the render
+    *start* time, not the insert time — otherwise the other worker's
+    invalidation is silently undone by the late store."""
+    async def run():
+        path = tmp_path / "cache.sqlite3"
+        first = ISRCache(cache_backend="sqlite", cache_path=path)
+        second = ISRCache(cache_backend="sqlite", cache_path=path)
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def slow_render():
+            started.set()
+            await release.wait()
+            return Response("old")
+
+        async def new_render():
+            return Response("new")
+
+        # Worker B starts a slow render.
+        task = asyncio.create_task(
+            second.get_or_render("/a", POLICY, slow_render, tags=("post:42",)))
+        await asyncio.wait_for(started.wait(), 3)
+        # Worker A invalidates while B is still rendering.
+        assert await first.revalidate_tag("post:42") is True
+        release.set()
+        assert await task == b"old"
+        # B's stored entry predates the invalidation, so the next
+        # lookup must not serve it as fresh — it regenerates.
+        assert await second.get_or_render("/a", POLICY, new_render, tags=("post:42",)) == b"new"
+        await first.close()
+        await second.close()
+    asyncio.run(run())
+
+
+def test_memory_tag_manifest_is_pruned():
+    """The process-local tag manifest must not grow without bound:
+    rows older than any live entry (see the SQLite backend's prune)
+    are dropped when a new invalidation lands."""
+    from pynext.cache import MAX_CACHE_SECONDS
+
+    async def run():
+        cache = ISRCache()
+        old = time.time() - 3 * MAX_CACHE_SECONDS
+        cache._tag_manifest["old:1"] = (old, old)
+        cache._tag_manifest["old:2"] = (old, old + 1)
+        assert await cache.revalidate_tag("post:42") is True
+        assert "old:1" not in cache._tag_manifest
+        assert "old:2" not in cache._tag_manifest
+        assert "post:42" in cache._tag_manifest
+        await cache.close()
+    asyncio.run(run())
+
+
 # --- Redis backend (skipped without PYNEXT_TEST_REDIS_URL) -----------------
 
 URL = os.environ.get("PYNEXT_TEST_REDIS_URL")
