@@ -1581,7 +1581,7 @@ class App:
         return await asyncio.to_thread(_native.render, payload)
 
 
-    async def _layout_shell(self, pattern, layouts):
+    async def _layout_shell(self, pattern, layouts, request=None):
         """Return the cached layout shell entry for ``pattern``.
 
         The entry holds the layouts applied once to a marker text node
@@ -1592,6 +1592,13 @@ class App:
         out with ``@layout(dynamic=True)``, in which case this returns
         None and the caller renders the shell on every request. Returns
         the entry dict, or None for dynamic layouts.
+
+        ``request`` is threaded through to the layout invocations so a
+        sync layout runs under the sync-worker limit (``_invoke_sync``)
+        exactly as it did before shell caching; without it the layout
+        would run on a bare worker thread, bypassing the limit and its
+        tracking counter. Prerenders pass None and keep the old bypass,
+        as they did before caching existed.
         """
         if self._layout_shell_dynamic.get(pattern, False):
             return None
@@ -1612,7 +1619,7 @@ class App:
                 marker = "__pynext_shell_" + uuid.uuid4().hex + "__"
             shell = {"kind": "text", "value": marker}
             for layout_fn in reversed(layouts):
-                shell = await _invoke(layout_fn, children=shell)
+                shell = await _invoke(layout_fn, children=shell, request=request)
                 if not isinstance(shell, dict):
                     raise TypeError(
                         f"Layout for {pattern} must return a render node dict, "
@@ -1665,7 +1672,7 @@ class App:
             entry["prefix"], entry["suffix"] = prefix, suffix
             return prefix, suffix
 
-    async def _streaming_page_response(self, pattern, chunks, layouts, tracker=None):
+    async def _streaming_page_response(self, pattern, chunks, layouts, tracker=None, request=None):
         """Wrap an async iterable of UI nodes in a StreamingResponse.
 
         The layout shell is rendered once per route and cached; the
@@ -1680,8 +1687,12 @@ class App:
         When ``tracker`` is given, the stream owns it: ``page_stream()``
         exits it when the body is fully consumed or the stream is closed,
         so dynamic accesses in later chunks are still recorded.
+
+        ``request`` is threaded through to the layout invocations (see
+        :meth:`_layout_shell`) so sync layouts stay under the
+        sync-worker limit; prerenders pass None.
         """
-        entry = await self._layout_shell(pattern, layouts)
+        entry = await self._layout_shell(pattern, layouts, request)
         if entry is None:
             # The marker is framework-generated, not a page read: suppress
             # it so it is never misreported as the page being dynamic.
@@ -1689,7 +1700,7 @@ class App:
                 marker = "__pynext_stream_" + uuid.uuid4().hex + "__"
             shell = {"kind": "text", "value": marker}
             for layout_fn in reversed(layouts):
-                shell = await _invoke(layout_fn, children=shell)
+                shell = await _invoke(layout_fn, children=shell, request=request)
                 if not isinstance(shell, dict):
                     raise TypeError(
                         f"Layout for {pattern} must return a render node dict, "
@@ -1827,11 +1838,12 @@ class App:
         else:
             result = await _invoke(fn, request=request, params=params, query=query)
         if hasattr(result, "__aiter__"):
-            return await self._streaming_page_response(pattern, result, layouts, tracker=tracker)
+            return await self._streaming_page_response(pattern, result, layouts, tracker=tracker,
+                                                       request=request)
         tree = result
         if not isinstance(tree, dict):
             raise TypeError(f"Page {pattern} must return a render node dict, got {type(tree).__name__}")
-        entry = await self._layout_shell(pattern, layouts)
+        entry = await self._layout_shell(pattern, layouts, request)
         if entry is None:
             # Dynamic layouts: render the shell on every request.
             for layout_fn in reversed(layouts):
@@ -2200,16 +2212,22 @@ class App:
                     # Classify the outcome before rendering: a fresh entry is
                     # a hit, a stale entry is served while one regeneration
                     # runs in the background, a miss renders synchronously.
-                    cache_key = path
+                    # The cache key is the routing-normalized path, not
+                    # the fully decoded one: "/files/a%2Fb" and
+                    # "/files/a/b" are different routes (different
+                    # patterns and params) and must not share an entry.
+                    # The normalized form is also what revalidate() sees
+                    # for an encoded URL, so invalidation still matches.
+                    cache_key = match_path
                     if self.isr_queries[pattern]:
                         try:
-                            generation, _ = await self.isr.variant_generation(path)
+                            generation, _ = await self.isr.variant_generation(match_path)
                         except SharedCacheUnavailable:
                             self.metrics.observe_regeneration("failure")
                             return Response("Service Unavailable", status=503,
                                             headers=[(b"retry-after", b"1")])
                         encoded = json.dumps(query, ensure_ascii=True, separators=(",", ":")).encode("ascii")
-                        cache_key = ("\0isr:" + hashlib.sha256(path.encode("utf-8")).hexdigest() + ":" +
+                        cache_key = ("\0isr:" + hashlib.sha256(match_path.encode("utf-8")).hexdigest() + ":" +
                                      generation + ":" + hashlib.sha256(encoded).hexdigest())
                     cache_before = self.isr.store.lookup(cache_key)[0]
                     self.metrics.observe_cache(cache_before)
@@ -2221,6 +2239,13 @@ class App:
                         # declared policy.
                         policy = dev_retention_policy(policy)
                     try:
+                        # Implicit path tags stay on the decoded path:
+                        # the tag charset (letters, digits, "_", ".",
+                        # "/", ":", "-") rejects "%", so a normalized
+                        # tag such as "_pynext_path_/files/a%2Fb" would
+                        # fail validation and 500 the request. Key
+                        # invalidation above still reaches the entry
+                        # because the key itself is the normalized path.
                         tags = (tuple(self.isr_tags.get(pattern, ())) +
                                 tuple(_implicit_path_tags(path)))
                         body = await self._render_isr_cached(pattern, params, query, cache_key, policy, tags)
@@ -2592,12 +2617,19 @@ class App:
         request = None
         try:
             path, encoded_path = _split_request_path(scope["path"], scope.get("raw_path"))
-        except (ValueError, UnicodeError):
+            # Admission uses the routing-normalized path (Next.js
+            # decodePathParams): an encoded delimiter stays one segment,
+            # so "/free%2Fblocked" is not under "/free" even though its
+            # fully decoded form "/free/blocked" is. Exemption must agree
+            # with the handler routing actually serves, or an encoded
+            # path escapes the limiter while reaching another handler.
+            match_path = _normalize_path_for_matching(encoded_path)
+        except (ValueError, UnicodeError, BadRequest):
             response = Response("Bad Request", status=400)
         else:
             # Liveness/readiness remain available when decision slots are full.
-            denied = (None if path in ("/healthz", "/readyz") else
-                      await self._rate_limit_denied(scope, path))
+            denied = (None if match_path in ("/healthz", "/readyz") else
+                      await self._rate_limit_denied(scope, match_path))
             if denied is not None:
                 if scope["method"].upper() == "HEAD":
                     denied.body = b""

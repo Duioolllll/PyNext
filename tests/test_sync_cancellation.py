@@ -161,6 +161,63 @@ def test_cancelled_sync_work_keeps_capacity_until_thread_finishes(tmp_path, monk
     asyncio.run(exercise())
 
 
+def test_sync_layouts_share_the_sync_worker_limit(tmp_path):
+    """Sync layouts run under the sync-worker limit, like sync handlers.
+
+    With sync_workers=1, a second concurrent request whose layout shell
+    is still being computed must be refused with 503, and the tracking
+    counter must show the first layout occupying the slot. Before the
+    shell cache threaded the request through, layouts ran on a bare
+    worker thread: both executed at once and the counter stayed 0.
+    """
+    for route in ("a", "b"):
+        folder = tmp_path / "app" / route
+        folder.mkdir(parents=True)
+        (folder / "layout.py").write_text(
+            'from pynext import layout, h\n'
+            'import threading\n'
+            'entered = threading.Event()\nrelease = threading.Event()\n'
+            '@layout()\n'
+            'def Layout(children):\n'
+            '    entered.set()\n'
+            '    release.wait(10)\n'
+            '    return h("div", {}, children)\n',
+            encoding="utf-8",
+        )
+        (folder / "page.py").write_text(
+            'from pynext import h, page\n'
+            '@page()\ndef Page(): return h("p", {}, "ok")\n',
+            encoding="utf-8",
+        )
+
+    async def run():
+        app = create_app(tmp_path, sync_workers=1)
+        mod_a = mod_b = None
+        try:
+            mod_a = app._module("app/a/layout.py")
+            mod_b = app._module("app/b/layout.py")
+            async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                first = asyncio.create_task(client.get("/a"))
+                await asyncio.to_thread(mod_a.entered.wait, 5)
+                assert mod_a.entered.is_set()
+                assert app._sync_active == 1
+                second = asyncio.create_task(client.get("/b"))
+                await asyncio.sleep(0.5)
+                assert not mod_b.entered.is_set()
+                mod_a.release.set()
+                mod_b.release.set()
+                assert (await first).status_code == 200
+                assert (await second).status_code == 503
+        finally:
+            for mod in (mod_a, mod_b):
+                if mod is not None:
+                    mod.release.set()
+            await app.shutdown()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("workers", [0, -1, True, 1.5, 1025])
 def test_sync_capacity_is_validated(tmp_path, workers):
     (tmp_path / "app").mkdir()
