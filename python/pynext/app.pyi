@@ -26,6 +26,8 @@ class App:
     middleware: tuple[Middleware, ...]
     middleware_scopes: tuple[Scope | None, ...]
     header_rules: tuple[HeaderRule, ...]
+    base_path: str
+    trailing_slash: Literal["redirect", "ignore"]
     def __init__(self, root: str | PathLike[str], manifest: dict[str, Any], *, production: bool = ...,
                  security: SecurityConfig | None = ..., cache_backend: Literal["memory", "sqlite", "redis"] = ...,
                  cache_path: str | PathLike[str] | None = ..., observability: ObservabilityConfig | None = ...,
@@ -37,7 +39,8 @@ class App:
                  websocket_max_message: int = ..., hot_reload: bool = ...,
                  trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...,
                  strict_ssg: bool = ...,
-                 revalidate_secret: str | None = ...) -> None: ...
+                 revalidate_secret: str | None = ...,
+                 base_path: str = ..., trailing_slash: Literal["redirect", "ignore"] = ...) -> None: ...
     def configure_observability(self, config: ObservabilityConfig) -> App: ...
     async def startup(self) -> None: ...
     async def shutdown(self) -> None: ...
@@ -72,4 +75,5 @@ def create_app(root: str | PathLike[str] = ..., *, production: bool = ...,
                websocket_max_message: int = ..., hot_reload: bool = ...,
                trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...,
                strict_ssg: bool = ...,
-               revalidate_secret: str | None = ...) -> App: ...
+               revalidate_secret: str | None = ...,
+               base_path: str = ..., trailing_slash: Literal["redirect", "ignore"] = ...) -> App: ...

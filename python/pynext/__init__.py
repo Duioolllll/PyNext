@@ -36,7 +36,7 @@ from .proxy import ProxyTrust, ResolvedProxy, parse_trusted_proxies
 from .pubsub import PubSubOverflow, WebSocketPubSub
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
-from .routing import route, websocket
+from .routing import add_base_path, preprocess_pathname, route, url_for, websocket
 from .sessions import RedisSessionStore, Session, SessionMiddleware, SQLiteSessionStore
 
 __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layout", "model_prop", "page", "route", "websocket", "Database",
@@ -60,4 +60,5 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "no_store", "mark_dynamic_access", "StaticGenBailoutError", "is_prerender_bailout",
            "FetchCacheDecision", "apply_fetch_revalidate", "decide_fetch_cache", "fetch_cache_store_key",
            "generate_fetch_cache_key", "generate_simple_fetch_cache_key",
-           "MiddlewareScope", "RouteHas", "scoped"]
+           "MiddlewareScope", "RouteHas", "scoped",
+           "url_for", "preprocess_pathname", "add_base_path"]

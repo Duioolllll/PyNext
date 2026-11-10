@@ -111,6 +111,9 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `MiddlewareScope` | `pynext.middleware` |
 | `RouteHas` | `pynext.middleware` |
 | `scoped` | `pynext.middleware` |
+| `url_for` | `pynext.routing` |
+| `preprocess_pathname` | `pynext.routing` |
+| `add_base_path` | `pynext.routing` |
 
 ## Security defaults (`SecurityConfig`)
 

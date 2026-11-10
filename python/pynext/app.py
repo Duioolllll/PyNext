@@ -66,6 +66,7 @@ from .observability import (
 )
 from .proxy import ProxyTrust
 from .ratelimit import _is_exempt_path, rate_limited_response
+from .routing import normalize_base_path, preprocess_pathname, validate_trailing_slash
 from .sessions import SessionMiddleware
 from .static import asset_response
 from .ws_origin import websocket_origin_allowed
@@ -721,7 +722,7 @@ class App:
                  resources=None, cache_url=None, cache_failure_policy=None, cache_handler=None,
                  websocket_max_message=DEFAULT_CONFIG.websocket_max_message, hot_reload=False,
                  trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None,
-                 revalidate_secret=None):
+                 revalidate_secret=None, base_path="", trailing_slash="redirect"):
         if isinstance(sync_workers, bool) or not isinstance(sync_workers, int) or not 1 <= sync_workers <= 1024:
             raise ValueError("sync_workers must be an integer from 1 to 1024")
         self.sync_workers = sync_workers
@@ -732,6 +733,13 @@ class App:
                 not isinstance(revalidate_secret, str) or not revalidate_secret):
             raise ValueError("revalidate_secret must be a non-empty string")
         self.revalidate_secret = revalidate_secret
+        # Path preprocessing (REPORT.md §2.3 P2, track A §2.8): the base
+        # path is stripped before route matching and re-added by
+        # url_for(); the trailing-slash policy names the 308 behaviour
+        # that used to be hardcoded in _dispatch. Both are validated
+        # here so a bad deployment fails at startup.
+        self.base_path = normalize_base_path(base_path)
+        self.trailing_slash = validate_trailing_slash(trailing_slash)
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
         if not isinstance(strict_ssg, bool):
@@ -1621,14 +1629,18 @@ class App:
         (``"/"`` is the root layout, so it covers all pages). A dynamic
         pattern without ``type`` only warns and invalidates nothing, like
         Next.js ``revalidatePath``. ``"/"`` and ``"/index"`` are aliases.
-        Returns True when at least one entry (or query-variant generation)
-        was invalidated.
+        A base-path-prefixed path is accepted and stripped first, so
+        operators can pass the public URL. Returns True when at least
+        one entry (or query-variant generation) was invalidated.
         """
         if type is not None and type not in ("page", "layout"):
             raise ValueError("revalidate type must be 'page' or 'layout'")
         if not isinstance(path, str):
             raise TypeError("ISR path must be a string")
         path = _decode_path(path)
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash="redirect")
+        if path is None:
+            raise ValueError("Path does not match an ISR page")
         if path != "/" and path.endswith("/"):
             raise ValueError("ISR path must not have a trailing slash")
         if _is_dynamic_pattern(path):
@@ -2706,7 +2718,6 @@ class App:
         # encoded delimiter stays one segment. The encoded path is kept
         # for the trailing-slash redirect so the encoding is preserved.
         encoded_path = request.raw_path or request.path
-        match_path = _normalize_path_for_matching(encoded_path)
         if self.hot_reload and path == "/_pynext/dev/client":
             route_var.set("__dev__")
             if request.method not in {"GET", "HEAD"}:
@@ -2716,14 +2727,31 @@ class App:
             if request.method == "HEAD":
                 response.body = b""
             return response
+        # Path preprocessing (track A §2.8): strip the base path before
+        # matching, then apply the trailing-slash policy. Everything
+        # below — route matching, `/_pynext/` assets, public files,
+        # SSG/ISR lookups — sees the app-relative path. The raw path
+        # is kept for the 308 Location, so the prefix survives the
+        # redirect. A path outside the base path is a plain 404.
+        # Matching still runs on the normalized encoded form (see the
+        # comment above), computed from the stripped encoded path, so
+        # an encoded delimiter stays one segment.
+        raw_path = encoded_path
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
+        encoded_path = preprocess_pathname(encoded_path, base_path=self.base_path,
+                                           trailing_slash=self.trailing_slash)
+        if path is None or encoded_path is None:
+            route_var.set("__not_found__")
+            return Response("Not Found", status=404)
+        match_path = _normalize_path_for_matching(encoded_path)
         if match_path != "/" and match_path.endswith("/"):
             route_var.set("__redirect__")
             # Redirect to the encoded form so an encoded delimiter in a
             # parameter value is preserved instead of becoming a separator.
             if request.raw_path:
-                location = encoded_path.rstrip("/").encode("ascii")
+                location = raw_path.rstrip("/").encode("ascii")
             else:
-                location = quote(encoded_path.rstrip("/"), safe="/!$&'()*+,;=:@-._~").encode("ascii")
+                location = quote(raw_path.rstrip("/"), safe="/!$&'()*+,;=:@-._~").encode("ascii")
             if request.query_string:
                 if any(c < 32 or c == 127 for c in request.query_string):
                     return Response("Bad Request", status=400)
@@ -3040,11 +3068,22 @@ class App:
         token's ``set-cookie`` would never reach the client while the
         old token is already gone from the store.
         """
-        # Match on the per-segment decoded form (Next.js
-        # decodePathParams) so the pre-flight checks the same route the
-        # handler will run; when no encoded path is available (native
-        # transport, where Rust already decoded it) the decoded path
-        # normalizes to the same form.
+        # Same path preprocessing as _dispatch: the pre-flight matches
+        # the app-relative path, so a prefixed upgrade finds its route
+        # (this also covers the native transport, whose Rust side knows
+        # no base path). Matching then runs on the per-segment decoded
+        # form (Next.js decodePathParams) so the pre-flight checks the
+        # same route the handler will run; when no encoded path is
+        # available (native transport, where Rust already decoded it)
+        # the decoded path normalizes to the same form.
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
+        if path is None:
+            return Response("Not Found", status=404)
+        if raw_path is not None:
+            raw_path = preprocess_pathname(raw_path, base_path=self.base_path,
+                                           trailing_slash=self.trailing_slash)
+            if raw_path is None:
+                return Response("Not Found", status=404)
         try:
             match_path = _normalize_path_for_matching(raw_path or path)
         except BadRequest:
@@ -3098,6 +3137,17 @@ class App:
         # before any rate-limit charge (B-1 / review #7). Matching on
         # the normalized form would hide the '?' and let the handshake
         # reach the rate limiter instead.
+        # Same path preprocessing as _dispatch: a prefixed handshake
+        # matches the app-relative path; outside the base path the
+        # upgrade is refused like an unknown route. The original paths
+        # are kept for _authorize_websocket below, which preprocesses
+        # them itself — passing the stripped path twice would 404.
+        raw_path = path
+        raw_encoded_path = encoded_path
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
+        if path is None:
+            await send({"type": "websocket.close", "code": 1008})
+            return
         match = self.router.matches(path)
         handler = None
         params = {}
@@ -3146,8 +3196,8 @@ class App:
         # Authorization runs before the handshake completes: a denied
         # upgrade is refused with a close instead of an accept, so the
         # handler never runs and no data is sent.
-        denied = await self._authorize_websocket(path, scope.get("query_string", b""),
-                                                 scope.get("headers", []), raw_path=encoded_path)
+        denied = await self._authorize_websocket(raw_path, scope.get("query_string", b""),
+                                                 scope.get("headers", []), raw_path=raw_encoded_path)
         if denied is not None:
             await send({"type": "websocket.close", "code": 1008})
             return
@@ -3390,7 +3440,7 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                cache_failure_policy=None, cache_handler=None, websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
                hot_reload=False,
                trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None,
-               revalidate_secret=None):
+               revalidate_secret=None, base_path="", trailing_slash="redirect"):
     root = Path(root).resolve()
     # .env files are loaded before the manifest is read or user code runs,
     # so server code, middleware and island bundling all see them.
@@ -3403,4 +3453,5 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
                websocket_max_message=websocket_max_message, hot_reload=hot_reload,
                trusted_proxies=trusted_proxies, sync_workers=sync_workers, strict_ssg=strict_ssg,
-               revalidate_secret=revalidate_secret, cache_handler=cache_handler)
+               revalidate_secret=revalidate_secret, cache_handler=cache_handler,
+               base_path=base_path, trailing_slash=trailing_slash)
