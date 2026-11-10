@@ -88,7 +88,6 @@ class CacheBackend:
     def remove(self, key):
         raise NotImplementedError
 
-<<<<<<< HEAD
     def revalidate_tag(self, tag, expire=None):
         """Record a tag invalidation. Returns True when the record was stored.
 
@@ -97,7 +96,6 @@ class CacheBackend:
         Backends without a shared store may keep the record process-local.
         """
         raise NotImplementedError
-=======
     def keys(self):
         """Return the raw keys this backend currently stores.
 
@@ -108,7 +106,6 @@ class CacheBackend:
         callers that need concrete paths filter those out.
         """
         return []
->>>>>>> feat/nextjs-p1x-reval
 
     def close(self):
         pass
@@ -521,7 +518,6 @@ class SQLiteCacheBackend(CacheBackend):
                 log.warning("Shared cache remove failed for %s", key, exc_info=True)
                 return False
 
-<<<<<<< HEAD
     def revalidate_tag(self, tag, expire=None):
         """Record a tag invalidation in the shared manifest.
 
@@ -555,7 +551,6 @@ class SQLiteCacheBackend(CacheBackend):
             except sqlite3.Error:
                 log.warning("Shared cache tag invalidation failed for %s", tag, exc_info=True)
                 return False
-=======
     def keys(self):
         """Return every stored entry key plus every variant-generation key.
 
@@ -571,7 +566,6 @@ class SQLiteCacheBackend(CacheBackend):
                 return [row[0] for row in rows]
             except sqlite3.Error as exc:
                 raise SharedCacheUnavailable("Shared cache key listing failed") from exc
->>>>>>> feat/nextjs-p1x-reval
 
     def variant_generation(self, key, *, invalidate=False):
         """Get or replace a path generation atomically across workers."""
@@ -739,7 +733,6 @@ class ISRCache:
         self._task_leases = {}
         self._tasks = set()
         self._variant_paths = OrderedDict()
-<<<<<<< HEAD
         # Tag invalidation state. ``_tag_manifest`` is the process-local
         # copy of the tag manifest (authoritative for the memory backend;
         # shared backends keep their own copy in the shared store).
@@ -750,9 +743,7 @@ class ISRCache:
         self._tag_manifest = {}
         self._key_tags = OrderedDict()
         self._key_generated_at = OrderedDict()
-=======
         self._cached_paths = OrderedDict()
->>>>>>> feat/nextjs-p1x-reval
         self._loop = None
         self._closed = False
         self.namespace = namespace
@@ -778,12 +769,9 @@ class ISRCache:
         self._task_leases.clear()
         self._tasks.clear()
         self._variant_paths.clear()
-<<<<<<< HEAD
         self._key_tags.clear()
         self._key_generated_at.clear()
-=======
         self._cached_paths.clear()
->>>>>>> feat/nextjs-p1x-reval
         self._loop = None
         if self.shared is not None:
             await asyncio.to_thread(self.shared.close)
@@ -1079,7 +1067,6 @@ class ISRCache:
             self._loop = loop
         elif self._loop is not loop:
             raise RuntimeError("An ISR app instance must use a single event loop")
-<<<<<<< HEAD
         tags = _validate_tags(tags)
         self._remember_key_tags(key, tags)
         # Normalize to the 3-axis policy, then hand the backends the two
@@ -1089,13 +1076,11 @@ class ISRCache:
         # (expire = revalidate + stale).
         fresh_for, stale_for = policy_windows(policy)
         policy = {"revalidate": fresh_for, "stale": stale_for}
-=======
         if not key.startswith("\0isr:"):
             # Plain cache keys are concrete paths; remember them so a
             # scoped revalidation can find this entry later. Hashed
             # query-variant keys are covered by _variant_paths instead.
             self._remember_cached_path(key)
->>>>>>> feat/nextjs-p1x-reval
         status, body = self.store.lookup(key)
         if status == "fresh":
             # A tag invalidation recorded locally reclassifies a

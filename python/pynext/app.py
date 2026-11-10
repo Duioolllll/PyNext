@@ -634,11 +634,8 @@ class App:
         self.isr_policies = {}
         self.layout_policies = {}
         self.isr_queries = {}
-<<<<<<< HEAD
         self.isr_tags = {}
-=======
         self.entry_layouts = {}
->>>>>>> feat/nextjs-p1x-reval
         if cache_backend == "sqlite" and cache_path is None:
             cache_path = self.root / ".pynext" / "isr-cache.sqlite3"
         build_id = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"),
@@ -1094,7 +1091,6 @@ class App:
             return existed
         return await self.isr.invalidate(path)
 
-<<<<<<< HEAD
     async def revalidate_tag(self, tag, expire=None):
         """Invalidate every ISR entry carrying ``tag`` for this app instance.
 
@@ -1150,7 +1146,6 @@ class App:
                 paths = None
         self._dev_static_paths[pattern] = paths
         return paths
-=======
     async def _revalidate_pattern(self, pattern):
         """Invalidate every cached entry for one ISR route pattern."""
         if self.render_modes.get(pattern) != "isr":
@@ -1200,7 +1195,6 @@ class App:
             else:
                 removed = await self._revalidate_one(pattern) or removed
         return removed
->>>>>>> feat/nextjs-p1x-reval
 
     async def _render_stream_chunk(self, node):
         """Serialize one streamed UI node to HTML on a worker thread."""

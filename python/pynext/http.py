@@ -811,10 +811,7 @@ class Request:
     params: dict = field(default_factory=dict)
     _app: object = field(default=None, repr=False, compare=False)
     state: dict = field(default_factory=dict, compare=False)
-<<<<<<< HEAD
     _cancel_event: threading.Event = field(default_factory=_RequestCancellation, repr=False, compare=False)
-=======
-    _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
     # Still-encoded request path, when the transport supplied one. Route
     # matching normalizes this form per segment (Next.js
     # decodePathParams) so an encoded delimiter inside a parameter value
@@ -824,7 +821,6 @@ class Request:
     # (for example in tests), in which case matching falls back to
     # ``path``.
     raw_path: str = ""
->>>>>>> feat/nextjs-p1-paramdec
 
     @property
     def cancelled(self) -> bool:
