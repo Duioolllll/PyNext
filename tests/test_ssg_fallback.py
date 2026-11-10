@@ -11,7 +11,7 @@ import pytest
 
 from conftest import page_html
 from pynext import create_app, page
-from pynext.build import write_manifest
+from pynext.build import build_id_for, write_manifest
 from pynext.http import Request
 
 
@@ -269,7 +269,12 @@ def test_ssg_fallback_mismatch_requires_rebuild(tmp_path):
     saved = tmp_path / ".pynext" / "manifest.json"
     data = json.loads(saved.read_text())
     data["ssg_fallback"]["/blog/[slug]"]["fallback"] = "not_found"
-    saved.write_text(json.dumps(data))
+    raw = json.dumps(data).encode("utf-8")
+    saved.write_bytes(raw)
+    # Re-sign the edited manifest so the BUILD_ID integrity check passes
+    # and the fallback check is the one that fires (same pattern as the
+    # ISR-tags mismatch test).
+    (tmp_path / ".pynext" / "BUILD_ID").write_text(build_id_for(raw), encoding="utf-8")
     with pytest.raises(ValueError, match="SSG fallback modes changed"):
         create_app(tmp_path, production=True)
 

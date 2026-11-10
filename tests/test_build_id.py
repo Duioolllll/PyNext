@@ -54,7 +54,7 @@ def test_build_id_is_deterministic_and_source_bound(tmp_path):
     # .pynext/BUILD_ID holds the manifest-integrity seal (SHA-256 of the
     # manifest bytes), not the build ID; the ID itself lives in the manifest.
     manifest_path = tmp_path / ".pynext" / "manifest.json"
-    assert (tmp_path / ".pynext" / BUILD_ID_FILE).read_text(encoding="ascii").strip() == \
+    assert (tmp_path / BUILD_ID_FILE).read_text(encoding="ascii").strip() == \
         build_id_for(manifest_path.read_bytes())
     assert read_build_id(tmp_path) == build_id
     # A rebuild of unchanged sources keeps the ID (reproducible).
@@ -67,7 +67,7 @@ def test_build_id_is_deterministic_and_source_bound(tmp_path):
     third = write_manifest(tmp_path)
     assert third["build_id"] != build_id
     assert BUILD_ID_RE.match(third["build_id"])
-    assert (tmp_path / ".pynext" / BUILD_ID_FILE).read_text(encoding="ascii").strip() == \
+    assert (tmp_path / BUILD_ID_FILE).read_text(encoding="ascii").strip() == \
         build_id_for(manifest_path.read_bytes())
 
 
@@ -106,7 +106,7 @@ def test_load_manifest_rejects_build_id_mismatch(tmp_path):
     make_project(tmp_path)
     write_manifest(tmp_path)
     create_app(tmp_path, production=True)
-    (tmp_path / ".pynext" / BUILD_ID_FILE).write_text("0" * 16 + "\n", encoding="ascii")
+    (tmp_path / BUILD_ID_FILE).write_text("0" * 16 + "\n", encoding="ascii")
     with pytest.raises(ValueError, match="Incomplete build"):
         create_app(tmp_path, production=True)
 

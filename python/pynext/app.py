@@ -279,13 +279,20 @@ _STREAM_ERROR_MARKER = b"<!-- pynext-stream-error -->"
 def _partition_header_rules(rules):
     """Split ``headers`` between the two per-path header systems.
 
-    Returns ``(path_items, matcher_items)``: dict rules and ``(source,
-    headers)`` tuples whose source uses a ``*`` glob go to the matcher
-    rules (:func:`pynext.matcher.compile_header_rules`); ``PathHeaderRule``
-    objects and all other tuples go to the native-aware
-    :class:`pynext.http.PathHeaders`. A non-iterable ``rules`` value is
-    passed through untouched so :func:`compile_path_headers` raises its
-    usual error for it.
+    Returns ``(path_items, matcher_items)``: a ``(source, headers)``
+    tuple is compiled by BOTH systems — the matcher rules apply first
+    in ASGI dispatch (first matching rule wins per header) while the
+    native-aware :class:`pynext.http.PathHeaders` copy serves the
+    native fast path and responses that bypass dispatch, and
+    :func:`pynext.http.apply_path_headers` never overwrites a header
+    the matcher already set, so the two copies agree. Dict rules go to
+    the matcher only (``PathHeaders`` cannot take them) and
+    ``PathHeaderRule`` objects go to ``PathHeaders`` only (the matcher
+    cannot take them). A non-iterable ``rules`` value is passed through
+    untouched so :func:`compile_path_headers` raises its usual error
+    for it. A tuple source the route-pattern grammar rejects (a ``*``
+    glob) fails startup in :func:`compile_path_headers`, even though
+    the matcher would accept it.
     """
     if rules is None:
         return [], []
@@ -301,8 +308,9 @@ def _partition_header_rules(rules):
             matcher_items.append(item)
         elif isinstance(item, PathHeaderRule):
             path_items.append(item)
-        elif (isinstance(item, (list, tuple)) and len(item) == 2
-              and isinstance(item[0], str) and "*" in item[0]):
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            # Compiled by both systems (see the docstring).
+            path_items.append(item)
             matcher_items.append(item)
         else:
             path_items.append(item)
@@ -695,12 +703,14 @@ class App:
         # Per-path response headers (Next.js headers() equivalent): compiled
         # and validated here, so a bad rule fails at startup. See
         # http.compile_path_headers for the accepted shapes.
-        # `headers` feeds two per-path header systems: route-syntax tuples
-        # and PathHeaderRule objects go to the native-aware PathHeaders,
-        # while dict rules and `*`-glob sources go to the matcher rules
-        # (see _partition_header_rules). Each rule is compiled by exactly
-        # one system, so a dict rule cannot break PathHeaders startup
-        # validation and a PathHeaderRule cannot break the matcher.
+        # `headers` feeds two per-path header systems: (source, headers)
+        # tuples are compiled by both — the matcher rules for first-wins
+        # ordering in ASGI dispatch, PathHeaders for the native fast path
+        # and responses that bypass dispatch — while dict rules go to the
+        # matcher only and PathHeaderRule objects to PathHeaders only
+        # (see _partition_header_rules). A dict rule cannot break
+        # PathHeaders startup validation and a PathHeaderRule cannot
+        # break the matcher.
         _path_header_items, _matcher_header_items = _partition_header_rules(headers)
         self.path_headers = compile_path_headers(_path_header_items)
         self.observability_config = observability or ObservabilityConfig.from_env()
@@ -1264,7 +1274,15 @@ class App:
                 error=exc, status=500)
             if response is not None:
                 return response
-        return self.error_response(exc)
+        # No boundary rendered: the plain 500 is the last resort. Log the
+        # failure and record the error metric like dispatch_and_send does
+        # for uncaught errors, so a 500 always has exactly one error log
+        # line carrying its digest (see
+        # test_errors.py::test_500_body_carries_request_id_and_digest).
+        digest, _count = digest_for_error(exc)
+        self.metrics.observe_error(pattern or "__unmatched__", type(exc).__name__, digest)
+        log.exception("Request failed", extra={"error_digest": digest})
+        return self.error_response(exc, digest=digest)
 
     async def _not_found_page_response(self, request, pattern, params):
         """Nearest segment not-found boundary, else the global one, else plain 404.
@@ -2463,8 +2481,20 @@ class App:
         """
         try:
             return await render()
-        except NotFoundError:
+        except NotFoundError as exc:
+            # Record the error metric like _dispatch_timed does for
+            # signals that escape dispatch: this handler converts the
+            # signal to a boundary response here, so it never reaches
+            # there (see test_errors.py::test_signals_answer_without_error_log).
+            # The digest is the signal's well-known label digest, not the
+            # computed error digest used for real 500s.
+            self.metrics.observe_error(pattern or "__unmatched__", type(exc).__name__, exc.label_digest)
             return await self._not_found_page_response(request, pattern, params)
+        except SignalError:
+            # Other signals (forbidden, unauthorized, redirect) propagate
+            # so dispatch converts them to their responses without an
+            # error log; only NotFoundError renders a boundary here.
+            raise
         except (BadRequest, _SyncHandlerBusy, RequestCancelled, CacheBusy,
                 SharedCacheUnavailable, TimeoutError):
             raise
@@ -3308,4 +3338,4 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
                websocket_max_message=websocket_max_message, hot_reload=hot_reload,
                trusted_proxies=trusted_proxies, sync_workers=sync_workers, strict_ssg=strict_ssg,
-               headers=headers, revalidate_secret=revalidate_secret, cache_handler=cache_handler)
+               revalidate_secret=revalidate_secret, cache_handler=cache_handler)

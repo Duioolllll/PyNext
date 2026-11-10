@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 import httpx
 import pytest
@@ -134,7 +135,11 @@ def test_broken_boundary_falls_back_to_global_then_plain(tmp_path):
     async def check_plain(client):
         response = await client.get("/")
         assert response.status_code == 500
-        assert response.text == "Internal Server Error"
+        # Plain 500 (no boundary rendered); the body carries the error
+        # digest since the errdigest change, like test_errors.py expects.
+        assert re.fullmatch(
+            r"Internal Server Error \(request_id: [0-9a-f-]+, digest: [0-9a-f]{16}\)",
+            response.text)
     run_with_client(app, "asgi", check_plain)
 
 
@@ -191,7 +196,11 @@ def test_api_route_errors_stay_plain(tmp_path):
     async def check(client):
         response = await client.get("/api/boom")
         assert response.status_code == 500
-        assert response.text == "Internal Server Error"
+        # Plain 500 (API routes never render an HTML boundary); the body
+        # carries the error digest since the errdigest change.
+        assert re.fullmatch(
+            r"Internal Server Error \(request_id: [0-9a-f-]+, digest: [0-9a-f]{16}\)",
+            response.text)
     run_with_client(app, "asgi", check)
 
 

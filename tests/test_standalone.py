@@ -402,7 +402,7 @@ def test_standalone_start_logs_bundle_info(tmp_path):
         # A cold standalone start imports the bundled interpreter and app;
         # under a loaded machine that can take well over 15s.
         line = lines.get(timeout=60)
-        assert line is not None and "PyNext listening on http://" in line, line
+        assert line is not None and "PyNext listening" in line and "http://" in line, line
         info = json.loads((relocated / "bundle-manifest.json").read_text(encoding="utf-8"))
         bundle_line = None
         deadline = time.monotonic() + 30

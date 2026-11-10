@@ -39,9 +39,11 @@ from dataclasses import dataclass, field
 __all__ = ["CatchAllReport", "normalize_catch_all_routes", "verify_static_enumeration"]
 
 # Same segment grammar as build._segment_param: `[name]`, `[...name]`,
-# `[[...name]]`. Kept in sync with it; this module stays dependency-free so
+# `[[...name]]`, plus affixed dynamic parameters (`v[version]`,
+# `[name].json` — Next.js PARAMETER_PATTERN in get-dynamic-param.ts).
+# Kept in sync with it; this module stays dependency-free so
 # the normalization can be tested without building an app.
-_SEGMENT_RE = re.compile(r"\[(\[)?(\.\.\.)?([A-Za-z0-9_-]+)\](\])?")
+_SEGMENT_RE = re.compile(r"([^[]*)\[(\[)?(\.\.\.)?([A-Za-z0-9_-]+)\](\]?)(.*)")
 
 # Segment specificity, mirroring Next.js sortable-routes.ts
 # getSegmentSpecificity(): static 0, dynamic 1, catch-all 2, optional
@@ -52,22 +54,31 @@ _SPECIFICITY = {"static": 0, "dynamic": 1, "catch_all": 2, "optional": 3}
 def _parse_segment(segment):
     """Parse one route segment.
 
-    Returns (name, kind) where kind is "dynamic", "catch_all" or
-    "optional", or None for a static segment. Raises ValueError on a
-    malformed segment, mirroring build._segment_param.
+    Returns (name, kind, prefix, suffix) where kind is "dynamic",
+    "catch_all" or "optional", or None for a static segment. A dynamic
+    parameter may carry a static prefix and/or suffix, as in
+    ``v[version]`` or ``[name].json``; catch-all parameters may not.
+    Raises ValueError on a malformed segment, mirroring
+    build._segment_param.
     """
-    if not segment.startswith("["):
+    if "[" not in segment:
+        if "]" in segment:
+            raise ValueError(f"Invalid route segment: {segment}")
         return None
     match = _SEGMENT_RE.fullmatch(segment)
     if match is None:
         raise ValueError(f"Invalid route segment: {segment}")
-    double_open, dots, name, double_close = match.groups()
+    prefix, double_open, dots, name, double_close, suffix = match.groups()
     if bool(double_open) != bool(double_close):
         raise ValueError(f"Invalid route segment: {segment}")
     if double_open and not dots:
         raise ValueError(f"Optional catch-all must use [[...name]]: {segment}")
+    if "]" in prefix or "[" in suffix or "]" in suffix:
+        raise ValueError(f"Invalid route segment: {segment}")
     kind = "optional" if double_open else ("catch_all" if dots else "dynamic")
-    return name, kind
+    if kind != "dynamic" and (prefix or suffix):
+        raise ValueError(f"Catch-all parameters cannot have a prefix or suffix: {segment}")
+    return name, kind, prefix, suffix
 
 
 def _split(pattern):
@@ -79,27 +90,30 @@ def _split(pattern):
 def _segment_kinds(pattern):
     """Return the parsed segments of a route pattern.
 
-    Each entry is ("static", segment) or (kind, name). A catch-all or
-    optional catch-all anywhere but the last segment is invalid — the
-    router only allows it last — so it fails here too.
+    Each entry is (kind, name, prefix, suffix): ("static", segment, "", "")
+    for a literal segment, or (kind, name, prefix, suffix) for a parameter
+    (prefix/suffix are "" except for affixed dynamic parameters like
+    ``v[version]`` or ``[name].json``). A catch-all or optional catch-all
+    anywhere but the last segment is invalid — the router only allows it
+    last — so it fails here too.
     """
     parsed = []
     segments = _split(pattern)
     for index, segment in enumerate(segments):
         result = _parse_segment(segment)
         if result is None:
-            parsed.append(("static", segment))
+            parsed.append(("static", segment, "", ""))
         else:
-            name, kind = result
+            name, kind, prefix, suffix = result
             if kind in {"catch_all", "optional"} and index != len(segments) - 1:
                 raise ValueError(f"Catch-all must be the last part of the URL: {pattern}")
-            parsed.append((kind, name))
+            parsed.append((kind, name, prefix, suffix))
     return parsed
 
 
 def _specificity(parsed):
     """Specificity tuple for one pattern, for most-specific-first ordering."""
-    return tuple(_SPECIFICITY[kind] for kind, _ in parsed)
+    return tuple(_SPECIFICITY[kind] for kind, *_ in parsed)
 
 
 def _is_catch_all(parsed):
@@ -109,18 +123,25 @@ def _is_catch_all(parsed):
 def _matches(parsed, path_segments):
     """Whether a concrete path matches a parsed pattern, segment by segment.
 
-    A dynamic segment consumes exactly one segment; a catch-all consumes
+    A dynamic segment consumes exactly one segment; an affixed dynamic
+    segment (``v[version]``, ``[name].json``) additionally requires the
+    path segment to start with the prefix, end with the suffix, and carry
+    a non-empty parameter value between them. A catch-all consumes
     one or more remaining segments; an optional catch-all consumes zero or
     more. Static segments must match literally.
     """
     index = 0
-    for kind, value in parsed:
+    for kind, value, prefix, suffix in parsed:
         if kind == "static":
             if index >= len(path_segments) or path_segments[index] != value:
                 return False
             index += 1
         elif kind == "dynamic":
             if index >= len(path_segments):
+                return False
+            segment = path_segments[index]
+            if (not segment.startswith(prefix) or not segment.endswith(suffix)
+                    or len(segment) < len(prefix) + len(suffix) + 1):
                 return False
             index += 1
         elif kind == "catch_all":
