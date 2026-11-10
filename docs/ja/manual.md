@@ -110,9 +110,9 @@ app = create_app(".", security=SecurityConfig(
 ))
 ~~~
 
-許可されたオリジンからのプリフライト（`Origin` と `Access-Control-Request-Method` を含む `OPTIONS`）には 204 と `Allow` および `Access-Control-Allow-*` ヘッダーを返し、許可されていないオリジン・メソッド・ヘッダーのプリフライトは 403 になります。許可されたオリジンからの実際のクロスオリジンリクエストには `Access-Control-Allow-Origin`（設定時は `Access-Control-Allow-Credentials: true` も）を付け、それ以外のオリジンには CORS ヘッダーを付けないため、ブラウザーはレスポンスを公開しません。`Origin` を含むリクエストへのレスポンスには常に `Vary: Origin` も付きます。同一オリジンのリクエストは CORS でブロックされないため、オリジンを設定しなくても同一オリジンのページはカスタムヘッダーを付けてアプリ自身の API を呼べます。`cors_allowed_origins=("*",)` はすべてのオリジンを許可し、`cors_allow_credentials=True` の場合は `*` の代わりに正確なオリジンをそのまま返します。
+許可されたオリジンからのプリフライト（`Origin` と `Access-Control-Request-Method` を含む `OPTIONS`）には 204 と `Allow` および `Access-Control-Allow-*` ヘッダーを返し、許可されていないオリジン・メソッド・ヘッダーのプリフライトは 403 になります。許可されたオリジンからの実際のクロスオリジンリクエストには `Access-Control-Allow-Origin`（設定時は `Access-Control-Allow-Credentials: true` も）を付け、それ以外のオリジンには CORS ヘッダーを付けないため、ブラウザーはレスポンスを公開しません。`Origin` を含むリクエストへのレスポンスには常に `Vary: Origin` も付きます。同一オリジンのリクエストは CORS でブロックされないため、オリジンを設定しなくても同一オリジンのページはカスタムヘッダーを付けてアプリ自身の API を呼べます。`cors_allowed_origins=("*",)` はすべてのオリジンを許可します。`cors_allow_credentials=True` と一緒に設定ファイルに書くと、ロード時に `ConfigError` で拒否されるため、資格情報を使う場合は明示的なオリジン一覧を書いてください。`SecurityConfig` を直接作った場合（設定の検証を迂回）はリクエストのオリジンをそのまま返さず `Access-Control-Allow-Origin: *` を返します。ブラウザーは資格情報付きリクエストでワイルドカードを無視するため、クロスオリジンのページがレスポンスを読むことはできません。
 
-静的ファイル、SSG ページ、キャッシュされた ISR レスポンスはネイティブサーバーが直接提供するため CORS ヘッダーは付きません。CORS は Python ディスパッチを経るレスポンス（API ルートと動的レンダリングページ）に適用されます。
+静的ファイル、SSG ページ、キャッシュされた ISR レスポンスはネイティブサーバーが直接提供しますが、`Origin` を含むリクエストには ASGI レスポンスと同じ CORS ポリシーが適用されます（条件付き・範囲・HEAD レスポンスを含みます）。CORS は Python ディスパッチを経るレスポンス（API ルートと動的レンダリングページ）だけに適用されるものではありません。
 
 既定の CSP は `script-src 'self'; object-src 'none'` です。`SecurityConfig(csp_nonce_enabled=True)` を設定すると、動的レンダリングページごとにリクエスト単位の新しい nonce が発行されます。ヘッダーは `script-src 'self' 'nonce-<値>'; object-src 'none'` となり、同じ nonce が island ランタイムの `<script>` タグにも付きます。nonce はレスポンスごとに変わるため、nonce を含むページを自分でキャッシュしないでください。事前レンダリングされた SSG ページ、キャッシュされた ISR レスポンス、静的ファイルは nonce なしの静的ポリシーのままです。共有 HTML に埋め込まれた nonce は複数レスポンスで再利用され、nonce の意味がなくなるためです。Cookie または Authorization ヘッダー付きの ISR リクエストはリクエストごとに新たにレンダリングされるため、nonce が適用されます。
 

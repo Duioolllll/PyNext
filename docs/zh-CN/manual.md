@@ -110,9 +110,9 @@ app = create_app(".", security=SecurityConfig(
 ))
 ~~~
 
-来自允许来源的预检请求（携带 `Origin` 和 `Access-Control-Request-Method` 的 `OPTIONS`）会返回 204 以及 `Allow` 和 `Access-Control-Allow-*` 请求头；来源、方法或请求头不在允许范围内的预检请求返回 403。来自允许来源的实际跨源请求会带有 `Access-Control-Allow-Origin`（如已配置，还会带有 `Access-Control-Allow-Credentials: true`）；其他来源则不带 CORS 请求头，浏览器会拒绝向调用方页面暴露响应。所有携带 `Origin` 的请求的响应还会带有 `Vary: Origin`。同源请求永远不会被 CORS 拦截，因此即使未配置来源，同源页面也可以携带自定义请求头调用应用自身的 API。`cors_allowed_origins=("*",)` 表示允许任意来源；当 `cors_allow_credentials=True` 时，将原样回显确切来源，而不是 `*`。
+来自允许来源的预检请求（携带 `Origin` 和 `Access-Control-Request-Method` 的 `OPTIONS`）会返回 204 以及 `Allow` 和 `Access-Control-Allow-*` 请求头；来源、方法或请求头不在允许范围内的预检请求返回 403。来自允许来源的实际跨源请求会带有 `Access-Control-Allow-Origin`（如已配置，还会带有 `Access-Control-Allow-Credentials: true`）；其他来源则不带 CORS 请求头，浏览器会拒绝向调用方页面暴露响应。所有携带 `Origin` 的请求的响应还会带有 `Vary: Origin`。同源请求永远不会被 CORS 拦截，因此即使未配置来源，同源页面也可以携带自定义请求头调用应用自身的 API。`cors_allowed_origins=("*",)` 表示允许任意来源。如果在配置文件中将其与 `cors_allow_credentials=True` 一起设置，加载时会被 `ConfigError` 拒绝；使用凭据时请列出明确的来源。直接构造 `SecurityConfig`（绕过配置校验）时，不会原样回显请求来源，而是返回 `Access-Control-Allow-Origin: *`。浏览器会忽略凭据请求中的通配符，因此跨源页面无法读取响应。
 
-静态文件、SSG 页面和已缓存的 ISR 响应由原生服务器直接提供，不带 CORS 请求头；CORS 仅适用于经 Python 分发产生的响应（API 路由和动态渲染页面）。
+静态文件、SSG 页面和已缓存的 ISR 响应由原生服务器直接提供，但携带 `Origin` 的请求会适用与 ASGI 响应相同的 CORS 策略（包括条件请求、范围请求和 HEAD 响应）。CORS 并不仅适用于经 Python 分发产生的响应（API 路由和动态渲染页面）。
 
 默认 CSP 为 `script-src 'self'; object-src 'none'`。设置 `SecurityConfig(csp_nonce_enabled=True)` 后，每个动态渲染页面都会获得一个新的按请求生成的 nonce：响应头变为 `script-src 'self' 'nonce-<值>'; object-src 'none'`，同一个 nonce 也会添加到 island 运行时 `<script>` 标签上。nonce 每次响应都不同，请勿自行缓存带有 nonce 的页面。预渲染的 SSG 页面、已缓存的 ISR 响应和静态文件保持不带 nonce 的静态策略：嵌入共享 HTML 的 nonce 会在多个响应中被重复使用，从而失去 nonce 的意义。携带 Cookie 或 Authorization 请求头的 ISR 请求会按请求重新渲染，因此会获得 nonce。
 

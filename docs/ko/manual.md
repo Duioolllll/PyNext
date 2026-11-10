@@ -157,9 +157,9 @@ app = create_app(".", security=SecurityConfig(
 ))
 ~~~
 
-허용된 출처의 preflight(`Origin`과 `Access-Control-Request-Method`를 담은 `OPTIONS`)에는 204와 `Allow` 및 `Access-Control-Allow-*` 헤더를 반환하고, 허용되지 않은 출처·메서드·헤더의 preflight는 403을 받습니다. 허용된 출처의 실제 교차 출처 요청에는 `Access-Control-Allow-Origin`(설정한 경우 `Access-Control-Allow-Credentials: true`도)을 붙이고, 그 외의 출처에는 CORS 헤더를 붙이지 않으므로 브라우저가 응답을 노출하지 않습니다. `Origin`을 담은 요청에 대한 응답에는 항상 `Vary: Origin`도 붙습니다. 같은 출처 요청은 CORS로 차단하지 않으므로, 출처를 설정하지 않아도 같은 출처 페이지는 커스텀 헤더를 달아 앱 자신의 API를 호출할 수 있습니다. `cors_allowed_origins=("*",)`는 모든 출처를 허용하며, `cors_allow_credentials=True`인 경우 `*` 대신 정확한 출처를 그대로 반환합니다.
+허용된 출처의 preflight(`Origin`과 `Access-Control-Request-Method`를 담은 `OPTIONS`)에는 204와 `Allow` 및 `Access-Control-Allow-*` 헤더를 반환하고, 허용되지 않은 출처·메서드·헤더의 preflight는 403을 받습니다. 허용된 출처의 실제 교차 출처 요청에는 `Access-Control-Allow-Origin`(설정한 경우 `Access-Control-Allow-Credentials: true`도)을 붙이고, 그 외의 출처에는 CORS 헤더를 붙이지 않으므로 브라우저가 응답을 노출하지 않습니다. `Origin`을 담은 요청에 대한 응답에는 항상 `Vary: Origin`도 붙습니다. 같은 출처 요청은 CORS로 차단하지 않으므로, 출처를 설정하지 않아도 같은 출처 페이지는 커스텀 헤더를 달아 앱 자신의 API를 호출할 수 있습니다. `cors_allowed_origins=("*",)`는 모든 출처를 허용합니다. `cors_allow_credentials=True`와 함께 설정 파일에 적으면 로드 시점에 `ConfigError`로 거부되므로, 자격 증명을 쓸 때는 명시적인 출처 목록을 적으세요. `SecurityConfig`를 직접 만들면(설정 검증을 우회) 요청 출처를 그대로 반환하지 않고 `Access-Control-Allow-Origin: *`를 반환합니다. 브라우저는 자격 증명 요청에서 와일드카드를 무시하므로 교차 출처 페이지가 응답을 읽을 수 없습니다.
 
-정적 파일, SSG 페이지, 캐시된 ISR 응답은 네이티브 서버가 직접 제공하므로 CORS 헤더가 붙지 않습니다. CORS는 Python 디스패치를 거치는 응답(API 라우트와 동적 렌더링 페이지)에 적용됩니다.
+정적 파일, SSG 페이지, 캐시된 ISR 응답은 네이티브 서버가 직접 제공하지만, `Origin`을 담은 요청에는 ASGI 응답과 같은 CORS 정책이 적용됩니다(조건부·범위·HEAD 응답 포함). CORS는 Python 디스패치를 거치는 응답(API 라우트와 동적 렌더링 페이지)에만 적용되는 것이 아닙니다.
 
 기본 CSP는 `script-src 'self'; object-src 'none'`입니다. `SecurityConfig(csp_nonce_enabled=True)`로 설정하면 동적 렌더링 페이지마다 요청별 새 nonce가 발급됩니다. 헤더는 `script-src 'self' 'nonce-<값>'; object-src 'none'`이 되고, 같은 nonce가 island 런타임 `<script>` 태그에도 들어갑니다. nonce는 응답마다 다르므로 nonce가 포함된 페이지를 직접 캐시하지 마세요. 미리 렌더링된 SSG 페이지, 캐시된 ISR 응답, 정적 파일은 nonce 없는 정적 정책을 유지합니다. 공유 HTML에 박힌 nonce는 여러 응답에서 재사용돼 nonce의 의미가 사라지기 때문입니다. 쿠키나 Authorization 헤더가 있는 ISR 요청은 요청마다 새로 렌더링하므로 nonce가 적용됩니다.
 
