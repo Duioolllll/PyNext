@@ -60,7 +60,7 @@ from .observability import (
 from .proxy import ProxyTrust
 from .ratelimit import _is_exempt_path, rate_limited_response
 from .sessions import SessionMiddleware
-from .static import asset_response
+from .static import StaticPathError, asset_response, validate_static_request_path
 from .ws_origin import websocket_origin_allowed
 
 log = logging.getLogger("pynext")
@@ -2128,6 +2128,15 @@ class App:
                     len(width) > 4 or len(quality) > 2 or not 1 <= int(width) <= MAX_IMAGE_WIDTH or
                     not 1 <= int(quality) <= MAX_IMAGE_QUALITY):
                 raise BadRequest("Invalid image dimensions or quality")
+            try:
+                # S-P0-6: the image source is a query parameter, so it never
+                # passed request-path validation — apply the static-path
+                # defense (normpath + absolute/UNC rejection) before the
+                # in-memory lookup. A traversal/UNC source is a 404, like
+                # a missing asset, never a disk access.
+                source = validate_static_request_path(source)
+            except StaticPathError:
+                return Response("Not Found", status=404)
             asset = self.public_assets.get(source)
             if asset is None:
                 return Response("Not Found", status=404)
@@ -2146,6 +2155,12 @@ class App:
             return await self._revalidate_webhook(request)
         if path == "/_pynext" or path.startswith("/_pynext/"):
             route_var.set("__client__")
+            try:
+                # S-P0-6: defense in depth at the serving layer (the
+                # request path was already validated on ingress).
+                validate_static_request_path(path)
+            except StaticPathError:
+                return Response("Not Found", status=404)
             if path not in self.client_assets:
                 return Response("Not Found", status=404)
             allow = b"GET, HEAD, OPTIONS"
@@ -2156,6 +2171,13 @@ class App:
             return asset_response(request, self.client_assets[path], "text/javascript; charset=utf-8",
                                   self.asset_etags[path], cache_control=b"public, max-age=31536000, immutable",
                                   extra_headers=[(b"x-content-type-options", b"nosniff")])
+        # S-P0-6: validate the request path at the serving layer before
+        # the in-memory lookup (normpath + absolute/UNC rejection). The
+        # snapshot itself was built with the symlink checks in assets.py.
+        try:
+            validate_static_request_path(path)
+        except StaticPathError:
+            return Response("Not Found", status=404)
         if path in self.public_assets:
             route_var.set("__public__")
             allow = b"GET, HEAD, OPTIONS"

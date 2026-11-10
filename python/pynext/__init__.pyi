@@ -20,3 +20,4 @@ from .ratelimit import RateLimiter as RateLimiter
 from .redis_rate import RedisRateLimiter as RedisRateLimiter
 from .routing import route as route, websocket as websocket
 from .sessions import RedisSessionStore as RedisSessionStore, Session as Session, SessionMiddleware as SessionMiddleware, SQLiteSessionStore as SQLiteSessionStore
+from .static import StaticPathError as StaticPathError, resolve_static_path as resolve_static_path, validate_static_request_path as validate_static_request_path
