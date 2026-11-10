@@ -1561,6 +1561,19 @@ async def _render_static_pages(app):
                 rendered_params[path] = params
             except Exception as exc:
                 failures.append((path if path is not None else f"{pattern} {params}", exc))
+    if failures:
+        # A build whose every failure is a prerender bailout (dynamic
+        # access in dynamic="error" mode) fails with the bailout itself,
+        # as before staging: callers distinguish it from a page bug via
+        # is_prerender_bailout(), and the CLI still reports it cleanly
+        # (StaticGenBailoutError is a ValueError). Mixed or real page
+        # failures aggregate into one staged BuildError instead.
+        if all(is_prerender_bailout(exc) for _label, exc in failures):
+            raise failures[0][1]
+        lines = "\n".join(f"  {label}: {exc}" for label, exc in failures)
+        raise BuildError(
+            "render",
+            f"{len(failures)} static page(s) failed to render:\n{lines}") from failures[0][1]
     return rendered
 
 
