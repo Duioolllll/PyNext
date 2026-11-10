@@ -11,7 +11,7 @@ from dataclasses import replace
 
 from . import _native
 from .app import _decode_path, _invoke, _split_request_path, _typed_params
-from .config import DEFAULT_CONFIG
+from .config import DEFAULT_CONFIG, effective_allowed_hosts
 from .errors import SignalError, digest_for_error
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
                    WebSocketDisconnect, _FALLBACK_CSRF_SIGNING_KEY, _RequestCancellation,
@@ -510,7 +510,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                  fast_path_max_concurrent=None,
                  streaming_max_lifetime_secs=300, body_capacity_per_ip=4,
                  ws_idle_timeout_secs=300, ws_max_lifetime_secs=3600,
-                 ws_ping_interval_secs=60):
+                 ws_ping_interval_secs=60,
+                 allowed_hosts=None):
     """Start the native server and return its handle.
 
     Overload policy (roadmap C7): bounded wait, then reject. At most
@@ -566,6 +567,14 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     an idle WebSocket session, ``ws_max_lifetime_secs`` caps a session's
     total lifetime, and ``ws_ping_interval_secs`` pings idle sessions
     (unanswered for 10s: close) — 0 disables each.
+
+    Host validation (S-P1-19, M-9): the native server rejects requests
+    whose Host header is missing or not on ``allowed_hosts`` with 400,
+    before any handler runs. ``allowed_hosts`` is a Django
+    ``ALLOWED_HOSTS`` list (``*``, ``.example.com``,
+    ``*.example.com``, exact hosts); ``None`` (the default) means the
+    loopback default plus the bind host
+    (``config.effective_allowed_hosts``).
     """
     _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
                             body_capacity, body_timeout_ms, max_connections,
@@ -884,7 +893,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 # (total cap still applies); per-client limits
                                 # behind it are enforced at request time by
                                 # the trust-resolved rate limiter.
-                                trusted_proxies=_trusted_proxy_strings(app))
+                                trusted_proxies=_trusted_proxy_strings(app),
+                                allowed_hosts=list(effective_allowed_hosts(allowed_hosts, host)))
 
 
 async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
@@ -908,7 +918,8 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                 body_capacity_per_ip=DEFAULT_CONFIG.body_capacity_per_ip,
                 ws_idle_timeout_secs=DEFAULT_CONFIG.ws_idle_timeout_secs,
                 ws_max_lifetime_secs=DEFAULT_CONFIG.ws_max_lifetime_secs,
-                ws_ping_interval_secs=DEFAULT_CONFIG.ws_ping_interval_secs):
+                ws_ping_interval_secs=DEFAULT_CONFIG.ws_ping_interval_secs,
+                allowed_hosts=None):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
@@ -995,7 +1006,8 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               body_capacity_per_ip=body_capacity_per_ip,
                               ws_idle_timeout_secs=ws_idle_timeout_secs,
                               ws_max_lifetime_secs=ws_max_lifetime_secs,
-                              ws_ping_interval_secs=ws_ping_interval_secs)
+                              ws_ping_interval_secs=ws_ping_interval_secs,
+                              allowed_hosts=allowed_hosts)
         print(f"PyNext listening on http://{server.address}", flush=True)
         # A standalone bundle records its provenance in
         # bundle-manifest.json next to the app dir; log it (and warn on

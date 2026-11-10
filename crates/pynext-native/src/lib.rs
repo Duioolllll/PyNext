@@ -488,6 +488,9 @@ struct ServerState {
     /// applied to the same Rust-built responses. Each rule carries its own
     /// one-pattern router, so every matching rule applies.
     path_headers: Vec<PathHeaderRule>,
+    /// Host allowlist (S-P1-19, M-9): compiled `allowed_hosts` patterns,
+    /// checked for every request at the top of `dispatch`.
+    allowed_hosts: Vec<HostPattern>,
     websocket_router: Router,
     websocket_paths: std::collections::HashSet<String>,
     websocket_protocols: HashMap<String, Vec<String>>,
@@ -1165,6 +1168,194 @@ fn conflicting_content_length(headers: &HeaderMap) -> bool {
     values.len() > 1
 }
 
+/// Host header validation (S-P1-19, M-9; Django `ALLOWED_HOSTS`
+/// semantics). Python uses the Host for same-origin decisions and for
+/// building absolute URLs (password-reset mail links and the like), so
+/// an unvalidated Host is an injection vector. The check runs at the
+/// top of `dispatch`, before the WebSocket branch, the fast path and
+/// the Python bridge, so it covers every transport the native server
+/// serves. A missing or disallowed Host is a 400; the allowlist is
+/// configured through `allowed_hosts` (`pynext.config`), defaulting
+/// to loopback only.
+enum HostPattern {
+    /// `*`: any host.
+    Any,
+    /// An exact hostname or IP literal, lowercased.
+    Exact(String),
+    /// `.example.com`: the domain itself and every subdomain.
+    DomainAndSubdomains(String),
+    /// `*.example.com`: subdomains only, not the bare domain.
+    Subdomains(String),
+}
+
+/// The default allowlist, matching `pynext.config.DEFAULT_ALLOWED_HOSTS`.
+fn default_host_patterns() -> Vec<HostPattern> {
+    vec![
+        HostPattern::Exact("localhost".to_string()),
+        HostPattern::Exact("127.0.0.1".to_string()),
+        HostPattern::Exact("::1".to_string()),
+    ]
+}
+
+/// Compile one `allowed_hosts` entry. Entries are bare hosts — no
+/// scheme, no port (the request Host's port is stripped at match time),
+/// no path or query — mirroring the Python validator in
+/// `pynext.config._validate_allowed_host`, so a direct `NativeServer`
+/// caller cannot smuggle in a pattern Python would have rejected.
+fn parse_host_pattern(entry: &str) -> Result<HostPattern, String> {
+    let invalid = || format!("invalid allowed host {entry:?}");
+    let lowered = entry.to_ascii_lowercase();
+    if lowered == "*" {
+        return Ok(HostPattern::Any);
+    }
+    if lowered.is_empty()
+        || lowered.contains("://")
+        || lowered
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '@'))
+    {
+        return Err(invalid());
+    }
+    let (suffix, body) = if let Some(rest) = lowered.strip_prefix("*.") {
+        (true, rest)
+    } else if let Some(rest) = lowered.strip_prefix('.') {
+        (true, rest)
+    } else {
+        (false, lowered.as_str())
+    };
+    if body.contains('*') {
+        return Err(invalid());
+    }
+    let (bracketed, body) = if body.starts_with('[') && body.ends_with(']') {
+        (true, &body[1..body.len() - 1])
+    } else {
+        (false, body)
+    };
+    if body.is_empty() || body.len() > 253 {
+        return Err(invalid());
+    }
+    // An IP literal (v4 or v6) is exact only: `.127.0.0.1` names no
+    // subdomain tree. Anything with a colon that is not a valid IP is
+    // a port (or malformed) and is rejected. A bracketed name that is
+    // not an IP literal is rejected too.
+    if bracketed && body.parse::<std::net::IpAddr>().is_err() {
+        return Err(invalid());
+    }
+    if body.parse::<std::net::IpAddr>().is_ok() {
+        if suffix {
+            return Err(invalid());
+        }
+        return Ok(HostPattern::Exact(body.to_string()));
+    }
+    if body.contains(':') {
+        return Err(invalid());
+    }
+    if !body.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    }) {
+        return Err(invalid());
+    }
+    let suffix_text = format!(".{body}");
+    if suffix {
+        if lowered.starts_with("*.") {
+            Ok(HostPattern::Subdomains(suffix_text))
+        } else {
+            Ok(HostPattern::DomainAndSubdomains(suffix_text))
+        }
+    } else {
+        Ok(HostPattern::Exact(body.to_string()))
+    }
+}
+
+fn parse_host_patterns(entries: Vec<String>) -> Result<Vec<HostPattern>, String> {
+    entries
+        .iter()
+        .map(|entry| parse_host_pattern(entry))
+        .collect()
+}
+
+/// Strip a port from a Host header value and return the bare host,
+/// lowercased, or `None` when the value is not a usable host. A
+/// trailing dot is stripped (`example.com.` is `example.com`).
+/// Bracketed IPv6 (`[::1]:3000`) and bare IPv6 (`::1`, which carries
+/// no port) are handled; a single `host:port` pair loses the port.
+fn bare_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#' | '@'))
+    {
+        return None;
+    }
+    let mut host = if let Some(rest) = value.strip_prefix('[') {
+        let (inside, after) = rest.split_once(']')?;
+        if !after.is_empty() && !after.starts_with(':') {
+            return None;
+        }
+        inside.to_string()
+    } else if value.matches(':').count() > 1 {
+        // A bare IPv6 literal: no port can be attached to this form.
+        value.to_string()
+    } else if let Some((before, port)) = value.split_once(':') {
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        before.to_string()
+    } else {
+        value.to_string()
+    };
+    if host.ends_with('.') {
+        host.pop();
+    }
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+fn host_matches(host: &str, pattern: &HostPattern) -> bool {
+    match pattern {
+        HostPattern::Any => true,
+        HostPattern::Exact(exact) => host == exact,
+        HostPattern::DomainAndSubdomains(suffix) => {
+            host == &suffix[1..] || host.ends_with(suffix.as_str())
+        }
+        HostPattern::Subdomains(suffix) => host.ends_with(suffix.as_str()),
+    }
+}
+
+/// The request Host must be present and on the allowlist. Missing is
+/// 400 (HTTP/1.1 requests without Host are already rejected by hyper
+/// before dispatch; this is the layer that catches HTTP/1.0 and any
+/// other form hyper lets through). h2c carries no Host header: the
+/// `:authority` pseudo-header (exposed as the request URI authority)
+/// stands in for it, so it is the fallback source when the header is
+/// absent.
+fn host_header_allowed(
+    headers: &HeaderMap,
+    authority: Option<&str>,
+    patterns: &[HostPattern],
+) -> bool {
+    let text = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or(authority);
+    let Some(text) = text else {
+        return false;
+    };
+    let Some(host) = bare_host(text) else {
+        return false;
+    };
+    patterns.iter().any(|pattern| host_matches(&host, pattern))
+}
+
 enum BodyReadError {
     TooLarge,
     BadRequest,
@@ -1676,6 +1867,27 @@ async fn rate_limit_denial(
 
 async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> AxumResponse<Body> {
     let (parts, body) = request.into_parts();
+    // Host validation (S-P1-19, M-9) runs first, before the WebSocket
+    // branch, the fast path and the Python bridge: no request reaches
+    // any handler with a missing or disallowed Host.
+    if !host_header_allowed(
+        &parts.headers,
+        parts.uri.authority().map(|authority| authority.as_str()),
+        &state.allowed_hosts,
+    ) {
+        return close_with_unread_body(
+            apply_path_headers_for_raw_path(
+                plain_response(
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request",
+                    &state.security_headers,
+                ),
+                parts.uri.path(),
+                &state.path_headers,
+            ),
+            parts.version,
+        );
+    }
     // A WebSocket upgrade is decided here, before any body handling: the
     // upgrade handshake must not compete for a Python execution slot, and a
     // request that is not a WebSocket route must not reach the HTTP bridge
@@ -2732,7 +2944,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, max_concurrent_per_ip=16, acquire_timeout_max_ms=None, fast_path_max_concurrent=None, streaming_max_lifetime_secs=300, body_capacity_per_ip=4, ws_idle_timeout_secs=300, ws_max_lifetime_secs=3600, ws_ping_interval_secs=60, trusted_proxies=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, max_concurrent_per_ip=16, acquire_timeout_max_ms=None, fast_path_max_concurrent=None, streaming_max_lifetime_secs=300, body_capacity_per_ip=4, ws_idle_timeout_secs=300, ws_max_lifetime_secs=3600, ws_ping_interval_secs=60, trusted_proxies=None, allowed_hosts=None))]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn new(
@@ -2779,6 +2991,7 @@ impl NativeServer {
         ws_max_lifetime_secs: u64,
         ws_ping_interval_secs: u64,
         trusted_proxies: Option<Vec<String>>,
+        allowed_hosts: Option<Vec<String>>,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -2904,6 +3117,15 @@ impl NativeServer {
                 Ok(PathHeaderRule { router, headers })
             })
             .collect::<PyResult<Vec<_>>>()?;
+        // Host allowlist (S-P1-19, M-9): an explicit list is compiled
+        // as given; None or an empty list means the loopback default,
+        // matching `pynext.config.effective_allowed_hosts`.
+        let allowed_hosts = match allowed_hosts {
+            Some(entries) if !entries.is_empty() => {
+                parse_host_patterns(entries).map_err(PyValueError::new_err)?
+            }
+            _ => default_host_patterns(),
+        };
         let isr_cache = isr_cache.inner.clone();
         let public_assets = public_assets
             .into_iter()
@@ -3015,6 +3237,7 @@ impl NativeServer {
                     shared_cache_enabled,
                     security_headers: security_headers.unwrap_or_default(),
                     path_headers,
+                    allowed_hosts,
                     websocket_router,
                     websocket_paths: websocket_paths.into_iter().collect(),
                     websocket_protocols: websocket_protocols.unwrap_or_default(),
@@ -3308,6 +3531,85 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use serde_json::json;
+
+    // Host allowlist (S-P1-19, M-9): Django ALLOWED_HOSTS semantics —
+    // exact, `.domain` (domain + subdomains), `*.domain` (subdomains
+    // only), `*` (any), with the request port stripped before matching.
+    #[test]
+    fn host_patterns_match_django_semantics() {
+        let patterns = parse_host_patterns(vec![
+            "example.com".to_string(),
+            ".example.org".to_string(),
+            "*.example.net".to_string(),
+        ])
+        .unwrap();
+        let allowed = |host: &str| {
+            let bare = bare_host(host).unwrap();
+            patterns.iter().any(|p| host_matches(&bare, p))
+        };
+        assert!(allowed("example.com"));
+        assert!(allowed("example.com:3000"));
+        assert!(allowed("EXAMPLE.COM"));
+        assert!(allowed("example.com."));
+        assert!(!allowed("sub.example.com"));
+        assert!(!allowed("evil.com"));
+        assert!(allowed("example.org"));
+        assert!(allowed("www.example.org"));
+        assert!(allowed("deep.sub.example.org"));
+        assert!(allowed("www.example.net"));
+        assert!(!allowed("example.net"));
+        assert!(!allowed("example.com.evil.com"));
+    }
+
+    #[test]
+    fn host_patterns_reject_bad_entries() {
+        for bad in [
+            "",
+            "https://example.com",
+            "example.com:3000",
+            "example.com/path",
+            "exa mple.com",
+            "foo.*.example.com",
+            ".127.0.0.1",
+            "*.127.0.0.1",
+            "[example.com]",
+            "example..com",
+            "-example.com",
+            "example.com-",
+        ] {
+            assert!(parse_host_pattern(bad).is_err(), "{bad}");
+        }
+        assert!(parse_host_pattern("*").is_ok());
+        assert!(parse_host_pattern("[::1]").is_ok());
+        assert!(parse_host_pattern("::1").is_ok());
+        assert!(matches!(
+            parse_host_pattern("EXAMPLE.COM").unwrap(),
+            HostPattern::Exact(ref h) if h == "example.com"
+        ));
+    }
+
+    #[test]
+    fn host_header_requires_a_present_allowed_host() {
+        let patterns = default_host_patterns();
+        let mut headers = HeaderMap::new();
+        assert!(!host_header_allowed(&headers, None, &patterns));
+        // h2c carries :authority instead of a Host header: the URI
+        // authority is the fallback source.
+        assert!(host_header_allowed(
+            &headers,
+            Some("127.0.0.1:3000"),
+            &patterns
+        ));
+        assert!(!host_header_allowed(&headers, Some("evil.com"), &patterns));
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:3000"));
+        assert!(host_header_allowed(&headers, None, &patterns));
+        headers.insert(header::HOST, HeaderValue::from_static("[::1]:3000"));
+        assert!(host_header_allowed(&headers, None, &patterns));
+        headers.insert(header::HOST, HeaderValue::from_static("evil.com"));
+        assert!(!host_header_allowed(&headers, None, &patterns));
+        headers.insert(header::HOST, HeaderValue::from_static(""));
+        assert!(!host_header_allowed(&headers, None, &patterns));
+    }
 
     // Property-based coverage for the HTML serializer (finding #48, spec §13).
     // These tests call the pure-Rust render_node directly; the same renderer

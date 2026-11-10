@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import difflib
 import importlib.util
+import ipaddress
 import math
 import os
+import re
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -48,10 +50,12 @@ from .http import _ORIGIN, canonical_origin, parse_csrf_signing_key
 __all__ = [
     "CONFIG_FILENAME",
     "CONFIG_VARIABLE",
+    "DEFAULT_ALLOWED_HOSTS",
     "DEFAULT_CONFIG",
     "ConfigError",
     "PyNextConfig",
     "ResolvedConfig",
+    "effective_allowed_hosts",
     "find_config_file",
     "load_config",
     "load_config_file",
@@ -216,6 +220,9 @@ class PyNextConfig:
     websocket_max_message: int = 65_536
     websocket_allowed_origins: tuple = ()
     websocket_allow_missing_origin: bool = False
+    # Host header validation (S-P1-19, Django ALLOWED_HOSTS): an empty
+    # list means the loopback default (see effective_allowed_hosts).
+    allowed_hosts: tuple = ()
     # Observability (None = from the environment, as before).
     structured_logs: bool | None = None
     metrics: bool | None = None
@@ -225,6 +232,30 @@ class PyNextConfig:
 
 #: The single default source. Frozen: callers must not mutate it.
 DEFAULT_CONFIG = PyNextConfig()
+
+#: Hosts allowed when ``allowed_hosts`` is empty: loopback only. The
+#: native server enforces the same default for a direct caller that
+#: passes no allowlist (see ``effective_allowed_hosts``).
+DEFAULT_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def effective_allowed_hosts(allowed_hosts=(), bind_host=None):
+    """The Host allowlist actually enforced by the native server.
+
+    An explicitly configured list wins as-is. Otherwise the loopback
+    default applies, plus the bind host when it names a host (for
+    example ``--host example.com``); a wildcard bind (``0.0.0.0``,
+    ``::``) is not a hostname and adds nothing — a public deployment
+    must set ``allowed_hosts`` explicitly (Django ``ALLOWED_HOSTS``).
+    """
+    if allowed_hosts:
+        return tuple(allowed_hosts)
+    hosts = list(DEFAULT_ALLOWED_HOSTS)
+    if bind_host:
+        candidate = bind_host.lower()
+        if candidate not in hosts and candidate not in ("0.0.0.0", "::"):
+            hosts.append(candidate)
+    return tuple(hosts)
 
 
 @dataclass(frozen=True)
@@ -297,11 +328,70 @@ _SPECS = {
     "websocket_max_message": _Spec("int", 1, _MAX_WS_MESSAGE_BYTES),
     "websocket_allowed_origins": _Spec("ws_origins"),
     "websocket_allow_missing_origin": _Spec("bool"),
+    "allowed_hosts": _Spec("allowed_hosts"),
     "structured_logs": _Spec("bool_or_none"),
     "metrics": _Spec("bool_or_none"),
     "tracing": _Spec("bool_or_none"),
     "log_level": _Spec("log_level"),
 }
+
+#: One DNS label: alphanumerics, hyphens (not at either end) and
+#: underscores (intranet names such as ``my_host``). The native matcher
+#: enforces the same alphabet on request Host values.
+_HOST_LABEL = re.compile(r"^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$")
+
+
+def _validate_allowed_host(entry, *, source, key):
+    """Validate one ``allowed_hosts`` entry; return it lowercased.
+
+    Django ``ALLOWED_HOSTS`` forms: ``*`` (any host), ``.example.com``
+    (the domain and all its subdomains), ``*.example.com`` (subdomains
+    only), or an exact hostname / IP literal. Entries are bare hosts:
+    no scheme, no port (the request Host's port is stripped at match
+    time), no path or query.
+    """
+    if not isinstance(entry, str) or not entry:
+        _fail(source, key, "must be a list or tuple of non-empty host patterns", entry)
+    lowered = entry.lower()
+    if lowered == "*":
+        return "*"
+    if "://" in lowered or any(ch in lowered for ch in " /?#@"):
+        _fail(source, key, f"has an invalid allowed host {entry!r}", entry)
+    body = lowered
+    suffix = body.startswith("*.") or body.startswith(".")
+    if body.startswith("*."):
+        body = body[2:]
+    elif body.startswith("."):
+        body = body[1:]
+    if "*" in body:
+        _fail(source, key, f"has an invalid allowed host {entry!r}", entry)
+    if body.startswith("[") and body.endswith("]"):
+        try:
+            ipaddress.ip_address(body[1:-1])
+        except ValueError:
+            _fail(source, key, f"has an invalid allowed host {entry!r}", entry)
+        if suffix:
+            _fail(source, key,
+                  f"subdomain pattern {entry!r} must name a domain, not an IP literal", entry)
+        return body[1:-1]
+    try:
+        ipaddress.ip_address(body)
+    except ValueError:
+        pass
+    else:
+        if suffix:
+            _fail(source, key,
+                  f"subdomain pattern {entry!r} must name a domain, not an IP literal", entry)
+        return body
+    if ":" in body:
+        _fail(source, key, f"allowed host {entry!r} must not include a port", entry)
+    if not body or len(body) > 253:
+        _fail(source, key, f"has an invalid allowed host {entry!r}", entry)
+    for label in body.split("."):
+        if not _HOST_LABEL.fullmatch(label):
+            _fail(source, key, f"has an invalid allowed host {entry!r}", entry)
+    return lowered
+
 
 def _env_bool_value(value):
     """Parse an env-var bool the way :func:`observability._env_bool` does."""
@@ -403,6 +493,10 @@ def _validate_value(key, value, *, source):
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"{source}: {exc}") from exc
         return value
+    if kind == "allowed_hosts":
+        if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+            _fail(source, key, "must be a list or tuple of host patterns", value)
+        return tuple(_validate_allowed_host(item, source=source, key=key) for item in value)
     if kind in ("str_tuple", "cors_origins", "ws_origins"):
         if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
             _fail(source, key, "must be a list or tuple of strings", value)
@@ -479,6 +573,10 @@ def _cross_check(values, *, source, workers_source="default"):
             f"{source}: with workers={values.workers} and the memory ISR cache "
             "backend, each worker keeps its own ISR cache; use "
             "cache_backend 'sqlite' or 'redis' to share it")
+    if "*" in values.allowed_hosts:
+        warnings.append(
+            f"{source}: 'allowed_hosts' contains '*', which allows any Host header; "
+            "set explicit hosts before deploying publicly")
     return warnings
 
 
