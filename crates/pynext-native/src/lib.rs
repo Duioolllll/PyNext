@@ -444,6 +444,10 @@ struct ServerState {
     /// cached ISR pages, plain errors). Bridge responses already carry them
     /// from Python dispatch and pass through untouched.
     security_headers: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Per-path response headers configured in Python (`App(headers=...)`),
+    /// applied to the same Rust-built responses. Each rule carries its own
+    /// one-pattern router, so every matching rule applies.
+    path_headers: Vec<PathHeaderRule>,
     websocket_router: Router,
     websocket_paths: std::collections::HashSet<String>,
     websocket_protocols: HashMap<String, Vec<String>>,
@@ -687,6 +691,81 @@ fn apply_security_headers(
         }
     }
     builder
+}
+
+/// One per-path response-header rule, compiled in Python
+/// (`App(headers=...)`) and handed over as `(source, headers)` pairs.
+/// Each rule carries its own one-pattern `Router`, so — unlike route
+/// dispatch, which takes the single best match — every matching rule
+/// applies.
+struct PathHeaderRule {
+    router: Router,
+    headers: Vec<(HeaderName, HeaderValue)>,
+}
+
+/// Merged per-path headers for `path`: every matching rule applies, and
+/// when two rules set the same header the later rule wins — the same
+/// merge as `http.PathHeaders.headers_for`.
+fn path_headers_for(path: &str, rules: &[PathHeaderRule]) -> Vec<(HeaderName, HeaderValue)> {
+    let mut merged: Vec<(HeaderName, HeaderValue)> = Vec::new();
+    for rule in rules {
+        if rule.router.matches(path).is_some() {
+            for (name, value) in &rule.headers {
+                if let Some(slot) = merged.iter_mut().find(|(n, _)| n == name) {
+                    slot.1 = value.clone();
+                } else {
+                    merged.push((name.clone(), value.clone()));
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// Apply merged per-path headers to a response the Rust layer built.
+/// A header already present wins (asset or framework default), except
+/// `content-security-policy`, which replaces the default policy the
+/// security headers added — mirroring `http.apply_path_headers`.
+/// Responses that cross the Python bridge already carry their path
+/// headers from dispatch and never reach this function.
+fn apply_path_headers(
+    response: AxumResponse<Body>,
+    path: &str,
+    rules: &[PathHeaderRule],
+) -> AxumResponse<Body> {
+    apply_merged_path_headers(response, &path_headers_for(path, rules))
+}
+
+/// Apply already-merged per-path headers (see [`path_headers_for`]) to a
+/// response. Split out so a response built after the bridge — where the
+/// rules were moved into the blocking task — can still carry the headers
+/// merged for its path beforehand.
+fn apply_merged_path_headers(
+    mut response: AxumResponse<Body>,
+    merged: &[(HeaderName, HeaderValue)],
+) -> AxumResponse<Body> {
+    for (name, value) in merged {
+        // CSP always replaces the default policy; any other header is
+        // added only when the response does not already carry it.
+        if name == header::CONTENT_SECURITY_POLICY || !response.headers().contains_key(name) {
+            response.headers_mut().insert(name, value.clone());
+        }
+    }
+    response
+}
+
+/// Apply per-path headers to a Rust-built error response for `raw_path`,
+/// decoding it first; an undecodable path matches no rule, so the
+/// response passes through unchanged.
+fn apply_path_headers_for_raw_path(
+    response: AxumResponse<Body>,
+    raw_path: &str,
+    rules: &[PathHeaderRule],
+) -> AxumResponse<Body> {
+    match static_path(raw_path) {
+        Some(path) => apply_path_headers(response, &path, rules),
+        None => response,
+    }
 }
 
 fn static_response(
@@ -1191,6 +1270,8 @@ async fn rate_limit_denial(
         &state.http_rate_limit_callback
     };
     callback.as_ref()?;
+    // `path` moves into the callback task below, so merge its headers now.
+    let merged_path_headers = path_headers_for(&path, &state.path_headers);
     let unavailable = || {
         let mut response = plain_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1203,7 +1284,10 @@ async fn rate_limit_denial(
         response
     };
     let Ok(permit) = Arc::clone(&state.rate_limit_capacity).try_acquire_owned() else {
-        return Some(unavailable());
+        return Some(apply_merged_path_headers(
+            unavailable(),
+            &merged_path_headers,
+        ));
     };
     let headers: Vec<(Vec<u8>, Vec<u8>)> = parts
         .headers
@@ -1251,9 +1335,12 @@ async fn rate_limit_denial(
             if let Ok(value) = HeaderValue::from_str(&retry_after.unwrap_or(1).max(1).to_string()) {
                 response.headers_mut().insert(header::RETRY_AFTER, value);
             }
-            Some(response)
+            Some(apply_merged_path_headers(response, &merged_path_headers))
         }
-        _ => Some(unavailable()),
+        _ => Some(apply_merged_path_headers(
+            unavailable(),
+            &merged_path_headers,
+        )),
     }
 }
 
@@ -1457,10 +1544,14 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     }
     if conflicting_content_length(&parts.headers) {
         return close_with_unread_body(
-            plain_response(
-                StatusCode::BAD_REQUEST,
-                "Bad Request",
-                &state.security_headers,
+            apply_path_headers_for_raw_path(
+                plain_response(
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request",
+                    &state.security_headers,
+                ),
+                parts.uri.path(),
+                &state.path_headers,
             ),
             parts.version,
         );
@@ -1501,7 +1592,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             Ok(permit) => permit,
             Err(_) => {
                 return close_with_unread_body(
-                    busy_response(1, &state.security_headers),
+                    apply_path_headers_for_raw_path(
+                        busy_response(1, &state.security_headers),
+                        parts.uri.path(),
+                        &state.path_headers,
+                    ),
                     parts.version,
                 );
             }
@@ -1527,7 +1622,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         (StatusCode::REQUEST_TIMEOUT, "Request Timeout", true)
                     }
                 };
-                let mut response = plain_response(status, message, &state.security_headers);
+                let mut response = apply_path_headers_for_raw_path(
+                    plain_response(status, message, &state.security_headers),
+                    parts.uri.path(),
+                    &state.path_headers,
+                );
                 if retry_after {
                     response
                         .headers_mut()
@@ -1536,10 +1635,14 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 return close_with_unread_body(response, parts.version);
             }
             Err(_) => {
-                let mut response = plain_response(
-                    StatusCode::REQUEST_TIMEOUT,
-                    "Request Timeout",
-                    &state.security_headers,
+                let mut response = apply_path_headers_for_raw_path(
+                    plain_response(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "Request Timeout",
+                        &state.security_headers,
+                    ),
+                    parts.uri.path(),
+                    &state.path_headers,
                 );
                 response
                     .headers_mut()
@@ -1560,42 +1663,56 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     {
         if let Some(path) = decoded_path {
             if let Some(content) = state.client_assets.get(&path) {
-                return static_response(
-                    &parts,
-                    content,
-                    AssetPolicy {
-                        content_type: &HeaderValue::from_static("text/javascript; charset=utf-8"),
-                        etag: &state.asset_etags[&path],
-                        cache_control: "public, max-age=31536000, immutable",
-                        vary: false,
-                    },
-                    &state.security_headers,
+                return apply_path_headers(
+                    static_response(
+                        &parts,
+                        content,
+                        AssetPolicy {
+                            content_type: &HeaderValue::from_static(
+                                "text/javascript; charset=utf-8",
+                            ),
+                            etag: &state.asset_etags[&path],
+                            cache_control: "public, max-age=31536000, immutable",
+                            vary: false,
+                        },
+                        &state.security_headers,
+                    ),
+                    &path,
+                    &state.path_headers,
                 );
             }
             if let Some(asset) = state.public_assets.get(&path) {
-                return static_response(
-                    &parts,
-                    &asset.body,
-                    AssetPolicy {
-                        content_type: &asset.content_type,
-                        etag: &state.asset_etags[&path],
-                        cache_control: "public, max-age=0, must-revalidate",
-                        vary: false,
-                    },
-                    &state.security_headers,
+                return apply_path_headers(
+                    static_response(
+                        &parts,
+                        &asset.body,
+                        AssetPolicy {
+                            content_type: &asset.content_type,
+                            etag: &state.asset_etags[&path],
+                            cache_control: "public, max-age=0, must-revalidate",
+                            vary: false,
+                        },
+                        &state.security_headers,
+                    ),
+                    &path,
+                    &state.path_headers,
                 );
             }
             if let Some(content) = state.static_pages.get(&path) {
-                return static_response(
-                    &parts,
-                    content,
-                    AssetPolicy {
-                        content_type: &HeaderValue::from_static("text/html; charset=utf-8"),
-                        etag: &state.asset_etags[&path],
-                        cache_control: "public, max-age=0, must-revalidate",
-                        vary: true,
-                    },
-                    &state.security_headers,
+                return apply_path_headers(
+                    static_response(
+                        &parts,
+                        content,
+                        AssetPolicy {
+                            content_type: &HeaderValue::from_static("text/html; charset=utf-8"),
+                            etag: &state.asset_etags[&path],
+                            cache_control: "public, max-age=0, must-revalidate",
+                            vary: true,
+                        },
+                        &state.security_headers,
+                    ),
+                    &path,
+                    &state.path_headers,
                 );
             }
             if !state.shared_cache_enabled
@@ -1609,17 +1726,21 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     } else {
                         Body::from(content)
                     };
-                    return apply_security_headers(
-                        AxumResponse::builder()
-                            .status(StatusCode::OK)
-                            .header("content-type", "text/html; charset=utf-8")
-                            .header("content-length", length.to_string())
-                            .header("cache-control", "public, max-age=0, must-revalidate")
-                            .header("vary", "Cookie, Authorization"),
-                        &state.security_headers,
-                    )
-                    .body(body)
-                    .expect("cached response is valid");
+                    return apply_path_headers(
+                        apply_security_headers(
+                            AxumResponse::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/html; charset=utf-8")
+                                .header("content-length", length.to_string())
+                                .header("cache-control", "public, max-age=0, must-revalidate")
+                                .header("vary", "Cookie, Authorization"),
+                            &state.security_headers,
+                        )
+                        .body(body)
+                        .expect("cached response is valid"),
+                        &path,
+                        &state.path_headers,
+                    );
                 }
             }
         }
@@ -1644,7 +1765,13 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 Ok(permit) => permit,
                 // No waiting slot: the earliest a slot could free is
                 // unknown, so the advisory retry delay stays 1 second.
-                Err(_) => return busy_response(1, &state.security_headers),
+                Err(_) => {
+                    return apply_path_headers_for_raw_path(
+                        busy_response(1, &state.security_headers),
+                        parts.uri.path(),
+                        &state.path_headers,
+                    )
+                }
             };
             match tokio::time::timeout(
                 state.acquire_timeout,
@@ -1657,9 +1784,13 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     permit
                 }
                 _ => {
-                    return busy_response(
-                        retry_after_for_timeout(state.acquire_timeout),
-                        &state.security_headers,
+                    return apply_path_headers_for_raw_path(
+                        busy_response(
+                            retry_after_for_timeout(state.acquire_timeout),
+                            &state.security_headers,
+                        ),
+                        parts.uri.path(),
+                        &state.path_headers,
                     )
                 }
             }
@@ -1680,6 +1811,12 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         .get::<PeerAddr>()
         .map(|peer| peer.0.ip().to_string());
     let security_headers = state.security_headers.clone();
+    // The bridge task moves `state`, so merge this request's path headers
+    // beforehand for the plain 500s built below; bridge responses already
+    // carry their path headers from Python dispatch.
+    let path_headers_for_request = static_path(&path)
+        .map(|decoded| path_headers_for(&decoded, &state.path_headers))
+        .unwrap_or_default();
     let result = tokio::task::spawn_blocking(move || {
         let result = Python::attach(|py| {
             let cb = state.callback.bind(py);
@@ -1716,10 +1853,13 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 if let BridgeBody::Streaming(stream) = body {
                     close_stream(Arc::new(stream));
                 }
-                return plain_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal Server Error",
-                    &security_headers,
+                return apply_merged_path_headers(
+                    plain_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal Server Error",
+                        &security_headers,
+                    ),
+                    &path_headers_for_request,
                 );
             };
             let mut response = AxumResponse::new(Body::empty());
@@ -1732,10 +1872,13 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     if let BridgeBody::Streaming(stream) = body {
                         close_stream(Arc::new(stream));
                     }
-                    return plain_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Internal Server Error",
-                        &security_headers,
+                    return apply_merged_path_headers(
+                        plain_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Internal Server Error",
+                            &security_headers,
+                        ),
+                        &path_headers_for_request,
                     );
                 };
                 response.headers_mut().append(key, value);
@@ -1749,10 +1892,13 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             };
             response
         }
-        _ => plain_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal Server Error",
-            &security_headers,
+        _ => apply_merged_path_headers(
+            plain_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                &security_headers,
+            ),
+            &path_headers_for_request,
         ),
     }
 }
@@ -1899,8 +2045,9 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None))]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     fn new(
         py: Python<'_>,
         callback: Py<PyAny>,
@@ -1935,6 +2082,7 @@ impl NativeServer {
         websocket_rate_limit_callback: Option<Py<PyAny>>,
         websocket_auth_callback: Option<Py<PyAny>>,
         http_rate_limit_callback: Option<Py<PyAny>>,
+        path_headers: Option<Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>>,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -2008,6 +2156,28 @@ impl NativeServer {
                 Ok((path, value))
             })
             .collect::<PyResult<HashMap<_, _>>>()?;
+        // Per-path headers arrive already validated from Python; reject
+        // them here too so a direct NativeServer caller cannot smuggle in
+        // a bad source or header value past the Python compiler.
+        let path_headers = path_headers
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(source, headers)| {
+                let router = Router::new(vec![source]).map_err(PyValueError::new_err)?;
+                let headers = headers
+                    .into_iter()
+                    .map(|(name, value)| {
+                        Ok((
+                            HeaderName::from_bytes(&name)
+                                .map_err(|_| PyValueError::new_err("Invalid path header name"))?,
+                            HeaderValue::from_bytes(&value)
+                                .map_err(|_| PyValueError::new_err("Invalid path header value"))?,
+                        ))
+                    })
+                    .collect::<PyResult<Vec<_>>>()?;
+                Ok(PathHeaderRule { router, headers })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
         let isr_cache = isr_cache.inner.clone();
         let public_assets = public_assets
             .into_iter()
@@ -2102,6 +2272,7 @@ impl NativeServer {
                     middleware_enabled,
                     shared_cache_enabled,
                     security_headers: security_headers.unwrap_or_default(),
+                    path_headers,
                     websocket_router,
                     websocket_paths: websocket_paths.into_iter().collect(),
                     websocket_protocols: websocket_protocols.unwrap_or_default(),

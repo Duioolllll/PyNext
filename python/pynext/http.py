@@ -566,6 +566,288 @@ def apply_security_headers(response, *, config=DEFAULT_SECURITY, nonce=None, pro
     return response
 
 
+#: Response headers a path rule must never set. Framing headers are owned
+#: by the server: a rule-supplied ``Content-Length`` would disagree with
+#: the body the server actually sends, and ``Transfer-Encoding`` is a
+#: hop-by-hop header the transport controls.
+_FORBIDDEN_PATH_HEADER_NAMES = frozenset({b"content-length", b"transfer-encoding"})
+
+
+def _compile_path_pattern(source):
+    """Compile a route-pattern ``source`` to a regex matching one decoded path.
+
+    The grammar is the router's own (``/api/[id]``, ``/docs/[...rest]``,
+    ``/docs/[[...path]]``), case-sensitive like every other PyNext route
+    match, so a rule source the router would reject is rejected here too
+    instead of silently never matching. Literal segments must not contain
+    ``[`` or ``]`` (write ``[name]`` for a parameter); ``*`` globs and
+    Next.js ``:param`` syntax are not part of this grammar — use
+    ``[...slug]`` for a multi-segment match.
+    """
+    if not isinstance(source, str):
+        raise TypeError(f"path header source must be a str, got {type(source).__name__}")
+    if not source.startswith("/") or (len(source) > 1 and source.endswith("/")) or "//" in source:
+        raise ValueError(f"Invalid path header source {source!r}: must be an absolute normalized path")
+    if source == "/":
+        return re.compile(r"/")
+    segments = source[1:].split("/")
+    names = set()
+    # Each fragment carries its own leading slash, except an optional
+    # catch-all, whose "(?:/.+)?" already includes it — so "/docs" +
+    # "(?:/.+)?" matches "/docs" itself. A lone optional catch-all
+    # ("/[[...rest]]") instead compiles to "/(?:.+)?", which matches "/".
+    fragments = []
+    for index, segment in enumerate(segments):
+        if segment in {".", ".."} or any(c in segment for c in "?#\\\x00") or any(
+                ord(c) < 32 or ord(c) == 127 for c in segment):
+            raise ValueError(f"Invalid path header source {source!r}: bad segment {segment!r}")
+        if segment.startswith("[[") and segment.endswith("]]"):
+            inner = segment[2:-2]
+            if not inner.startswith("..."):
+                raise ValueError(
+                    f"Invalid path header source {source!r}: optional parameters must use [[...name]]")
+            kind, name = "optional_catch_all", inner[3:]
+            if index + 1 != len(segments):
+                raise ValueError(f"Invalid path header source {source!r}: a catch-all must be last")
+        elif segment.startswith("[") and segment.endswith("]"):
+            inner = segment[1:-1]
+            if inner.startswith("..."):
+                kind, name = "catch_all", inner[3:]
+                if index + 1 != len(segments):
+                    raise ValueError(f"Invalid path header source {source!r}: a catch-all must be last")
+            else:
+                kind, name = "dynamic", inner
+        elif "[" in segment or "]" in segment:
+            raise ValueError(
+                f"Invalid path header source {source!r}: segment {segment!r} mixes literal text "
+                "with brackets; use [name] for a whole-segment parameter")
+        else:
+            if "*" in segment:
+                raise ValueError(
+                    f"Invalid path header source {source!r}: '*' globs are not supported; "
+                    "use [...slug] for a multi-segment match")
+            fragments.append("/" + re.escape(segment))
+            continue
+        if (not name or not all(c.isascii() and (c.isalnum() or c in "_-") for c in name)
+                or not any(c.isalnum() or c == "_" for c in name)):
+            raise ValueError(f"Invalid path header source {source!r}: bad parameter name in {segment!r}")
+        comparable = "".join(c for c in name if c.isalnum())
+        if comparable in names:
+            raise ValueError(f"Invalid path header source {source!r}: repeated parameter {name!r}")
+        names.add(comparable)
+        if kind == "dynamic":
+            fragments.append(r"/[^/]+")
+        elif kind == "catch_all":
+            fragments.append(r"/.+")
+        else:
+            # Preceded by other segments the group carries its own slash
+            # ("/docs" + "(?:/.+)?"); as the only segment it follows the
+            # root slash instead ("/" + "(?:.+)?" matches "/" itself).
+            fragments.append(r"(?:/.+)?" if fragments else r"(?:.+)?")
+    pattern = "".join(fragments)
+    if not pattern.startswith("/"):
+        # A source of only an optional catch-all ("/[[...rest]]") has no
+        # literal fragment to carry the leading slash.
+        pattern = "/" + pattern
+    return re.compile(pattern)
+
+
+def _normalize_path_rule_headers(headers, *, source):
+    """Normalize one rule's headers to ``((name, value), ...)`` (names lowercased).
+
+    Accepts a mapping or an iterable of ``(name, value)`` pairs, like a
+    :class:`Response` header list. Names must be valid header tokens and
+    values ASCII without control characters (the same checks
+    :class:`Response` applies); a rule must set at least one header, and a
+    name may appear only once per rule — a repeated name is a typo, not a
+    multi-value header.
+    """
+    if isinstance(headers, dict):
+        items = list(headers.items())
+    else:
+        try:
+            items = list(headers)
+        except TypeError as exc:
+            raise TypeError(
+                f"headers for path header source {source!r} must be a mapping or "
+                "an iterable of (name, value) pairs") from exc
+    if not items:
+        raise ValueError(f"headers for path header source {source!r} must not be empty")
+    normalized = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(
+                f"headers for path header source {source!r} must be (name, value) pairs, got {item!r}")
+        name, value = item
+        if not isinstance(name, str) or not _TOKEN_NAME.fullmatch(name):
+            raise ValueError(f"Invalid header name {name!r} for path header source {source!r}")
+        if not isinstance(value, str):
+            raise TypeError(f"Header value for {name!r} must be str, got {type(value).__name__}")
+        try:
+            encoded = value.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"Header value for {name!r} must be ASCII") from exc
+        if any(c < 32 or c == 127 for c in encoded):
+            raise ValueError(f"Header value for {name!r} must not contain control characters")
+        lowered = name.lower()
+        if lowered in seen:
+            raise ValueError(
+                f"Duplicate header {name!r} for path header source {source!r}")
+        if lowered.encode("ascii") in _FORBIDDEN_PATH_HEADER_NAMES:
+            raise ValueError(
+                f"Header {name!r} cannot be set by a path rule for {source!r}: "
+                "framing headers are owned by the server")
+        seen.add(lowered)
+        normalized.append((lowered, value))
+    return tuple(normalized)
+
+
+@dataclass(frozen=True)
+class PathHeaderRule:
+    """One per-path response-header rule (Next.js ``headers()`` equivalent).
+
+    ``source`` is a route pattern (``/api/[id]``, ``/docs/[...rest]``) and
+    ``headers`` is a mapping or ``(name, value)`` pairs. The source and the
+    headers are validated on construction, so a bad rule fails at startup
+    instead of silently never matching. Build rules with
+    :func:`compile_path_headers`, which also accepts plain
+    ``(source, headers)`` tuples.
+    """
+
+    source: str
+    headers: tuple = ()
+    _regex: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self):
+        headers = _normalize_path_rule_headers(self.headers, source=self.source)
+        object.__setattr__(self, "headers", headers)
+        object.__setattr__(self, "_regex", _compile_path_pattern(self.source))
+
+    def matches(self, path):
+        """True when this rule's source matches the decoded request ``path``."""
+        return self._regex.fullmatch(path) is not None
+
+
+class PathHeaders:
+    """Compiled per-path response headers for an app.
+
+    Rules are tried in declaration order and every matching rule applies;
+    when two matching rules set the same header the later rule wins. A rule
+    never overwrites a header a handler (or an earlier dispatch step) set
+    explicitly — see :func:`apply_path_headers` — but it does beat the
+    framework's default security headers, so a rule can relax (or tighten)
+    e.g. ``X-Frame-Options`` for one path. A rule's
+    ``Content-Security-Policy`` replaces the default policy the
+    :class:`Response` constructor added, and is then treated as explicit,
+    so :func:`apply_security_headers` leaves it alone.
+
+    Rules match the decoded request path, including framework-served paths
+    (``/_pynext/`` client assets, public files, ``/healthz``) and responses
+    the router never reaches (404/405/308), but not WebSocket handshakes.
+    Matching is case-sensitive, like PyNext routing.
+    """
+
+    def __init__(self, rules=()):
+        self.rules = tuple(rules)
+        for rule in self.rules:
+            if not isinstance(rule, PathHeaderRule):
+                raise TypeError("PathHeaders rules must be PathHeaderRule objects")
+
+    def __len__(self):
+        return len(self.rules)
+
+    def __bool__(self):
+        return bool(self.rules)
+
+    def headers_for(self, path):
+        """Merged ``((name, value), ...)`` byte pairs for ``path`` (later rules win)."""
+        merged = {}
+        for rule in self.rules:
+            if not rule.matches(path):
+                continue
+            for name, value in rule.headers:
+                merged[name.encode("ascii")] = value.encode("ascii")
+        return tuple(merged.items())
+
+    def for_native(self):
+        """Rules as ``((source, ((name, value), ...)), ...)`` byte pairs for the Rust server."""
+        return tuple((rule.source,
+                      tuple((name.encode("ascii"), value.encode("ascii"))
+                            for name, value in rule.headers))
+                     for rule in self.rules)
+
+
+def compile_path_headers(rules=None):
+    """Compile per-path header rules into a :class:`PathHeaders` (startup validation).
+
+    ``rules`` is an iterable of :class:`PathHeaderRule` objects or
+    ``(source, headers)`` tuples, where ``headers`` is a mapping or
+    ``(name, value)`` pairs — e.g.
+    ``[("/api/[...rest]", {"Cache-Control": "no-store"})]``. (``*`` globs
+    are not part of the route-pattern grammar; ``[...rest]`` is the
+    multi-segment match.)
+    ``None`` (the default) means no rules. A bad source, header name or
+    value raises :class:`ValueError` (a wrong type raises
+    :class:`TypeError`), so :class:`App` construction fails loudly.
+    """
+    if rules is None:
+        return PathHeaders()
+    if isinstance(rules, (str, bytes)) or isinstance(rules, PathHeaderRule):
+        raise TypeError("path headers must be an iterable of rules, not a single rule")
+    compiled = []
+    try:
+        items = list(rules)
+    except TypeError as exc:
+        raise TypeError("path headers must be an iterable of rules") from exc
+    for item in items:
+        if isinstance(item, PathHeaderRule):
+            compiled.append(item)
+            continue
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(
+                f"path header rules must be (source, headers) pairs, got {item!r}")
+        source, headers = item
+        compiled.append(PathHeaderRule(source, headers))
+    return PathHeaders(compiled)
+
+
+def apply_path_headers(response, path, *, path_headers=None):
+    """Apply the matching per-path headers to ``response`` (in place).
+
+    Call after dispatch and before :func:`apply_security_headers`: a rule
+    header is added only when the response does not already carry that
+    name, so a handler's explicit header always wins, while a rule still
+    beats the framework defaults (which are applied afterwards and never
+    overwrite an existing header). The one exception is
+    ``Content-Security-Policy``: the policy :class:`Response` adds on
+    construction is the framework default, not a handler choice, so a
+    matching rule replaces it and marks it explicit. Idempotent: a
+    response that already went through this function is returned
+    unchanged. Returns the response for call-site chaining.
+    """
+    if not path_headers:
+        return response
+    if getattr(response, "_path_headers_applied", False):
+        return response
+    response._path_headers_applied = True
+    for key, value in path_headers.headers_for(path):
+        if key == b"content-security-policy":
+            if getattr(response, "_csp_explicit", False):
+                continue
+            for index, (existing_key, _existing) in enumerate(response.headers):
+                if existing_key == key:
+                    response.headers[index] = (key, value)
+                    break
+            else:
+                response.headers.append((key, value))
+            response._csp_explicit = True
+            continue
+        if not any(existing_key == key for existing_key, _ in response.headers):
+            response.headers.append((key, value))
+    return response
+
+
 def _request_origin(request):
     values = _header_values(request, "origin")
     return values[0].decode("ascii", "ignore").strip() if values else None

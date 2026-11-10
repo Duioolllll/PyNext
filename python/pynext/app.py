@@ -38,7 +38,8 @@ from .dynamic import (DYNAMIC_MODES, MAX_DYNAMIC_ACCESSES, format_dynamic_access
 from .errors import SignalError, digest_for_error, error_count
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
-                   apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
+                   apply_path_headers, apply_security_headers, compile_path_headers,
+                   cors_preflight_response, new_csp_nonce, validate_csrf)
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .middleware import ScopedMiddleware
 from .observability import (
@@ -517,7 +518,7 @@ class App:
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
                  resources=None, cache_url=None, cache_failure_policy=None,
                  websocket_max_message=DEFAULT_CONFIG.websocket_max_message, hot_reload=False,
-                 trusted_proxies=None, sync_workers=32, strict_ssg=False):
+                 trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None):
         if isinstance(sync_workers, bool) or not isinstance(sync_workers, int) or not 1 <= sync_workers <= 1024:
             raise ValueError("sync_workers must be an integer from 1 to 1024")
         self.sync_workers = sync_workers
@@ -550,6 +551,10 @@ class App:
         if not isinstance(security, SecurityConfig):
             raise TypeError("security must be a SecurityConfig")
         self.security = security
+        # Per-path response headers (Next.js headers() equivalent): compiled
+        # and validated here, so a bad rule fails at startup. See
+        # http.compile_path_headers for the accepted shapes.
+        self.path_headers = compile_path_headers(headers)
         self.observability_config = observability or ObservabilityConfig.from_env()
         self.metrics = MetricsCollector(enabled=self.observability_config.metrics)
         configure_logging(self.observability_config)
@@ -1510,6 +1515,7 @@ class App:
             return await self._dispatch_response(request)
         except _SyncHandlerBusy:
             response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
+            apply_path_headers(response, request.path, path_headers=self.path_headers)
             apply_cors_headers(request, response, config=self.security)
             apply_security_headers(response, config=self.security, production=self.production)
             if request.method == "HEAD":
@@ -1538,17 +1544,21 @@ class App:
         if request.path in ("/healthz", "/readyz"):
             route_var.set("__health__")
             if request.method not in {"GET", "HEAD"}:
-                return Response("Method Not Allowed", status=405,
-                                headers=[(b"allow", b"GET, HEAD")])
-            if request.path == "/healthz":
+                response = Response("Method Not Allowed", status=405,
+                                    headers=[(b"allow", b"GET, HEAD")])
+            elif request.path == "/healthz":
                 body = b"" if request.method == "HEAD" else b"ok"
-                return Response(body, media_type="text/plain; charset=utf-8")
-            if self.is_ready:
+                response = Response(body, media_type="text/plain; charset=utf-8")
+            elif self.is_ready:
                 body = b"" if request.method == "HEAD" else b"ready"
-                return Response(body, media_type="text/plain; charset=utf-8")
-            return Response(b"" if request.method == "HEAD" else b"not ready", status=503,
-                            media_type="text/plain; charset=utf-8",
-                            headers=[(b"retry-after", b"1")])
+                response = Response(body, media_type="text/plain; charset=utf-8")
+            else:
+                response = Response(b"" if request.method == "HEAD" else b"not ready", status=503,
+                                    media_type="text/plain; charset=utf-8",
+                                    headers=[(b"retry-after", b"1")])
+            # Health responses skip the security-header step here (the
+            # transport applies it); path headers still apply, before it.
+            return apply_path_headers(response, request.path, path_headers=self.path_headers)
         preflight = cors_preflight_response(request, config=self.security)
         if self.middleware:
             async def terminal(current):
@@ -1560,6 +1570,7 @@ class App:
             response = await self._dispatch_timed(request, lambda: self._run_middleware(request, terminal))
             if preflight is None:
                 apply_cors_headers(request, response, config=self.security)
+            apply_path_headers(response, request.path, path_headers=self.path_headers)
             apply_security_headers(response, config=self.security, production=self.production)
             if request.method == "HEAD":
                 if isinstance(response, StreamingResponse):
@@ -1568,10 +1579,12 @@ class App:
                 response.body = b""
             return response
         if preflight is not None:
+            apply_path_headers(preflight, request.path, path_headers=self.path_headers)
             apply_security_headers(preflight, config=self.security, production=self.production)
             return preflight
         response = await self._dispatch_timed(request)
         apply_cors_headers(request, response, config=self.security)
+        apply_path_headers(response, request.path, path_headers=self.path_headers)
         apply_security_headers(response, config=self.security, production=self.production)
         return response
 
@@ -2034,6 +2047,7 @@ class App:
         # read, so the socket is never accepted and then closed.
         denied = await self._websocket_rate_limit_denied(scope, path)
         if denied is not None:
+            apply_path_headers(denied, path, path_headers=self.path_headers)
             apply_security_headers(denied, config=self.security, production=self.production)
             await send({"type": "websocket.http.response.start", "status": denied.status,
                         "headers": denied.headers})
@@ -2189,6 +2203,7 @@ class App:
             if denied is not None:
                 if scope["method"].upper() == "HEAD":
                     denied.body = b""
+                apply_path_headers(denied, path, path_headers=self.path_headers)
                 await _send_response(denied, send, config=self.security, production=self.production)
                 return
             chunks, total = [], 0
@@ -2258,6 +2273,10 @@ class App:
                     request_id = get_request_id()
                     if request_id and not any(k == b"x-request-id" for k, _ in result.headers):
                         result.headers.append((b"x-request-id", request_id.encode("ascii")))
+                # error_response results bypass dispatch, so path headers
+                # are applied here; routed responses already have them
+                # (apply_path_headers is idempotent).
+                apply_path_headers(result, path, path_headers=self.path_headers)
                 if scope["method"].upper() == "HEAD":
                     result.body = b""
                 try:
@@ -2281,7 +2300,7 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
                cache_failure_policy=None, websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
                hot_reload=False,
-               trusted_proxies=None, sync_workers=32, strict_ssg=False):
+               trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None):
     root = Path(root).resolve()
     # .env files are loaded before the manifest is read or user code runs,
     # so server code, middleware and island bundling all see them.
@@ -2291,4 +2310,5 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
                resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
                websocket_max_message=websocket_max_message, hot_reload=hot_reload,
-               trusted_proxies=trusted_proxies, sync_workers=sync_workers, strict_ssg=strict_ssg)
+            trusted_proxies=trusted_proxies, sync_workers=sync_workers, strict_ssg=strict_ssg,
+            headers=headers)

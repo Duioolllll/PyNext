@@ -1,7 +1,7 @@
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from os import PathLike
 from typing import Any, Literal
-from .http import Request, Response, SecurityConfig
+from .http import PathHeaderRuleInput, PathHeaders, Request, Response, SecurityConfig
 from .observability import MetricsCollector, ObservabilityConfig
 from .proxy import ProxyTrust
 from .types import ProxyEntry
@@ -15,6 +15,7 @@ class App:
     sync_workers: int
     websocket_max_message: int
     security: SecurityConfig
+    path_headers: PathHeaders
     proxy_trust: ProxyTrust
     resources: Mapping[str, Resource]
     metrics: MetricsCollector
@@ -26,7 +27,7 @@ class App:
                  cache_failure_policy: Literal["fail_open", "fail_closed"] | None = ...,
                  websocket_max_message: int = ..., hot_reload: bool = ...,
                  trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...,
-                 strict_ssg: bool = ...) -> None: ...
+                 strict_ssg: bool = ..., headers: Iterable[PathHeaderRuleInput] | None = ...) -> None: ...
     def configure_observability(self, config: ObservabilityConfig) -> App: ...
     async def startup(self) -> None: ...
     async def shutdown(self) -> None: ...
@@ -57,4 +58,4 @@ def create_app(root: str | PathLike[str] = ..., *, production: bool = ...,
                cache_failure_policy: Literal["fail_open", "fail_closed"] | None = ...,
                websocket_max_message: int = ..., hot_reload: bool = ...,
                trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...,
-               strict_ssg: bool = ...) -> App: ...
+               strict_ssg: bool = ..., headers: Iterable[PathHeaderRuleInput] | None = ...) -> App: ...

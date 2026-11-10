@@ -13,7 +13,8 @@ from .app import _decode_path, _invoke, _split_request_path, _typed_params
 from .config import DEFAULT_CONFIG
 from .errors import SignalError, digest_for_error
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
-                   WebSocketDisconnect, _RequestCancellation, apply_security_headers, security_headers)
+                   WebSocketDisconnect, _RequestCancellation, apply_path_headers,
+                   apply_security_headers, security_headers)
 from .observability import begin_request_context, get_request_id, queue_wait_var
 from .ratelimit import _is_exempt_path
 from .ws_origin import websocket_origin_allowed
@@ -430,6 +431,9 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                 digest, _count = digest_for_error(exc)
                 log.exception("Request failed", extra={"error_digest": digest})
                 response = app.error_response(exc, digest=digest)
+                # error_response results bypass dispatch, so path headers
+                # are applied here; routed responses already have them.
+                apply_path_headers(response, path, path_headers=app.path_headers)
         if method.upper() == "HEAD":
             response.body = b""
         if isinstance(response, StreamingResponse) and not response._head_only:
@@ -482,6 +486,13 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                     break
         # Timeout/unavailable responses built here bypass dispatch, so apply
         # the headers here; routed responses already have them (idempotent).
+        # The raw path may not decode; then no rule can match it anyway.
+        try:
+            bridge_path = _decode_path(raw_path, raw_path.encode("ascii"))
+        except (ValueError, UnicodeError):
+            bridge_path = None
+        if bridge_path is not None:
+            apply_path_headers(response, bridge_path, path_headers=app.path_headers)
         apply_security_headers(response, config=app.security, production=app.production)
         body = (_NativeStream(response, loop, app) if isinstance(response, StreamingResponse) and not response._head_only
                 else response.body)
@@ -554,6 +565,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 websocket_max_message=app.websocket_max_message, listener=listener,
                                 security_headers=security_headers(config=app.security,
                                                                   production=app.production),
+                                path_headers=app.path_headers.for_native(),
                                 drain_timeout_secs=shutdown_timeout)
 
 
