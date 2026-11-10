@@ -88,6 +88,11 @@ class WorkerConfig:
     header_read_timeout_ms: int = DEFAULT_CONFIG.header_read_timeout_ms
     body_min_rate_bytes_per_sec: int = DEFAULT_CONFIG.body_min_rate_bytes_per_sec
     max_waiting: int | None = None  # None keeps the native default min(max_concurrent, 64)
+    # Adaptive admission ceiling (C-P1-5): None keeps the fixed
+    # acquire_timeout_ms; per-stage timeouts (C-P1-7) in ms.
+    acquire_timeout_max_ms: int | None = DEFAULT_CONFIG.acquire_timeout_max_ms
+    handler_timeout_ms: int = DEFAULT_CONFIG.handler_timeout_ms
+    response_timeout_ms: int = DEFAULT_CONFIG.response_timeout_ms
     rate_limit: int = DEFAULT_CONFIG.rate_limit  # 0 disables rate limiting
     rate_limit_window: float = DEFAULT_CONFIG.rate_limit_window
     rate_limit_backend: str = DEFAULT_CONFIG.rate_limit_backend
@@ -144,7 +149,10 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                      cache_failure_policy=config.cache_failure_policy,
                      observability=config.observability, debug=not config.production,
                      security=config.security, websocket_max_message=config.websocket_max_message,
-                     trusted_proxies=config.trusted_proxies, strict_ssg=config.strict_ssg)
+                     trusted_proxies=config.trusted_proxies, strict_ssg=config.strict_ssg,
+                     body_timeout_ms=config.body_timeout_ms,
+                     handler_timeout_ms=config.handler_timeout_ms,
+                     response_timeout_ms=config.response_timeout_ms)
 
     async def run():
         loop = asyncio.get_running_loop()
@@ -169,6 +177,9 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                         config.acquire_timeout_ms, config.body_capacity, config.body_timeout_ms,
                         listener=listener, stop_event=stop_event,
                         observability=config.observability,
+                        acquire_timeout_max_ms=config.acquire_timeout_max_ms,
+                        handler_timeout_ms=config.handler_timeout_ms,
+                        response_timeout_ms=config.response_timeout_ms,
                         max_connections=config.max_connections,
                         max_connections_per_ip=config.max_connections_per_ip,
                         max_concurrent_per_ip=config.max_concurrent_per_ip,

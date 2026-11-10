@@ -11,7 +11,7 @@ from .app import create_app
 from .build import write_manifest
 from .client import compile_client, discover_client
 from .env import load_env
-from .config import DEFAULT_CONFIG, ConfigError, load_config
+from .config import DEFAULT_CONFIG, ConfigError, load_config, resolve_workers
 from .http import MAX_WS_MESSAGE, SecurityConfig
 from .observability import ObservabilityConfig
 from .ratelimit import RateLimiter
@@ -79,6 +79,20 @@ def _bounded(minimum, maximum, label):
     return convert
 
 
+def _workers_value(value):
+    """``--workers`` value: an integer 1..64, or ``"auto"`` (C-P1-5).
+
+    ``"auto"`` means one worker per CPU, clamped to 1..64 — the
+    Sanic ``fast=True`` rule. The probe parse in
+    :func:`_explicit_cli_values` runs this converter too, so an
+    explicit ``--workers auto`` is already an int by the time the
+    config is resolved.
+    """
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return resolve_workers(value)
+    return _bounded(1, MAX_WORKERS, "--workers")(value)
+
+
 async def _wait_for_change(watcher, server_task):
     """Wait for a watched file to change.
 
@@ -116,7 +130,8 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                  header_read_timeout_ms=None, body_min_rate_bytes_per_sec=None,
                  trusted_proxies=(), cache_failure_policy=None,
                  shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout,
-                 max_waiting=None, strict_ssg=False, config=None, cli_overrides=None):
+                 max_waiting=None, strict_ssg=False, config=None, cli_overrides=None,
+                 acquire_timeout_max_ms=None, handler_timeout_ms=None, response_timeout_ms=None):
     """Serve the app in development mode, replacing changed island bundles.
 
     Other file changes restart the server on the same port and reload open
@@ -146,6 +161,13 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
         "cache_failure_policy": cache_failure_policy,
         "shutdown_timeout": shutdown_timeout, "max_waiting": max_waiting,
         "strict_ssg": strict_ssg,
+        # Stage/adaptive timeouts (C-P1-5/C-P1-7); None keeps serve()'s
+        # default, which is also DEFAULT_CONFIG's value.
+        "acquire_timeout_max_ms": acquire_timeout_max_ms,
+        "handler_timeout_ms": (DEFAULT_CONFIG.handler_timeout_ms
+                               if handler_timeout_ms is None else handler_timeout_ms),
+        "response_timeout_ms": (DEFAULT_CONFIG.response_timeout_ms
+                                if response_timeout_ms is None else response_timeout_ms),
     }
 
     def refresh_settings():
@@ -181,6 +203,9 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
             "trusted_proxies": values.trusted_proxies,
             "cache_failure_policy": values.cache_failure_policy,
             "shutdown_timeout": values.shutdown_timeout, "max_waiting": values.max_waiting,
+            "acquire_timeout_max_ms": values.acquire_timeout_max_ms,
+            "handler_timeout_ms": values.handler_timeout_ms,
+            "response_timeout_ms": values.response_timeout_ms,
         })
         return True
 
@@ -194,6 +219,9 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                           websocket_max_message=settings["websocket_max_message"],
                           hot_reload=True, trusted_proxies=settings["trusted_proxies"],
                           strict_ssg=settings["strict_ssg"],
+                          body_timeout_ms=settings["body_timeout_ms"],
+                          handler_timeout_ms=settings["handler_timeout_ms"],
+                          response_timeout_ms=settings["response_timeout_ms"],
                           **({"cache_failure_policy": settings["cache_failure_policy"]}
                              if settings["cache_failure_policy"] is not None else {}))
 
@@ -210,6 +238,12 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                     "header_read_timeout_ms", "body_min_rate_bytes_per_sec"):
             if (settings[key] is not None
                     and settings[key] != getattr(DEFAULT_CONFIG, key)):
+                kwargs[key] = settings[key]
+        # Same rule for the stage/adaptive timeouts (C-P1-5/C-P1-7).
+        if settings["acquire_timeout_max_ms"] is not None:
+            kwargs["acquire_timeout_max_ms"] = settings["acquire_timeout_max_ms"]
+        for key in ("handler_timeout_ms", "response_timeout_ms"):
+            if settings[key] != getattr(DEFAULT_CONFIG, key):
                 kwargs[key] = settings[key]
         return kwargs
 
@@ -316,6 +350,9 @@ _CLI_CONFIG_MAP = {
     "port": "port",
     "max_concurrent": "max_concurrent",
     "acquire_timeout_ms": "acquire_timeout_ms",
+    "acquire_timeout_max_ms": "acquire_timeout_max_ms",
+    "handler_timeout_ms": "handler_timeout_ms",
+    "response_timeout_ms": "response_timeout_ms",
     "max_waiting": "max_waiting",
     "body_capacity": "body_capacity",
     "body_timeout_ms": "body_timeout_ms",
@@ -492,7 +529,22 @@ def _build_parser():
             command.add_argument("--acquire-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--acquire-timeout-ms"),
                                  default=DEFAULT_CONFIG.acquire_timeout_ms,
                                  help="how long a request waits for a slot before getting a 503 "
-                                      "(default 3000; 0-86400000)")
+                                      "(default 3000; 0-86400000); raise it toward 5000 or set "
+                                      "--acquire-timeout-max-ms when handlers typically take "
+                                      "hundreds of ms, or most waits end in 503")
+            command.add_argument("--acquire-timeout-max-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--acquire-timeout-max-ms"),
+                                 default=DEFAULT_CONFIG.acquire_timeout_max_ms,
+                                 help="adaptive admission ceiling: when set, the slot wait becomes "
+                                      "clamp(2 x mean slot-hold time, --acquire-timeout-ms, this value) "
+                                      "instead of a fixed timeout (default: unset, fixed timeout)")
+            command.add_argument("--handler-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--handler-timeout-ms"),
+                                 default=DEFAULT_CONFIG.handler_timeout_ms,
+                                 help="how long a handler may run before the request answers 504 "
+                                      "(0 disables; default 30000)")
+            command.add_argument("--response-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--response-timeout-ms"),
+                                 default=DEFAULT_CONFIG.response_timeout_ms,
+                                 help="per-chunk budget for sending a response, in ms "
+                                      "(0 disables; default 30000)")
             command.add_argument("--max-waiting", type=_bounded(0, MAX_WAITING, "--max-waiting"), default=None,
                                  help="requests waiting for an execution slot before new ones get a 503"
                                       " (default: min(--max-concurrent, 64); 0 waits for nobody; max 1000000)")
@@ -548,9 +600,10 @@ def _build_parser():
             command.add_argument("--tracing", dest="tracing",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="emit OpenTelemetry spans when the opentelemetry packages are installed (default: off)")
-            command.add_argument("--workers", type=_bounded(1, MAX_WORKERS, "--workers"),
+            command.add_argument("--workers", type=_workers_value,
                                  default=DEFAULT_CONFIG.workers,
-                                 help="worker processes sharing the port (default 2; max 64); "
+                                 help="worker processes sharing the port: an integer 1-64, or 'auto' "
+                                      "for one per CPU (default 2; max 64); "
                                       "a supervisor restarts crashed workers")
             command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"),
                                  default=DEFAULT_CONFIG.rate_limit,
@@ -744,6 +797,9 @@ def main():
                               production=args.command == "start",
                               max_concurrent=args.max_concurrent,
                               acquire_timeout_ms=args.acquire_timeout_ms,
+                              acquire_timeout_max_ms=args.acquire_timeout_max_ms,
+                              handler_timeout_ms=args.handler_timeout_ms,
+                              response_timeout_ms=args.response_timeout_ms,
                               max_waiting=args.max_waiting,
                               body_capacity=args.body_capacity,
                               body_timeout_ms=args.body_timeout_ms,
@@ -761,6 +817,16 @@ def main():
                               websocket_max_message=args.ws_max_message_bytes,
                               shutdown_timeout=args.shutdown_timeout, strict_ssg=args.strict_ssg)
         return run_supervisor(config, workers=args.workers)
+    # Only forward a stage/adaptive timeout that differs from serve()'s
+    # default: the historical call shape is preserved otherwise (see
+    # test_cli_without_observability_flags_keeps_old_call_shape, whose
+    # fake serve() has a fixed signature).
+    timeout_kwargs = {}
+    if args.acquire_timeout_max_ms is not None:
+        timeout_kwargs["acquire_timeout_max_ms"] = args.acquire_timeout_max_ms
+    for key in ("handler_timeout_ms", "response_timeout_ms"):
+        if getattr(args, key) != getattr(DEFAULT_CONFIG, key):
+            timeout_kwargs[key] = getattr(args, key)
     if args.command == "dev":
         try:
             asyncio.run(run_dev(root, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
@@ -773,7 +839,7 @@ def main():
                                 shutdown_timeout=args.shutdown_timeout, max_waiting=args.max_waiting,
                                 config=resolved, cli_overrides=cli_overrides,
                                 strict_ssg=args.strict_ssg,
-                                **extra, **conn_kwargs))
+                                **extra, **conn_kwargs, **timeout_kwargs))
         except KeyboardInterrupt:
             pass
         return
@@ -787,7 +853,13 @@ def main():
                             if args.cache_failure_policy != "fail_open" else {}),
                          **({"websocket_max_message": args.ws_max_message_bytes}
                             if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}),
-                         **({"strict_ssg": True} if args.strict_ssg else {}), **extra)
+                         **({"strict_ssg": True} if args.strict_ssg else {}), **extra,
+                         **({"body_timeout_ms": args.body_timeout_ms}
+                            if args.body_timeout_ms != DEFAULT_CONFIG.body_timeout_ms else {}),
+                         **({"handler_timeout_ms": args.handler_timeout_ms}
+                            if args.handler_timeout_ms != DEFAULT_CONFIG.handler_timeout_ms else {}),
+                         **({"response_timeout_ms": args.response_timeout_ms}
+                            if args.response_timeout_ms != DEFAULT_CONFIG.response_timeout_ms else {}))
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     try:
@@ -795,7 +867,7 @@ def main():
                           args.body_capacity, args.body_timeout_ms,
                           shutdown_timeout=args.shutdown_timeout,
                           **({"max_waiting": args.max_waiting} if args.max_waiting is not None else {}),
-                          **extra, **conn_kwargs))
+                          **extra, **conn_kwargs, **timeout_kwargs))
     except KeyboardInterrupt:
         pass
 

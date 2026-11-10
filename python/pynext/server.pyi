@@ -16,7 +16,9 @@ def start_native(app: App, loop: asyncio.AbstractEventLoop, host: str = ..., por
                  max_connections_per_ip: int = ..., max_concurrent_per_ip: int = ...,
                  header_read_timeout_ms: int = ...,
                  body_min_rate_bytes_per_sec: int = ..., shutdown_timeout: float = ...,
-                 max_waiting: int | None = ...) -> _NativeServer: ...
+                 max_waiting: int | None = ..., acquire_timeout_max_ms: int | None = ...,
+                 handler_timeout_ms: int | None = ...,
+                 response_timeout_ms: int | None = ...) -> _NativeServer: ...
 async def serve(app: App, host: str = ..., port: int = ..., max_concurrent: int = ...,
                 acquire_timeout_ms: int = ..., body_capacity: int = ..., body_timeout_ms: int = ...,
                 stop_event: asyncio.Event | None = ..., observability: ObservabilityConfig | None = ..., *,
@@ -25,4 +27,5 @@ async def serve(app: App, host: str = ..., port: int = ..., max_concurrent: int 
                 max_connections_per_ip: int = ..., max_concurrent_per_ip: int = ...,
                 header_read_timeout_ms: int = ...,
                 body_min_rate_bytes_per_sec: int = ..., shutdown_timeout: float = ...,
-                max_waiting: int | None = ...) -> None: ...
+                max_waiting: int | None = ..., acquire_timeout_max_ms: int | None = ...,
+                handler_timeout_ms: int = ..., response_timeout_ms: int = ...) -> None: ...
