@@ -482,10 +482,12 @@ def _build_parser():
             command.add_argument("--port", type=_port, default=DEFAULT_CONFIG.port)
             command.add_argument("--max-concurrent", type=_bounded(1, MAX_CONCURRENT, "--max-concurrent"),
                                  default=DEFAULT_CONFIG.max_concurrent,
-                                 help="in-flight requests before new ones wait for a slot (1-1000000)")
+                                 help="in-flight requests before new ones wait for a slot "
+                                      "(default 128; 1-1000000)")
             command.add_argument("--acquire-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--acquire-timeout-ms"),
                                  default=DEFAULT_CONFIG.acquire_timeout_ms,
-                                 help="how long a request waits for a slot before getting a 503 (0-86400000)")
+                                 help="how long a request waits for a slot before getting a 503 "
+                                      "(default 3000; 0-86400000)")
             command.add_argument("--max-waiting", type=_bounded(0, MAX_WAITING, "--max-waiting"), default=None,
                                  help="requests waiting for an execution slot before new ones get a 503"
                                       " (default: min(--max-concurrent, 64); 0 waits for nobody; max 1000000)")
@@ -515,7 +517,9 @@ def _build_parser():
             command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis"),
                                  default=DEFAULT_CONFIG.cache_backend,
                                  help="ISR page cache backend: process-local memory (default) or a"
-                                      " shared SQLite file or Redis via PYNEXT_REDIS_URL")
+                                      " shared SQLite file or Redis via PYNEXT_REDIS_URL"
+                                      " (recommended with --workers > 1: the memory cache"
+                                      " is per-process and not shared between workers)")
             command.add_argument("--cache-path", default=None,
                                  help="SQLite cache file for --cache-backend sqlite;"
                                       " defaults to <project>/.pynext/isr-cache.sqlite3")
@@ -535,7 +539,7 @@ def _build_parser():
                                  help="emit OpenTelemetry spans when the opentelemetry packages are installed (default: off)")
             command.add_argument("--workers", type=_bounded(1, MAX_WORKERS, "--workers"),
                                  default=DEFAULT_CONFIG.workers,
-                                 help="worker processes sharing the port (default 1: single process; max 64); "
+                                 help="worker processes sharing the port (default 2; max 64); "
                                       "a supervisor restarts crashed workers")
             command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"),
                                  default=DEFAULT_CONFIG.rate_limit,

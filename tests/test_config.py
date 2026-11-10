@@ -76,6 +76,37 @@ def test_defaults_are_single_sourced():
         assert getattr(worker, key) == getattr(DEFAULT_CONFIG, key), key
 
 
+def test_concurrency_p0_defaults():
+    """C-P0-1/C-P0-2: multi-worker default with a raised admission budget.
+
+    The defaults are sized to be used together: two workers share one
+    accept queue, so max_concurrent/acquire_timeout_ms cover both.
+    """
+    assert DEFAULT_CONFIG.workers == 2
+    assert DEFAULT_CONFIG.max_concurrent == 128
+    assert DEFAULT_CONFIG.acquire_timeout_ms == 3000
+
+
+def test_load_config_default_workers_do_not_warn(tmp_path):
+    """The multi-worker default alone must not warn on every load.
+
+    The per-process memory-cache warning only fires when workers > 1 was
+    set explicitly (file/env/cli), not when it comes from the default.
+    """
+    resolved = load_config(tmp_path, "dev", env={})
+    assert resolved.values.workers == 2
+    assert resolved.values.max_concurrent == 128
+    assert resolved.values.acquire_timeout_ms == 3000
+    assert resolved.warnings == ()
+
+
+def test_load_config_explicit_workers_warn_about_memory_cache(tmp_path):
+    """Explicit workers > 1 with the memory cache still warns."""
+    resolved = load_config(tmp_path, "dev", env={}, cli_overrides={"workers": 2})
+    assert any("each worker keeps its own ISR cache" in warning
+               for warning in resolved.warnings)
+
+
 # -- load_config --------------------------------------------------------------
 
 
@@ -232,9 +263,12 @@ def test_cli_config_file_values_reach_server(tmp_path, monkeypatch):
                          body_capacity, body_timeout_ms, shutdown_timeout, max_waiting)
 
     monkeypatch.setattr(cli, "serve", serve)
-    _run_cli(["start", "--dir", str(root)], monkeypatch)
+    # C-P0-1: pin single-process; the default now takes the supervisor path.
+    _run_cli(["start", "--dir", str(root), "--workers", "1"], monkeypatch)
     assert seen["app"] == (root, True, "sqlite")
-    assert seen["serve"] == ("0.0.0.0", 4001, 33, 1000, 16, 10000, 5, None)
+    # C-P0-2: acquire_timeout_ms comes from the new default (3000); the
+    # file only sets max_concurrent (33).
+    assert seen["serve"] == ("0.0.0.0", 4001, 33, 3000, 16, 10000, 5, None)
 
 
 def test_cli_flag_beats_config_file(tmp_path, monkeypatch):
@@ -248,7 +282,8 @@ def test_cli_flag_beats_config_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli, "serve", serve)
-    _run_cli(["start", "--dir", str(root), "--port", "5000"], monkeypatch)
+    # C-P0-1: pin single-process; the default now takes the supervisor path.
+    _run_cli(["start", "--dir", str(root), "--workers", "1", "--port", "5000"], monkeypatch)
     assert seen["serve"] == ("127.0.0.1", 5000, 33)
 
 
@@ -275,7 +310,8 @@ def test_cli_unknown_config_key_warns_but_starts(tmp_path, monkeypatch, capsys):
         pass
 
     monkeypatch.setattr(cli, "serve", serve)
-    _run_cli(["start", "--dir", str(root)], monkeypatch)
+    # C-P0-1: pin single-process; the default now takes the supervisor path.
+    _run_cli(["start", "--dir", str(root), "--workers", "1"], monkeypatch)
     err = capsys.readouterr().err
     assert "unknown config key 'bogus_key'" in err
 
@@ -295,10 +331,12 @@ def test_cli_repeatable_option_replaces_file_list(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "create_app", create_app)
     monkeypatch.setattr(cli, "serve", serve)
     # Without a CLI flag the file value reaches the app.
-    _run_cli(["start", "--dir", str(root)], monkeypatch)
+    # C-P0-1: pin single-process; the default now takes the supervisor path.
+    _run_cli(["start", "--dir", str(root), "--workers", "1"], monkeypatch)
     assert seen["security"].cors_allowed_origins == ("https://file.example.com",)
     # With a CLI flag the file list is replaced, not extended.
-    _run_cli(["start", "--dir", str(root), "--cors-origin", "https://cli.example.com"], monkeypatch)
+    _run_cli(["start", "--dir", str(root), "--workers", "1",
+              "--cors-origin", "https://cli.example.com"], monkeypatch)
     assert seen["security"].cors_allowed_origins == ("https://cli.example.com",)
 
 
@@ -330,7 +368,8 @@ def test_cli_config_observability_reaches_app(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "create_app", create_app)
     monkeypatch.setattr(cli, "serve", serve)
-    _run_cli(["start", "--dir", str(root)], monkeypatch)
+    # C-P0-1: pin single-process; the default now takes the supervisor path.
+    _run_cli(["start", "--dir", str(root), "--workers", "1"], monkeypatch)
     config = seen["create_app"]["observability"]
     assert config.metrics is False
     assert config.log_level == "WARNING"
@@ -382,8 +421,11 @@ def _wait_for_content(url, marker, timeout=15):
 
 
 def _start_dev(root):
+    # C-P0-1: pin single-process so the dev server keeps the run_dev path
+    # (file watching/reload); the multi-worker default takes the
+    # supervisor path, which prints a different listening line.
     proc = subprocess.Popen(
-        [sys.executable, "-m", "pynext.cli", "dev", "--dir", str(root), "--port", "0"],
+        [sys.executable, "-m", "pynext.cli", "dev", "--dir", str(root), "--workers", "1", "--port", "0"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     lines = queue.Queue()
 
