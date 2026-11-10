@@ -57,7 +57,7 @@ jobs:
           enable-cache: true
 
       - name: Install Python dependencies
-        run: uv sync --locked --extra dev --extra images --extra database --extra django
+        run: uv sync --locked --extra dev --extra images --extra database --extra django --extra encryption --extra redis
 
       - name: Install JavaScript dependencies
         run: npm ci
@@ -72,7 +72,7 @@ jobs:
         run: cargo test --locked --workspace --all-features
 
       - name: Run Python tests
-        run: uv run --locked --extra dev --extra images --extra database --extra django pytest -q
+        run: uv run --locked --extra dev --extra images --extra database --extra django --extra encryption --extra redis pytest -q
 
       - name: Verify example production build
         run: uv run pynext build --dir examples/basic
