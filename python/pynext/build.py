@@ -407,6 +407,32 @@ def read_build_id(root):
     return value
 
 
+def _short_repr(value, limit=200):
+    """One-line repr of a config value, truncated so a huge user value
+    cannot flood the error message."""
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _config_error(summary, details=(), fixes=()):
+    """Format a config/route conflict error: what happened, where, and how
+    to fix it.
+
+    Follows the Next.js ensure-static shape: the conflicting values with
+    their source files, then a "Possible fixes" list. ``details`` is a
+    sequence of (label, value) pairs; both ``details`` and ``fixes`` may
+    be empty.
+    """
+    lines = [summary]
+    for label, value in details:
+        lines.append(f"  {label}: {value}")
+    if fixes:
+        lines.append("Possible fixes:")
+        for fix in fixes:
+            lines.append(f"  - {fix}")
+    return "\n".join(lines)
+
+
 def _check_build_paths(root):
     build_dir = root / ".pynext"
     if build_dir.is_symlink() or (build_dir.exists() and not build_dir.is_dir()):
@@ -468,13 +494,33 @@ def discover(root):
         # not appear in the URL; layouts inside a group still apply.
         parts = []
         for part in relative_parent.parts:
-            if _route_group(part) is None:
+            try:
+                group = _route_group(part)
+            except ValueError as exc:
+                raise ValueError(_config_error(
+                    str(exc),
+                    [("file", str(path.relative_to(root))), ("segment", part)],
+                    ["Rename the directory to a valid route group like (name)",
+                     "Remove the parentheses to make it a literal URL segment"])) from exc
+            if group is None:
                 parts.append(part)
         pattern = "/" + "/".join(parts)
         if pattern in routes:
-            if routes[pattern]["kind"] != path.stem:
-                raise ValueError(f"A page and an API cannot share a path: {pattern}")
-            raise ValueError(f"Duplicate route path: {pattern}")
+            entry = str(path.relative_to(root))
+            existing = routes[pattern]
+            if existing["kind"] != path.stem:
+                page_entry = entry if path.stem == "page" else existing["entry"]
+                api_entry = entry if path.stem == "route" else existing["entry"]
+                raise ValueError(_config_error(
+                    f"A page and an API cannot share a path: {pattern}",
+                    [("page", page_entry), ("API route", api_entry)],
+                    ["Move one of the files to a different route directory",
+                     "Delete the file you do not need"]))
+            raise ValueError(_config_error(
+                f"Duplicate route path: {pattern}",
+                [("first", existing["entry"]), ("second", entry)],
+                ["Keep only one of the two files",
+                 "Move one of them to a different route directory"]))
         dirs = [app_dir]
         current = app_dir
         for part in relative_parent.parts:
@@ -494,7 +540,11 @@ def discover(root):
         routes[pattern] = {"entry": str(path.relative_to(root)), "kind": path.stem,
                            "layouts": layouts if path.stem == "page" else [], **boundaries}
     if not routes:
-        raise ValueError("No page.py or route.py files found")
+        raise ValueError(_config_error(
+            "No page.py or route.py files found",
+            [("app directory", "app")],
+            ["Add an app/page.py file with a @page() Page function",
+             "Add an app/route.py file with @route handlers"]))
     router = validate_routes(routes)
     # Global boundaries live at the app root. They are also the nearest
     # boundary for every route (the walk above includes the app directory),
@@ -506,10 +556,19 @@ def discover(root):
     public_sources = discover_public(root)
     for path in list(routes) + list(public_sources):
         if path == "/_pynext" or path.startswith("/_pynext/"):
-            raise ValueError(f"Reserved PyNext path: {path}")
+            source = routes[path]["entry"] if path in routes else f"public{path}"
+            raise ValueError(_config_error(
+                f"Reserved PyNext path: {path}",
+                [("source", source)],
+                ["Rename the route or public file so its URL does not start with /_pynext"]))
     conflicts = set(public_sources).intersection(routes)
     if conflicts:
-        raise ValueError(f"Public file conflicts with a page or API route: {sorted(conflicts)[0]}")
+        path = sorted(conflicts)[0]
+        raise ValueError(_config_error(
+            f"Public file conflicts with a page or API route: {path}",
+            [("public file", f"public{path}"), ("route", routes[path]["entry"])],
+            ["Rename or move the public file so its URL does not match the route",
+             "Move or rename the route"]))
     # The manifest lists routes in specificity order. The trie already
     # produces that order (Router.ordered_routes), but sorting here through
     # the shared comparator (pynext.sortable_routes, translated from
@@ -1239,12 +1298,27 @@ def find_unreachable_routes(routes):
     return unreachable
 
 
-def _materialize(pattern, params):
+def _materialize(pattern, params, entry=None):
+    """Materialize a route pattern with concrete parameter values.
+
+    ``entry`` is the source file (``app/.../page.py``) naming the route;
+    it is only used to name the file in error details, so ``url_for()``
+    (which has no file) calls without it.
+    """
+    # Details prefix naming the source file, empty when there is no file.
+    file_detail = [("file", entry)] if entry is not None else []
     segments = pattern.strip("/").split("/") if pattern != "/" else []
     keys = {}
     seen = set()
     for segment in segments:
-        parsed = _segment_param(segment)
+        try:
+            parsed = _segment_param(segment)
+        except ValueError as exc:
+            raise ValueError(_config_error(
+                str(exc),
+                file_detail + [("pattern", pattern)],
+                ["Use [name], [...name], or [[...name]] with a name matching [A-Za-z0-9_-]+",
+                 "Remove the brackets to make it a literal URL segment"])) from exc
         if parsed:
             name, kind, _prefix, _suffix = parsed
             # The Rust router rejects a repeated name in one route; check
@@ -1256,7 +1330,11 @@ def _materialize(pattern, params):
             seen.add(comparable)
             keys[name] = kind
     if not isinstance(params, dict) or set(params) != set(keys):
-        raise ValueError(f"Static params for {pattern} must contain exactly {sorted(keys)}")
+        got = sorted(params) if isinstance(params, dict) else f"{type(params).__name__}: {_short_repr(params)}"
+        raise ValueError(_config_error(
+            f"Static params for {pattern} must contain exactly {sorted(keys)}",
+            file_detail + [("got", got)],
+            [f"Return one dict per path with exactly these keys: {sorted(keys)}"]))
     output = []
     for segment in segments:
         parsed = _segment_param(segment)
@@ -1267,22 +1345,35 @@ def _materialize(pattern, params):
         value = params[name]
         if kind == "catch_all":
             if not isinstance(value, list) or not value:
-                raise ValueError(f"Catch-all parameter {name} must be a nonempty list")
+                raise ValueError(_config_error(
+                    f"Catch-all parameter {name} must be a nonempty list",
+                    file_detail + [("pattern", pattern), ("got", _short_repr(value))],
+                    [f"Return a nonempty list of strings for {name!r} in generate_static_params"]))
             values = value
         elif kind == "optional":
             if not isinstance(value, list):
-                raise ValueError(f"Optional catch-all parameter {name} must be a list")
+                raise ValueError(_config_error(
+                    f"Optional catch-all parameter {name} must be a list",
+                    file_detail + [("pattern", pattern), ("got", _short_repr(value))],
+                    [f"Return a list of strings for {name!r} in generate_static_params (use [] for no segments)"]))
             values = value
         else:
             values = [value]
         for part in values:
             if (not isinstance(part, str) or not part or part in {".", ".."} or
                     any(c in "/\\?#" or ord(c) < 32 or ord(c) == 127 for c in part)):
-                raise ValueError(f"Invalid static parameter in {pattern}: {part!r}")
+                raise ValueError(_config_error(
+                    f"Invalid static parameter in {pattern}: {part!r}",
+                    file_detail + [("parameter", name)],
+                    ["Use a nonempty string without /, \\, ?, #, or control characters",
+                     "Use '.' or '..' only as literal route segments, not as parameter values"]))
             try:
                 part.encode("utf-8")
             except UnicodeEncodeError as exc:
-                raise ValueError(f"Invalid Unicode static parameter in {pattern}") from exc
+                raise ValueError(_config_error(
+                    f"Invalid Unicode static parameter in {pattern}",
+                    file_detail + [("parameter", name), ("got", _short_repr(part))],
+                    ["Return a valid UTF-8 string for the parameter"])) from exc
             output.append(prefix + part + suffix)
     return "/" + "/".join(output)
 
@@ -1298,21 +1389,41 @@ async def _materialize_params(app, pattern, generator):
     time.
     """
     from .app import _invoke
+    entry = app.manifest["routes"][pattern]["entry"]
     params_list = [{}] if generator is None else await _invoke(generator)
     if not isinstance(params_list, list):
-        raise ValueError(f"generate_static_params for {pattern} must return a list")
+        raise ValueError(_config_error(
+            f"generate_static_params for {pattern} must return a list",
+            [("file", entry), ("got", f"{type(params_list).__name__}: {_short_repr(params_list)}")],
+            ["Return a list of dicts, one per path (use [] when the route has no paths)"]))
     paths = []
     seen = set()
+    seen_params = {}
     for params in params_list:
-        path = _materialize(pattern, params)
+        path = _materialize(pattern, params, entry)
         if path in seen:
-            raise ValueError(f"Duplicate generated path: {path}")
+            raise ValueError(_config_error(
+                f"Duplicate generated path: {path}",
+                [("file", entry), ("pattern", pattern),
+                 ("first", _short_repr(seen_params[path])),
+                 ("second", _short_repr(params))],
+                ["Make generate_static_params return unique parameter sets"]))
         seen.add(path)
+        seen_params[path] = params
         if path in app.public_assets:
-            raise ValueError(f"Public file shadows a generated page: {path}")
+            raise ValueError(_config_error(
+                f"Public file shadows a generated page: {path}",
+                [("public file", f"public{path}"),
+                 ("generated by", f"{entry} ({pattern})")],
+                ["Rename or move the public file",
+                 f"Change generate_static_params in {entry} so it does not generate {path}"]))
         match = app.router.matches(path)
         if match is None or match[0] != pattern:
-            raise ValueError(f"Generated path {path} is not reachable through {pattern}")
+            raise ValueError(_config_error(
+                f"Generated path {path} is not reachable through {pattern}",
+                [("file", entry), ("parameters", _short_repr(params))],
+                ["Return only parameter values that match the route pattern",
+                 "Check that the parameter names match the [param] segments of the route"]))
         paths.append(path)
     return paths
 
@@ -1352,31 +1463,55 @@ async def _render_static_pages(app):
     from .app import _invoke
     from .http import StreamingResponse
     rendered = {}
+    rendered_params = {}
     failures = []
     for pattern, generator in app.static_generators.items():
         if app.dynamic_modes.get(pattern) == "force-dynamic":
             # Never generated at build time; served dynamically instead.
             continue
+        entry = app.manifest["routes"][pattern]["entry"]
         try:
             params_list = [{}] if generator is None else await _invoke(generator)
         except Exception as exc:
             failures.append((f"{pattern} (generate_static_params)", exc))
             continue
         if not isinstance(params_list, list):
-            raise ValueError(f"generate_static_params for {pattern} must return a list")
+            raise ValueError(_config_error(
+                f"generate_static_params for {pattern} must return a list",
+                [("file", entry), ("got", f"{type(params_list).__name__}: {_short_repr(params_list)}")],
+                ["Return a list of dicts, one per path (use [] when the route has no paths)"]))
         if len(params_list) + len(rendered) > MAX_STATIC_PAGES:
-            raise ValueError(f"Static page limit ({MAX_STATIC_PAGES}) exceeded")
+            raise ValueError(_config_error(
+                f"Static page limit ({MAX_STATIC_PAGES}) exceeded",
+                [("file", entry), ("pattern", pattern),
+                 ("pages", f"{len(rendered)} already rendered + {len(params_list)} from this route")],
+                ["Return fewer paths from generate_static_params",
+                 "Split the route into smaller routes"]))
         for params in params_list:
             path = None
             try:
-                path = _materialize(pattern, params)
+                path = _materialize(pattern, params, entry)
                 if path in rendered:
-                    raise ValueError(f"Duplicate generated path: {path}")
+                    raise ValueError(_config_error(
+                        f"Duplicate generated path: {path}",
+                        [("file", entry), ("pattern", pattern),
+                         ("first", _short_repr(rendered_params[path])),
+                         ("second", _short_repr(params))],
+                        ["Make generate_static_params return unique parameter sets"]))
                 if path in app.public_assets:
-                    raise ValueError(f"Public file shadows a generated page: {path}")
+                    raise ValueError(_config_error(
+                        f"Public file shadows a generated page: {path}",
+                        [("public file", f"public{path}"),
+                         ("generated by", f"{entry} ({pattern})")],
+                        ["Rename or move the public file",
+                         f"Change generate_static_params in {entry} so it does not generate {path}"]))
                 match = app.router.matches(path)
                 if match is None or match[0] != pattern:
-                    raise ValueError(f"Generated path {path} is not reachable through {pattern}")
+                    raise ValueError(_config_error(
+                        f"Generated path {path} is not reachable through {pattern}",
+                        [("file", entry), ("parameters", _short_repr(params))],
+                        ["Return only parameter values that match the route pattern",
+                         "Check that the parameter names match the [param] segments of the route"]))
                 response = await app.render_page(pattern, None, params)
                 if isinstance(response, StreamingResponse):
                     body = bytearray()
@@ -1392,34 +1527,33 @@ async def _render_static_pages(app):
                                     continue
                                 index += 1
                                 if len(body) + len(chunk) > MAX_STREAMED_STATIC_BYTES:
-                                    raise ValueError("Streamed static page exceeds build size limit")
+                                    raise ValueError(_config_error(
+                                        f"Streamed static page {path} exceeds the build size limit "
+                                        f"({MAX_STREAMED_STATIC_BYTES} bytes)",
+                                        [("file", entry), ("pattern", pattern)],
+                                        ["Split the page or reduce its content"]))
                                 body.extend(chunk)
                     except asyncio.TimeoutError as exc:
-                        raise ValueError(
+                        raise ValueError(_config_error(
                             f"Streamed static page for {path} exceeded the build time limit "
-                            f"({MAX_STREAMED_STATIC_SECONDS}s)") from exc
+                            f"({MAX_STREAMED_STATIC_SECONDS}s)",
+                            [("file", entry), ("pattern", pattern)],
+                            ["Reduce the page content or make it render faster",
+                             "Split the page into smaller pages"])) from exc
                     finally:
                         await response.aclose()
                     rendered[path] = (pattern, bytes(body))
                 else:
                     if len(response.body) > MAX_STATIC_PAGE_BYTES:
-                        raise ValueError("Static page exceeds build size limit")
+                        raise ValueError(_config_error(
+                            f"Static page {path} exceeds the build size limit "
+                            f"({MAX_STATIC_PAGE_BYTES} bytes)",
+                            [("file", entry), ("pattern", pattern)],
+                            ["Split the page or reduce its content"]))
                     rendered[path] = (pattern, response.body)
+                rendered_params[path] = params
             except Exception as exc:
                 failures.append((path if path is not None else f"{pattern} {params}", exc))
-    if failures:
-        # A build whose every failure is a prerender bailout (dynamic
-        # access in dynamic="error" mode) fails with the bailout itself,
-        # as before staging: callers distinguish it from a page bug via
-        # is_prerender_bailout(), and the CLI still reports it cleanly
-        # (StaticGenBailoutError is a ValueError). Mixed or real page
-        # failures aggregate into one staged BuildError instead.
-        if all(is_prerender_bailout(exc) for _label, exc in failures):
-            raise failures[0][1]
-        lines = "\n".join(f"  {label}: {exc}" for label, exc in failures)
-        raise BuildError(
-            "render",
-            f"{len(failures)} static page(s) failed to render:\n{lines}") from failures[0][1]
     return rendered
 
 
