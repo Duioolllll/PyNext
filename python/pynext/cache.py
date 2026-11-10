@@ -1144,6 +1144,26 @@ class ISRCache:
             self.shared = RedisCacheBackend(self._cache_url)
         self._closed = False
 
+    async def wait_for_background(self, timeout):
+        """Wait for background ISR regenerations to finish (C-P2-5).
+
+        Returns True when no background task is left, False on timeout.
+        Tasks still running after ``timeout`` are left alone here;
+        :meth:`close` cancels them, so shutdown stays bounded. A
+        regeneration that finishes in time publishes its result
+        normally, instead of being cancelled mid-render for no reason.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            tasks = [task for task in list(self._tasks) if not task.done()]
+            if not tasks:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.wait(tasks, timeout=remaining,
+                               return_when=asyncio.FIRST_COMPLETED)
+
     async def close(self):
         self._closed = True
         tasks = list(self._tasks)

@@ -610,11 +610,27 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
     readiness (``/readyz`` starts returning 503), live WebSocket
     sessions get a clean 1001 close, in-flight HTTP requests and
     streaming bodies are waited out for up to ``shutdown_timeout``
-    seconds, the native server stops accepting and drains its
+    seconds, background ISR regenerations get whatever of that same
+    budget is left to finish, the native server stops and drains its
     connections (bounded by the same timeout), and finally the app
-    shuts its resources down. A request that is still running when the
-    timeout expires is abandoned: the server stops anyway and the
-    timeout is logged, rather than hanging the shutdown forever.
+    shuts its resources down. New connections are still accepted
+    during the drain, so a load balancer keeps reaching ``/healthz``
+    (200) and ``/readyz`` (503) while in-flight requests finish; the
+    listener closes only when the server stops. A request that is
+    still running when the timeout expires is abandoned: the server
+    stops anyway and the timeout is logged, rather than hanging the
+    shutdown forever. A background regeneration still running at that
+    point is cancelled the same way.
+
+    Keep-alive policy: an idle keep-alive connection is closed after
+    ``header_read_timeout_ms`` (default 10s) without a complete request
+    header — the same bound that limits slow request headers — and idle
+    connections count toward ``max_connections`` (default 1024) and
+    ``max_connections_per_ip`` (default 128), so idle clients cannot
+    exhaust the connection budget. Set the idle timeout longer than the
+    fronting proxy's idle timeout (e.g. Cloudflare Tunnel) so the proxy,
+    not this server, initiates the close of an idle connection; a server
+    that closes first can reset a connection the proxy is about to reuse.
     """
     await app.startup()
     server = None
@@ -648,6 +664,18 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
             on_ready(server.address)
         await stop_event.wait()
     finally:
+        # Two-phase drain (C-P2-5): one shared shutdown budget starting
+        # here. First stop advertising readiness, then wait out what is
+        # already in flight, then let background work finish with what
+        # is left; whatever is still running is cancelled in
+        # app.shutdown(), so shutdown stays bounded instead of hanging
+        # on a stuck request or regeneration. New connections are still
+        # accepted during the drain (the listener closes only in
+        # server.stop() below): a load balancer must still reach
+        # /healthz (200) and /readyz (503) while in-flight requests
+        # finish, and a client without an idle keep-alive connection
+        # would otherwise be refused outright.
+        drain_deadline = time.monotonic() + shutdown_timeout
         app.begin_drain()
         try:
             await app.close_websockets(timeout=min(5.0, shutdown_timeout))
@@ -659,6 +687,16 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                             shutdown_timeout)
         except Exception:
             log.exception("Inflight drain wait failed")
+        try:
+            # Background work (C-P2-5): an ISR regeneration that started
+            # while serving stale gets the budget that is left to finish
+            # and publish its result; a regeneration still running when
+            # the budget runs out is cancelled by app.shutdown() below.
+            remaining = drain_deadline - time.monotonic()
+            if remaining > 0 and not await app.isr.wait_for_background(remaining):
+                log.warning("Proceeding with shutdown with ISR regenerations still running")
+        except Exception:
+            log.exception("Background drain wait failed")
         try:
             if server is not None:
                 await asyncio.to_thread(server.stop)
