@@ -50,6 +50,7 @@ from .http import (
     BadRequest,
     _header_values,
     _signed_csrf_token,
+    _submitted_csrf_secret,
 )
 
 __all__ = [
@@ -519,7 +520,10 @@ def bind_csrf_token(request, submitted, *, config=None):
 
     Constant-time comparison (Django lesson 2). ``False`` when either
     side is missing or not a string — binding fails closed, and the
-    submitted value is never logged or echoed.
+    submitted value is never logged or echoed. A masked token (the
+    form :meth:`Session.csrf_token` issues) is unmasked first, the
+    same as :func:`validate_csrf` does; a malformed masked value is
+    rejected outright.
     """
     if config is None:
         config = DEFAULT_SECURITY
@@ -528,8 +532,11 @@ def bind_csrf_token(request, submitted, *, config=None):
     expected = _expected_csrf_token(request, config=config)
     if not isinstance(expected, str) or not expected:
         return False
+    secret = _submitted_csrf_secret(submitted)
+    if secret is None:
+        return False
     try:
-        return hmac.compare_digest(submitted, expected)
+        return hmac.compare_digest(secret, expected)
     except (TypeError, ValueError):
         return False
 
