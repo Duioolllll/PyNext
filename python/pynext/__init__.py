@@ -33,7 +33,7 @@ from .pubsub import PubSubOverflow, WebSocketPubSub
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
 from .routing import route, state_changing_get, websocket
-from .sessions import RedisSessionStore, Session, SessionMiddleware, SQLiteSessionStore
+from .sessions import RedisSessionStore, Session, SessionMiddleware, SessionPayloadCipher, SQLiteSessionStore
 from .static import StaticPathError, resolve_static_path, validate_static_request_path
 
 __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layout", "model_prop", "page", "route", "websocket", "Database",
@@ -50,7 +50,7 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "PathHeaderRule", "PathHeaders", "apply_path_headers", "compile_path_headers",
            "ObservabilityConfig", "MetricsCollector", "WebSocket", "WebSocketDisconnect", "MAX_WS_MESSAGE",
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
-           "Session", "SessionMiddleware", "SQLiteSessionStore", "RedisSessionStore", "require_auth", "require_permission",
+           "Session", "SessionMiddleware", "SQLiteSessionStore", "RedisSessionStore", "SessionPayloadCipher", "require_auth", "require_permission",
            "require_scope", "AuthorizationPolicy", "authorization_policy", "state_changing_get",
            "RedisRateLimiter", "WebSocketPubSub", "PubSubOverflow",
            "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies", "FAIL_OPEN", "FAIL_CLOSED",
