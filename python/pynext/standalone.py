@@ -18,10 +18,55 @@ log = logging.getLogger("pynext")
 # Schema version of bundle-manifest.json. Bump when its fields change.
 BUNDLE_MANIFEST_VERSION = 1
 BUNDLE_MANIFEST = "bundle-manifest.json"
-# Environment files copied into the bundle (Next.js copies .env and
-# .env.production only). Local overrides are never shipped: they may hold
-# development secrets.
+# Environment files copied into the bundle when ``include_env`` is true
+# (Next.js copies .env and .env.production only). Local overrides are
+# never shipped: they may hold development secrets.
+# NOTE (M-18 / S-P1-27): a bundle that includes these files carries their
+# values verbatim, so anyone who obtains the bundle can read them. Copying
+# is kept as the default only for backward compatibility; every copy logs
+# a warning naming the file and its variable names with values masked
+# (``KEY=***`` — values are never logged), and ``include_env=False``
+# leaves the files out of the bundle entirely.
 ENV_FILES = (".env", ".env.production")
+
+_ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _env_key_names(path):
+    """Variable names defined in a ``.env`` file, sorted and deduplicated.
+
+    Only key *names* are returned — values are never read into a return
+    value, so they cannot leak into logs or the bundle manifest. Lines
+    that do not parse as ``KEY=VALUE`` (comments, blanks, malformed
+    lines) are skipped; an unreadable file yields no names.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    names = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key = line.split("=", 1)[0].strip()
+        if _ENV_KEY.fullmatch(key):
+            names.add(key)
+    return sorted(names)
+
+
+def _masked_env_summary(path):
+    """Log-safe summary of a ``.env`` file: ``KEY=***`` per variable.
+
+    Values are replaced with ``***`` unconditionally; the summary only
+    ever names variables, never their values.
+    """
+    names = _env_key_names(path)
+    if not names:
+        return "(no variables)"
+    return ", ".join(f"{name}=***" for name in names)
 
 
 def _project_copy(source, target):
@@ -245,6 +290,19 @@ def log_bundle_info(app_root):
     log.info("Standalone bundle: pynext %s, python %s, build %s, %d packages, %d files (%d bytes)",
              info.get("pynext_version"), info.get("python_version"), info.get("build_id"),
              len(packages), files, total_bytes)
+    env_files = info.get("env_files") or []
+    if env_files:
+        # M-18 / S-P1-27: a bundle carrying .env files is secret-bearing —
+        # anyone with the bundle can read the values verbatim. Say so at
+        # every startup, not just at build time, since the bundle may
+        # outlive the machine that built it. Only file names are logged.
+        log.warning("Standalone bundle contains .env file(s) (%s); treat the bundle "
+                    "as secret-bearing and protect it like the server itself",
+                    ", ".join(sorted(env_files)))
+    elif info.get("env_files_excluded"):
+        log.info("Standalone bundle leaves out .env file(s) (%s); provide their "
+                 "values via the runtime environment",
+                 ", ".join(sorted(info["env_files_excluded"])))
     if info.get("python_version") not in (None, platform.python_version()):
         log.warning("Standalone bundle was built with Python %s but is running on Python %s",
                     info.get("python_version"), platform.python_version())
@@ -253,7 +311,7 @@ def log_bundle_info(app_root):
                     info.get("pynext_version"), PYNEXT_VERSION)
 
 
-def build_standalone(root, output, *, lock_timeout=None, excludes=()):
+def build_standalone(root, output, *, lock_timeout=None, excludes=(), include_env=True):
     """Create a new bundle; existing output is never overwritten.
 
     Linux builds include the current interpreter, stdlib, installed Python
@@ -265,9 +323,22 @@ def build_standalone(root, output, *, lock_timeout=None, excludes=()):
     bundle root recording the Python/PyNext/esbuild versions, the build
     id, the copied packages with versions, and anything dropped or
     excluded, so a bundle can be diagnosed without its build machine.
+
+    ``include_env`` (M-18 / S-P1-27) controls whether ``.env`` and
+    ``.env.production`` are copied into the bundle. The default ``True``
+    preserves the historical Next.js-like behaviour, but every copied
+    file logs a warning naming the file and its variable names with
+    values masked (``KEY=***``) — a bundle carrying those files is
+    secret-bearing, and anyone who obtains it can read the values
+    verbatim. Pass ``include_env=False`` to leave the files out of the
+    bundle (recorded as ``env_files_excluded`` in the manifest) and
+    provide their values via the runtime environment instead.
+    ``.env.local`` / ``.env.*.local`` are never copied either way.
     """
     if sys.platform != "linux":
         raise ValueError("Standalone directory builds currently support Linux only")
+    if not isinstance(include_env, bool):
+        raise ValueError("Standalone include_env must be a bool")
     excludes = tuple(excludes)
     if any(not isinstance(name, str) or not name for name in excludes):
         raise ValueError("Standalone excludes must be non-empty package names")
@@ -285,10 +356,10 @@ def build_standalone(root, output, *, lock_timeout=None, excludes=()):
     # consistent, completed build, not a manifest mid-rewrite.
     with BuildLock(root, timeout=LOCK_TIMEOUT_SECONDS if lock_timeout is None else lock_timeout):
         built = load_manifest(root)
-        return _build_standalone_locked(root, output, built, excludes)
+        return _build_standalone_locked(root, output, built, excludes, include_env)
 
 
-def _build_standalone_locked(root, output, built, excludes=()):
+def _build_standalone_locked(root, output, built, excludes=(), include_env=True):
     purelib = Path(sysconfig.get_path("purelib"))
     if purelib == Path(sysconfig.get_path("stdlib")):
         raise ValueError("Build standalone from an isolated Python environment")
@@ -315,7 +386,9 @@ def _build_standalone_locked(root, output, built, excludes=()):
             raise ValueError(f"Missing standalone build artifact: {filename}")
     output.mkdir(parents=True, exist_ok=False)
     try:
-        _populate_standalone(root, output, built, purelib, package, excludes)
+        # Positional args: tests monkeypatch _populate_standalone with a
+        # *args-only fake, so a keyword call would raise TypeError there.
+        _populate_standalone(root, output, built, purelib, package, excludes, include_env)
     except BaseException:
         # Preserve the build exception and make an incomplete cleanup
         # visible so a partial bundle cannot be mistaken for usable output.
@@ -326,7 +399,7 @@ def _build_standalone_locked(root, output, built, excludes=()):
     return output
 
 
-def _populate_standalone(root, output, built, purelib, package, excludes=()):
+def _populate_standalone(root, output, built, purelib, package, excludes=(), include_env=True):
     """Copy the runtime, project and launcher into ``output`` (freshly made)."""
     runtime = output / "runtime"
     python_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
@@ -368,15 +441,33 @@ def _populate_standalone(root, output, built, purelib, package, excludes=()):
         source = root / name
         if source.exists() or source.is_symlink():
             _project_copy(source, project / name)
-    # Environment files: .env and .env.production travel with the bundle
-    # (Next.js copies the same two). .env.local and .env.*.local never do:
-    # they may hold development secrets.
+    # Environment files (M-18 / S-P1-27): .env and .env.production travel
+    # with the bundle only when include_env is true (Next.js copies the
+    # same two). .env.local and .env.*.local never do: they may hold
+    # development secrets. When included, warn per file with values
+    # masked (KEY=*** — values are never logged); when excluded, warn
+    # that the bundle ships without them so the omission is visible
+    # instead of a silent runtime misconfiguration.
     env_files = []
+    env_files_excluded = []
     for name in ENV_FILES:
         source = root / name
-        if source.is_file():
+        if not source.is_file():
+            continue
+        if include_env:
             _project_copy(source, project / name)
             env_files.append(name)
+            log.warning("Standalone bundle includes %s (%s); the bundle now carries "
+                        "those values — treat it as secret-bearing and protect it "
+                        "like the server itself. Pass include_env=False to leave "
+                        ".env files out of the bundle.",
+                        name, _masked_env_summary(source))
+        else:
+            env_files_excluded.append(name)
+            log.warning("Standalone bundle leaves out %s (%s); provide those values "
+                        "via the runtime environment instead. Pass include_env=True "
+                        "to copy .env files into the bundle.",
+                        name, _masked_env_summary(source))
     build = project / ".pynext"
     build.mkdir()
     manifest = root / ".pynext" / "manifest.json"
@@ -412,10 +503,10 @@ def _populate_standalone(root, output, built, purelib, package, excludes=()):
     license_path = Path(f"/usr/share/doc/{python_version}/copyright")
     if license_path.is_file():
         shutil.copy2(license_path, output / "PYTHON-LICENSE")
-    _write_bundle_manifest(output, built, copied, dropped, env_files)
+    _write_bundle_manifest(output, built, copied, dropped, env_files, env_files_excluded)
 
 
-def _write_bundle_manifest(output, built, copied, dropped, env_files):
+def _write_bundle_manifest(output, built, copied, dropped, env_files, env_files_excluded=()):
     """Record what the bundle holds and where it came from.
 
     Written last, after the launcher: ``files``/``bytes`` count the
@@ -436,6 +527,7 @@ def _write_bundle_manifest(output, built, copied, dropped, env_files):
         "dropped_symlinks": sorted({str(Path(path).relative_to(output)) for path in dropped
                                     if Path(path).is_relative_to(output)}),
         "env_files": sorted(env_files),
+        "env_files_excluded": sorted(env_files_excluded),
         "files": len(files),
         "bytes": sum(path.stat().st_size for path in files),
     }
