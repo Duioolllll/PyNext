@@ -142,6 +142,11 @@ def test_dev_isr_reload_serves_stale_until_expire(tmp_path):
             assert second.text == page_html("<p>count:1</p>")
             # The stale serve triggered exactly one background regeneration.
             await until(lambda: module.calls == 2)
+            # The regeneration may have returned but not yet landed in the
+            # store; wait for the new body before requesting, otherwise
+            # the third request can still see the stale entry (flaky).
+            await until(lambda: app.isr.store.lookup("/counter")[1]
+                        == page_html("<p>count:2</p>").encode())
             third = await client.get("/counter")
             assert third.status_code == 200
             assert third.text == page_html("<p>count:2</p>")
