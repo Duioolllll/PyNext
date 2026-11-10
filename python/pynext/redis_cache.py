@@ -193,15 +193,21 @@ class RedisCacheBackend:
             raise SharedCacheUnavailable("Redis cache lease release failed") from exc
 
     def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
-                      tags=(), generated_at=None):
-        """Store ``body`` under a version + lease fence.
+                      tags=(), generated_at=None, generated_mono=None):
+        """Store ``body`` only if the entry version still equals
+        ``expected_version`` (``0`` when no entry existed, ``None`` for an
+        unfenced write). When an owner is given, its lease must still be live
+        in the same atomic step. Returns False when either fence has moved.
 
-        ``generated_at`` (seconds, wall clock) stamps the entry with
-        the render *start* time instead of the insert time, so a
-        generation that started before a tag invalidation but stored
-        after it is judged by when its content was produced. The
-        freshness windows (``fresh_until`` / ``stale_until``) still
-        run from the insert time. The render-start time comes from
+        ``generated_at`` / ``generated_mono`` stamp the entry with the
+        render *start* time instead of the insert time, so a generation
+        that started before a tag invalidation but stored after it is
+        judged by when its content was produced (see
+        :meth:`SQLiteCacheBackend.insert_fenced`). ``generated_mono`` is
+        accepted for signature parity and ignored: a worker-local
+        monotonic timestamp cannot be compared against Redis server
+        time. The freshness windows (``fresh_until`` / ``stale_until``)
+        still run from the insert time. The render-start time comes from
         the worker's clock while tag records use the Redis server
         clock (``TIME``), so on multi-host deployments a worker whose
         clock runs ahead of the server can still look fresh after an
