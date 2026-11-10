@@ -43,7 +43,8 @@ from .errors import SignalError, digest_for_error, error_count
 from .http import (SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_path_headers, apply_security_headers, compile_path_headers,
-                   cors_preflight_response, filter_internal_headers, new_csp_nonce, validate_csrf)
+                   cors_preflight_response, filter_internal_headers, new_csp_nonce, sanitize_response_headers,
+                   validate_csrf)
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .middleware import ScopedMiddleware
 from .observability import (
@@ -364,15 +365,23 @@ async def _send_response(response, send, *, config=None, production=True):
     :meth:`App.dispatch` applied the headers there). Applying here as well
     covers the responses that bypass dispatch: rate-limit 429/503, bad
     request 400, oversized 413 and the 500 error page.
+
+    Headers are sanitized exactly once here, immediately before the
+    ``http.response.start`` message (see
+    :func:`pynext.http.sanitize_response_headers`, S-P1-30): a handler or
+    middleware may have appended a header after :class:`Response`
+    construction, so the constructor check alone cannot guarantee the
+    bytes on the wire carry no CR/LF.
     """
     if config is not None:
         apply_security_headers(response, config=config, production=production)
+    headers = sanitize_response_headers(response.headers)
     if not isinstance(response, StreamingResponse):
-        await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
+        await send({"type": "http.response.start", "status": response.status, "headers": headers})
         await send({"type": "http.response.body", "body": response.body})
         return
     try:
-        await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
+        await send({"type": "http.response.start", "status": response.status, "headers": headers})
         if not response._head_only:
             while (chunk := await response._next_chunk()) is not None:
                 await send({"type": "http.response.body", "body": chunk, "more_body": True})

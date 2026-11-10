@@ -619,6 +619,44 @@ def apply_security_headers(response, *, config=DEFAULT_SECURITY, nonce=None, pro
     return response
 
 
+#: Bytes stripped from response header names and values at the
+#: serialization point (S-P1-30): CR and LF split a response, NUL is never
+#: valid in a header field. Same set Sanic strips in its CVE-2026-85077
+#: fix (``response/types.py`` ``HEADER_TRANSLATION_TABLE``).
+_CRLF_STRIP_BYTES = b"\r\n\x00"
+
+
+def sanitize_response_headers(headers):
+    """Return ``headers`` with response-splitting bytes removed (S-P1-30).
+
+    This is the single serialization-point invariant for the ASGI path,
+    mirroring Sanic's CVE-2026-85077 fix: :class:`Response` already rejects
+    CR/LF in headers at construction, but headers are a mutable list, so
+    a handler, middleware, or a ``set-cookie``/CORS/path-header helper can
+    append an attacker-controlled value afterwards (e.g. a ``Location`` or
+    ``Content-Disposition`` filename carrying ``\\r\\n``). Checking here —
+    once, immediately before the ``http.response.start`` message is sent —
+    covers every response that crosses this point instead of trusting each
+    call site to remember.
+
+    CR, LF and NUL are stripped from both names and values. A pair whose
+    sanitized name is not a valid header token, or whose value still holds
+    another control byte, is dropped rather than sent, so no byte the
+    server emits here can ever terminate a header line early. Valid
+    headers pass through unchanged. The input list is never mutated.
+    """
+    clean = []
+    for name, value in headers:
+        name = bytes(name).translate(None, _CRLF_STRIP_BYTES)
+        value = bytes(value).translate(None, _CRLF_STRIP_BYTES)
+        if not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9a-zA-Z-]+", name):
+            continue
+        if any(byte < 32 or byte == 127 for byte in value):
+            continue
+        clean.append((name, value))
+    return clean
+
+
 #: Response headers a path rule must never set. Framing headers are owned
 #: by the server: a rule-supplied ``Content-Length`` would disagree with
 #: the body the server actually sends, and ``Transfer-Encoding`` is a
