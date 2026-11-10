@@ -391,6 +391,44 @@ def _substitute_shell_marker(node, marker, page_tree):
     return node, 0
 
 
+def _header_pair_has_ctl(name, value):
+    """True when a response header name/value pair carries a CTL byte (S-P1-7).
+
+    Same rule as the Rust parser/writer (``lib.rs``) and aiohttp's
+    ``_safe_header`` (RFC 9110 §5.5, RFC 9112 §4): a value may not
+    contain ``0x00-0x08``, ``0x0A-0x1F`` or ``0x7F`` (HTAB ``0x09`` is a
+    legal field-value byte); a name may not contain any byte below
+    ``0x20`` or ``0x7F`` at all.
+    """
+    name_bytes = bytes(name) if isinstance(name, (bytes, bytearray, memoryview)) else str(name).encode("utf-8", "ignore")
+    value_bytes = bytes(value) if isinstance(value, (bytes, bytearray, memoryview)) else str(value).encode("utf-8", "ignore")
+    return (any(b < 0x20 or b == 0x7F for b in name_bytes)
+            or any((b < 0x20 and b != 0x09) or b == 0x7F for b in value_bytes))
+
+
+def _strip_ctl_response_headers(response):
+    """Drop response headers carrying a control character (S-P1-7, writer side).
+
+    The ASGI ``send`` below is the last serialization point on the Python
+    path: a handler can append to ``response.headers`` after the
+    :class:`Response` constructor validated them, so re-check here. A bad
+    header is dropped — not raised — so one bad app header cannot fail
+    the whole response; only the offending header's name is logged, never
+    its value. The native bridge instead rejects the whole response with
+    500 (see ``lib.rs`` ``bridge_response_header``); both paths agree
+    that no CTL byte ever reaches the wire. Returns the response for
+    call-site chaining.
+    """
+    if not any(_header_pair_has_ctl(key, value) for key, value in response.headers):
+        return response
+    dropped = [bytes(key) for key, value in response.headers
+               if _header_pair_has_ctl(key, value)]
+    response.headers = [(key, value) for key, value in response.headers
+                        if not _header_pair_has_ctl(key, value)]
+    log.warning("Dropped response header(s) containing control characters: %r", dropped)
+    return response
+
+
 async def _send_response(response, send, *, config=None, production=True, response_timeout=None):
     """Send ``response`` over ASGI, adding the A1 security headers first.
 
@@ -419,6 +457,7 @@ async def _send_response(response, send, *, config=None, production=True, respon
     """
     if config is not None:
         apply_security_headers(response, config=config, production=production)
+    _strip_ctl_response_headers(response)
     headers = sanitize_response_headers(response.headers)
     if not isinstance(response, StreamingResponse):
         if response_timeout is None:

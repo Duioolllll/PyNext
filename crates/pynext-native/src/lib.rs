@@ -1137,6 +1137,51 @@ fn busy_response(
     .expect("busy response is valid")
 }
 
+/// Control characters (CTL) in a header name or value (S-P1-7).
+///
+/// The same rule on both sides, matching aiohttp's `_safe_header` /
+/// `_write_str_raise_on_nlcr` (RFC 9110 §5.5, RFC 9112 §4): a header
+/// value may not contain `0x00-0x08`, `0x0A-0x1F` or `0x7F` (HTAB
+/// `0x09` is a legal field-value byte); a header name may not contain
+/// any byte below `0x20` or `0x7F` at all. A CTL in a header value is
+/// the classic response-splitting / request-smuggling primitive
+/// (CVE-2023-37276, CVE-2026-34519/34520), so the request parser
+/// rejects the request with 400 (see [`dispatch`]) and the response
+/// writer rejects the response (see [`bridge_response_header`]).
+fn header_value_contains_ctl(value: &[u8]) -> bool {
+    value
+        .iter()
+        .any(|b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
+}
+
+fn header_name_contains_ctl(name: &[u8]) -> bool {
+    name.iter().any(|b| *b < 0x20 || *b == 0x7F)
+}
+
+fn headers_contain_ctl(headers: &HeaderMap) -> bool {
+    headers.iter().any(|(name, value)| {
+        header_name_contains_ctl(name.as_str().as_bytes())
+            || header_value_contains_ctl(value.as_bytes())
+    })
+}
+
+/// Validate one response header the Python bridge hands back, before it
+/// is written to the wire (S-P1-7, writer side). Returns `None` when
+/// the name/value cannot go on the wire — in particular when either
+/// carries a control character, under the same rule as
+/// [`headers_contain_ctl`]. The caller turns `None` into a 500: the app
+/// set a header the wire format cannot carry, so the response is
+/// rejected whole instead of letting hyper fail the write mid-response.
+fn bridge_response_header(key: &[u8], value: &[u8]) -> Option<(HeaderName, HeaderValue)> {
+    if header_name_contains_ctl(key) || header_value_contains_ctl(value) {
+        return None;
+    }
+    Some((
+        HeaderName::from_bytes(key).ok()?,
+        HeaderValue::from_bytes(value).ok()?,
+    ))
+}
+
 /// Conflicting `Content-Length` headers must fail as a clean 400 in dispatch
 /// instead of reaching hyper as a protocol error that just drops the
 /// connection. Identical duplicates are one value and pass; anything
@@ -1888,6 +1933,27 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             parts.version,
         );
     }
+    // S-P1-7 (parser side): a control character in a request header
+    // name or value is a clean 400, mirroring the conflicting
+    // Content-Length check below. hyper's parser already rejects most
+    // CTL on the wire; this is the explicit layer that also covers any
+    // header reaching dispatch through another path, and keeps the
+    // parser rule identical to the writer rule (see
+    // `bridge_response_header`) and to aiohttp's `_safe_header`.
+    if headers_contain_ctl(&parts.headers) {
+        return close_with_unread_body(
+            apply_path_headers_for_raw_path(
+                plain_response(
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request",
+                    &state.security_headers,
+                ),
+                parts.uri.path(),
+                &state.path_headers,
+            ),
+            parts.version,
+        );
+    }
     // A WebSocket upgrade is decided here, before any body handling: the
     // upgrade handshake must not compete for a Python execution slot, and a
     // request that is not a WebSocket route must not reach the HTTP bridge
@@ -2559,10 +2625,14 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             let mut response = AxumResponse::new(Body::empty());
             *response.status_mut() = status;
             for (key, value) in headers {
-                let (Ok(key), Ok(value)) = (
-                    HeaderName::from_bytes(&key),
-                    HeaderValue::from_bytes(&value),
-                ) else {
+                // S-P1-7 (writer side): a CTL in a response header name
+                // or value rejects the whole response with 500 — the app
+                // set a header the wire format cannot carry. A handler
+                // can smuggle one past `Response`'s constructor by
+                // appending to `response.headers` afterwards, so this
+                // check is the last gate before serialization, mirroring
+                // the ASGI-side strip in `app._send_response`.
+                let Some((key, value)) = bridge_response_header(&key, &value) else {
                     if let BridgeBody::Streaming(stream) = body {
                         close_stream(Arc::new(stream));
                     }
@@ -3776,5 +3846,57 @@ mod tests {
         ] {
             assert!(TrustedProxyNetwork::parse(bad).is_err(), "{bad}");
         }
+    }
+    // S-P1-7: header CTL validation, parser and writer sides share one rule.
+    #[test]
+    fn header_value_ctl_set_matches_aiohttp_safe_header() {
+        // Every CTL byte aiohttp rejects in a header value.
+        for byte in (0x00..=0x08).chain(0x0A..=0x1F).chain([0x7F]) {
+            assert!(
+                header_value_contains_ctl(&[b'a', byte, b'b']),
+                "byte 0x{byte:02x} must be a CTL in a header value"
+            );
+        }
+        // HTAB, SP, printable ASCII and obs-text are legal field-value bytes.
+        assert!(!header_value_contains_ctl(b"a\tb c~d"));
+        assert!(!header_value_contains_ctl(&[0x80, 0xFF]));
+        assert!(!header_value_contains_ctl(b""));
+    }
+
+    #[test]
+    fn header_name_ctl_rejects_any_byte_below_space_or_del() {
+        for byte in (0x00..=0x1F).chain([0x7F]) {
+            assert!(
+                header_name_contains_ctl(&[b'x', byte]),
+                "byte 0x{byte:02x} must be a CTL in a header name"
+            );
+        }
+        assert!(!header_name_contains_ctl(b"x-header"));
+    }
+
+    #[test]
+    fn headers_contain_ctl_covers_names_and_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ok", HeaderValue::from_static("fine"));
+        assert!(!headers_contain_ctl(&headers));
+        // HeaderValue cannot hold a CTL, so exercise the value path via a
+        // raw map built from bytes that `HeaderValue::from_bytes` accepts
+        // only when clean; the CTL case is covered through
+        // `bridge_response_header` below.
+        headers.insert("x-tab", HeaderValue::from_static("a\tb"));
+        assert!(!headers_contain_ctl(&headers));
+    }
+
+    #[test]
+    fn bridge_response_header_rejects_ctl_and_accepts_clean() {
+        assert!(bridge_response_header(b"x-ok", b"fine").is_some());
+        assert!(bridge_response_header(b"x-tab", b"a\tb").is_some());
+        assert!(bridge_response_header(b"x-evil", b"a\x01b").is_none());
+        assert!(bridge_response_header(b"x-evil", b"a\nb").is_none());
+        assert!(bridge_response_header(b"x-evil", b"a\rb").is_none());
+        assert!(bridge_response_header(b"x-evil", b"a\x00b").is_none());
+        assert!(bridge_response_header(b"x-evil", b"a\x7fb").is_none());
+        assert!(bridge_response_header(b"x-\x01vil", b"a").is_none());
+        assert!(bridge_response_header(b"bad name", b"a").is_none());
     }
 }
