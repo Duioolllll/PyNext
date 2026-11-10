@@ -16,6 +16,7 @@ def page(*, render: Literal["ssr", "ssg", "isr"] = ..., revalidate: int | float 
          tags: Iterable[str] = ...,
          fallback: Literal["not_found", "blocking", "prerender"] = ...,
          dynamic_params: bool = ...) -> Callable[[_F], _F]: ...
+@overload
 def layout(fn: _F) -> _F: ...
 @overload
 def layout(fn: None = ..., *, revalidate: int | None = ...,

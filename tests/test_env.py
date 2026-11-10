@@ -270,6 +270,7 @@ def _fake_purelib(monkeypatch, tmp_path):
     return fake
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Standalone directory builds are Linux-only")
 def test_standalone_copies_env_but_never_local(tmp_path, monkeypatch):
     project = tmp_path / "source"
     _project(project)
