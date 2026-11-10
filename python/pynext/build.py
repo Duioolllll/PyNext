@@ -857,6 +857,7 @@ async def _render_static_pages(app):
     would be a 404 in production — but the report is complete and the
     good pages were all rendered.
     """
+    from .app import _invoke
     from .http import StreamingResponse
     rendered = {}
     failures = []
