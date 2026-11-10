@@ -48,9 +48,9 @@ def test_runtime_override_defaults_to_manifest_policy(tmp_path):
     make_project(tmp_path)
     manifest = write_manifest(tmp_path)
     app = create_app(tmp_path, production=True)
-    assert app.get_isr_policy("/blog/[slug]") == {"revalidate": 30.0, "stale": 1.0}
+    assert app.get_isr_policy("/blog/[slug]") == {"revalidate": 30.0, "stale": 1.0, "expire": 31.0}
     assert app.isr_policy_overrides == {}
-    assert manifest["isr_policies"]["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0}
+    assert manifest["isr_policies"]["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0, "expire": 31.0}
 
 
 def test_set_isr_policy_overrides_without_rebuild_or_manifest_change(tmp_path):
@@ -60,11 +60,11 @@ def test_set_isr_policy_overrides_without_rebuild_or_manifest_change(tmp_path):
     before = manifest_path.read_bytes()
     app = create_app(tmp_path, production=True)
     assert app.set_isr_policy("/blog/[slug]", revalidate=120, stale=10) == {
-        "revalidate": 120.0, "stale": 10.0}
-    assert app.get_isr_policy("/blog/[slug]") == {"revalidate": 120.0, "stale": 10.0}
+        "revalidate": 120.0, "stale": 10.0, "expire": 130.0}
+    assert app.get_isr_policy("/blog/[slug]") == {"revalidate": 120.0, "stale": 10.0, "expire": 130.0}
     # Base policy and manifest are untouched: no rebuild was needed.
-    assert app.isr_policies["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0}
-    assert app.manifest["isr_policies"]["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0}
+    assert app.isr_policies["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0, "expire": 31.0}
+    assert app.manifest["isr_policies"]["/blog/[slug]"] == {"revalidate": 30.0, "stale": 1.0, "expire": 31.0}
     assert manifest_path.read_bytes() == before
     # A fresh production app still passes the manifest check.
     create_app(tmp_path, production=True)
@@ -74,10 +74,10 @@ def test_set_isr_policy_partial_override_inherits_current(tmp_path):
     make_project(tmp_path)
     app = create_app(tmp_path)
     assert app.set_isr_policy("/blog/[slug]", revalidate=5) == {
-        "revalidate": 5.0, "stale": 1.0}
+        "revalidate": 5.0, "stale": 1.0, "expire": 6.0}
     # The second call inherits the overridden revalidate, not the base one.
     assert app.set_isr_policy("/blog/[slug]", stale=2) == {
-        "revalidate": 5.0, "stale": 2.0}
+        "revalidate": 5.0, "stale": 2.0, "expire": 7.0}
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -85,7 +85,7 @@ def test_set_isr_policy_partial_override_inherits_current(tmp_path):
     {"revalidate": 0},
     {"revalidate": -1},
     {"revalidate": True},
-    {"revalidate": 604_801},
+    {"revalidate": 31_536_001},
     {"revalidate": float("nan")},
     {"stale": -1},
     {"stale": float("inf")},
@@ -122,11 +122,11 @@ def test_get_isr_policy_returns_a_copy(tmp_path):
     app = create_app(tmp_path)
     policy = app.get_isr_policy("/blog/[slug]")
     policy["revalidate"] = 0
-    assert app.get_isr_policy("/blog/[slug]") == {"revalidate": 30.0, "stale": 1.0}
+    assert app.get_isr_policy("/blog/[slug]") == {"revalidate": 30.0, "stale": 1.0, "expire": 31.0}
     app.set_isr_policy("/blog/[slug]", revalidate=9)
     override = app.get_isr_policy("/blog/[slug]")
     override["stale"] = 0
-    assert app.get_isr_policy("/blog/[slug]") == {"revalidate": 9.0, "stale": 1.0}
+    assert app.get_isr_policy("/blog/[slug]") == {"revalidate": 9.0, "stale": 1.0, "expire": 10.0}
 
 
 def test_clear_isr_policy_restores_base(tmp_path):
@@ -134,14 +134,14 @@ def test_clear_isr_policy_restores_base(tmp_path):
     app = create_app(tmp_path)
     app.set_isr_policy("/blog/[slug]", revalidate=9)
     assert app.clear_isr_policy("/blog/[slug]") is True
-    assert app.get_isr_policy("/blog/[slug]") == {"revalidate": 30.0, "stale": 1.0}
+    assert app.get_isr_policy("/blog/[slug]") == {"revalidate": 30.0, "stale": 1.0, "expire": 31.0}
     assert app.clear_isr_policy("/blog/[slug]") is False
     with pytest.raises(ValueError):
         app.clear_isr_policy("/about")
     app.set_isr_policy("/blog/[slug]", revalidate=9)
     assert app.clear_isr_policies() == 1
     assert app.clear_isr_policies() == 0
-    assert app.get_isr_policy("/blog/[slug]") == {"revalidate": 30.0, "stale": 1.0}
+    assert app.get_isr_policy("/blog/[slug]") == {"revalidate": 30.0, "stale": 1.0, "expire": 31.0}
 
 
 def test_runtime_override_applies_to_next_generation(tmp_path):
