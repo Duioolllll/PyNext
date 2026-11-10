@@ -2793,4 +2793,29 @@ mod tests {
         let ewma = stats.ewma_ms().unwrap();
         assert!((ewma - 1200.0).abs() < 1e-6, "ewma was {ewma}");
     }
+
+    // S-P1-30: the native bridge builds response headers with
+    // `HeaderValue::from_bytes` / `HeaderName::from_bytes` and turns a
+    // failure into a 500 instead of writing the bytes, so a CR, LF or NUL
+    // in a Python-supplied header can never split the response on the
+    // wire. Pin that `http`-crate rejection here: if a future upgrade
+    // ever accepted these bytes, the bridge's 500 fallback would silently
+    // stop defending the response.
+    #[test]
+    fn bridge_header_bytes_reject_crlf() {
+        assert!(HeaderValue::from_bytes(b"ok").is_ok());
+        assert!(HeaderName::from_bytes(b"x-custom").is_ok());
+        for bad_value in [
+            &b"a\r\nInjected: 1"[..],
+            &b"a\rb"[..],
+            &b"a\nb"[..],
+            &b"a\x00b"[..],
+        ] {
+            assert!(
+                HeaderValue::from_bytes(bad_value).is_err(),
+                "{bad_value:?} must be rejected"
+            );
+        }
+        assert!(HeaderName::from_bytes(b"x-bad\r\nname").is_err());
+    }
 }
