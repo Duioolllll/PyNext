@@ -52,7 +52,7 @@ from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Reque
                    apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
 from .matcher import compile_header_rules, compile_middleware_entries
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
-from .middleware import ScopedMiddleware
+from .middleware import MAX_MIDDLEWARE_REWRITES, MiddlewareResult, ScopedMiddleware
 from .observability import (
     MetricsCollector,
     ObservabilityConfig,
@@ -2456,7 +2456,58 @@ class App:
         scoped middleware (see :func:`pynext.matcher.scoped_middleware`)
         whose scope does not match this request is skipped — the chain
         continues past it as if it were not registered.
+
+        Middleware results are the four standard outcomes (see
+        :mod:`pynext.middleware`): ``next`` (``call_next`` with the
+        request unchanged), ``rewrite`` (``call_next`` with a request
+        whose path or query string differs), ``redirect`` (a 3xx response
+        with a ``Location`` header) and ``response`` (any other response
+        of the middleware's own making). ``redirect`` and ``response``
+        short-circuit the chain: ``terminal`` never runs. A middleware
+        may state its outcome implicitly — return a plain ``Response``,
+        or call ``call_next`` with a rewritten request — or explicitly
+        by returning a :class:`pynext.middleware.MiddlewareResult`;
+        both spellings follow the same rules below.
+
+        Rewrite rules: a rewritten path is validated with the same
+        ``_decode_path`` the transports use at the edge (encoded
+        separators, malformed escapes, ``//``, backslashes and dot
+        segments are rejected, and the stored path is the decoded one),
+        then routing, authorization and CSRF are re-evaluated against
+        the rewritten request by ``_dispatch``. Rate limiting is *not*
+        re-evaluated: it is decided once, before middleware runs, on
+        the original path. At most ``MAX_MIDDLEWARE_REWRITES`` rewrites
+        run per request; the next one fails closed with
+        ``RuntimeError`` (a 500 for HTTP, a 503 for a WebSocket
+        pre-flight). ``call_next`` may still be called only once per
+        middleware, and a middleware that called it must return its
+        result (a plain ``Response``), not a ``MiddlewareResult``.
         """
+
+        rewrites = 0
+
+        def _validated_rewrite(next_request):
+            path = next_request.path
+            if not isinstance(path, str) or "?" in path or "#" in path:
+                raise ValueError("Invalid middleware rewrite path")
+            try:
+                normalized = _decode_path(path, path.encode("utf-8"))
+            except (ValueError, UnicodeError) as exc:
+                raise ValueError("Invalid middleware rewrite path") from exc
+            return dataclasses.replace(next_request, path=normalized, params={})
+
+        async def _continue(index, current, next_request):
+            nonlocal rewrites
+            if not isinstance(next_request, Request):
+                raise TypeError("call_next requires a Request")
+            if (next_request.path != current.path
+                    or next_request.query_string != current.query_string):
+                rewrites += 1
+                if rewrites > MAX_MIDDLEWARE_REWRITES:
+                    raise RuntimeError("middleware rewrite limit exceeded")
+                next_request = _validated_rewrite(next_request)
+            return await invoke(index + 1, next_request)
+
         async def invoke(index, current):
             if not isinstance(current, Request):
                 raise TypeError("call_next requires a Request")
@@ -2472,11 +2523,18 @@ class App:
                 if called:
                     raise RuntimeError("call_next may be called only once")
                 called = True
-                return await invoke(index + 1, next_request)
+                return await _continue(index, current, next_request)
 
             result = await self.middleware[index](current, call_next)
+            if isinstance(result, MiddlewareResult):
+                if called:
+                    raise RuntimeError(
+                        "middleware must not return a MiddlewareResult after calling call_next")
+                if result.kind in ("next", "rewrite"):
+                    return await _continue(index, current, result.request)
+                return result.response
             if not isinstance(result, Response):
-                raise TypeError("middleware must return a Response")
+                raise TypeError("middleware must return a Response or a MiddlewareResult")
             return result
 
         return await invoke(0, request)
