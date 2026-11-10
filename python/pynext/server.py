@@ -334,7 +334,8 @@ def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
                             body_min_rate_bytes_per_sec, shutdown_timeout,
                             max_concurrent_per_ip=DEFAULT_CONFIG.max_concurrent_per_ip,
                             acquire_timeout_max_ms=None, handler_timeout_ms=None,
-                            response_timeout_ms=None):
+                            response_timeout_ms=None,
+                            fast_path_max_concurrent=None):
     """Reject server limits that cannot reach the native server safely.
 
     Counts and timeouts cross into Rust as usize/u64/f64: a value past
@@ -361,6 +362,7 @@ def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
         ("header_read_timeout_ms", header_read_timeout_ms, 0, MAX_TIMEOUT_MS),
         ("body_min_rate_bytes_per_sec", body_min_rate_bytes_per_sec, 0,
          MAX_BODY_MIN_RATE_BYTES_PER_SEC),
+        ("fast_path_max_concurrent", fast_path_max_concurrent, 1, MAX_CONCURRENT),
     )
     for name, value, minimum, maximum in counts:
         if value is None:
@@ -461,7 +463,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                  body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
                  shutdown_timeout=30.0, max_waiting=None,
                  acquire_timeout_max_ms=None, handler_timeout_ms=None, response_timeout_ms=None,
-                 management_plane=None):
+                 management_plane=None,
+                 fast_path_max_concurrent=None):
     """Start the native server and return its handle.
 
     Overload policy (roadmap C7): bounded wait, then reject. At most
@@ -517,7 +520,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                             max_concurrent_per_ip,
                             acquire_timeout_max_ms=acquire_timeout_max_ms,
                             handler_timeout_ms=handler_timeout_ms,
-                            response_timeout_ms=response_timeout_ms)
+                            response_timeout_ms=response_timeout_ms,
+                            fast_path_max_concurrent=fast_path_max_concurrent)
     # M-10: non-supervisor servers share one CSRF signing key too, so a
     # cookie issued by this process validates on any process spawned
     # from it (and survives a dev-server restart).
@@ -806,7 +810,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 security_headers=security_headers(config=app.security,
                                                                   production=app.production),
                                 path_headers=app.path_headers.for_native(),
-                                drain_timeout_secs=shutdown_timeout)
+                                drain_timeout_secs=shutdown_timeout,
+                                fast_path_max_concurrent=fast_path_max_concurrent)
 
 
 async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
@@ -824,7 +829,8 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                 acquire_timeout_max_ms=DEFAULT_CONFIG.acquire_timeout_max_ms,
                 handler_timeout_ms=DEFAULT_CONFIG.handler_timeout_ms,
                 response_timeout_ms=DEFAULT_CONFIG.response_timeout_ms,
-                management_plane=None):
+                management_plane=None,
+                fast_path_max_concurrent=None):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
@@ -840,8 +846,12 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
     keep-alive connections (hyper applies it to every header read on the
     connection); ``body_min_rate_bytes_per_sec`` rejects bodies arriving
     slower than that average after a 2-second grace window with a 408.
-    These limits apply to the native (Axum) server only; the ASGI adapter
-    relies on the ASGI server's own limits.
+    The fast-path budget (``fast_path_max_concurrent``, default 4x
+    ``max_concurrent``) caps concurrent static/ISR-Fresh responses served
+    without an execution slot; excess fast-path requests get 503 with
+    ``Retry-After``. The ASGI adapter enforces the same body timeout and
+    minimum receive rate as the native server; the other connection
+    limits apply to the native server only.
 
     Graceful shutdown (B6), in order: the app stops advertising
     readiness (``/readyz`` starts returning 503), live WebSocket
@@ -895,7 +905,8 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               acquire_timeout_max_ms=acquire_timeout_max_ms,
                               handler_timeout_ms=handler_timeout_ms,
                               response_timeout_ms=response_timeout_ms,
-                              management_plane=management_plane)
+                              management_plane=management_plane,
+                              fast_path_max_concurrent=fast_path_max_concurrent)
         print(f"PyNext listening on http://{server.address}", flush=True)
         # A standalone bundle records its provenance in
         # bundle-manifest.json next to the app dir; log it (and warn on

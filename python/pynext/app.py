@@ -77,6 +77,17 @@ log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
 ASGI_DECISION_CAPACITY = 64
 ASGI_DECISION_TIMEOUT = 2.0
+# ASGI body limits (S-P1-12 / M-2): native parity — the whole body must
+# arrive within the body timeout, and after the grace window it must
+# average at least the minimum receive rate (native: 10 s, 1024 B/s,
+# 2 s grace, re-checked every 250 ms while stalled). The values come
+# from the same DEFAULT_CONFIG the native server defaults to; uvicorn
+# itself applies no such bound, so without this a slow body can hold an
+# ASGI connection (Slowloris) indefinitely.
+ASGI_BODY_TIMEOUT_SECS = DEFAULT_CONFIG.body_timeout_ms / 1000.0
+ASGI_BODY_MIN_RATE_BYTES_PER_SEC = DEFAULT_CONFIG.body_min_rate_bytes_per_sec
+ASGI_BODY_MIN_RATE_GRACE_SECS = 2.0
+ASGI_BODY_MIN_RATE_CHECK_INTERVAL_SECS = 0.25
 
 # Development error page (P1-3): how much of a traceback the dev page keeps.
 # The tail is kept so the frames nearest the failure survive; anything cut
@@ -3146,28 +3157,51 @@ class App:
                                      response_timeout=self._response_timeout_s)
                 return
             chunks, total = [], 0
-            # Body-read stage (C-P1-7): the whole body must arrive
-            # within body_timeout_ms of the first read — the same
-            # whole-body budget the native server enforces in Rust, so
-            # a trickle sender cannot hold the request open one chunk
-            # at a time. A timeout answers 408 (Sanic REQUEST stage),
+            # Body-read stage (C-P1-7 + S-P1-12 / M-2): the whole body must
+            # arrive within the body timeout — the same whole-body budget
+            # the native server enforces in Rust, so a trickle sender
+            # cannot hold the request open one chunk at a time. After the
+            # grace window it must also average at least the minimum
+            # receive rate (Slowloris). Each receive waits at most one
+            # check interval, so a stall is re-checked every 250 ms
+            # instead of waiting out the whole timeout; a client that
+            # resumes sending within the budget is never cut off. The
+            # effective budget is the tighter of the app's configured
+            # body_timeout_ms and the module-level ASGI_BODY_TIMEOUT_SECS
+            # (kept as the operator/test override point); a configured 0
+            # falls back to the module constant, so the ASGI path never
+            # waits forever. A timeout answers 408 (Sanic REQUEST stage),
             # never 503: the server is not out of capacity, the client
             # is too slow.
-            body_deadline = (asyncio.get_running_loop().time() + self._body_timeout_s
-                             if self._body_timeout_s is not None else None)
+            body_started = asyncio.get_running_loop().time()
+            body_timeout_s = self._body_timeout_s
+            if body_timeout_s is None or ASGI_BODY_TIMEOUT_SECS < body_timeout_s:
+                body_timeout_s = ASGI_BODY_TIMEOUT_SECS
+            body_deadline = body_started + body_timeout_s
             try:
                 while True:
-                    if body_deadline is None:
-                        message = await receive()
-                    else:
-                        try:
-                            message = await asyncio.wait_for(
-                                receive(), max(0, body_deadline - asyncio.get_running_loop().time()))
-                        except TimeoutError:
+                    remaining = body_deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        self.metrics.observe_stage_timeout("body")
+                        log.warning("Body read timeout: %s %s", scope["method"], path)
+                        response = Response("Request Timeout", status=408,
+                                            headers=[(b"retry-after", b"1")])
+                        break
+                    try:
+                        message = await asyncio.wait_for(
+                            receive(),
+                            timeout=min(remaining, ASGI_BODY_MIN_RATE_CHECK_INTERVAL_SECS))
+                    except TimeoutError:
+                        elapsed = asyncio.get_running_loop().time() - body_started
+                        if (ASGI_BODY_MIN_RATE_BYTES_PER_SEC > 0
+                                and elapsed >= ASGI_BODY_MIN_RATE_GRACE_SECS
+                                and total < ASGI_BODY_MIN_RATE_BYTES_PER_SEC * elapsed):
                             self.metrics.observe_stage_timeout("body")
                             log.warning("Body read timeout: %s %s", scope["method"], path)
-                            response = Response("Request Timeout", status=408)
+                            response = Response("Request Timeout", status=408,
+                                                headers=[(b"retry-after", b"1")])
                             break
+                        continue
                     if message["type"] == "http.disconnect":
                         return
                     if message["type"] != "http.request":
