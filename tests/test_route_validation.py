@@ -28,6 +28,23 @@ def write_page(base, *parts, body=None):
     )
 
 
+def test_discovery_uses_posix_project_relative_paths(tmp_path):
+    write_page(tmp_path / "app", "blog", "[slug]")
+    for path in (tmp_path / "app" / "layout.py",
+                 tmp_path / "app" / "blog" / "layout.py",
+                 tmp_path / "middleware.py", tmp_path / "resources.py"):
+        path.write_text("# source\n", encoding="utf-8")
+    manifest = discover(tmp_path)
+    assert manifest["routes"]["/blog/[slug]"] == {
+        "entry": "app/blog/[slug]/page.py", "kind": "page",
+        "layouts": ["app/layout.py", "app/blog/layout.py"],
+    }
+    assert set(manifest["sources"]) == {
+        "app/blog/[slug]/page.py", "app/layout.py", "app/blog/layout.py",
+        "middleware.py", "resources.py",
+    }
+
+
 def test_slot_directory_fails_build(tmp_path):
     write_page(tmp_path / "app", "@team")
     with pytest.raises(ValueError, match=r"Parallel routes \(@slot\) are not supported"):

@@ -1,0 +1,148 @@
+PR #26 Windows compatibility fixes
+Base: 1315eef5a47dd81ef3ff03724c43bf67a56fad5c
+
+The PR #26 tests and config diagnostics are absent from 109da3a.
+Apply in the PR #26 tree with: git apply patches/pr26-windows-compat.patch
+Only project-relative paths are normalized; parameter values are untouched.
+
+diff --git a/python/pynext/build.py b/python/pynext/build.py
+--- a/python/pynext/build.py
++++ b/python/pynext/build.py
+@@ -535,14 +535,14 @@
+             except ValueError as exc:
+                 raise ValueError(_config_error(
+                     str(exc),
+-                    [("file", str(path.relative_to(root))), ("segment", part)],
++                    [("file", path.relative_to(root).as_posix()), ("segment", part)],
+                     ["Rename the directory to a valid route group like (name)",
+                      "Remove the parentheses to make it a literal URL segment"])) from exc
+             if group is None:
+                 parts.append(part)
+         pattern = "/" + "/".join(parts)
+         if pattern in routes:
+-            entry = str(path.relative_to(root))
++            entry = path.relative_to(root).as_posix()
+             existing = routes[pattern]
+             if existing["kind"] != path.stem:
+                 page_entry = entry if path.stem == "page" else existing["entry"]
+@@ -562,7 +562,7 @@
+         for part in relative_parent.parts:
+             current = current / part
+             dirs.append(current)
+-        layouts = [str((d / "layout.py").relative_to(root)) for d in dirs if (d / "layout.py").is_file()]
++        layouts = [(d / "layout.py").relative_to(root).as_posix() for d in dirs if (d / "layout.py").is_file()]
+         # Segment error boundaries (error.py / not-found.py / loading.py):
+         # the nearest file walking up from the route directory wins, like
+         # layouts. Only pages get boundaries; API routes keep the plain
+@@ -573,7 +573,7 @@
+                            ("loading", "loading.py"))}
+         else:
+             boundaries = {"error": None, "not_found": None, "loading": None}
+-        routes[pattern] = {"entry": str(path.relative_to(root)), "kind": path.stem,
++        routes[pattern] = {"entry": path.relative_to(root).as_posix(), "kind": path.stem,
+                            "layouts": layouts if path.stem == "page" else [], **boundaries}
+     if not routes:
+         raise ValueError(_config_error(
+@@ -613,7 +613,7 @@
+     # property test in tests/test_sortable_routes.py pins the two equal.
+     return {"schema_version": VERSION, "routes": {p: routes[p] for p in sort_routes(router.ordered_routes())},
+             "error": global_error, "not_found": global_not_found,
+-            "sources": {str(p.relative_to(root)): _hash(p) for p in files},
++            "sources": {p.relative_to(root).as_posix(): _hash(p) for p in files},
+             "public_sources": public_sources, "client_sources": discover_client(root)}
+
+
+@@ -925,7 +925,7 @@
+     for directory in reversed(dirs):
+         candidate = directory / filename
+         if candidate.is_file():
+-            return str(candidate.relative_to(root))
++            return candidate.relative_to(root).as_posix()
+     return None
+
+
+diff --git a/tests/test_build_modes.py b/tests/test_build_modes.py
+--- a/tests/test_build_modes.py
++++ b/tests/test_build_modes.py
+@@ -65,7 +65,7 @@
+     if public:
+         public_dir = root / "public"
+         public_dir.mkdir(exist_ok=True)
+-        (public_dir / "hello.txt").write_text("hello public\n", encoding="utf-8")
++        (public_dir / "hello.txt").write_bytes(b"hello public\n")
+     return root
+
+
+@@ -174,7 +174,7 @@
+     page = output / "index.html"
+     assert page.read_bytes() == (tmp_path / ".pynext" / "static" /
+                                  f"{manifest['static_pages']['/']['sha256']}.html").read_bytes()
+-    assert (output / "hello.txt").read_text(encoding="utf-8") == "hello public\n"
++    assert (output / "hello.txt").read_bytes() == b"hello public\n"
+     for digest in {manifest["client"]["runtime"], *manifest["client"]["bundles"].values()}:
+         assert (output / "_pynext" / "static" / f"{digest}.js").is_file()
+     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(output))
+@@ -189,7 +189,7 @@
+             bundle = manifest["client"]["bundles"]["counter"]
+             bundle_response = client.get(f"/_pynext/static/{bundle}.js")
+             assert bundle_response.status_code == 200 and "Count: " in bundle_response.text
+-            assert client.get("/hello.txt").text == "hello public\n"
++            assert client.get("/hello.txt").content == b"hello public\n"
+             assert client.get("/missing").status_code == 404
+     finally:
+         server.shutdown()
+diff --git a/tests/test_filesystem_cache.py b/tests/test_filesystem_cache.py
+--- a/tests/test_filesystem_cache.py
++++ b/tests/test_filesystem_cache.py
+@@ -305,26 +305,26 @@
+         FileSystemCacheBackend(tmp_path, max_bytes=0)
+
+
+-def _child_hold_lease(cache_dir, queue):
++def _child_hold_lease(cache_dir, ready, release):
+     from pynext.cache import FileSystemCacheBackend
+
+     backend = FileSystemCacheBackend(cache_dir)
+     assert backend.acquire_lease("/shared", "child", ttl=30.0) == 0
+     assert backend.insert_fenced("/shared", b"from-child", 30.0, 60.0, 0, owner="child") is True
+-    queue.put("held")
+-    # Hold the lease while the parent probes; the queue blocks until the
+-    # parent closes it.
+-    queue.get()
+-    backend.release_lease("/shared", "child")
++    try:
++        ready.set()
++        assert release.wait(timeout=10), "parent did not release the lease holder"
++    finally:
++        backend.release_lease("/shared", "child")
+
+
+ def test_cross_process_lease_and_visibility(tmp_path):
+-    ctx = mp.get_context("fork")
+-    queue = ctx.Queue()
+-    proc = ctx.Process(target=_child_hold_lease, args=(str(tmp_path), queue))
++    ctx = mp.get_context("spawn")
++    ready, release = ctx.Event(), ctx.Event()
++    proc = ctx.Process(target=_child_hold_lease, args=(str(tmp_path), ready, release))
+     proc.start()
+     try:
+-        assert queue.get(timeout=10) == "held"
++        assert ready.wait(timeout=10), "child did not acquire its lease"
+         backend = FileSystemCacheBackend(tmp_path)
+         # The child's lease blocks this process, and the child's entry
+         # is already visible here.
+@@ -338,9 +338,11 @@
+         # A different key is unaffected by the child's lease.
+         assert backend.insert("/other", b"ok", 30.0, 60.0) is True
+     finally:
+-        queue.put("release")
+-        queue.close()
++        release.set()
+         proc.join(timeout=10)
++        if proc.is_alive():
++            proc.terminate()
++            proc.join(timeout=10)
+         assert proc.exitcode == 0
+
+
+# End of PR #26 patch
