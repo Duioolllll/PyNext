@@ -2,7 +2,7 @@
 
 The watcher snapshots the modification time, size and contents of every regular file under
 the watched roots (``app/``, ``islands/``, ``public/``, ``middleware.py``,
-``resources.py`` and ``pynext.config.py``) and reports changes. Native events
+``resources.py``, ``pynext.config.py`` and the ``.env*`` files) and reports changes. Native events
 are debounced and a periodic snapshot detects changes missed during startup.
 """
 import asyncio
@@ -15,9 +15,16 @@ from pathlib import Path
 
 from watchfiles import awatch
 
+from .env import env_file_names
+
 # Directories never watched: build output, bytecode caches, VCS metadata,
 # virtual environments and JS dependencies.
 IGNORED_DIRS = {"__pycache__", ".git", ".pynext", ".venv", "venv", "node_modules"}
+
+# Every .env file name any mode can load (development/production/test),
+# so editing one restarts the dev server and reloads its values.
+ENV_FILE_NAMES = frozenset(name for mode in ("development", "production", "test")
+                           for name in env_file_names(mode))
 
 POLL_INTERVAL_SECONDS = 0.25
 DEBOUNCE_SECONDS = 0.3
@@ -44,6 +51,10 @@ class Watcher:
             config = self.root / name
             if config.is_file():
                 roots.append(config)
+        for name in sorted(ENV_FILE_NAMES):
+            env_file = self.root / name
+            if env_file.is_file():
+                roots.append(env_file)
         return roots
 
     def snapshot(self):
@@ -96,7 +107,8 @@ class Watcher:
             if not parts or any(part in IGNORED_DIRS for part in parts):
                 return False
             return parts[0] in {"app", "islands", "public"} or (
-                len(parts) == 1 and parts[0] in {"pynext.config.py", "middleware.py", "resources.py"})
+                len(parts) == 1 and parts[0] in {"pynext.config.py", "middleware.py", "resources.py"}
+                | ENV_FILE_NAMES)
 
         async def changed_snapshot():
             current = await asyncio.to_thread(self.snapshot)

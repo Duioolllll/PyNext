@@ -10,6 +10,7 @@ from pathlib import Path
 from . import _native
 from .assets import discover_public
 from .client import discover_client
+from .env import load_env
 
 MANIFEST = ".pynext/manifest.json"
 VERSION = 9
@@ -109,6 +110,10 @@ def discover(root):
 def write_manifest(root):
     root = Path(root).resolve()
     _check_build_paths(root)
+    # Production env files are loaded before any user code runs, so static
+    # rendering and island bundling both see them (Next.js loads .env
+    # before loadConfig in the same way).
+    loaded = load_env(root, mode="production")
     manifest = discover(root)
     # Loading user code and running its generators are intentional build steps.
     from .app import App
@@ -120,6 +125,11 @@ def write_manifest(root):
     manifest["isr_policies"] = app.isr_policies
     manifest["isr_queries"] = app.isr_queries
     manifest["client"] = app.client_manifest
+    # Only the file names and the public-variable keys are recorded, never
+    # values: secrets stay out of the manifest, and the public keys show
+    # which variables were inlined into the island bundles.
+    manifest["env_files"] = list(loaded.files)
+    manifest["public_env_keys"] = sorted(loaded.public_values)
     manifest["static_pages"] = {}
     for path, (pattern, body) in rendered.items():
         digest = hashlib.sha256(body).hexdigest()

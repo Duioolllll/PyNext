@@ -26,6 +26,7 @@ from .auth import check_authorization
 from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
 from .client import compile_client, read_client_artifacts
 from .components import _isr_policy, _isr_query_keys, _node, bind_islands
+from .env import load_env
 from .build import discover, load_manifest
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
@@ -1650,6 +1651,9 @@ def create_app(root=".", *, production=False, security=None, cache_backend="memo
                cache_failure_policy=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
                trusted_proxies=None, sync_workers=32):
     root = Path(root).resolve()
+    # .env files are loaded before the manifest is read or user code runs,
+    # so server code, middleware and island bundling all see them.
+    load_env(root, mode="production" if production else "development")
     return App(root, load_manifest(root) if production else discover(root), production=production,
                security=security, cache_backend=cache_backend, cache_path=cache_path,
                observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,

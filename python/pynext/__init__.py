@@ -10,6 +10,7 @@ from .client_dsl import ClientDSLCompileError, compile_client_dsl
 from .components import h, fragment, island, layout, model_prop, page
 from .database import Database
 from .django import DjangoBusyError, DjangoResource
+from .env import LoadedEnv, env_file_names, load_env, public_env_defines, public_env_vars
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN
 from .forms import UploadFile
 from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
@@ -34,4 +35,5 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
            "Session", "SessionMiddleware", "SQLiteSessionStore", "RedisSessionStore", "require_auth", "require_permission",
            "RedisRateLimiter", "WebSocketPubSub", "PubSubOverflow",
-           "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies", "FAIL_OPEN", "FAIL_CLOSED"]
+           "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies", "FAIL_OPEN", "FAIL_CLOSED",
+           "LoadedEnv", "env_file_names", "load_env", "public_env_defines", "public_env_vars"]

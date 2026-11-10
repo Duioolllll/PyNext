@@ -303,6 +303,12 @@ The forwarded chain is walked from right to left through trusted proxies; the ne
 
 Multiple workers: `pynext start --workers 4` runs a supervisor whose worker processes share one listener. With `--port 0`, the assigned port remains stable across worker restarts. Workers have independent interpreters and event loops; memory caches and rate limits are per worker, while SQLite/Redis ISR and Redis rate limiting can be shared. The supervisor restarts failed workers and coordinates shutdown. An interrupted in-flight request fails and must be retried. CI tests shared-listener worker startup and restart on Linux, macOS, and Windows; signal-based supervisor tests run on Linux and macOS.
 
+## Environment files (`.env`)
+
+`pynext dev`, `pynext build` and `pynext start` load `.env` files from the project root before any user code runs. Priority, highest first: `.env.{mode}.local`, `.env.local`, `.env.{mode}`, `.env` — where mode is `development` for `dev` and `production` for `build`/`start`. In `test` mode `.env.local` is skipped (`.env.test.local` still loads). A variable already set in the process environment always wins over the files. Editing a `.env` file restarts the dev server and reloads its values.
+
+Only variables prefixed `PYNEXT_PUBLIC_` are inlined into island bundles (via esbuild `--define`, as `process.env.PYNEXT_PUBLIC_<NAME>`); every other variable stays server-only, so a secret can never leak into client JavaScript. Put secrets such as `PYNEXT_REDIS_URL` or `PYNEXT_CSRF_SIGNING_KEY` in `.env.local` / `.env.production.local` only. A standalone bundle copies `.env` and `.env.production` and never any `.env*.local` file. The loaded file names and the public-variable keys (never values) are recorded in `.pynext/manifest.json` as `env_files` and `public_env_keys`. Programmatic use: `load_env(root, mode="production")` from `pynext.env`.
+
 ## Tests and troubleshooting
 
 ~~~bash
