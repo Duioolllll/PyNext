@@ -1,7 +1,10 @@
+import json
 import os
+import sys
 
 import pytest
 
+from pynext import cli
 from pynext.build import write_manifest
 from pynext.env import (
     LoadedEnv,
@@ -195,6 +198,25 @@ def test_build_loads_env_for_static_rendering(tmp_path):
     manifest = write_manifest(tmp_path)
     body = (tmp_path / ".pynext" / "static" / (manifest["static_pages"]["/"]["sha256"] + ".html")).read_bytes()
     assert b"hello-from-env" in body
+
+
+def test_cli_build_uses_production_env_not_development(tmp_path, monkeypatch):
+    # PR #22 P1: `pynext build` used to load the development env files
+    # first (cli.py), poisoning os.environ so write_manifest's own
+    # production load could not override the values — a variable already
+    # in the process environment wins over every file. The built HTML
+    # baked in the DEV values instead of the production ones.
+    _project(tmp_path, page=(
+        "import os\nfrom pynext import h, page\n@page(render=\"ssg\")\n"
+        "def Page(): return h('p', {}, os.environ.get('GREETING', 'missing'))\n"))
+    (tmp_path / ".env.development").write_text("GREETING=hello-dev\n")
+    (tmp_path / ".env.production").write_text("GREETING=hello-prod\n")
+    monkeypatch.setattr(sys, "argv", ["pynext", "build", "--dir", str(tmp_path)])
+    cli.main()
+    manifest = json.loads((tmp_path / ".pynext" / "manifest.json").read_text())
+    body = (tmp_path / ".pynext" / "static" / (manifest["static_pages"]["/"]["sha256"] + ".html")).read_bytes()
+    assert b"hello-prod" in body
+    assert b"hello-dev" not in body
 
 
 def test_island_bundle_inlines_public_only(tmp_path, esbuild, monkeypatch):
