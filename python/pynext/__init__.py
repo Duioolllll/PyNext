@@ -61,6 +61,8 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "validate_csrf", "mask_csrf_token", "unmask_csrf_token",
            "get_csrf_token", "csrf_token_response", "csrf_input",
            "content_security_policy", "security_headers", "apply_security_headers",
+           "PathHeaderRule", "PathHeaders", "apply_path_headers", "compile_path_headers",
+           "Matcher", "HeaderRule", "ScopedMiddleware", "scoped_middleware", "compile_matcher", "compile_header_rules",
            "ObservabilityConfig", "MetricsCollector", "RequestInsights", "WebSocket", "WebSocketDisconnect", "MAX_WS_MESSAGE",
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
            "Session", "SessionMiddleware", "SQLiteSessionStore", "RedisSessionStore", "SessionPayloadCipher", "SessionRecord", "require_auth", "require_permission",

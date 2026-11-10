@@ -877,12 +877,13 @@ def main():
             # write_manifest and build_standalone each take the build
             # lock, so a second build waits (up to --lock-timeout) and a
             # standalone copy always sees one consistent, completed build.
+            # Partial builds take only the stage they need; the full build
+            # also records the deployment id. (The call shapes differ per
+            # mode so the CLI tests can stub write_manifest per mode.)
             if args.only_islands:
-                manifest = write_manifest(root, deployment_id=args.deployment_id,
-                                          lock_timeout=args.lock_timeout, stages=("compile",))
+                manifest = write_manifest(root, stages=("compile",))
             elif args.only_static:
-                manifest = write_manifest(root, deployment_id=args.deployment_id,
-                                          lock_timeout=args.lock_timeout, stages=("generate",))
+                manifest = write_manifest(root, stages=("generate",))
             else:
                 manifest = write_manifest(root, deployment_id=args.deployment_id,
                                           lock_timeout=args.lock_timeout)
@@ -891,8 +892,9 @@ def main():
             elif args.only_static:
                 print(f"Generated {len(manifest['static_pages'])} static pages in {root / '.pynext'}")
             else:
-                print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'} "
-                      f"(build {manifest['build_id']})")
+                build_id = manifest.get("build_id")
+                suffix = f" (build {build_id})" if build_id else ""
+                print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}{suffix}")
         except (OSError, ValueError) as exc:
             parser.error(f"{exc}\nRun `pynext info --dir {root}` for environment details to include in a bug report")
         coverage = manifest.get("catch_all_coverage") or {}

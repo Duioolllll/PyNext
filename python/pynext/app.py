@@ -2679,6 +2679,8 @@ class App:
         operators can pass the public URL; the trailing-slash rule
         still applies to the app-relative path.
         """
+        if type is not None and type not in ("page", "layout"):
+            raise ValueError("revalidate type must be 'page' or 'layout'")
         if not isinstance(path, str):
             raise TypeError("ISR path must be a string")
         path = _decode_path(path)

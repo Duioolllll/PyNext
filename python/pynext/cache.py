@@ -3225,7 +3225,6 @@ class ISRCache:
                 raise ValueError("cache_path is required when cache_backend is 'sqlite'")
             self.shared = SQLiteCacheBackend(
                 self._cache_path, max_entries=sqlite_max_entries, max_bytes=sqlite_max_bytes)
-            self.shared = SQLiteCacheBackend(self._cache_path)
         elif cache_backend == "filesystem":
             if cache_path is None:
                 raise ValueError("cache_path is required when cache_backend is 'filesystem'")
@@ -3302,7 +3301,6 @@ class ISRCache:
             self.shared = SQLiteCacheBackend(
                 self._cache_path, max_entries=self._sqlite_max_entries,
                 max_bytes=self._sqlite_max_bytes)
-            self.shared = SQLiteCacheBackend(self._cache_path)
         elif self.shared is None and self.backend_name == "filesystem":
             self.shared = FileSystemCacheBackend(self._cache_path)
         elif self.shared is None and self.backend_name == "redis":

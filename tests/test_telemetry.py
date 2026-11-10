@@ -120,8 +120,12 @@ def test_failed_build_records_discover_stage(tmp_path):
 
 
 def test_failed_build_records_render_stage(tmp_path):
+    # Integrated build: render failures are aggregated into a staged
+    # BuildError whose message preserves the original error text.
+    from pynext.build import BuildError
+
     _make_broken_app(tmp_path, 'raise RuntimeError("boom-secret-message")\n')
-    with pytest.raises(RuntimeError, match="boom-secret-message"):
+    with pytest.raises(BuildError, match="boom-secret-message"):
         write_manifest(tmp_path)
     events = read_events(tmp_path)
     assert len(events) == 1 and events[0]["stage"] == "render"
@@ -143,7 +147,11 @@ def test_failed_build_records_write_stage(tmp_path, monkeypatch):
         return real_atomic_write(path, contents)
 
     monkeypatch.setattr(build_module, "_atomic_write", failing_write)
-    with pytest.raises(OSError, match="disk full"):
+    # Integrated build: the write failure is wrapped in a staged
+    # BuildError whose message preserves the original error text.
+    from pynext.build import BuildError
+
+    with pytest.raises(BuildError, match="disk full"):
         write_manifest(tmp_path)
     events = read_events(tmp_path)
     assert len(events) == 1 and events[0]["stage"] == "write"

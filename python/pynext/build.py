@@ -995,12 +995,25 @@ def _finish_manifest(root, manifest, app, rendered, *, previous=None, deployment
     ``rendered`` is the ``_render_static_pages`` result (or None for a
     compile-only build, which reuses the previous static pages). ``previous``
     is the manifest of an earlier build whose static pages/assets may be
-    reused; it is ignored when ``rendered`` is given.
+    reused; it is ignored when ``rendered`` is given. The manifest records
+    the same policy keys a full build records, so a production app can
+    start from it, plus the deterministic ``build_id``, the
+    ``deployment_id`` and the BUILD_ID seal ``load_manifest`` checks.
     """
     manifest["render_modes"] = app.render_modes
     manifest["isr_policies"] = app.isr_policies
+    manifest["layout_policies"] = app.layout_policies
     manifest["isr_queries"] = app.isr_queries
+    manifest["ssg_fallback"] = app.ssg_fallback
+    manifest["dynamic_modes"] = app.dynamic_modes
+    manifest["isr_tags"] = app.isr_tags
     manifest["client"] = app.client_manifest
+    # Prerender report, as in a full build (empty when every static page
+    # stayed static). ISR accesses recorded later at runtime are not part
+    # of the build manifest.
+    manifest["dynamic_accesses"] = {pattern: accesses for pattern, accesses in app.dynamic_accesses.items()
+                                    if accesses}
+    manifest["isr_static_paths"] = asyncio.run(_enumerate_isr_static_paths(app))
     if rendered is None:
         if previous is not None:
             manifest["static_pages"] = previous.get("static_pages", {})
@@ -1012,7 +1025,11 @@ def _finish_manifest(root, manifest, app, rendered, *, previous=None, deployment
         manifest["static_pages"] = _write_static_files(root, rendered)
         manifest["assets"] = _write_public_files(root, app.public_assets)
     _write_client_files(root, app.client_assets)
-    _write_manifest_file(root, manifest)
+    manifest["build_id"] = generate_build_id(manifest)
+    manifest["deployment_id"] = deployment_id
+    manifest_bytes = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    _atomic_write(root / MANIFEST, manifest_bytes)
+    _write_build_id(root, manifest_bytes)
     return manifest
 
 
@@ -1927,6 +1944,18 @@ def load_manifest(root):
     deployment_id = saved.get("deployment_id")
     if deployment_id is not None and not _validate_deployment_id(deployment_id):
         raise ValueError("Invalid deployment ID in manifest; rebuild the application")
+    # BUILD_ID is written last by a successful build and holds the
+    # SHA-256 of the manifest bytes: a manifest left behind by a build
+    # that died between writing it and finishing (or hand-edited since)
+    # has no matching BUILD_ID and must not start.
+    build_id_path = root / BUILD_ID_FILE
+    try:
+        recorded = build_id_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        recorded = None
+    if recorded != build_id_for(target.read_bytes()):
+        raise ValueError("Incomplete build: BUILD_ID is missing or does not match the manifest; "
+                         "run `pynext build` again")
     stages = saved.get("stages")
     if stages is not None:
         # Manifests written before build stages existed have no key and are
