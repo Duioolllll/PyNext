@@ -314,7 +314,8 @@ class _NativeStream:
 def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
                             body_capacity, body_timeout_ms, max_connections,
                             max_connections_per_ip, header_read_timeout_ms,
-                            body_min_rate_bytes_per_sec, shutdown_timeout):
+                            body_min_rate_bytes_per_sec, shutdown_timeout,
+                            fast_path_max_concurrent=None):
     """Reject server limits that cannot reach the native server safely.
 
     Counts and timeouts cross into Rust as usize/u64/f64: a value past
@@ -334,6 +335,7 @@ def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
         ("header_read_timeout_ms", header_read_timeout_ms, 0, MAX_TIMEOUT_MS),
         ("body_min_rate_bytes_per_sec", body_min_rate_bytes_per_sec, 0,
          MAX_BODY_MIN_RATE_BYTES_PER_SEC),
+        ("fast_path_max_concurrent", fast_path_max_concurrent, 1, MAX_CONCURRENT),
     )
     for name, value, minimum, maximum in counts:
         if value is None:
@@ -352,7 +354,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                  max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                  header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                  body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
-                 shutdown_timeout=30.0, max_waiting=None):
+                 shutdown_timeout=30.0, max_waiting=None, fast_path_max_concurrent=None):
     """Start the native server and return its handle.
 
     Overload policy (roadmap C7): bounded wait, then reject. At most
@@ -371,7 +373,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
                             body_capacity, body_timeout_ms, max_connections,
                             max_connections_per_ip, header_read_timeout_ms,
-                            body_min_rate_bytes_per_sec, shutdown_timeout)
+                            body_min_rate_bytes_per_sec, shutdown_timeout,
+                            fast_path_max_concurrent)
     if observability is not None:
         app.configure_observability(observability)
     app.metrics.observe_worker_start()
@@ -574,7 +577,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 security_headers=security_headers(config=app.security,
                                                                   production=app.production),
                                 path_headers=app.path_headers.for_native(),
-                                drain_timeout_secs=shutdown_timeout)
+                                drain_timeout_secs=shutdown_timeout,
+                                fast_path_max_concurrent=fast_path_max_concurrent)
 
 
 async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
@@ -587,7 +591,8 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                 max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                 header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                 body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
-                shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None):
+                shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None,
+                fast_path_max_concurrent=None):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
@@ -603,8 +608,12 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
     keep-alive connections (hyper applies it to every header read on the
     connection); ``body_min_rate_bytes_per_sec`` rejects bodies arriving
     slower than that average after a 2-second grace window with a 408.
-    These limits apply to the native (Axum) server only; the ASGI adapter
-    relies on the ASGI server's own limits.
+    The fast-path budget (``fast_path_max_concurrent``, default 4x
+    ``max_concurrent``) caps concurrent static/ISR-Fresh responses served
+    without an execution slot; excess fast-path requests get 503 with
+    ``Retry-After``. The ASGI adapter enforces the same body timeout and
+    minimum receive rate as the native server; the other connection
+    limits apply to the native server only.
 
     Graceful shutdown (B6), in order: the app stops advertising
     readiness (``/readyz`` starts returning 503), live WebSocket
@@ -637,7 +646,8 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               max_connections_per_ip=max_connections_per_ip,
                               header_read_timeout_ms=header_read_timeout_ms,
                               body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
-                              shutdown_timeout=shutdown_timeout, max_waiting=max_waiting)
+                              shutdown_timeout=shutdown_timeout, max_waiting=max_waiting,
+                              fast_path_max_concurrent=fast_path_max_concurrent)
         print(f"PyNext listening on http://{server.address}", flush=True)
         # A standalone bundle records its provenance in
         # bundle-manifest.json next to the app dir; log it (and warn on

@@ -21,11 +21,14 @@ use pyo3::types::{PyBytes, PyList};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tower_service::Service as TowerService;
 
@@ -420,6 +423,15 @@ struct ServerState {
     acquire_timeout: Duration,
     body_capacity: Arc<Semaphore>,
     body_timeout: Duration,
+    // Fast-path budget (S-P1-11 / M-1): static assets and Fresh ISR pages
+    // bypass the execution semaphore, so without their own cap a flood on
+    // those paths is bounded only by the connection limits (1024/128).
+    // A permit is held from dispatch until the response body has been
+    // fully consumed by hyper (see `capped_body`); when the budget is
+    // exhausted the request is shed with 503 + Retry-After instead of
+    // falling through to the Python bridge, which would turn a cheap
+    // static flood into expensive Python work.
+    fast_path_capacity: Arc<Semaphore>,
     // Connection budget (A4): a semaphore for the total number of live TCP
     // connections, plus a per-IP count. Both are checked in the accept loop
     // before any request is read.
@@ -768,11 +780,33 @@ fn apply_path_headers_for_raw_path(
     }
 }
 
+/// A fast-path response body that holds its concurrency permit until the
+/// body has been fully consumed (or the connection is dropped): the permit
+/// lives in the stream state, so it is released when hyper polls the stream
+/// to its end or drops it — not when `dispatch` returns. Holding the permit
+/// only across `dispatch` would be useless, because the fast-path section
+/// has no await point and hyper streams the body after `dispatch` returns;
+/// under socket backpressure hyper stops polling the body, so a slow reader
+/// keeps the permit (and the budget) occupied, which is exactly what the
+/// cap must bound.
+fn capped_body(content: Bytes, permit: Option<OwnedSemaphorePermit>) -> Body {
+    let Some(permit) = permit else {
+        return Body::from(content);
+    };
+    let stream =
+        futures_util::stream::unfold((Some(content), Some(permit)), |(data, permit)| async move {
+            let data = data?;
+            Some((Ok::<_, std::convert::Infallible>(data), (None, permit)))
+        });
+    Body::from_stream(stream)
+}
+
 fn static_response(
     parts: &axum::http::request::Parts,
     content: &Bytes,
     policy: AssetPolicy<'_>,
     security_headers: &[(Vec<u8>, Vec<u8>)],
+    fast_path_permit: Option<OwnedSemaphorePermit>,
 ) -> AxumResponse<Body> {
     let length = content.len();
     let mut status = StatusCode::OK;
@@ -828,9 +862,9 @@ fn static_response(
     {
         Body::empty()
     } else if let Some((start, end)) = range {
-        Body::from(content.slice(start..end + 1))
+        capped_body(content.slice(start..end + 1), fast_path_permit)
     } else {
-        Body::from(content.clone())
+        capped_body(content.clone(), fast_path_permit)
     };
     let mut builder = AxumResponse::builder()
         .status(status)
@@ -1663,6 +1697,19 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     {
         if let Some(path) = decoded_path {
             if let Some(content) = state.client_assets.get(&path) {
+                // S-P1-11 (M-1): the fast path bypasses the execution
+                // semaphore, so it has its own budget. The permit is
+                // only taken once a fast-path hit is confirmed — a
+                // dynamic request must never be shed by this cap — and
+                // exhaustion sheds with 503 + Retry-After instead of
+                // falling through to the Python bridge.
+                let Ok(fast_permit) = state.fast_path_capacity.clone().try_acquire_owned() else {
+                    return apply_path_headers_for_raw_path(
+                        busy_response(1, &state.security_headers),
+                        parts.uri.path(),
+                        &state.path_headers,
+                    );
+                };
                 return apply_path_headers(
                     static_response(
                         &parts,
@@ -1676,12 +1723,20 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                             vary: false,
                         },
                         &state.security_headers,
+                        Some(fast_permit),
                     ),
                     &path,
                     &state.path_headers,
                 );
             }
             if let Some(asset) = state.public_assets.get(&path) {
+                let Ok(fast_permit) = state.fast_path_capacity.clone().try_acquire_owned() else {
+                    return apply_path_headers_for_raw_path(
+                        busy_response(1, &state.security_headers),
+                        parts.uri.path(),
+                        &state.path_headers,
+                    );
+                };
                 return apply_path_headers(
                     static_response(
                         &parts,
@@ -1693,12 +1748,20 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                             vary: false,
                         },
                         &state.security_headers,
+                        Some(fast_permit),
                     ),
                     &path,
                     &state.path_headers,
                 );
             }
             if let Some(content) = state.static_pages.get(&path) {
+                let Ok(fast_permit) = state.fast_path_capacity.clone().try_acquire_owned() else {
+                    return apply_path_headers_for_raw_path(
+                        busy_response(1, &state.security_headers),
+                        parts.uri.path(),
+                        &state.path_headers,
+                    );
+                };
                 return apply_path_headers(
                     static_response(
                         &parts,
@@ -1710,6 +1773,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                             vary: true,
                         },
                         &state.security_headers,
+                        Some(fast_permit),
                     ),
                     &path,
                     &state.path_headers,
@@ -1720,11 +1784,19 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 && !parts.headers.contains_key("cookie")
             {
                 if let CacheResult::Fresh(content) = state.isr_cache.lookup(&path) {
+                    let Ok(fast_permit) = state.fast_path_capacity.clone().try_acquire_owned()
+                    else {
+                        return apply_path_headers_for_raw_path(
+                            busy_response(1, &state.security_headers),
+                            parts.uri.path(),
+                            &state.path_headers,
+                        );
+                    };
                     let length = content.len();
                     let body = if parts.method == axum::http::Method::HEAD {
                         Body::empty()
                     } else {
-                        Body::from(content)
+                        capped_body(content, Some(fast_permit))
                     };
                     return apply_path_headers(
                         apply_security_headers(
@@ -1926,6 +1998,86 @@ impl Drop for PerIpConnectionGuard {
     }
 }
 
+/// Last-activity clock for one connection (S-P1-13 / M-3): h2c has no
+/// header-read timeout, so idle h2c connections would otherwise sit in
+/// the connection budget forever. Time is millis since the connection
+/// started, stored atomically so the socket wrapper and the watchdog task
+/// can share it without a lock.
+struct IdleClock {
+    base: tokio::time::Instant,
+    last_millis: AtomicU64,
+}
+
+impl IdleClock {
+    fn new() -> Self {
+        Self {
+            base: tokio::time::Instant::now(),
+            last_millis: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_millis
+            .store(self.base.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn idle(&self) -> Duration {
+        let elapsed_millis = self.base.elapsed().as_millis() as u64;
+        Duration::from_millis(
+            elapsed_millis.saturating_sub(self.last_millis.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+/// A socket wrapper that records every successful read/write on the
+/// connection's [`IdleClock`]. Hyper never reports per-connection
+/// activity, so the idle watchdog in the accept loop needs this hook.
+struct IdleWatchStream<S> {
+    inner: S,
+    clock: Arc<IdleClock>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for IdleWatchStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result {
+            if buf.filled().len() > filled_before {
+                self.clock.touch();
+            }
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for IdleWatchStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = &result {
+            if *written > 0 {
+                self.clock.touch();
+            }
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// The peer address of the TCP connection a request arrived on, carried in
 /// request extensions so dispatch can hand the client IP to the Python
 /// bridge. The Python rate limiter keys buckets on it (spec §11); without
@@ -2045,7 +2197,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, fast_path_max_concurrent=None))]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn new(
@@ -2083,6 +2235,7 @@ impl NativeServer {
         websocket_auth_callback: Option<Py<PyAny>>,
         http_rate_limit_callback: Option<Py<PyAny>>,
         path_headers: Option<Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>>,
+        fast_path_max_concurrent: Option<usize>,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -2128,6 +2281,18 @@ impl NativeServer {
         if max_connections_per_ip == 0 || max_connections_per_ip > Semaphore::MAX_PERMITS {
             return Err(PyValueError::new_err(
                 "max_connections_per_ip is outside the supported range",
+            ));
+        }
+        // S-P1-11: the fast-path budget defaults to 4x the execution
+        // slots — generous for cheap static responses, but still a cap
+        // instead of the bare connection limit. An explicit 0 would shed
+        // every fast-path response, so it is rejected like the other
+        // zero capacities.
+        let fast_path_max_concurrent = fast_path_max_concurrent
+            .unwrap_or_else(|| max_concurrent.saturating_mul(4).min(Semaphore::MAX_PERMITS));
+        if fast_path_max_concurrent == 0 || fast_path_max_concurrent > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "fast_path_max_concurrent is outside the supported range",
             ));
         }
         if static_pages
@@ -2253,6 +2418,7 @@ impl NativeServer {
                     // bottleneck.
                     body_capacity: Arc::new(Semaphore::new(body_capacity)),
                     body_timeout: Duration::from_millis(body_timeout_ms),
+                    fast_path_capacity: Arc::new(Semaphore::new(fast_path_max_concurrent)),
                     connection_capacity: Arc::new(Semaphore::new(max_connections)),
                     per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
                     max_connections_per_ip,
@@ -2366,12 +2532,44 @@ impl NativeServer {
                             // old Http1Builder-only loop turned the h2
                             // preface into a VersionH2 error and dropped the
                             // connection. The header read timeout applies to
-                            // the HTTP/1.1 side via `.http1()`; h2c
-                            // connections have no idle timeout, only the
-                            // connection caps above.
+                            // the HTTP/1.1 side via `.http1()`; h2c gets the
+                            // same bound from the idle watchdog below
+                            // (S-P1-13), since hyper has no h2c idle
+                            // timeout of its own.
                             connections.spawn(async move {
                                 let _total_permit = total_permit;
                                 let _per_ip_guard = per_ip_guard;
+                                // S-P1-13 (M-3): tell h2c apart from
+                                // HTTP/1.1 by peeking at the prior-knowledge
+                                // preface. Hyper auto-detects the protocol
+                                // itself; the peek only decides whether the
+                                // idle watchdog applies, so a slow or
+                                // partial preface merely fails open to "no
+                                // watchdog". The peek consumes nothing, and
+                                // a client that has not sent anything yet
+                                // only delays connection setup by the peek
+                                // timeout.
+                                let is_h2c = {
+                                    let mut preface = [0u8; 24];
+                                    match tokio::time::timeout(
+                                        Duration::from_millis(100),
+                                        stream.peek(&mut preface),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(n)) => {
+                                            n >= 24
+                                                && preface
+                                                    == *b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+                                        }
+                                        _ => false,
+                                    }
+                                };
+                                let idle_clock = Arc::new(IdleClock::new());
+                                let watched = IdleWatchStream {
+                                    inner: stream,
+                                    clock: Arc::clone(&idle_clock),
+                                };
                                 let mut builder = AutoBuilder::new(TokioExecutor::new());
                                 {
                                     let mut http1 = builder.http1();
@@ -2385,7 +2583,7 @@ impl NativeServer {
                                 // the upgrade future failing with "upgrade
                                 // expected but low level API in use".
                                 let connection = builder
-                                    .serve_connection_with_upgrades(TokioIo::new(stream), service);
+                                    .serve_connection_with_upgrades(TokioIo::new(watched), service);
                                 tokio::pin!(connection);
                                 tokio::select! {
                                     _ = &mut connection => {}
@@ -2393,6 +2591,28 @@ impl NativeServer {
                                         connection.as_mut().graceful_shutdown();
                                         let _ = connection.await;
                                     }
+                                    // Idle timeout for h2c only: HTTP/1.1
+                                    // already gets the header-read timeout
+                                    // from hyper, and applying this watchdog
+                                    // there too would kill long handlers that
+                                    // stay silent for a while. Activity is
+                                    // any socket read/write, so a live stream
+                                    // or a peer answering frames keeps the
+                                    // connection; only a connection idle for
+                                    // the whole timeout is dropped, which
+                                    // releases its connection-budget permits.
+                                    _ = async {
+                                        if !is_h2c || header_read_timeout.is_zero() {
+                                            return futures_util::future::pending::<()>().await;
+                                        }
+                                        loop {
+                                            let idle = idle_clock.idle();
+                                            if idle >= header_read_timeout {
+                                                return;
+                                            }
+                                            tokio::time::sleep(header_read_timeout - idle).await;
+                                        }
+                                    } => {}
                                 }
                             });
                         }

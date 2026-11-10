@@ -67,6 +67,17 @@ log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
 ASGI_DECISION_CAPACITY = 64
 ASGI_DECISION_TIMEOUT = 2.0
+# ASGI body limits (S-P1-12 / M-2): native parity — the whole body must
+# arrive within the body timeout, and after the grace window it must
+# average at least the minimum receive rate (native: 10 s, 1024 B/s,
+# 2 s grace, re-checked every 250 ms while stalled). The values come
+# from the same DEFAULT_CONFIG the native server defaults to; uvicorn
+# itself applies no such bound, so without this a slow body can hold an
+# ASGI connection (Slowloris) indefinitely.
+ASGI_BODY_TIMEOUT_SECS = DEFAULT_CONFIG.body_timeout_ms / 1000.0
+ASGI_BODY_MIN_RATE_BYTES_PER_SEC = DEFAULT_CONFIG.body_min_rate_bytes_per_sec
+ASGI_BODY_MIN_RATE_GRACE_SECS = 2.0
+ASGI_BODY_MIN_RATE_CHECK_INTERVAL_SECS = 0.25
 
 # Development error page (P1-3): how much of a traceback the dev page keeps.
 # The tail is kept so the frames nearest the failure survive; anything cut
@@ -2659,9 +2670,37 @@ class App:
                 await _send_response(denied, send, config=self.security, production=self.production)
                 return
             chunks, total = [], 0
+            body_started = asyncio.get_running_loop().time()
             try:
                 while True:
-                    message = await receive()
+                    # Native parity (S-P1-12 / M-2): the whole body must
+                    # arrive within the body timeout, and after the grace
+                    # window it must average at least the minimum receive
+                    # rate — a slow body must not hold the connection
+                    # (Slowloris) behind uvicorn. Each receive waits at
+                    # most one check interval, so a stall is re-checked
+                    # every 250 ms instead of waiting out the whole
+                    # timeout; a client that resumes sending within the
+                    # budget is never cut off.
+                    elapsed = asyncio.get_running_loop().time() - body_started
+                    remaining = ASGI_BODY_TIMEOUT_SECS - elapsed
+                    if remaining <= 0:
+                        response = Response("Request Timeout", status=408,
+                                            headers=[(b"retry-after", b"1")])
+                        break
+                    try:
+                        message = await asyncio.wait_for(
+                            receive(),
+                            timeout=min(remaining, ASGI_BODY_MIN_RATE_CHECK_INTERVAL_SECS))
+                    except TimeoutError:
+                        elapsed = asyncio.get_running_loop().time() - body_started
+                        if (ASGI_BODY_MIN_RATE_BYTES_PER_SEC > 0
+                                and elapsed >= ASGI_BODY_MIN_RATE_GRACE_SECS
+                                and total < ASGI_BODY_MIN_RATE_BYTES_PER_SEC * elapsed):
+                            response = Response("Request Timeout", status=408,
+                                                headers=[(b"retry-after", b"1")])
+                            break
+                        continue
                     if message["type"] == "http.disconnect":
                         return
                     if message["type"] != "http.request":
