@@ -125,6 +125,7 @@ def test_authenticated_static_pages_are_rejected(tmp_path):
 
 def test_rotate_on_login_preserves_data_and_rotates_csrf():
     """The login hook rotates the id and the CSRF token, keeping the data."""
+    from pynext.http import unmask_csrf_token
     from pynext.sessions import Session
 
     session = Session({"user_id": "alice"}, csrf="old-csrf", token="old-token", version=1)
@@ -133,7 +134,13 @@ def test_rotate_on_login_preserves_data_and_rotates_csrf():
     assert session._rotate is True
     assert session["user_id"] == "alice"
     assert session._csrf != "old-csrf"
-    assert session.csrf_token() == session._csrf
+    # csrf_token() is masked (S-P0-2): every call returns a different
+    # value over the same stored secret.
+    first_issued = session.csrf_token()
+    assert first_issued != session._csrf
+    assert unmask_csrf_token(first_issued) == session._csrf
+    assert session.csrf_token() != first_issued
+    assert unmask_csrf_token(session.csrf_token()) == session._csrf
     # Rotating twice, or after invalidation, behaves like rotate().
     session.rotate_on_login()
     assert session._rotate is True

@@ -25,7 +25,18 @@ def require_permission(permission):
 
 
 def check_authorization(request, fn):
-    """Return 401/403, or None when the handler's policy is satisfied."""
+    """Return 401/403, or None when the handler's policy is satisfied.
+
+    Session fixation (H-6) is not decided here: this runs before the
+    handler, so it cannot see the login transition — there is no
+    rotation to check yet at this point. The guarantee lives in
+    :class:`pynext.sessions.SessionMiddleware`, which rotates the
+    session id whenever a request authenticates a previously anonymous
+    (or different-user) session, even when the login handler forgot
+    ``rotate_on_login()`` — so by the time any later request reaches
+    this check with a ``user_id``, its id is one issued after
+    authentication, never one fixed before login.
+    """
     if not getattr(fn, "__pynext_auth__", False):
         return None
     from .http import Response

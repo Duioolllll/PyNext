@@ -46,9 +46,10 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 #: environment variable still override it per config. Workers are
 #: separate processes, so each has its own fallback key — a lone worker
 #: (or a single-process server) is unaffected, but a multi-worker
-#: supervisor must share one key explicitly: see
+#: deployment must share one key explicitly: see
 #: :func:`ensure_shared_csrf_signing_key`, which the supervisor calls
-#: before spawning workers so every worker signs with the same key.
+#: before spawning workers and ``server.start_native``/``serve`` call
+#: at startup, so every worker signs with the same key.
 _FALLBACK_CSRF_SIGNING_KEY = secrets.token_bytes(32)
 
 
@@ -110,9 +111,12 @@ def ensure_shared_csrf_signing_key(explicit_key=None):
     the app's config. The key itself is never logged; only the fact
     that one key is shared is observable to callers.
 
-    The supervisor calls this once before spawning workers; single-
-    process servers do not call it, so their per-process fallback
-    behaviour is unchanged.
+    The supervisor calls this once before spawning workers, and
+    ``server.start_native``/``serve`` call it at startup, so every
+    server entry point shares one key; a lone single-process server
+    generates its key here and publishes it, so processes spawned
+    afterwards inherit it instead of each minting a per-process
+    fallback.
     """
     if explicit_key is not None:
         key = parse_csrf_signing_key(explicit_key, source="csrf_signing_key")
@@ -123,6 +127,14 @@ def ensure_shared_csrf_signing_key(explicit_key=None):
         else:
             key = secrets.token_bytes(32)
     os.environ["PYNEXT_CSRF_SIGNING_KEY"] = f"hex:{key.hex()}"
+    # Keep the framework default in agreement: helpers that sign with
+    # the default config (``set_csrf_cookie`` without an explicit
+    # config) must verify against an app's own config, which resolves
+    # the same shared key. Without this, a server that resolved a
+    # shared key would issue cookies signed with the import-time
+    # fallback key and then reject them under its own config.
+    if DEFAULT_SECURITY.csrf_signing_key != key:
+        DEFAULT_SECURITY.csrf_signing_key = key
     return key
 
 _KNOWN_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
@@ -169,9 +181,21 @@ class SecurityConfig:
     app is started with ``--workers N`` the supervisor generates one
     key (or adopts ``--csrf-signing-key`` / ``PYNEXT_CSRF_SIGNING_KEY``)
     and shares it with every worker, including replacements started
-    after a crash or a rolling restart. With sessions the token is
-    bound to the server-side session instead and the signing key is
-    unused.
+    after a crash or a rolling restart. The same sharing happens for
+    non-supervisor servers: ``server.start_native``/``serve`` resolve
+    the shared key at startup (see :func:`ensure_shared_csrf_signing_key`).
+    With sessions the token is bound to the server-side session instead
+    and the signing key is unused.
+
+    State-changing requests from another origin are rejected by the
+    Origin check unless the origin is listed in ``csrf_trusted_origins``
+    (Django's ``CSRF_TRUSTED_ORIGINS``): same-origin requests and
+    listed origins pass, anything else fails closed before the token is
+    even looked at. The token a session hands out is masked — every
+    call to ``Session.csrf_token()`` returns a different value over the
+    same stored secret (BREACH mitigation) — and validation unmasks it
+    and compares the secret in constant time; a raw (unmasked) token
+    still validates, so clients holding one issued earlier keep working.
 
     The A1 default security headers (HSTS, ``X-Content-Type-Options``,
     ``X-Frame-Options``, ``Referrer-Policy``, ``Permissions-Policy`` and the
@@ -210,6 +234,7 @@ class SecurityConfig:
     csp_nonce_enabled: bool = False
     csrf_signing_key: str | bytes | None = field(default=None, repr=False)
     csrf_origin_check: bool = True
+    csrf_trusted_origins: tuple = ()
     hsts_enabled: bool = True
     hsts_max_age: int = 31_536_000
     hsts_include_subdomains: bool = True
@@ -237,6 +262,12 @@ class SecurityConfig:
             raise TypeError("csrf_cookie_secure must be a bool")
         if not isinstance(self.csrf_origin_check, bool):
             raise TypeError("csrf_origin_check must be a bool")
+        if isinstance(self.csrf_trusted_origins, (str, bytes)):
+            raise TypeError("csrf_trusted_origins must be a sequence of origins")
+        self.csrf_trusted_origins = tuple(self.csrf_trusted_origins)
+        trusted_keys = [canonical_origin(origin) for origin in self.csrf_trusted_origins]
+        if any(origin is None for origin in trusted_keys):
+            raise ValueError("csrf_trusted_origins must contain valid HTTP(S) origins")
         if not isinstance(self.websocket_allow_missing_origin, bool):
             raise TypeError("websocket_allow_missing_origin must be a bool")
         if isinstance(self.websocket_allowed_origins, (str, bytes)):
@@ -318,6 +349,99 @@ DEFAULT_SECURITY = SecurityConfig()
 def new_csrf_token():
     """Return a fresh unpredictable CSRF token (double-submit pattern)."""
     return secrets.token_urlsafe(32)
+
+
+#: Characters a raw CSRF secret may contain (the
+#: ``secrets.token_urlsafe`` alphabet). A masked token unmasks to a
+#: value in this alphabet; anything else is malformed.
+_CSRF_TOKEN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+
+#: Unpadded base64url alphabet (one or more characters).
+_B64URL = re.compile(r"[A-Za-z0-9_-]+\Z")
+
+
+def _b64url_nopad(data):
+    """Base64url-encode ``data`` without padding (token-safe)."""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode_nopad(text):
+    """Decode unpadded base64url, raising on invalid input."""
+    if not _B64URL.fullmatch(text):
+        raise ValueError("not base64url")
+    return base64.urlsafe_b64decode(text.encode("ascii") + b"=" * (-len(text) % 4))
+
+
+def mask_csrf_token(token):
+    """Return a masked CSRF token that unmasks to ``token`` (Django-style).
+
+    The mask is a fresh random one-time pad XORed over the secret, so
+    every call returns a different value even for the same secret: the
+    token embedded in a page or JSON response changes per request and
+    cannot be recovered by BREACH-style compression analysis of the
+    response body. The secret itself is never sent unmasked by
+    :meth:`pynext.sessions.Session.csrf_token` — submit the masked
+    value in the header or form field and validation unmasks it first.
+    A double-submit app can mask the token it embeds the same way
+    (the signed cookie still carries the raw secret). ``token`` must be
+    a nonempty ASCII string (every framework-issued secret is).
+    """
+    if not isinstance(token, str):
+        raise TypeError("CSRF token must be str")
+    try:
+        raw = token.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("CSRF token must be ASCII") from exc
+    if not raw:
+        raise ValueError("CSRF token must not be empty")
+    pad = secrets.token_bytes(len(raw))
+    masked = bytes(byte ^ pad_byte for byte, pad_byte in zip(raw, pad))
+    return f"{_b64url_nopad(pad)}.{_b64url_nopad(masked)}"
+
+
+def unmask_csrf_token(masked):
+    """Return the raw secret inside a masked CSRF token, or ``None``.
+
+    ``None`` means ``masked`` is not a masked token at all: not a
+    string, missing the ``"."`` separator, undecodable base64url, pad
+    and payload of different lengths, or an unmasked value outside the
+    token alphabet. Callers treat ``None`` as a failed token, never as
+    a value to compare.
+    """
+    if not isinstance(masked, str):
+        return None
+    pad_text, separator, masked_text = masked.partition(".")
+    if not separator or not pad_text or not masked_text:
+        return None
+    try:
+        pad = _b64url_decode_nopad(pad_text)
+        masked_bytes = _b64url_decode_nopad(masked_text)
+    except (binascii.Error, ValueError):
+        return None
+    if not pad or len(pad) != len(masked_bytes):
+        return None
+    try:
+        token = bytes(byte ^ pad_byte for byte, pad_byte in zip(masked_bytes, pad)).decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if not token or any(char not in _CSRF_TOKEN_CHARS for char in token):
+        return None
+    return token
+
+
+def _submitted_csrf_secret(submitted):
+    """Return the raw secret a submitted token carries, or ``None``.
+
+    A masked token (``Session.csrf_token()`` output, or
+    :func:`mask_csrf_token`) is unmasked first — it is the form every
+    current client sends. A raw token (no ``"."``) is used as-is, so a
+    client holding a token issued before masking still validates. A
+    malformed masked value is rejected outright.
+    """
+    if "." in submitted:
+        return unmask_csrf_token(submitted)
+    return submitted
 
 
 def sign_csrf_token(token, *, config=DEFAULT_SECURITY):
@@ -459,11 +583,16 @@ def csrf_token_from_request(request, *, config=DEFAULT_SECURITY):
     return None
 
 
-def _csrf_origin_allowed(request):
+def _csrf_origin_allowed(request, *, config=DEFAULT_SECURITY):
     """True when the request's origin signals do not show a cross-site call.
 
     A present ``Origin`` must match the ``Host`` header exactly (a
-    malformed Origin, ``Origin: null`` or a missing Host all fail closed).
+    malformed Origin, ``Origin: null`` or a missing Host all fail closed),
+    or be listed in ``config.csrf_trusted_origins`` (Django's
+    ``CSRF_TRUSTED_ORIGINS``: origins allowed to drive state-changing
+    requests from another origin, for example an app whose API lives on
+    a different subdomain). The Origin check runs before the token
+    check, so a cross-site request with a stolen token still fails.
     Without an Origin, ``Sec-Fetch-Site`` must be ``same-origin`` or
     ``none`` (a non-browser client sends neither header and is allowed
     through to the token check). ``same-site`` is rejected too: a
@@ -479,7 +608,12 @@ def _csrf_origin_allowed(request):
             origin = origins[0].decode("ascii")
         except UnicodeDecodeError:
             return False
-        return _is_same_origin(request, origin)
+        if _is_same_origin(request, origin):
+            return True
+        parsed = canonical_origin(origin)
+        return parsed is not None and any(
+            parsed == canonical_origin(trusted)
+            for trusted in config.csrf_trusted_origins)
     fetch_site = _header_values(request, "sec-fetch-site")
     if fetch_site:
         return fetch_site[0].decode("ascii", "ignore").strip().lower() in {"same-origin", "none"}
@@ -494,11 +628,13 @@ def validate_csrf(request, *, config=DEFAULT_SECURITY):
     then the token: with a session the token must match the session-bound
     token, and without one the cookie must be a valid HMAC-signed
     double-submit value whose token matches the submitted header or form
-    field. Tokens are compared in constant time.
+    field. The submitted token may be masked (see :func:`mask_csrf_token`)
+    or raw; either way it is unmasked first and then compared with the
+    secret in constant time (``hmac.compare_digest``).
     """
     if request.method.upper() in SAFE_METHODS:
         return True
-    if config.csrf_origin_check and not _csrf_origin_allowed(request):
+    if config.csrf_origin_check and not _csrf_origin_allowed(request, config=config):
         return False
     submitted = csrf_token_from_request(request, config=config)
     from .sessions import Session
@@ -507,6 +643,9 @@ def validate_csrf(request, *, config=DEFAULT_SECURITY):
         expected = session._csrf
         if not expected or not submitted:
             return False
+        submitted = _submitted_csrf_secret(submitted)
+        if submitted is None:
+            return False
         try:
             return hmac.compare_digest(expected, submitted)
         except TypeError:
@@ -514,6 +653,9 @@ def validate_csrf(request, *, config=DEFAULT_SECURITY):
     cookie = _cookie_value(request, config.csrf_cookie_name)
     token = _signed_csrf_token(cookie, config=config) if cookie else None
     if not token or not submitted:
+        return False
+    submitted = _submitted_csrf_secret(submitted)
+    if submitted is None:
         return False
     try:
         return hmac.compare_digest(token, submitted)
