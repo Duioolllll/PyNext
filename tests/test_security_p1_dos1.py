@@ -1,6 +1,10 @@
 """P1 DoS defenses (S-P1-11/12/13): fast-path cap, ASGI body timeout, h2c idle timeout."""
 import asyncio
-import socket
+
+import h2.config
+import h2.connection
+import h2.events
+import h2.settings
 
 import httpx
 import pytest
@@ -20,69 +24,79 @@ def _project_with_big_public_file(root, size=12 * 1024 * 1024):
 
 
 def test_fast_path_cap_sheds_when_budget_exhausted(tmp_path):
-    """S-P1-11 (M-1): with fast_path_max_concurrent=1, a slow reader
-    holding the only fast-path permit makes the next static request
-    503 (with Retry-After); once the holder goes away the same request
-    succeeds again."""
-    _project_with_big_public_file(tmp_path)
+    """An HTTP/2 flow-control barrier holds the sole fast-path permit."""
+    size = 128 * 1024
+    _project_with_big_public_file(tmp_path, size=size)
 
     async def run():
         app = create_app(tmp_path)
         server = start_native(app, asyncio.get_running_loop(), port=0,
                               fast_path_max_concurrent=1)
         host, port = server.address.rsplit(":", 1)
-        reader, writer = None, None
+        writer = None
         try:
-            # Holder: request the 12 MiB asset and stop reading after the
-            # headers, so hyper cannot flush the body and the fast-path
-            # permit stays held. 12 MiB deliberately exceeds the loopback
-            # send buffer (tcp_wmem max 4 MiB here): a smaller asset would
-            # fit in the kernel buffer, hyper would finish the body, and
-            # the permit would be released before the next request.
             reader, writer = await asyncio.open_connection(host, int(port))
-            sock = writer.get_extra_info("socket")
-            if sock is not None:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-            writer.write(b"GET /big.bin HTTP/1.1\r\nHost: localhost\r\n"
-                         b"Connection: close\r\n\r\n")
+            connection = h2.connection.H2Connection(
+                config=h2.config.H2Configuration(header_encoding="utf-8"))
+            connection.initiate_connection()
+            # A zero stream window prevents DATA transmission on every OS.
+            # Receiving the response headers confirms dispatch acquired the
+            # permit; only our explicit window update can release the body.
+            connection.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 0})
+            connection.send_headers(1, [
+                (":method", "GET"), (":scheme", "http"),
+                (":authority", server.address), (":path", "/big.bin"),
+            ], end_stream=True)
+            writer.write(connection.data_to_send())
             await writer.drain()
-            headers = await asyncio.wait_for(
-                reader.readuntil(b"\r\n\r\n"), timeout=5)
-            assert b"200" in headers.split(b"\r\n", 1)[0], headers
-            assert b"content-length: 12582912" in headers.lower(), headers
-            # The permit is held while the body is being flushed; give the
-            # server a moment to fill the socket buffer and stall.
-            await asyncio.sleep(0.5)
+            headers = None
+            async with asyncio.timeout(5):
+                while headers is None:
+                    packet = await reader.read(65536)
+                    assert packet, "holder connection closed before response headers"
+                    for event in connection.receive_data(packet):
+                        assert not isinstance(event, (h2.events.DataReceived, h2.events.StreamEnded)), event
+                        if isinstance(event, h2.events.ResponseReceived):
+                            headers = dict(event.headers)
+                    writer.write(connection.data_to_send())
+                    await writer.drain()
+            assert headers[":status"] == "200", headers
+            assert headers["content-length"] == str(size), headers
             async with httpx.AsyncClient(base_url=f"http://{server.address}",
-                                         timeout=5) as client:
-                deadline = asyncio.get_running_loop().time() + 5
-                seen_503 = False
-                while asyncio.get_running_loop().time() < deadline:
-                    response = await client.get("/big.bin")
-                    # Drain the shed response so the connection is reusable.
-                    await response.aread()
-                    if response.status_code == 503:
-                        seen_503 = True
-                        assert response.headers.get("retry-after") == "1"
-                        break
-                    await asyncio.sleep(0.1)
-                assert seen_503, "fast-path cap never shed while permit held"
-            # Release the holder: the budget frees and the asset serves.
-            writer.close()
-            await writer.wait_closed()
-            writer = None
-            async with httpx.AsyncClient(base_url=f"http://{server.address}",
-                                         timeout=5) as client:
+                                         trust_env=False, timeout=5) as client:
+                response = await client.get("/big.bin")
+                assert response.status_code == 503
+                assert response.headers.get("retry-after") == "1"
+                # The separate execution budget remains available.
+                assert (await client.get("/")).text == "ok"
+
+                # Release the barrier and drain to END_STREAM before checking
+                # reuse. No kernel buffer sizes or scheduling sleeps are used.
+                connection.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 65535})
+                writer.write(connection.data_to_send())
+                await writer.drain()
+                received, ended = bytearray(), False
+                async with asyncio.timeout(5):
+                    while not ended:
+                        packet = await reader.read(65536)
+                        assert packet, "holder connection closed before END_STREAM"
+                        for event in connection.receive_data(packet):
+                            if isinstance(event, h2.events.DataReceived):
+                                received.extend(event.data)
+                                connection.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                            elif isinstance(event, h2.events.StreamEnded):
+                                assert event.stream_id == 1
+                                ended = True
+                        writer.write(connection.data_to_send())
+                        await writer.drain()
+                assert received == b"x" * size
                 response = await client.get("/big.bin")
                 assert response.status_code == 200
-                assert len(response.content) == 12 * 1024 * 1024
+                assert response.content == b"x" * size
         finally:
             if writer is not None:
                 writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
+                await writer.wait_closed()
             await asyncio.to_thread(server.stop)
             await app.isr.close()
 

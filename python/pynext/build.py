@@ -388,8 +388,8 @@ def discover(root):
         for part in relative_parent.parts:
             current = current / part
             dirs.append(current)
-        layouts = [str((d / "layout.py").relative_to(root)) for d in dirs if (d / "layout.py").is_file()]
-        routes[pattern] = {"entry": str(path.relative_to(root)), "kind": path.stem,
+        layouts = [(d / "layout.py").relative_to(root).as_posix() for d in dirs if (d / "layout.py").is_file()]
+        routes[pattern] = {"entry": path.relative_to(root).as_posix(), "kind": path.stem,
                            "layouts": layouts if path.stem == "page" else []}
     if not routes:
         raise ValueError("No page.py or route.py files found")
@@ -402,7 +402,7 @@ def discover(root):
     if conflicts:
         raise ValueError(f"Public file conflicts with a page or API route: {sorted(conflicts)[0]}")
     return {"schema_version": VERSION, "routes": {p: routes[p] for p in router.ordered_routes()},
-            "sources": {str(p.relative_to(root)): _hash(p) for p in files},
+            "sources": {p.relative_to(root).as_posix(): _hash(p) for p in files},
             "public_sources": public_sources, "client_sources": discover_client(root)}
 
 
