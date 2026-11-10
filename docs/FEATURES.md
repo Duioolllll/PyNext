@@ -26,7 +26,6 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `model_prop` | `pynext.components` |
 | `page` | `pynext.components` |
 | `route` | `pynext.routing` |
-| `url_for` | `pynext.routing` |
 | `websocket` | `pynext.routing` |
 | `Database` | `pynext.database` |
 | `raw_sql` | `pynext.sql` |
