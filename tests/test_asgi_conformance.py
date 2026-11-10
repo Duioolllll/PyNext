@@ -296,7 +296,7 @@ def test_lifespan_shutdown_failure_sends_failed_instead_of_raising():
                 {"type": "lifespan.shutdown"},
             ])
 
-            async def failing_close():
+            async def failing_close(*args, **kwargs):
                 raise RuntimeError("cache teardown failed")
 
             app.isr.close = failing_close

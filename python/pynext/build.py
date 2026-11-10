@@ -679,7 +679,7 @@ async def _render_static_pages(app):
             # Never generated at build time; served dynamically instead.
             continue
         try:
-            params_list = [{}] if generator is None else await _invoke(generator)
+            params_list = [{}] if generator is None else await _invoke(generator, _app=app)
         except Exception as exc:
             failures.append((f"{pattern} (generate_static_params)", exc))
             continue
