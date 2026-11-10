@@ -35,6 +35,7 @@ from collections import OrderedDict
 
 from . import _native
 from .components import MAX_CACHE_SECONDS, _validate_tag, _validate_tag_expire, _validate_tags
+from .errors import ForbiddenError, NotFoundError, SignalError, UnauthorizedError
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
 from .sync_dispatch import run_sync_with_context
 
@@ -219,6 +220,41 @@ class CacheBusy(Exception):
 
 class SharedCacheUnavailable(Exception):
     """A shared backend operation failed rather than observing a cache miss."""
+
+
+class ISRRenderStatusError(Exception):
+    """A render finished with a non-cacheable 4xx status.
+
+    Unlike a failed regeneration, a 4xx outcome is permanent for this
+    render: rendering the same request again cannot succeed, so it
+    must not arm the regeneration backoff or fall back to the retained
+    previous body. Callers re-raise it instead of serving retention
+    (see :meth:`ISRCache._generate`). The 401/403/404 cases surface
+    instead as the matching :class:`~pynext.errors.SignalError`, so
+    the dispatcher answers with that exact status; this exception
+    covers the remaining 4xx statuses, for which no signal exists.
+    """
+
+    def __init__(self, status, body=b""):
+        super().__init__(f"ISR render returned HTTP {status}")
+        self.status = status
+        self.body = body
+
+
+def _signal_for_status(status):
+    """Return the control-flow signal for a 4xx render status, or ``None``.
+
+    Only 401/403/404 have a signal whose dispatcher response carries
+    the exact status; every other 4xx is reported through
+    :class:`ISRRenderStatusError` instead.
+    """
+    if status == 404:
+        return NotFoundError()
+    if status == 403:
+        return ForbiddenError()
+    if status == 401:
+        return UnauthorizedError()
+    return None
 
 
 class CacheBackend:
@@ -1722,7 +1758,10 @@ class ISRCache:
                 self._inflight.pop(key, None)
             if not finished.cancelled():
                 error = finished.exception()
-                if error is not None:
+                if error is not None and not isinstance(error, (SignalError, ISRRenderStatusError)):
+                    # A permanent 4xx render is a deterministic outcome,
+                    # not a failure: like the dispatcher, do not log a
+                    # signal as an error.
                     log.error("ISR regeneration failed for %s", key,
                               exc_info=(type(error), error, error.__traceback__))
         task.add_done_callback(completed)
@@ -1846,6 +1885,26 @@ class ISRCache:
                         return entry.body
                 response = await render()
                 if response.status != 200:
+                    if 400 <= response.status < 500:
+                        # C-2: a 4xx render is a permanent outcome for
+                        # this key, not a failed regeneration. A deleted
+                        # page (404) must reach the client instead of
+                        # being masked by the retained previous body
+                        # forever: no backoff is armed, the retained copy
+                        # is dropped so no fallback path can resurrect
+                        # it, and the outcome is re-raised as the
+                        # matching signal (401/403/404) or as
+                        # ISRRenderStatusError (other 4xx) so the
+                        # callers below do not serve retention for it.
+                        # A 5xx render keeps the old path: it may be
+                        # transient, so it stays a regeneration failure
+                        # with backoff + retained fallback.
+                        self._drop_retained(key)
+                        self._clear_regen_failure(key)
+                        signal = _signal_for_status(response.status)
+                        if signal is not None:
+                            raise signal
+                        raise ISRRenderStatusError(response.status, response.body)
                     raise ValueError("ISR can cache only successful page responses")
                 # An invalidated generation may finish for existing callers,
                 # but must never repopulate the cache after invalidation.
@@ -1871,6 +1930,11 @@ class ISRCache:
                 self._clear_regen_failure(key)
                 return response.body
         except asyncio.CancelledError:
+            raise
+        except (SignalError, ISRRenderStatusError):
+            # A permanent 4xx outcome is not a regeneration failure:
+            # no backoff is recorded and the retained previous body is
+            # never served for it (see the raise site above).
             raise
         except Exception as exc:
             # C-2: a failed regeneration never evicts the previous
@@ -1916,6 +1980,10 @@ class ISRCache:
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
+            raise
+        except (SignalError, ISRRenderStatusError):
+            # A permanent 4xx render must reach the caller, never the
+            # retained previous body (C-2).
             raise
         except Exception:
             if previous is not None:
@@ -2022,6 +2090,10 @@ class ISRCache:
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
+            raise
+        except (SignalError, ISRRenderStatusError):
+            # A permanent 4xx render must reach the caller, never the
+            # retained previous body (C-2).
             raise
         except Exception:
             # C-2: a failed (re)generation serves the retained previous
