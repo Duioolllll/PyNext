@@ -1112,6 +1112,25 @@ class App:
                 if isinstance(store, SQLiteSessionStore) and store.executor is old_session:
                     store.executor = self._session_executor
 
+    def _hand_off_sync_slot_locked(self):
+        """Hand the owned sync slot to the oldest live waiter, or release it.
+
+        Callers must hold ``self._inflight_lock`` and own a sync slot
+        they will not run: either the worker thread just finished
+        (``finished``) or this waiter was cancelled/timed out after
+        ``finished`` had already transferred the slot to it (PR #61
+        review #1). Returns the waiter to wake, or ``None`` when the
+        slot was released instead (``_sync_active`` decremented). A
+        waiter that is already done cannot run the work, so it is
+        skipped and the slot keeps moving instead of leaking.
+        """
+        while self._sync_waiters:
+            candidate = self._sync_waiters.popleft()
+            if not candidate.done():
+                return candidate
+        self._sync_active -= 1
+        return None
+
     async def _invoke_sync(self, fn, kwargs, request=None):
         """Run a sync handler/layout on a worker thread (C-P1-8).
 
@@ -1171,14 +1190,26 @@ class App:
                 await asyncio.wait_for(asyncio.shield(waiter), self.sync_wait_timeout)
             except TimeoutError:
                 with self._inflight_lock:
-                    try:
-                        self._sync_waiters.remove(waiter)
-                    except ValueError:
+                    if waiter.done():
                         # Already dequeued by finished(): the slot was
-                        # transferred and the waiter was woken, so the
-                        # wait cannot time out afterwards (same loop
-                        # thread, no interleave). Defensive only.
-                        pass
+                        # transferred and the waiter was woken, but the
+                        # timeout fired in the same loop turn before the
+                        # coroutine resumed, so the wait still times out.
+                        # Hand the transferred slot on instead of leaking
+                        # it (PR #61 review #1).
+                        nxt = self._hand_off_sync_slot_locked()
+                    else:
+                        try:
+                            self._sync_waiters.remove(waiter)
+                        except ValueError:
+                            # Already dequeued by finished() without the
+                            # slot being transferred yet (defensive only:
+                            # pop and set_result run back-to-back in one
+                            # finished() call, no loop interleave).
+                            pass
+                        nxt = None
+                if nxt is not None:
+                    nxt.set_result(None)
                 queue_wait_var.set((queue_wait_var.get() or 0.0)
                                    + (time.monotonic() - wait_started) * 1000)
                 # Waiter deadline expiry: a sync-worker saturation 503
@@ -1188,10 +1219,22 @@ class App:
                 raise _SyncHandlerBusy()
             except asyncio.CancelledError:
                 with self._inflight_lock:
-                    try:
-                        self._sync_waiters.remove(waiter)
-                    except ValueError:
-                        pass
+                    if waiter.done():
+                        # Already dequeued by finished(): the slot was
+                        # transferred and the waiter was woken, but the
+                        # awaiter was cancelled before its coroutine
+                        # resumed. The cancelled waiter never runs the
+                        # work, so hand the transferred slot on instead
+                        # of leaking it (PR #61 review #1).
+                        nxt = self._hand_off_sync_slot_locked()
+                    else:
+                        try:
+                            self._sync_waiters.remove(waiter)
+                        except ValueError:
+                            pass
+                        nxt = None
+                if nxt is not None:
+                    nxt.set_result(None)
                 queue_wait_var.set((queue_wait_var.get() or 0.0)
                                    + (time.monotonic() - wait_started) * 1000)
                 if request is not None:
@@ -1224,17 +1267,10 @@ class App:
 
         def finished(done):
             with self._inflight_lock:
-                waiter = None
-                while self._sync_waiters:
-                    candidate = self._sync_waiters.popleft()
-                    if not candidate.done():
-                        waiter = candidate
-                        break
-                if waiter is None:
-                    self._sync_active -= 1
-                # Otherwise the freed slot transfers to the oldest
-                # waiter and _sync_active stays put until that waiter's
-                # thread finishes.
+                # The freed slot transfers to the oldest live waiter
+                # and _sync_active stays put until that waiter's thread
+                # finishes; with no waiter left the slot is released.
+                waiter = self._hand_off_sync_slot_locked()
             if waiter is not None:
                 waiter.set_result(None)
             # A timed-out awaiter cannot retrieve a late exception/result.
