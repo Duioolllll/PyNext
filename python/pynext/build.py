@@ -607,20 +607,6 @@ def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECOND
     also records the deterministic 16-hex ``build_id`` (source-hash prefix)
     and the optional ``deployment_id`` served as skew-protection headers.
     """
-
-
-def _nearest_boundary(dirs, filename, root):
-    """Nearest ``filename`` walking up from the route directory, else None.
-
-    ``dirs`` runs from the app directory down to the route directory, so
-    the reversed walk finds the closest boundary first. Returns the path
-    relative to the project root, like the ``layouts`` entries.
-    """
-    for directory in reversed(dirs):
-        candidate = directory / filename
-        if candidate.is_file():
-            return str(candidate.relative_to(root))
-    return None
     root = Path(root).resolve()
     deployment_id = resolve_deployment_id(deployment_id)
     with BuildLock(root, timeout=lock_timeout):
@@ -678,6 +664,20 @@ def _nearest_boundary(dirs, filename, root):
         _run_stage("write-build-id", _write_build_id, root, manifest_bytes)
         _run_stage("prune", _prune_orphans, root, manifest)
         return manifest
+
+
+def _nearest_boundary(dirs, filename, root):
+    """Nearest ``filename`` walking up from the route directory, else None.
+
+    ``dirs`` runs from the app directory down to the route directory, so
+    the reversed walk finds the closest boundary first. Returns the path
+    relative to the project root, like the ``layouts`` entries.
+    """
+    for directory in reversed(dirs):
+        candidate = directory / filename
+        if candidate.is_file():
+            return str(candidate.relative_to(root))
+    return None
 
 
 def _atomic_write(path, contents):

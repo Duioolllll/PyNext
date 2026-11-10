@@ -304,7 +304,7 @@ def test_prune_removes_orphan_digest_files(tmp_path):
 
 
 def test_cli_build_reports_lock_contention(tmp_path, monkeypatch, capsys):
-    def locked(path, lock_timeout=None):
+    def locked(path, deployment_id=None, lock_timeout=None):
         raise BuildLockError("another build is already running for /x")
 
     monkeypatch.setattr(cli, "write_manifest", locked)
