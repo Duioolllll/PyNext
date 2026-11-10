@@ -147,6 +147,30 @@ def _render_dev_traceback(text):
     return "\n".join(rendered)
 
 
+def _is_external_bind_host(host):
+    """True when ``host`` is a bind address reachable from other machines.
+
+    S-P1-28 (M-19): a development server bound to a non-loopback address
+    exposes the detailed dev error page (traceback, file paths, exception
+    messages) to the network. Loopback addresses (``127.0.0.1``, ``::1``,
+    ``localhost``) are local; the wildcard addresses (``0.0.0.0``, ``::``)
+    and any other concrete address are external. An unparseable hostname
+    fails closed (treated as external); ``None``/empty means no bind
+    address was recorded, so there is nothing to warn about.
+    """
+    if host is None:
+        return False
+    host = str(host).strip().lower()
+    if not host or host == "localhost" or host.endswith(".localhost"):
+        return False
+    import ipaddress
+
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True
+
+
 class _SyncHandlerBusy(Exception):
     """All bounded synchronous handler slots are still occupied."""
 
@@ -1568,7 +1592,15 @@ class App:
         else:
             count = error_count(digest)
         request_id = get_request_id()
-        if not self.debug:
+        # S-P1-28 (M-19): the detailed dev page below (traceback, file
+        # paths, exception message) must never reach a non-local client.
+        # When the dev server is bound to an external address (recorded by
+        # note_dev_bind_host() at startup), serve the same generic body as
+        # production instead. A bind address that was never recorded keeps
+        # the historical behaviour (detailed page) so local-only tools and
+        # the ASGI adapter are unaffected.
+        externally_bound = bool(getattr(self, "_dev_bind_external", False))
+        if not self.debug or externally_bound:
             detail = "Internal Server Error"
             parts = []
             if request_id:
@@ -1577,6 +1609,13 @@ class App:
                 parts.append(f"digest: {digest}")
             if parts:
                 detail += " (" + ", ".join(parts) + ")"
+            if externally_bound and not getattr(self, "_dev_external_page_warned", False):
+                self._dev_external_page_warned = True
+                log.warning(
+                    "Detailed development error page suppressed: the dev server is "
+                    "externally bound (host=%s); returning a generic error page "
+                    "instead. Bind to 127.0.0.1 for local development.",
+                    getattr(self, "_dev_bind_host", None))
             return Response(detail, status=500)
         digest = _dev_error_digest(exc)
         if digest not in self._dev_error_counts and len(self._dev_error_counts) >= _DEV_ERROR_COUNT_LIMIT:
@@ -1611,6 +1650,33 @@ class App:
                 + header + notice + "<pre>" + _render_dev_traceback(details) + "</pre></body></html>")
         return Response(body, status=500, media_type="text/html; charset=utf-8",
                         headers=[(b"cache-control", b"no-store")])
+
+    def note_dev_bind_host(self, host):
+        """Record the address the server is listening on (S-P1-28, M-19).
+
+        Called by :func:`pynext.server.serve` once the socket is bound.
+        With ``debug=True`` and a non-loopback ``host`` (``0.0.0.0``,
+        ``::``, a LAN address, ...), log a startup warning: anyone on the
+        network can reach this server, so :meth:`error_response` serves
+        the generic production-style page instead of the detailed dev
+        page while externally bound. The warning is logged once per
+        transition to externally bound; loopback binds stay silent.
+        The attributes are set here (rather than in ``__init__``) so the
+        bind address is only ever recorded by this method; an app that
+        never serves over a socket simply has no recorded bind address.
+        """
+        external = _is_external_bind_host(host)
+        was_external = bool(getattr(self, "_dev_bind_external", False))
+        self._dev_bind_host = host
+        self._dev_bind_external = external
+        if self.debug and external and not was_external:
+            log.warning(
+                "Development server (debug=True) is listening on %s, which is "
+                "reachable from other machines on the network. Detailed "
+                "development error pages (tracebacks, file paths, exception "
+                "messages) are disabled while externally bound; bind to "
+                "127.0.0.1 for local development only.",
+                host)
 
     async def startup(self):
         """Start the cache and registered resources in registration order."""
