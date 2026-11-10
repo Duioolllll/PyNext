@@ -294,6 +294,13 @@ class MetricsCollector:
         self._cache = {"hit": 0, "miss": 0, "stale": 0, "busy": 0}
         self._regeneration = {"success": 0, "failure": 0, "started": 0}
         self._workers = {"starts": 0, "timeouts": 0, "unavailable": 0}
+        # Per-stage timeout counts (C-P1-7): which request stage ran out
+        # of its budget — body read, handler execution, response sending,
+        # or admission (rate-limit decision gate). A handler timeout
+        # answers 504 and an admission timeout answers 503, so the
+        # stages must stay separable here too, not folded into one
+        # "timeouts" number.
+        self._stage_timeouts = {"body": 0, "handler": 0, "response": 0, "admission": 0}
         self._bundles = {}  # client asset path -> size in bytes
         # Error counts, joint key (route, error_type, digest); digest is ""
         # when the error has none. Computed digests are capped (see
@@ -388,6 +395,21 @@ class MetricsCollector:
             else:
                 self._workers["unavailable"] += 1
 
+    def observe_stage_timeout(self, stage):
+        """Count one stage timeout (C-P1-7).
+
+        ``stage`` is one of ``"body"`` (body read, 408), ``"handler"``
+        (handler execution, 504), ``"response"`` (response sending,
+        aborted stream) or ``"admission"`` (rate-limit decision gate,
+        503). Unknown stages are ignored so a typo cannot mint a new
+        metric series.
+        """
+        if not self.enabled:
+            return
+        with self._lock:
+            if stage in self._stage_timeouts:
+                self._stage_timeouts[stage] += 1
+
     # -- cache ------------------------------------------------------------
     def observe_cache(self, outcome):
         # The Rust page store reports "fresh"; the counter key is "hit".
@@ -463,6 +485,7 @@ class MetricsCollector:
                 "cache": dict(self._cache),
                 "regeneration": dict(self._regeneration),
                 "workers": dict(self._workers),
+                "stage_timeouts": dict(self._stage_timeouts),
                 "island_bundles": bundle_sizes,
                 "island_bundles_total_bytes": sum(bundle_sizes.values()),
             }
@@ -499,6 +522,10 @@ class MetricsCollector:
                   "# TYPE pynext_worker_total counter"]
         for outcome, count in snap["workers"].items():
             lines.append(f'pynext_worker_total{{outcome="{outcome}"}} {count}')
+        lines += ["# HELP pynext_stage_timeouts_total Request-stage timeouts, by stage.",
+                  "# TYPE pynext_stage_timeouts_total counter"]
+        for stage, count in snap["stage_timeouts"].items():
+            lines.append(f'pynext_stage_timeouts_total{{stage="{stage}"}} {count}')
         lines += ["# HELP pynext_errors_total Errors, by route, exception type and digest.",
                   "# TYPE pynext_errors_total counter"]
         # Emit from the joint (route, error_type, digest) counts, not the

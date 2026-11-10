@@ -14,9 +14,19 @@ class DecisionUnavailable(RuntimeError):
 
 
 class DecisionGate:
-    def __init__(self, capacity: int = 64, timeout: float = 2.0) -> None:
+    """Bounded gate for one admission stage (C-P1-7).
+
+    ``name`` identifies the stage in :class:`DecisionUnavailable`
+    messages and logs, so a 503 from this gate ("rate-limit
+    decision") is distinguishable from a 503 from the Rust slot
+    wait queue ("admission capacity") — the two are different
+    stages, even though both answer 503 + ``Retry-After``.
+    """
+
+    def __init__(self, capacity: int = 64, timeout: float = 2.0, name: str = "decision") -> None:
         self.capacity = capacity
         self.timeout = timeout
+        self.name = name
         self._active = 0
         self._lock = threading.Lock()
 
@@ -28,7 +38,7 @@ class DecisionGate:
     async def check(self, callback: Callable[[], _T]) -> _T:
         with self._lock:
             if self._active >= self.capacity:
-                raise DecisionUnavailable("Rate-limit decision capacity exhausted")
+                raise DecisionUnavailable(f"{self.name} capacity exhausted")
             self._active += 1
         deadline = time.monotonic() + self.timeout
         abandoned = threading.Event()
@@ -42,7 +52,7 @@ class DecisionGate:
                 # A request can expire while queued in the host executor.
                 # Never start a stale callback and charge a new token then.
                 if abandoned.is_set() or time.monotonic() >= deadline:
-                    raise DecisionUnavailable("Rate-limit decision deadline exceeded")
+                    raise DecisionUnavailable(f"{self.name} deadline exceeded")
                 return callback()
             finally:
                 # A cancelled awaiter cannot release a running thread's slot.
@@ -64,7 +74,7 @@ class DecisionGate:
             return await asyncio.wait_for(asyncio.shield(future), max(0, deadline - time.monotonic()))
         except TimeoutError as exc:
             abandoned.set()
-            raise DecisionUnavailable("Rate-limit decision deadline exceeded") from exc
+            raise DecisionUnavailable(f"{self.name} deadline exceeded") from exc
         except asyncio.CancelledError:
             abandoned.set()
             raise

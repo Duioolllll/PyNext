@@ -356,7 +356,7 @@ def _substitute_shell_marker(node, marker, page_tree):
     return node, 0
 
 
-async def _send_response(response, send, *, config=None, production=True):
+async def _send_response(response, send, *, config=None, production=True, response_timeout=None):
     """Send ``response`` over ASGI, adding the A1 security headers first.
 
     ``config`` is the app's :class:`SecurityConfig`; when it is ``None`` the
@@ -364,19 +364,48 @@ async def _send_response(response, send, *, config=None, production=True):
     :meth:`App.dispatch` applied the headers there). Applying here as well
     covers the responses that bypass dispatch: rate-limit 429/503, bad
     request 400, oversized 413 and the 500 error page.
+
+    ``response_timeout`` (seconds, C-P1-7) bounds the response-send
+    stage: a plain response must finish both sends within it, and each
+    streaming chunk pull and send gets its own budget of it. ``None``
+    (the default for callers that do not pass it) keeps the old
+    unbounded behaviour. A timeout raises :class:`TimeoutError` to the
+    caller — by then the status line may already be out, so no second
+    status can be sent; the caller records stage ``"response"`` and
+    stops. A long-lived stream is not killed for its total duration,
+    only for a single stalled chunk.
     """
     if config is not None:
         apply_security_headers(response, config=config, production=production)
     if not isinstance(response, StreamingResponse):
-        await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
-        await send({"type": "http.response.body", "body": response.body})
+        if response_timeout is None:
+            await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
+            await send({"type": "http.response.body", "body": response.body})
+            return
+        async with asyncio.timeout(response_timeout):
+            await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
+            await send({"type": "http.response.body", "body": response.body})
         return
     try:
-        await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
-        if not response._head_only:
-            while (chunk := await response._next_chunk()) is not None:
-                await send({"type": "http.response.body", "body": chunk, "more_body": True})
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        if response_timeout is None:
+            await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
+            if not response._head_only:
+                while (chunk := await response._next_chunk()) is not None:
+                    await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        else:
+            async with asyncio.timeout(response_timeout):
+                await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
+            if not response._head_only:
+                while True:
+                    async with asyncio.timeout(response_timeout):
+                        chunk = await response._next_chunk()
+                    if chunk is None:
+                        break
+                    async with asyncio.timeout(response_timeout):
+                        await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            async with asyncio.timeout(response_timeout):
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
     finally:
         await response.aclose()
 
@@ -601,10 +630,25 @@ class App:
                  resources=None, cache_url=None, cache_failure_policy=None,
                  websocket_max_message=DEFAULT_CONFIG.websocket_max_message, hot_reload=False,
                  trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None,
-                 revalidate_secret=None):
+                 revalidate_secret=None,
+                 body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms,
+                 handler_timeout_ms=DEFAULT_CONFIG.handler_timeout_ms,
+                 response_timeout_ms=DEFAULT_CONFIG.response_timeout_ms):
         if isinstance(sync_workers, bool) or not isinstance(sync_workers, int) or not 1 <= sync_workers <= 1024:
             raise ValueError("sync_workers must be an integer from 1 to 1024")
         self.sync_workers = sync_workers
+        # Per-stage ASGI timeouts (C-P1-7, milliseconds in, seconds kept):
+        # body read / handler execution / response send are separate
+        # budgets. 0 disables that stage's timeout; the defaults match
+        # the native server (10 s body, 30 s handler, 30 s per send).
+        for _name, _value in (("body_timeout_ms", body_timeout_ms),
+                              ("handler_timeout_ms", handler_timeout_ms),
+                              ("response_timeout_ms", response_timeout_ms)):
+            if isinstance(_value, bool) or not isinstance(_value, int) or not 0 <= _value <= 86_400_000:
+                raise ValueError(f"{_name} must be an integer from 0 to 86400000")
+        self._body_timeout_s = body_timeout_ms / 1000 or None
+        self._handler_timeout_s = handler_timeout_ms / 1000 or None
+        self._response_timeout_s = response_timeout_ms / 1000 or None
         # Secret for the POST /_pynext/revalidate webhook. None disables
         # the endpoint (it answers 404). create_app() also reads
         # PYNEXT_REVALIDATE_SECRET when no explicit secret is given.
@@ -734,7 +778,10 @@ class App:
             self._inflight_streams = 0
             self._sync_active = 0
             self._inflight_lock = threading.Lock()
-            self._asgi_admission = DecisionGate(ASGI_DECISION_CAPACITY, ASGI_DECISION_TIMEOUT)
+            # Named so a 503 from this gate reads as the rate-limit
+            # decision stage (C-P1-7), not the Rust slot-wait stage.
+            self._asgi_admission = DecisionGate(ASGI_DECISION_CAPACITY, ASGI_DECISION_TIMEOUT,
+                                                "rate-limit decision")
         except BaseException:
             self._release_modules()
             raise
@@ -2349,6 +2396,9 @@ class App:
         except Exception:
             # Match native admission: callback failures and overload fail
             # closed regardless of a backend's own failure-policy choice.
+            # Counted under the admission stage (C-P1-7), distinct from
+            # the Rust slot-wait 503s, which never reach this gate.
+            self.metrics.observe_stage_timeout("admission")
             return Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
         return None if allowed else rate_limited_response(max(1, retry_after or 1))
 
@@ -2633,6 +2683,27 @@ class App:
         finally:
             _reset_request_context()
 
+    async def _dispatch_with_timeout(self, request):
+        """Run dispatch under the handler-stage budget (C-P1-7).
+
+        A handler that runs past ``handler_timeout_ms`` answers 504:
+        the server could not finish the work (the aiohttp rule —
+        handler ``TimeoutError`` → explicit 504, never a silent drop).
+        Admission overload is a different stage and answers 503 +
+        ``Retry-After``; the two are never mixed. A handler that raises
+        ``TimeoutError`` itself is answered the same way. Cancellation
+        (client disconnect, server shutdown) still propagates as
+        ``CancelledError``.
+        """
+        if self._handler_timeout_s is None:
+            return await self.dispatch(request)
+        try:
+            return await asyncio.wait_for(self.dispatch(request), self._handler_timeout_s)
+        except TimeoutError:
+            self.metrics.observe_stage_timeout("handler")
+            log.warning("Handler timeout: %s %s", request.method, request.path)
+            return Response("Gateway Timeout", status=504)
+
     async def _handle_http(self, scope, receive, send):
         # Normalize before admission, as the native adapter does: malformed
         # paths never consume a token, even when the client's bucket is empty.
@@ -2656,12 +2727,32 @@ class App:
                 if scope["method"].upper() == "HEAD":
                     denied.body = b""
                 apply_path_headers(denied, path, path_headers=self.path_headers)
-                await _send_response(denied, send, config=self.security, production=self.production)
+                await _send_response(denied, send, config=self.security, production=self.production,
+                                     response_timeout=self._response_timeout_s)
                 return
             chunks, total = [], 0
+            # Body-read stage (C-P1-7): the whole body must arrive
+            # within body_timeout_ms of the first read — the same
+            # whole-body budget the native server enforces in Rust, so
+            # a trickle sender cannot hold the request open one chunk
+            # at a time. A timeout answers 408 (Sanic REQUEST stage),
+            # never 503: the server is not out of capacity, the client
+            # is too slow.
+            body_deadline = (asyncio.get_running_loop().time() + self._body_timeout_s
+                             if self._body_timeout_s is not None else None)
             try:
                 while True:
-                    message = await receive()
+                    if body_deadline is None:
+                        message = await receive()
+                    else:
+                        try:
+                            message = await asyncio.wait_for(
+                                receive(), max(0, body_deadline - asyncio.get_running_loop().time()))
+                        except TimeoutError:
+                            self.metrics.observe_stage_timeout("body")
+                            log.warning("Body read timeout: %s %s", scope["method"], path)
+                            response = Response("Request Timeout", status=408)
+                            break
                     if message["type"] == "http.disconnect":
                         return
                     if message["type"] != "http.request":
@@ -2706,7 +2797,7 @@ class App:
 
             async def dispatch_and_send():
                 try:
-                    result = await self.dispatch(request)
+                    result = await self._dispatch_with_timeout(request)
                 except SignalError as exc:
                     # A signal that escaped dispatch (defensive: the timed
                     # dispatcher converts these first) still answers without
@@ -2732,10 +2823,17 @@ class App:
                 if scope["method"].upper() == "HEAD":
                     result.body = b""
                 try:
-                    await _send_response(result, send, config=self.security, production=self.production)
+                    await _send_response(result, send, config=self.security, production=self.production,
+                                         response_timeout=self._response_timeout_s)
                 except asyncio.CancelledError:
                     request._cancel_event.set()
                     raise
+                except TimeoutError:
+                    # The status line may already be out, so no second
+                    # status can be sent; the stage is logged and
+                    # counted instead of dropping silently (C-P1-7).
+                    self.metrics.observe_stage_timeout("response")
+                    log.warning("Response send timeout: %s %s", request.method, request.path)
 
             await _run_while_connected(dispatch_and_send(), receive)
             return
@@ -2744,7 +2842,8 @@ class App:
         request_id = get_request_id()
         if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
             response.headers.append((b"x-request-id", request_id.encode("ascii")))
-        await _send_response(response, send, config=self.security, production=self.production)
+        await _send_response(response, send, config=self.security, production=self.production,
+                             response_timeout=self._response_timeout_s)
 
 
 def create_app(root=".", *, production=False, security=None, cache_backend=DEFAULT_CONFIG.cache_backend,
@@ -2753,7 +2852,10 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                cache_failure_policy=None, websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
                hot_reload=False,
                trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None,
-               revalidate_secret=None):
+               revalidate_secret=None,
+               body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms,
+               handler_timeout_ms=DEFAULT_CONFIG.handler_timeout_ms,
+               response_timeout_ms=DEFAULT_CONFIG.response_timeout_ms):
     root = Path(root).resolve()
     # .env files are loaded before the manifest is read or user code runs,
     # so server code, middleware and island bundling all see them.
@@ -2766,4 +2868,6 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
                websocket_max_message=websocket_max_message, hot_reload=hot_reload,
                trusted_proxies=trusted_proxies, sync_workers=sync_workers, strict_ssg=strict_ssg,
-               headers=headers, revalidate_secret=revalidate_secret)
+               headers=headers, revalidate_secret=revalidate_secret,
+               body_timeout_ms=body_timeout_ms, handler_timeout_ms=handler_timeout_ms,
+               response_timeout_ms=response_timeout_ms)

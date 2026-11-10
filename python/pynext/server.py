@@ -223,7 +223,7 @@ def _submit(loop, coroutine):
 class _NativeStream:
     """Pull one chunk at a time on the owning Python event loop."""
 
-    def __init__(self, response, loop, app=None):
+    def __init__(self, response, loop, app=None, chunk_timeout=None):
         self._response = response
         self._loop = loop
         self._lock = threading.Lock()
@@ -231,6 +231,11 @@ class _NativeStream:
         self._pending = None
         self._closed = False
         self._context = response._native_context
+        # Response-send stage budget (C-P1-7), seconds per chunk. None
+        # keeps STREAM_CHUNK_TIMEOUT (30 s); 0 disables the chunk
+        # deadline. Resolved here, not at import time, so tests can
+        # still monkeypatch the module constant.
+        self._chunk_timeout_s = STREAM_CHUNK_TIMEOUT if chunk_timeout is None else chunk_timeout
         # Counted on the app so serve() can wait out streaming bodies
         # during a graceful drain (B6), not just handler execution.
         self._app = app
@@ -258,10 +263,16 @@ class _NativeStream:
             future = self._context.run(_submit, self._loop, self._pull())
             self._pending = future
         try:
-            deadline = time.monotonic() + STREAM_CHUNK_TIMEOUT
+            # Response-send stage (C-P1-7): each chunk gets its own
+            # budget. A stalled chunk aborts the stream — the status
+            # line is already out, so no 504 can be sent; the stage is
+            # logged and counted instead of dropping silently.
+            deadline = None if self._chunk_timeout_s == 0 else time.monotonic() + self._chunk_timeout_s
             while True:
                 try:
-                    chunk, context = future.result(timeout=min(_CANCEL_POLL_SECONDS, max(0, deadline - time.monotonic())))
+                    poll = (_CANCEL_POLL_SECONDS if deadline is None
+                            else min(_CANCEL_POLL_SECONDS, max(0, deadline - time.monotonic())))
+                    chunk, context = future.result(timeout=poll)
                     break
                 except concurrent.futures.TimeoutError:
                     if future.done():
@@ -270,8 +281,11 @@ class _NativeStream:
                     if not self._loop.is_running():
                         self.close()
                         raise RuntimeError("Python event loop stopped during response streaming") from None
-                    if time.monotonic() >= deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         self.close()
+                        if self._app is not None:
+                            self._app.metrics.observe_stage_timeout("response")
+                        log.warning("Streaming response chunk timed out")
                         raise TimeoutError("Streaming response chunk timed out") from None
             with self._lock:
                 self._context = context
@@ -314,7 +328,9 @@ class _NativeStream:
 def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
                             body_capacity, body_timeout_ms, max_connections,
                             max_connections_per_ip, header_read_timeout_ms,
-                            body_min_rate_bytes_per_sec, shutdown_timeout):
+                            body_min_rate_bytes_per_sec, shutdown_timeout,
+                            acquire_timeout_max_ms=None, handler_timeout_ms=None,
+                            response_timeout_ms=None):
     """Reject server limits that cannot reach the native server safely.
 
     Counts and timeouts cross into Rust as usize/u64/f64: a value past
@@ -322,6 +338,9 @@ def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
     an absurd-but-fitting value (a million slots, a day-long drain)
     exhausts resources before serving anything. ``max_waiting`` may be
     None (the native default min(max_concurrent, 64)).
+    ``acquire_timeout_max_ms`` may be None (fixed acquire timeout);
+    when set it must be at least ``acquire_timeout_ms``, or the
+    adaptive ceiling could never apply.
     """
     counts = (
         ("max_concurrent", max_concurrent, 1, MAX_CONCURRENT),
@@ -330,6 +349,9 @@ def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
         ("max_connections", max_connections, 1, MAX_CONNECTIONS),
         ("max_connections_per_ip", max_connections_per_ip, 1, MAX_CONNECTIONS_PER_IP),
         ("acquire_timeout_ms", acquire_timeout_ms, 0, MAX_TIMEOUT_MS),
+        ("acquire_timeout_max_ms", acquire_timeout_max_ms, 0, MAX_TIMEOUT_MS),
+        ("handler_timeout_ms", handler_timeout_ms, 0, MAX_TIMEOUT_MS),
+        ("response_timeout_ms", response_timeout_ms, 0, MAX_TIMEOUT_MS),
         ("body_timeout_ms", body_timeout_ms, 0, MAX_TIMEOUT_MS),
         ("header_read_timeout_ms", header_read_timeout_ms, 0, MAX_TIMEOUT_MS),
         ("body_min_rate_bytes_per_sec", body_min_rate_bytes_per_sec, 0,
@@ -340,6 +362,9 @@ def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
             continue
         if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
             raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+    if (acquire_timeout_max_ms is not None
+            and acquire_timeout_max_ms < acquire_timeout_ms):
+        raise ValueError("acquire_timeout_max_ms must be at least acquire_timeout_ms")
     if (isinstance(shutdown_timeout, bool) or not isinstance(shutdown_timeout, (int, float))
             or not math.isfinite(shutdown_timeout)
             or not 0 <= shutdown_timeout <= MAX_SHUTDOWN_TIMEOUT):
@@ -352,7 +377,8 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                  max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                  header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                  body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
-                 shutdown_timeout=30.0, max_waiting=None):
+                 shutdown_timeout=30.0, max_waiting=None,
+                 acquire_timeout_max_ms=None, handler_timeout_ms=None, response_timeout_ms=None):
     """Start the native server and return its handle.
 
     Overload policy (roadmap C7): bounded wait, then reject. At most
@@ -367,11 +393,34 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     A 503 after the full wait carries ``Retry-After`` of
     ``ceil(acquire_timeout_ms / 1000)`` seconds (at least 1); a 503 for
     a full wait queue carries ``Retry-After: 1``.
+
+    Fairness and adaptivity (C-P1-5): the Rust wait queue is FIFO —
+    tokio's semaphore grants permits in request order — so a waiter
+    never starves behind later arrivals. When
+    ``acquire_timeout_max_ms`` is set, the wait is adaptive instead of
+    fixed: the effective timeout is ``clamp(2 * EWMA(slot hold time),
+    acquire_timeout_ms, acquire_timeout_max_ms)``, so a deployment
+    whose handlers typically take 500 ms waits longer than the 1 s
+    default instead of converting latency into 503s. ``None`` (the
+    default) keeps the fixed ``acquire_timeout_ms``.
+
+    Stage timeouts (C-P1-7): a handler that runs past
+    ``handler_timeout_ms`` (``None``: the ``REQUEST_TIMEOUT`` module
+    constant, 30 s; 0: no deadline) answers 504, and each streaming
+    response chunk gets ``response_timeout_ms`` (``None``: the
+    ``STREAM_CHUNK_TIMEOUT`` module constant, 30 s; 0: no deadline).
+    Admission overload answers 503 + ``Retry-After``; handler
+    overrun answers 504 — the two stages are never mixed, and each
+    timeout is counted under its stage (see
+    ``MetricsCollector.observe_stage_timeout``).
     """
     _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
                             body_capacity, body_timeout_ms, max_connections,
                             max_connections_per_ip, header_read_timeout_ms,
-                            body_min_rate_bytes_per_sec, shutdown_timeout)
+                            body_min_rate_bytes_per_sec, shutdown_timeout,
+                            acquire_timeout_max_ms=acquire_timeout_max_ms,
+                            handler_timeout_ms=handler_timeout_ms,
+                            response_timeout_ms=response_timeout_ms)
     if observability is not None:
         app.configure_observability(observability)
     app.metrics.observe_worker_start()
@@ -467,7 +516,16 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
             app.metrics.observe_worker_timeout("unavailable")
             response = Response("Service Unavailable", status=503)
         else:
-            deadline = time.monotonic() + REQUEST_TIMEOUT
+            # Handler stage (C-P1-7): this deadline bounds handler
+            # execution + response build only — streaming bodies get
+            # their own per-chunk budget in _NativeStream, and the body
+            # read is bounded in Rust by body_timeout_ms. A handler
+            # that runs past it answers 504 (counted under stage
+            # "handler"); admission overload answers 503 in Rust before
+            # the bridge is ever called.
+            handler_timeout_s = (REQUEST_TIMEOUT if handler_timeout_ms is None
+                                 else handler_timeout_ms / 1000)
+            deadline = None if handler_timeout_s == 0 else time.monotonic() + handler_timeout_s
             while True:
                 if cancellation.cancelled() or not loop.is_running():
                     cancel_event.cancel(499 if cancellation.cancelled() else 503)
@@ -476,13 +534,16 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                     response = Response("Service Unavailable", status=503)
                     break
                 try:
-                    response = future.result(timeout=min(_CANCEL_POLL_SECONDS, max(0, deadline - time.monotonic())))
+                    poll = (_CANCEL_POLL_SECONDS if deadline is None
+                            else min(_CANCEL_POLL_SECONDS, max(0, deadline - time.monotonic())))
+                    response = future.result(timeout=poll)
                     break
                 except concurrent.futures.TimeoutError:
-                    if time.monotonic() >= deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         cancel_event.cancel(504)
                         future.cancel()
                         app.metrics.observe_worker_timeout("timeout")
+                        app.metrics.observe_stage_timeout("handler")
                         response = Response("Gateway Timeout", status=504)
                         break
                 except concurrent.futures.CancelledError:
@@ -499,7 +560,10 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
         if bridge_path is not None:
             apply_path_headers(response, bridge_path, path_headers=app.path_headers)
         apply_security_headers(response, config=app.security, production=app.production)
-        body = (_NativeStream(response, loop, app) if isinstance(response, StreamingResponse) and not response._head_only
+        body = (_NativeStream(response, loop, app,
+                              chunk_timeout=(STREAM_CHUNK_TIMEOUT if response_timeout_ms is None
+                                            else response_timeout_ms / 1000))
+                if isinstance(response, StreamingResponse) and not response._head_only
                 else response.body)
         return response.status, response.headers, body
 
@@ -553,6 +617,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
 
     return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store, app.asset_etags,
                                 max_concurrent=max_concurrent, acquire_timeout_ms=acquire_timeout_ms,
+                                acquire_timeout_max_ms=acquire_timeout_max_ms,
                                 max_waiting=max_waiting,
                                 body_capacity=body_capacity, body_timeout_ms=body_timeout_ms,
                                 max_connections=max_connections,
@@ -587,7 +652,10 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                 max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                 header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                 body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
-                shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None):
+                shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None,
+                acquire_timeout_max_ms=DEFAULT_CONFIG.acquire_timeout_max_ms,
+                handler_timeout_ms=DEFAULT_CONFIG.handler_timeout_ms,
+                response_timeout_ms=DEFAULT_CONFIG.response_timeout_ms):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
@@ -637,7 +705,10 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               max_connections_per_ip=max_connections_per_ip,
                               header_read_timeout_ms=header_read_timeout_ms,
                               body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
-                              shutdown_timeout=shutdown_timeout, max_waiting=max_waiting)
+                              shutdown_timeout=shutdown_timeout, max_waiting=max_waiting,
+                              acquire_timeout_max_ms=acquire_timeout_max_ms,
+                              handler_timeout_ms=handler_timeout_ms,
+                              response_timeout_ms=response_timeout_ms)
         print(f"PyNext listening on http://{server.address}", flush=True)
         # A standalone bundle records its provenance in
         # bundle-manifest.json next to the app dir; log it (and warn on

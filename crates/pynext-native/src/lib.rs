@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tower_service::Service as TowerService;
 
@@ -418,6 +418,11 @@ struct ServerState {
     capacity: Arc<Semaphore>,
     waiting_capacity: Arc<Semaphore>,
     acquire_timeout: Duration,
+    /// Adaptive ceiling for the slot wait (C-P1-5); `None` keeps the
+    /// fixed `acquire_timeout`.
+    acquire_timeout_max: Option<Duration>,
+    /// EWMA of slot hold times, feeding the adaptive timeout.
+    hold_stats: Arc<HoldTimeStats>,
     body_capacity: Arc<Semaphore>,
     body_timeout: Duration,
     // Connection budget (A4): a semaphore for the total number of live TCP
@@ -497,7 +502,12 @@ fn close_stream(stream: Arc<Py<PyAny>>) {
     });
 }
 
-fn streaming_body(stream: Py<PyAny>, permit: OwnedSemaphorePermit) -> Body {
+fn streaming_body(
+    stream: Py<PyAny>,
+    permit: OwnedSemaphorePermit,
+    hold_stats: Arc<HoldTimeStats>,
+    acquired_at: Instant,
+) -> Body {
     let stream = Arc::new(stream);
     let (sender, receiver) = tokio_mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     let failed = Arc::new(AtomicBool::new(false));
@@ -534,6 +544,9 @@ fn streaming_body(stream: Py<PyAny>, permit: OwnedSemaphorePermit) -> Body {
                 }
             }
         }
+        // The slot is held until the stream ends: record the full hold
+        // so the adaptive timeout (C-P1-5) sees streaming lifetimes too.
+        hold_stats.record(acquired_at.elapsed());
         close_stream(stream);
     });
     let body =
@@ -905,6 +918,65 @@ fn plain_response(
 /// would most likely hit the same wall.
 fn retry_after_for_timeout(timeout: Duration) -> u64 {
     (timeout.as_millis() as u64).div_ceil(1000).max(1)
+}
+
+/// Exponentially weighted moving average of execution-slot hold times
+/// (C-P1-5). One sample per completed request: the time from slot
+/// acquisition to slot release — handler execution for buffered
+/// responses, the whole stream lifetime for streaming ones.
+struct HoldTimeStats {
+    /// EWMA in milliseconds; `None` until the first request completes.
+    ewma_ms: Mutex<Option<f64>>,
+}
+
+impl HoldTimeStats {
+    fn new() -> Self {
+        Self {
+            ewma_ms: Mutex::new(None),
+        }
+    }
+
+    fn record(&self, hold: Duration) {
+        let sample = hold.as_secs_f64() * 1000.0;
+        let mut guard = self
+            .ewma_ms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(match *guard {
+            Some(ewma) => 0.8 * ewma + 0.2 * sample,
+            None => sample,
+        });
+    }
+
+    fn ewma_ms(&self) -> Option<f64> {
+        *self
+            .ewma_ms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Effective slot-acquire timeout for one waiter (C-P1-5).
+///
+/// Without a ceiling (`None`) the timeout stays fixed at `base` — the
+/// historical behaviour. With a ceiling, the wait adapts to the
+/// observed slot-hold time: twice the EWMA, so a waiter survives
+/// roughly one full slot turnover, clamped to `[base, max]` so the
+/// wait stays bounded (each waiter can hold a fully buffered body).
+/// Until the first request completes there is no EWMA and the base
+/// applies.
+fn effective_acquire_timeout(
+    base: Duration,
+    max: Option<Duration>,
+    ewma_ms: Option<f64>,
+) -> Duration {
+    let Some(max) = max else {
+        return base;
+    };
+    let Some(ewma_ms) = ewma_ms else {
+        return base;
+    };
+    Duration::from_secs_f64(ewma_ms / 1000.0 * 2.0).clamp(base, max)
 }
 
 fn busy_response(
@@ -1773,11 +1845,19 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     )
                 }
             };
-            match tokio::time::timeout(
+            // Adaptive wait (C-P1-5): the effective timeout follows the
+            // observed slot-hold time, so slow handlers stretch the
+            // wait instead of converting latency into 503s. Fairness is
+            // already FIFO: tokio's Semaphore grants permits in the
+            // order they were requested, so a waiter never starves
+            // behind later arrivals.
+            let effective_timeout = effective_acquire_timeout(
                 state.acquire_timeout,
-                state.capacity.clone().acquire_owned(),
-            )
-            .await
+                state.acquire_timeout_max,
+                state.hold_stats.ewma_ms(),
+            );
+            match tokio::time::timeout(effective_timeout, state.capacity.clone().acquire_owned())
+                .await
             {
                 Ok(Ok(permit)) => {
                     drop(waiting);
@@ -1786,7 +1866,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 _ => {
                     return apply_path_headers_for_raw_path(
                         busy_response(
-                            retry_after_for_timeout(state.acquire_timeout),
+                            retry_after_for_timeout(effective_timeout),
                             &state.security_headers,
                         ),
                         parts.uri.path(),
@@ -1796,6 +1876,12 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             }
         }
     };
+    // Slot-hold clock for the adaptive timeout (C-P1-5): started when
+    // the permit is acquired, recorded when it is released (buffered
+    // responses below, streaming ones in streaming_body, bridge errors
+    // in the error arm).
+    let acquired_at = Instant::now();
+    let hold_stats = Arc::clone(&state.hold_stats);
     let method = parts.method.to_string();
     let path = parts.uri.path().to_string();
     let query = parts.uri.query().unwrap_or("").as_bytes().to_vec();
@@ -1885,21 +1971,27 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             }
             *response.body_mut() = match body {
                 BridgeBody::Buffered(body) => {
+                    hold_stats.record(acquired_at.elapsed());
                     drop(permit);
                     Body::from(body)
                 }
-                BridgeBody::Streaming(stream) => streaming_body(stream, permit),
+                BridgeBody::Streaming(stream) => {
+                    streaming_body(stream, permit, hold_stats, acquired_at)
+                }
             };
             response
         }
-        _ => apply_merged_path_headers(
-            plain_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal Server Error",
-                &security_headers,
-            ),
-            &path_headers_for_request,
-        ),
+        _ => {
+            hold_stats.record(acquired_at.elapsed());
+            apply_merged_path_headers(
+                plain_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
+                    &security_headers,
+                ),
+                &path_headers_for_request,
+            )
+        }
     }
 }
 
@@ -2045,7 +2137,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, acquire_timeout_max_ms=None))]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn new(
@@ -2083,6 +2175,7 @@ impl NativeServer {
         websocket_auth_callback: Option<Py<PyAny>>,
         http_rate_limit_callback: Option<Py<PyAny>>,
         path_headers: Option<Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>>,
+        acquire_timeout_max_ms: Option<u64>,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -2244,6 +2337,8 @@ impl NativeServer {
                         max_waiting.unwrap_or_else(|| max_concurrent.min(64)),
                     )),
                     acquire_timeout: Duration::from_millis(acquire_timeout_ms),
+                    acquire_timeout_max: acquire_timeout_max_ms.map(Duration::from_millis),
+                    hold_stats: Arc::new(HoldTimeStats::new()),
                     // Body intake gets fewer slots than Python execution on
                     // purpose: a flood of slow uploads can then only take the
                     // body slots, leaving execution slots free for requests
@@ -2510,5 +2605,49 @@ mod tests {
             let mut output = String::new();
             let _ = render_node(&node, &mut output, 0, None);
         }
+    }
+
+    // Adaptive admission timeout (C-P1-5): the effective wait follows the
+    // observed slot-hold time, capped by the configured ceiling.
+    #[test]
+    fn adaptive_timeout_stays_fixed_without_ceiling_or_samples() {
+        let base = Duration::from_millis(1000);
+        assert_eq!(effective_acquire_timeout(base, None, Some(5000.0)), base);
+        assert_eq!(
+            effective_acquire_timeout(base, Some(Duration::from_millis(5000)), None),
+            base
+        );
+    }
+
+    #[test]
+    fn adaptive_timeout_tracks_hold_time_ewma() {
+        let base = Duration::from_millis(1000);
+        let max = Duration::from_millis(5000);
+        // Mean hold 500 ms -> 2x = 1000 ms, the base: no stretch.
+        assert_eq!(
+            effective_acquire_timeout(base, Some(max), Some(500.0)),
+            base
+        );
+        // Mean hold 1500 ms -> 2x = 3000 ms.
+        assert_eq!(
+            effective_acquire_timeout(base, Some(max), Some(1500.0)),
+            Duration::from_millis(3000)
+        );
+        // Mean hold 10 s -> 2x = 20 s, capped at the 5000 ms ceiling.
+        assert_eq!(
+            effective_acquire_timeout(base, Some(max), Some(10000.0)),
+            max
+        );
+    }
+
+    #[test]
+    fn hold_time_ewma_learns_from_samples() {
+        let stats = HoldTimeStats::new();
+        assert_eq!(stats.ewma_ms(), None);
+        stats.record(Duration::from_millis(1000));
+        assert_eq!(stats.ewma_ms(), Some(1000.0));
+        stats.record(Duration::from_millis(2000));
+        let ewma = stats.ewma_ms().unwrap();
+        assert!((ewma - 1200.0).abs() < 1e-6, "ewma was {ewma}");
     }
 }

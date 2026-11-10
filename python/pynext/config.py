@@ -53,6 +53,7 @@ __all__ = [
     "find_config_file",
     "load_config",
     "load_config_file",
+    "resolve_workers",
 ]
 
 CONFIG_FILENAME = "pynext.config.py"
@@ -74,6 +75,22 @@ class ConfigError(ValueError):
     """A fatal configuration problem: startup must fail, not continue."""
 
 
+def resolve_workers(value):
+    """Resolve a ``workers`` setting to a process count (C-P1-5).
+
+    ``"auto"`` (any case, surrounding whitespace ignored) means one
+    worker per CPU, clamped to the 1..64 range the CLI enforces — the
+    Sanic ``fast=True`` rule. An int passes through unchanged (bounds
+    are checked by the caller). Anything else raises
+    :class:`ConfigError`.
+    """
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return min(64, max(1, os.cpu_count() or 1))
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"'workers' must be an integer or 'auto' (got {value!r})")
+    return value
+
+
 @dataclass(frozen=True)
 class PyNextConfig:
     """All server settings, with their defaults, in one place.
@@ -91,8 +108,42 @@ class PyNextConfig:
     host: str = "127.0.0.1"
     port: int = 3000
     # Request admission and body limits (serve()).
+    #
+    # ``acquire_timeout_ms`` (C-P1-5): how long a request waits in the
+    # Rust admission queue for an execution slot before it is refused
+    # with 503 + ``Retry-After``. The default (1000 ms) absorbs bursts
+    # when handlers are fast (a few ms: a waiter clears in one slot
+    # turnover), but it is shorter than one slow handler: the
+    # root-cause reproduction (``concurrency-analysis/
+    # pynext-root-cause.md`` §5) measured 90.4% 503 for 500 ms
+    # ``time.sleep`` handlers and 74.2% for ~130 ms CPU handlers at
+    # this default, because a waiter behind a full 64-slot queue waits
+    # roughly one mean slot-hold time per queue position ahead of it.
+    # Rule of thumb: set this to at least ~2x the p95 handler latency
+    # (3000-5000 ms for handlers that typically take ~500 ms), or set
+    # ``acquire_timeout_max_ms`` and let the effective timeout adapt to
+    # the observed slot-hold time instead of guessing one number.
     max_concurrent: int = 64
     acquire_timeout_ms: int = 1000
+    # Adaptive admission ceiling (C-P1-5): when set, the effective slot
+    # wait is ``clamp(2 * EWMA(slot hold time), acquire_timeout_ms,
+    # acquire_timeout_max_ms)`` — a slow-handler deployment waits longer
+    # instead of converting latency into 503s, while the ceiling keeps
+    # the wait bounded (each waiter can hold a fully buffered body).
+    # ``None`` (default) keeps the fixed ``acquire_timeout_ms``.
+    acquire_timeout_max_ms: int | None = None
+    # Per-stage request timeouts (C-P1-7): handler execution and
+    # response sending are separate stages with separate budgets.
+    # A handler that runs past ``handler_timeout_ms`` answers 504
+    # ("the server could not finish the work"); running out of
+    # admission capacity answers 503 + ``Retry-After`` ("cannot accept
+    # right now") — the two are never mixed. ``body_timeout_ms`` below
+    # is the body-read stage (a slow body answers 408). 0 disables the
+    # stage timeout on the ASGI path; on the native path 0 disables the
+    # bridge deadline (use with care: a hung handler then holds its
+    # slot until the client disconnects).
+    handler_timeout_ms: int = 30000
+    response_timeout_ms: int = 30000
     max_waiting: int | None = None
     body_capacity: int = 16
     body_timeout_ms: int = 10000
@@ -103,6 +154,14 @@ class PyNextConfig:
     body_min_rate_bytes_per_sec: int = 1024
     # Lifecycle.
     shutdown_timeout: float = 30.0
+    # ``workers`` is 1 by default in this branch (C-P0-1, which raises
+    # it, lives on another branch — integration decides the final
+    # default). It also accepts ``"auto"`` (config file or ``--workers
+    # auto``): the number of CPUs, clamped to 1..64 — the same rule
+    # Sanic's ``fast=True`` uses (workers = CPU affinity count). With
+    # workers > 1 each worker keeps its own memory ISR cache; use a
+    # shared cache backend (sqlite/redis) to share it (see
+    # ``_cross_check``).
     workers: int = 1
     # ISR cache.
     cache_backend: str = "memory"
@@ -170,6 +229,9 @@ _SPECS = {
     "port": _Spec("int", 0, 65535),
     "max_concurrent": _Spec("int", 1, 1000000),
     "acquire_timeout_ms": _Spec("int", 0, 86400000),
+    "acquire_timeout_max_ms": _Spec("int_or_none", 0, 86400000),
+    "handler_timeout_ms": _Spec("int", 0, 86400000),
+    "response_timeout_ms": _Spec("int", 0, 86400000),
     "max_waiting": _Spec("int_or_none", 0, 1000000),
     "body_capacity": _Spec("int", 1, 1000000),
     "body_timeout_ms": _Spec("int", 0, 86400000),
@@ -178,7 +240,7 @@ _SPECS = {
     "header_read_timeout_ms": _Spec("int", 0, 86400000),
     "body_min_rate_bytes_per_sec": _Spec("int", 0, 1000000000),
     "shutdown_timeout": _Spec("float", 0, 3600),
-    "workers": _Spec("int", 1, 64),
+    "workers": _Spec("workers", 1, 64),
     "cache_backend": _Spec("str", choices=("memory", "sqlite", "redis")),
     "cache_path": _Spec("str_or_none"),
     "cache_failure_policy": _Spec("str", choices=("fail_open", "fail_closed")),
@@ -255,6 +317,15 @@ def _validate_value(key, value, *, source):
     if kind == "int":
         if type(value) is not int:
             _fail(source, key, "must be an integer", value)
+        _check_bounds(source, key, value, spec)
+        return value
+    if kind == "workers":
+        if isinstance(value, str):
+            if value.strip().lower() != "auto":
+                _fail(source, key, "must be an integer or 'auto'", value)
+            return resolve_workers(value)
+        if type(value) is not int:
+            _fail(source, key, "must be an integer or 'auto'", value)
         _check_bounds(source, key, value, spec)
         return value
     if kind == "int_or_none":
@@ -337,6 +408,12 @@ def _validate_config_dict(raw, *, source):
 def _cross_check(values, *, source):
     """Warn about option combinations that are legal but surprising."""
     warnings = []
+    if (values.acquire_timeout_max_ms is not None
+            and values.acquire_timeout_max_ms < values.acquire_timeout_ms):
+        warnings.append(
+            f"{source}: 'acquire_timeout_max_ms' ({values.acquire_timeout_max_ms}) is below "
+            f"'acquire_timeout_ms' ({values.acquire_timeout_ms}); the adaptive ceiling never "
+            "applies — raise the ceiling or lower the base timeout")
     if values.cache_path is not None and values.cache_backend != "sqlite":
         warnings.append(
             f"{source}: 'cache_path' is only used with cache_backend 'sqlite'; "
