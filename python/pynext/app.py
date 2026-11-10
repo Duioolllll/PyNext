@@ -43,7 +43,8 @@ from .errors import SignalError, digest_for_error, error_count
 from .http import (SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_path_headers, apply_security_headers, compile_path_headers,
-                   cors_preflight_response, filter_internal_headers, new_csp_nonce, validate_csrf)
+                   cors_preflight_response, filter_internal_headers, new_csp_nonce, validate_csrf,
+                   validate_request_framing)
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .middleware import ScopedMiddleware
 from .observability import (
@@ -2646,6 +2647,14 @@ class App:
             # with the handler routing actually serves, or an encoded
             # path escapes the limiter while reaching another handler.
             match_path = _normalize_path_for_matching(encoded_path)
+            # Request-smuggling framing (S-P1-31): ambiguous framing is a
+            # 400 before admission or any body read, same as the native
+            # transport's dispatch check (`http.validate_request_framing`
+            # is the shared rule; the native side mirrors it in Rust).
+            framing = validate_request_framing(
+                scope.get("headers", []), scope.get("http_version", "1.1"))
+            if framing is not None:
+                raise BadRequest(framing)
         except (ValueError, UnicodeError, BadRequest):
             response = Response("Bad Request", status=400)
         else:
@@ -2666,6 +2675,12 @@ class App:
                         return
                     if message["type"] != "http.request":
                         raise RuntimeError("Unexpected ASGI message")
+                    # Chunk trailers (S-P1-31, Sanic CVE-2026-85078): a
+                    # trailer section must never be silently accepted —
+                    # trailer bytes re-parsed as a request are the
+                    # smuggling primitive — so any trailer part is a 400.
+                    if message.get("trailers"):
+                        raise BadRequest("Chunk trailers are not accepted")
                     chunk = message.get("body", b"")
                     total += len(chunk)
                     if total > MAX_BODY:
