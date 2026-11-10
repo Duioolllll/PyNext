@@ -16,7 +16,7 @@ from .http import MAX_WS_MESSAGE, SecurityConfig
 from .observability import ObservabilityConfig
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
-from .scaffold import init_project
+from .scaffold import TEMPLATES, init_project
 from .server import (MAX_BODY_CAPACITY, MAX_BODY_MIN_RATE_BYTES_PER_SEC,
                      MAX_CONCURRENT, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP,
                      MAX_SHUTDOWN_TIMEOUT, MAX_TIMEOUT_MS, MAX_WAITING, serve)
@@ -465,6 +465,13 @@ def _build_parser():
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a minimal application")
     init.add_argument("--dir", default=".", help="application project directory")
+    init.add_argument("--template", choices=TEMPLATES, default="basic",
+                      help="project template: basic (default), islands (browser counter island),"
+                           " or api (example JSON route)")
+    init.add_argument("--with-middleware", action="store_true",
+                      help="also create an example middleware.py")
+    init.add_argument("--no-gitignore", action="store_true",
+                      help="do not create a .gitignore")
     for name in ("build", "dev", "start"):
         command = sub.add_parser(name)
         command.add_argument("--dir", default=".", help="application project directory")
@@ -648,10 +655,19 @@ def main():
     root = Path(args.dir).resolve()
     if args.command == "init":
         try:
-            init_project(root)
+            init_project(root, template=args.template, with_middleware=args.with_middleware,
+                         gitignore=not args.no_gitignore)
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
-        print(f"Created a PyNext app in {root}")
+        print(f"Created a PyNext app in {root} (template: {args.template})")
+        print()
+        print("Next steps:")
+        print(f"  cd {root}")
+        print("  pynext dev    # serve the source with reload")
+        print("  pynext build  # render static pages and bundle islands")
+        print("  pynext start  # serve the production build")
+        if args.template == "islands":
+            print("Islands need Node.js and esbuild for `pynext build`.")
         return
     if args.command == "build":
         if args.standalone_dir and not args.standalone:
