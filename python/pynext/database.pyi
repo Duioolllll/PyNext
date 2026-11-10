@@ -1,6 +1,9 @@
 from contextlib import AbstractAsyncContextManager
 from typing import Any
+from sqlalchemy import TextClause
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+
+def raw_sql(sql: str, params: dict[str, Any] | None = ...) -> TextClause: ...
 
 class Database:
     def __init__(self, url: str = ..., *, engine_options: dict[str, Any] | None = ...) -> None: ...

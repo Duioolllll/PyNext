@@ -3,8 +3,9 @@ __version__: str
 from .app import App as App, create_app as create_app
 from .auth import AuthorizationPolicy as AuthorizationPolicy, authorization_policy as authorization_policy, require_auth as require_auth, require_permission as require_permission, require_scope as require_scope
 from .client_dsl import ClientDSLCompileError as ClientDSLCompileError, compile_client_dsl as compile_client_dsl
-from .components import h as h, fragment as fragment, island as island, layout as layout, model_prop as model_prop, page as page
+from .components import SafeString as SafeString, h as h, fragment as fragment, island as island, layout as layout, mark_safe as mark_safe, model_prop as model_prop, page as page
 from .database import Database as Database
+from .sql import RawSQL as RawSQL, quote_identifier as quote_identifier, raw_sql as raw_sql, validate_ddl_definition as validate_ddl_definition
 from .django import DjangoBusyError as DjangoBusyError, DjangoResource as DjangoResource
 from .env import LoadedEnv as LoadedEnv, env_file_names as env_file_names, load_env as load_env, public_env_defines as public_env_defines, public_env_vars as public_env_vars
 from .dynamic import StaticGenBailoutError as StaticGenBailoutError, is_prerender_bailout as is_prerender_bailout, mark_dynamic_access as mark_dynamic_access, no_store as no_store

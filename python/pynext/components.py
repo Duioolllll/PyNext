@@ -19,11 +19,53 @@ _MAX_MODEL_BYTES = 16_384
 _MAX_MODEL_NODES = 512
 
 def _node(child):
+    if isinstance(child, SafeString):
+        # The single explicit HTML escape hatch (S-P1-10): only a value
+        # wrapped by mark_safe() becomes a "raw" node. Everything else
+        # is a "text" node and the renderer escapes it. The native
+        # renderer must accept kind "raw" to emit it verbatim; until
+        # then it fails closed (unknown node kind) instead of emitting
+        # unescaped HTML. See docs/SECURITY.md.
+        return {"kind": "raw", "value": str(child)}
     if isinstance(child, dict) and "kind" in child:
         return child
     if isinstance(child, (str, int, float)) and not isinstance(child, bool):
         return {"kind": "text", "value": str(child)}
     raise TypeError(f"Unsupported child type: {type(child).__name__}")
+
+
+class SafeString(str):
+    """A string explicitly marked as trusted HTML (S-P1-10).
+
+    Only :func:`mark_safe` creates one. It is a ``str`` subclass so it
+    stays an ordinary string everywhere except the render tree, where
+    :func:`_node` turns it into a ``{"kind": "raw"}`` node — the one
+    place raw HTML may enter the output. Use it only for HTML the
+    application generated itself from trusted data; never for user
+    input, query strings, or database content.
+    """
+
+    def __html__(self):
+        return self
+
+
+def mark_safe(html):
+    """Mark a string as trusted HTML: the explicit opt-out of escaping.
+
+    This is the ONLY way to get unescaped HTML into an ``h()`` tree —
+    the Django ``mark_safe()`` equivalent. Plain strings are always
+    escaped by the renderer; ``mark_safe()`` is the visible, greppable
+    marker that a call site opted out, and every use belongs on the
+    "escape-hatch usages" review checklist (see ``docs/SECURITY.md``).
+
+    The opt-out applies to element children only. Attribute values are
+    always escaped by the renderer, even when wrapped in
+    :func:`mark_safe`, because attribute injection (``"`` breaking out
+    of ``href="..."``) has no safe raw form.
+    """
+    if not isinstance(html, str):
+        raise TypeError(f"mark_safe() requires a string, got {type(html).__name__}")
+    return SafeString(html)
 
 
 def h(tag, attrs=None, *children):

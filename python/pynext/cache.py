@@ -500,9 +500,23 @@ class SQLiteCacheBackend(CacheBackend):
             raise ValueError(f"Cannot open SQLite cache at {path}: {exc}") from exc
 
     def _ensure_column(self, table, column, definition):
-        columns = [row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")]
+        # DDL cannot use bound parameters for identifiers, so this is
+        # the one place in the cache that interpolates SQL text — routed
+        # through the explicit raw_sql() escape hatch (S-P1-10) with the
+        # table/column strictly validated as identifiers and the
+        # definition restricted to a bare type + optional NOT NULL /
+        # DEFAULT literal. Call sites pass framework constants only.
+        from .sql import quote_identifier, raw_sql, validate_ddl_definition
+
+        table_q = quote_identifier(table)
+        column_q = quote_identifier(column)
+        definition = validate_ddl_definition(definition)
+        columns = [row[1] for row in raw_sql(
+            f"PRAGMA table_info({table_q})").execute(self._conn)]
         if column not in columns:
-            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            raw_sql(
+                f"ALTER TABLE {table_q} ADD COLUMN {column_q} {definition}"
+            ).execute(self._conn)
 
     @staticmethod
     def _age(generated_at, generated_mono, now_wall, now_mono):
