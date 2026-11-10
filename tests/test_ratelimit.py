@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import time
 
 import httpx
 import pytest
@@ -246,6 +247,43 @@ def test_ipv6_flood_within_one_prefix_creates_one_bucket():
         key = limiter.key_for(f"2001:db8:0:1:{i >> 16:x}:{(i >> 8) & 0xFF:x}:{i & 0xFF:x}:1")
         limiter.allow(key, now=1000.0)
     assert limiter.stats()["buckets"] == 1
+
+
+def test_ipv6_48_flood_cannot_fill_new_key_window():
+    # S-P1-26 (M-17) mitigation: a /48 holder minting 10,000 distinct
+    # /64s inside one /48 collapses to a single bucket and a single
+    # new-key admission at ipv6_prefix_len=48, so a genuinely brand-new
+    # user is still admitted instead of getting 429.
+    # ``now`` is anchored at the real monotonic clock: stats() prunes
+    # new-key admissions against time.monotonic(), so a fixed fake
+    # timestamp would look expired to it.
+    now = time.monotonic()
+    limiter = RateLimiter(100, 60, ipv6_prefix_len=48)
+    for i in range(10_000):
+        key = limiter.key_for(f"2001:db8:0:{i:x}::1")
+        limiter.allow(key, now=now)
+    stats = limiter.stats()
+    assert stats["buckets"] == 1
+    assert stats["new_keys_in_window"] == 1
+    legit = limiter.key_for("2001:db8:1::1")
+    assert limiter.allow(legit, now=now) == (True, None)
+
+
+def test_ipv6_64_flood_fills_new_key_window_and_denies_new_key():
+    # Control for the test above: at the default /64 the same flood —
+    # 10,000 distinct /64s inside one /48 — fills the new-key window,
+    # so a genuinely brand-new key is denied with 429 until the window
+    # slides. This is the M-17 disruption the /48 grouping mitigates.
+    now = time.monotonic()
+    limiter = RateLimiter(100, 60)
+    for i in range(10_000):
+        key = limiter.key_for(f"2001:db8:0:{i:x}::1")
+        limiter.allow(key, now=now)
+    assert limiter.stats()["new_keys_in_window"] == 10_000
+    legit = limiter.key_for("2001:db8:1::1")
+    allowed, retry_after = limiter.allow(legit, now=now)
+    assert allowed is False
+    assert retry_after == 60
 
 
 def test_is_exempt_matches_exact_paths_and_subpaths():

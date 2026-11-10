@@ -33,6 +33,35 @@ global default. Lowering ``max_new_keys_per_window`` instead only
 slows the attacker down while also admitting fewer legitimate new
 users per window, so it does not fix the exhaustion either.
 
+How to narrow the grouping (operator setting, S-P1-26 / M-17):
+
+- CLI: ``pynext start --rate-limit 100 --rate-limit-ipv6-prefix-len 48``
+- Config file: ``rate_limit_ipv6_prefix_len = 48`` (``pynext.toml``;
+  the same key is ``rate_limit_ipv6_prefix_len`` in ``PyNextConfig``)
+- Programmatic: ``RateLimiter(100, 60, ipv6_prefix_len=48)``
+- The Redis backend groups the same way: ``RedisRateLimiter`` inherits
+  :meth:`RateLimiter.key_for`, so the same prefix applies to the
+  shared buckets; the transports call ``key_for`` before ``allow`` on
+  either backend.
+
+What 48 buys, quantitatively: one /48 minting distinct /64s collapses
+from 65,536 candidate buckets to exactly one bucket and one new-key
+admission. Filling the 10,000-per-window new-key window then needs
+10,000 distinct /48s instead of a single /48, so the flood that used
+to deny brand-new users with 429 can no longer do so from one /48.
+Narrow to 48 when new-key-window 429s spike under an IPv6 flood —
+``stats()["new_keys_in_window"]`` climbing towards
+``max_new_keys_per_window`` while the distinct /64s share few /48s is
+the signal — and revert to 64 once the flood subsides, because a /48
+shared by many legitimate hosts (carrier-grade NAT, a campus, a cloud
+region) throttles those hosts together under one bucket. Narrowing
+does not stop an attacker who holds many /48s: each /48 still mints
+its own bucket, so a distributed holder can still fill the window;
+pair the setting with monitoring of ``new_keys_in_window`` and, if
+the abuse persists, with an upstream (WAF / edge) block of the
+offending prefixes rather than a still narrower prefix, which only
+widens the collateral damage.
+
 Bucket table pressure never blocks an existing key. The table is a
 bounded leaderboard of the most recently active keys (at most
 ``_MAX_BUCKETS``): when it is full, a new key evicts the stalest bucket
