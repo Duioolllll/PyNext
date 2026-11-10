@@ -268,11 +268,13 @@ def test_500_dev_page_shows_digest_and_count(tmp_path):
             return await client.get("/")
     response = asyncio.run(run())
     assert response.status_code == 500
-    assert "request_id:" in response.text
-    match = re.search(r"digest: ([0-9a-f]{16}) \(seen (\d+) time", response.text)
-    assert match, response.text
-    assert int(match.group(2)) >= 1
-    assert lookup_error(match.group(1))["message"] == "dev-boom-errdigest"
+    # Dev page format (deverr, P1-3): a <dl> header with the request id,
+    # a 12-hex digest and a per-process occurrence count — not the old
+    # "request_id: ... digest: ... (seen N time" line. The error-registry
+    # lookup is covered by the production-format tests above.
+    assert re.search(r"<dt>Request ID</dt><dd>[^<]+</dd>", response.text)
+    assert re.search(r"<dt>Digest</dt><dd>[0-9a-f]{12}</dd>", response.text)
+    assert "Seen 1 time in this process" in response.text
 
 
 @pytest.mark.parametrize("mode", ["asgi", "axum"])
