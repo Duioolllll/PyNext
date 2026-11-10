@@ -61,6 +61,7 @@ from .proxy import ProxyTrust
 from .ratelimit import _is_exempt_path, rate_limited_response
 from .sessions import SessionMiddleware
 from .static import asset_response
+from .validation import validate_handler_input
 from .ws_origin import websocket_origin_allowed
 
 log = logging.getLogger("pynext")
@@ -2305,6 +2306,13 @@ class App:
                          or getattr(entry[method], "__pynext_csrf__", False))
                     and not validate_csrf(request, config=self.security)):
                 return Response("Forbidden", status=403)
+            # S-P1-2: input validation runs once, here at the handler
+            # entry point, before the handler is invoked. Handlers
+            # without a schema are untouched; a failure answers 400
+            # with field names and reason codes only (no value echo).
+            denied = await validate_handler_input(request, entry[method], params, config=self.security)
+            if denied is not None:
+                return denied
             response = await _invoke(entry[method], request=request, params=params)
             if not isinstance(response, Response):
                 raise TypeError("API handlers must return a Response")
