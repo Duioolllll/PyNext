@@ -212,7 +212,10 @@ class RedisCacheBackend:
         clock (``TIME``), so on multi-host deployments a worker whose
         clock runs ahead of the server can still look fresh after an
         invalidation — keep worker and server clocks synchronised
-        (NTP) and see the manual's clock-skew note.
+        (NTP) and see the manual's clock-skew note. ``generated_mono``
+        is accepted for signature parity with the other shared stores
+        and ignored: Redis keeps no monotonic clock, and freshness and
+        tag checks here are wall-clock only.
         """
         if len(body) > MAX_CACHE_BODY_BYTES or not _valid_durations(fresh_seconds, stale_seconds):
             return False

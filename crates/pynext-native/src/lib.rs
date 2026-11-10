@@ -437,6 +437,11 @@ struct ServerState {
     client_assets: HashMap<String, Bytes>,
     asset_etags: HashMap<String, HeaderValue>,
     isr_cache: Arc<PageCache>,
+    /// Per-route ISR `Cache-Control` values (`pattern -> header`), computed
+    /// in Python from each ISR policy. The native server matches a fresh
+    /// L1 hit against the route trie and serves the policy header; routes
+    /// without a policy fall back to `public, max-age=0, must-revalidate`.
+    isr_cache_control: HashMap<String, HeaderValue>,
     middleware_enabled: bool,
     shared_cache_enabled: bool,
     /// A1 security headers configured in Python (`SecurityConfig`), applied
@@ -448,6 +453,12 @@ struct ServerState {
     /// applied to the same Rust-built responses. Each rule carries its own
     /// one-pattern router, so every matching rule applies.
     path_headers: Vec<PathHeaderRule>,
+    /// Build-identity headers configured in Python (`X-PyNext-Build-Id`,
+    /// `X-PyNext-Deployment-Id`), applied to the static assets and HTML
+    /// the Rust layer serves itself, so a client can detect skew against
+    /// a newer deploy. Bridge responses already carry them from Python
+    /// dispatch and pass through untouched.
+    build_headers: Vec<(Vec<u8>, Vec<u8>)>,
     websocket_router: Router,
     websocket_paths: std::collections::HashSet<String>,
     websocket_protocols: HashMap<String, Vec<String>>,
@@ -768,11 +779,31 @@ fn apply_path_headers_for_raw_path(
     }
 }
 
+/// Add the Python-configured build-identity headers to a response the
+/// Rust layer builds itself (static assets, cached ISR pages). Invalid
+/// entries are skipped; Python validates the values before handing them
+/// over. Like `apply_security_headers`, this never overwrites a header
+/// the builder already carries.
+fn apply_build_headers(
+    mut builder: axum::http::response::Builder,
+    build_headers: &[(Vec<u8>, Vec<u8>)],
+) -> axum::http::response::Builder {
+    for (name, value) in build_headers {
+        if let (Ok(name), Ok(value)) =
+            (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+        {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+}
+
 fn static_response(
     parts: &axum::http::request::Parts,
     content: &Bytes,
     policy: AssetPolicy<'_>,
     security_headers: &[(Vec<u8>, Vec<u8>)],
+    build_headers: &[(Vec<u8>, Vec<u8>)],
 ) -> AxumResponse<Body> {
     let length = content.len();
     let mut status = StatusCode::OK;
@@ -839,6 +870,7 @@ fn static_response(
         .header(header::CACHE_CONTROL, policy.cache_control)
         .header(header::ACCEPT_RANGES, "bytes");
     builder = apply_security_headers(builder, security_headers);
+    builder = apply_build_headers(builder, build_headers);
     if status != StatusCode::NOT_MODIFIED {
         builder = builder.header(header::CONTENT_LENGTH, response_length.to_string());
     }
@@ -1676,6 +1708,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                             vary: false,
                         },
                         &state.security_headers,
+                        &state.build_headers,
                     ),
                     &path,
                     &state.path_headers,
@@ -1693,6 +1726,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                             vary: false,
                         },
                         &state.security_headers,
+                        &state.build_headers,
                     ),
                     &path,
                     &state.path_headers,
@@ -1710,6 +1744,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                             vary: true,
                         },
                         &state.security_headers,
+                        &state.build_headers,
                     ),
                     &path,
                     &state.path_headers,
@@ -1726,15 +1761,29 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     } else {
                         Body::from(content)
                     };
+                    // Serve the route's policy-based SWR header (Next.js
+                    // `getCacheControlHeader`); routes without an ISR
+                    // policy keep the previous no-cache default.
+                    let cache_control = state
+                        .websocket_router
+                        .matches(&path)
+                        .and_then(|(pattern, _, _)| state.isr_cache_control.get(&pattern))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            HeaderValue::from_static("public, max-age=0, must-revalidate")
+                        });
                     return apply_path_headers(
-                        apply_security_headers(
-                            AxumResponse::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "text/html; charset=utf-8")
-                                .header("content-length", length.to_string())
-                                .header("cache-control", "public, max-age=0, must-revalidate")
-                                .header("vary", "Cookie, Authorization"),
-                            &state.security_headers,
+                        apply_build_headers(
+                            apply_security_headers(
+                                AxumResponse::builder()
+                                    .status(StatusCode::OK)
+                                    .header("content-type", "text/html; charset=utf-8")
+                                    .header("content-length", length.to_string())
+                                    .header(header::CACHE_CONTROL, cache_control)
+                                    .header("vary", "Cookie, Authorization"),
+                                &state.security_headers,
+                            ),
+                            &state.build_headers,
                         )
                         .body(body)
                         .expect("cached response is valid"),
@@ -2045,7 +2094,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, build_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, isr_cache_control=None))]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn new(
@@ -2077,12 +2126,14 @@ impl NativeServer {
         header_read_timeout_ms: u64,
         body_min_rate_bytes_per_sec: usize,
         security_headers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+        build_headers: Option<Vec<(Vec<u8>, Vec<u8>)>>,
         drain_timeout_secs: f64,
         websocket_origin_callback: Option<Py<PyAny>>,
         websocket_rate_limit_callback: Option<Py<PyAny>>,
         websocket_auth_callback: Option<Py<PyAny>>,
         http_rate_limit_callback: Option<Py<PyAny>>,
         path_headers: Option<Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>>,
+        isr_cache_control: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -2179,6 +2230,15 @@ impl NativeServer {
             })
             .collect::<PyResult<Vec<_>>>()?;
         let isr_cache = isr_cache.inner.clone();
+        let isr_cache_control = isr_cache_control
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(pattern, value)| {
+                let value = HeaderValue::from_str(&value)
+                    .map_err(|_| PyValueError::new_err("Invalid ISR cache-control header"))?;
+                Ok((pattern, value))
+            })
+            .collect::<PyResult<HashMap<_, _>>>()?;
         let public_assets = public_assets
             .into_iter()
             .map(|(path, (body, content_type))| {
@@ -2269,10 +2329,12 @@ impl NativeServer {
                         .collect(),
                     asset_etags,
                     isr_cache,
+                    isr_cache_control,
                     middleware_enabled,
                     shared_cache_enabled,
                     security_headers: security_headers.unwrap_or_default(),
                     path_headers,
+                    build_headers: build_headers.unwrap_or_default(),
                     websocket_router,
                     websocket_paths: websocket_paths.into_iter().collect(),
                     websocket_protocols: websocket_protocols.unwrap_or_default(),

@@ -472,7 +472,24 @@ def _isr_query_keys(keys):
     return sorted(keys)
 
 
-def page(*, render="ssr", revalidate=None, stale=None, expire=None, cache_life=None, query_keys=(), dynamic="auto", tags=()):
+def _ssg_fallback(fallback, dynamic_params):
+    """Validate an SSG fallback policy (Next.js ``calculateFallbackMode``).
+
+    ``fallback`` is ``"not_found"`` (ungenerated paths 404, the historical
+    behaviour), ``"blocking"`` (generate on first request, then serve the
+    generated page statically) or ``"prerender"`` (stream the layout shell
+    first, then the generated page, and serve statically afterwards).
+    ``dynamic_params=False`` forces ``"not_found"`` at request time, like
+    Next.js ``dynamicParams === false``.
+    """
+    if fallback not in {"not_found", "blocking", "prerender"}:
+        raise ValueError("fallback must be 'not_found', 'blocking', or 'prerender'")
+    if not isinstance(dynamic_params, bool):
+        raise ValueError("dynamic_params must be a bool")
+    return {"fallback": fallback, "dynamic_params": dynamic_params}
+
+
+def page(*, render="ssr", revalidate=None, stale=None, expire=None, cache_life=None, query_keys=(), dynamic="auto", tags=(), fallback="not_found", dynamic_params=True):
     """Declare a page. ISR pages take a lifetime in one of two forms:
     explicit numbers (``revalidate`` + ``stale`` and/or ``expire`` — see
     :func:`_isr_policy`) or a named profile (``cache_life="hours"`` — see
@@ -481,7 +498,7 @@ def page(*, render="ssr", revalidate=None, stale=None, expire=None, cache_life=N
     data: ``"auto"`` (default) records the access, ``"error"`` fails the
     build/generation, ``"force-dynamic"`` skips build-time generation for
     SSG pages. ``tags`` names the ISR cache tags the page carries, so one
-    :func:`revalidate_tag` call can invalidate it (ISR pages only)."""
+    :func:`revalidate_tag` call can invalidate it (ISR pages only). ``fallback``/``dynamic_params`` control what happens for ungenerated SSG paths (see :func:`_ssg_fallback`)."""
     if render not in {"ssr", "ssg", "isr"}:
         raise ValueError("render must be 'ssr', 'ssg', or 'isr'")
     if dynamic not in {"auto", "error", "force-dynamic"}:
@@ -510,6 +527,12 @@ def page(*, render="ssr", revalidate=None, stale=None, expire=None, cache_life=N
             raise ValueError("revalidate, stale, expire, cache_life, query_keys, and tags are only valid for ISR pages")
         policy = None
         tags = ()
+    if render == "ssg":
+        ssg_fallback = _ssg_fallback(fallback, dynamic_params)
+    elif fallback != "not_found" or dynamic_params is not True:
+        raise ValueError("fallback and dynamic_params are only valid for SSG pages")
+    else:
+        ssg_fallback = None
     def decorate(fn):
         fn.__pynext_page__ = True
         fn.__pynext_render__ = render
@@ -517,6 +540,7 @@ def page(*, render="ssr", revalidate=None, stale=None, expire=None, cache_life=N
         fn.__pynext_cache_query__ = query_keys
         fn.__pynext_dynamic__ = dynamic
         fn.__pynext_cache_tags__ = tags
+        fn.__pynext_ssg_fallback__ = ssg_fallback
         return fn
     return decorate
 

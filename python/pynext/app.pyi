@@ -2,6 +2,8 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from os import PathLike
 from typing import Any, Literal
 from .http import PathHeaderRuleInput, PathHeaders, Request, Response, SecurityConfig
+from .http import Request, Response, SecurityConfig
+from .matcher import HeaderRule, Scope, ScopedMiddleware
 from .observability import MetricsCollector, ObservabilityConfig
 from .proxy import ProxyTrust
 from .types import ProxyEntry
@@ -14,20 +16,27 @@ class App:
     hot_reload: bool
     sync_workers: int
     websocket_max_message: int
+    build_id: str | None
+    deployment_id: str | None
     security: SecurityConfig
     path_headers: PathHeaders
     proxy_trust: ProxyTrust
     resources: Mapping[str, Resource]
     metrics: MetricsCollector
+    middleware: tuple[Middleware, ...]
+    middleware_scopes: tuple[Scope | None, ...]
+    header_rules: tuple[HeaderRule, ...]
     def __init__(self, root: str | PathLike[str], manifest: dict[str, Any], *, production: bool = ...,
                  security: SecurityConfig | None = ..., cache_backend: Literal["memory", "sqlite", "redis"] = ...,
                  cache_path: str | PathLike[str] | None = ..., observability: ObservabilityConfig | None = ...,
-                 rate_limit: RateLimiter | None = ..., middleware: list[Middleware] | tuple[Middleware, ...] | None = ...,
+                 rate_limit: RateLimiter | None = ..., middleware: list[Middleware | ScopedMiddleware] | tuple[Middleware | ScopedMiddleware, ...] | None = ...,
+                 headers: list[Any] | tuple[Any, ...] | Iterable[PathHeaderRuleInput] | None = ...,
                  debug: bool = ..., resources: dict[str, Resource] | None = ..., cache_url: str | None = ...,
                  cache_failure_policy: Literal["fail_open", "fail_closed"] | None = ...,
+                 cache_handler: Any = ...,
                  websocket_max_message: int = ..., hot_reload: bool = ...,
                  trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...,
-                 strict_ssg: bool = ..., headers: Iterable[PathHeaderRuleInput] | None = ...,
+                 strict_ssg: bool = ...,
                  revalidate_secret: str | None = ...) -> None: ...
     def configure_observability(self, config: ObservabilityConfig) -> App: ...
     async def startup(self) -> None: ...
@@ -55,10 +64,12 @@ class App:
 def create_app(root: str | PathLike[str] = ..., *, production: bool = ...,
                security: SecurityConfig | None = ..., cache_backend: Literal["memory", "sqlite", "redis"] = ...,
                cache_path: str | PathLike[str] | None = ..., observability: ObservabilityConfig | None = ...,
-               rate_limit: RateLimiter | None = ..., middleware: list[Middleware] | tuple[Middleware, ...] | None = ...,
+               rate_limit: RateLimiter | None = ..., middleware: list[Middleware | ScopedMiddleware] | tuple[Middleware | ScopedMiddleware, ...] | None = ...,
+               headers: list[Any] | tuple[Any, ...] | Iterable[PathHeaderRuleInput] | None = ...,
                debug: bool = ..., resources: dict[str, Resource] | None = ..., cache_url: str | None = ...,
                cache_failure_policy: Literal["fail_open", "fail_closed"] | None = ...,
+               cache_handler: Any = ...,
                websocket_max_message: int = ..., hot_reload: bool = ...,
                trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...,
-               strict_ssg: bool = ..., headers: Iterable[PathHeaderRuleInput] | None = ...,
+               strict_ssg: bool = ...,
                revalidate_secret: str | None = ...) -> App: ...

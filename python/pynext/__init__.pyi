@@ -6,13 +6,15 @@ from .client_dsl import ClientDSLCompileError as ClientDSLCompileError, compile_
 from .components import h as h, fragment as fragment, island as island, layout as layout, model_prop as model_prop, page as page
 from .database import Database as Database
 from .django import DjangoBusyError as DjangoBusyError, DjangoResource as DjangoResource
+from .errors import ForbiddenError as ForbiddenError, NotFoundError as NotFoundError, RedirectError as RedirectError, SignalError as SignalError, UnauthorizedError as UnauthorizedError, compute_digest as compute_digest, digest_for_error as digest_for_error, error_count as error_count, forbidden as forbidden, get_digest_for_well_known_error as get_digest_for_well_known_error, is_signal_error as is_signal_error, lookup_error as lookup_error, not_found as not_found, redirect as redirect, unauthorized as unauthorized
 from .env import LoadedEnv as LoadedEnv, env_file_names as env_file_names, load_env as load_env, public_env_defines as public_env_defines, public_env_vars as public_env_vars
 from .dynamic import StaticGenBailoutError as StaticGenBailoutError, is_prerender_bailout as is_prerender_bailout, mark_dynamic_access as mark_dynamic_access, no_store as no_store
 from .failure_policy import FAIL_CLOSED as FAIL_CLOSED, FAIL_OPEN as FAIL_OPEN
 from .fetch_cache import FetchCacheDecision as FetchCacheDecision, apply_fetch_revalidate as apply_fetch_revalidate, decide_fetch_cache as decide_fetch_cache, fetch_cache_store_key as fetch_cache_store_key, generate_fetch_cache_key as generate_fetch_cache_key, generate_simple_fetch_cache_key as generate_simple_fetch_cache_key
 from .forms import UploadFile as UploadFile
 from .http import MAX_WS_MESSAGE as MAX_WS_MESSAGE, BadRequest as BadRequest, JSONResponse as JSONResponse, Request as Request, RequestCancelled as RequestCancelled, Response as Response, SecurityConfig as SecurityConfig, StreamingResponse as StreamingResponse, WebSocket as WebSocket, WebSocketDisconnect as WebSocketDisconnect, apply_security_headers as apply_security_headers, content_security_policy as content_security_policy, csrf_protect as csrf_protect, new_csrf_token as new_csrf_token, new_csp_nonce as new_csp_nonce, security_headers as security_headers, set_csrf_cookie as set_csrf_cookie, sign_csrf_token as sign_csrf_token, validate_csrf as validate_csrf
-from .middleware import MiddlewareScope as MiddlewareScope, RouteHas as RouteHas, ScopedMiddleware as ScopedMiddleware, scoped as scoped
+from .middleware import MiddlewareScope as MiddlewareScope, RouteHas as RouteHas, scoped as scoped
+from .matcher import HeaderRule as HeaderRule, Matcher as Matcher, ScopedMiddleware as ScopedMiddleware, compile_header_rules as compile_header_rules, compile_matcher as compile_matcher, scoped_middleware as scoped_middleware
 from .observability import MetricsCollector as MetricsCollector, ObservabilityConfig as ObservabilityConfig
 from .proxy import ProxyTrust as ProxyTrust, ResolvedProxy as ResolvedProxy, parse_trusted_proxies as parse_trusted_proxies
 from .pubsub import PubSubOverflow as PubSubOverflow, WebSocketPubSub as WebSocketPubSub

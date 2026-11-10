@@ -22,6 +22,10 @@ log = logging.getLogger("pynext")
 MANIFEST = ".pynext/manifest.json"
 BUILD_ID_FILE = ".pynext/BUILD_ID"
 LOCK_FILE = ".pynext/.build.lock"
+# A build ID is 16 lowercase hex chars: short enough for a header value
+# and an asset URL, long enough to be unique per source set.
+BUILD_ID_LENGTH = 16
+MAX_DEPLOYMENT_ID_LENGTH = 128
 VERSION = 10
 MAX_STATIC_PAGES = 10_000
 # One cap for every static page rendered at build time, streaming or
@@ -315,6 +319,74 @@ def _hash(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def generate_build_id(manifest):
+    """Deterministic build ID from the manifest's source hashes.
+
+    SHA-256 over the canonical JSON of every source hash (app, public and
+    island sources), first 16 hex chars. Same sources give the same ID,
+    so a rebuild is reproducible; any source change gives a new ID.
+    Like Next.js's ``generateBuildId`` avoiding ``/ad/i``, an ID
+    containing ``ad`` (case-insensitive) is re-hashed with a counter
+    suffix, so an ad blocker never matches the ID inside an asset URL.
+    """
+    inputs = {key: manifest.get(key, {}) for key in ("sources", "public_sources", "client_sources")}
+    counter = 0
+    while True:
+        payload = json.dumps(inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        if counter:
+            payload += f"\0{counter}"
+        candidate = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:BUILD_ID_LENGTH]
+        if "ad" not in candidate.lower():
+            return candidate
+        counter += 1
+
+
+def _validate_deployment_id(value):
+    """True when ``value`` is a usable deployment ID.
+
+    1-128 printable ASCII characters without whitespace, so it is safe
+    in a header value, in JSON and on a log line.
+    """
+    return (isinstance(value, str) and 0 < len(value) <= MAX_DEPLOYMENT_ID_LENGTH
+            and all(33 <= ord(c) <= 126 for c in value))
+
+
+def resolve_deployment_id(explicit=None):
+    """Resolve the deployment ID: explicit value, ``PYNEXT_DEPLOYMENT_ID``, else None.
+
+    A deployment ID is an operator-chosen label (for example a rolling
+    deploy's replica-set name) that names the deployment a build belongs
+    to, separate from the build ID that names the build's sources.
+    """
+    value = explicit if explicit is not None else os.environ.get("PYNEXT_DEPLOYMENT_ID")
+    if value is None:
+        return None
+    if not _validate_deployment_id(value):
+        raise ValueError(
+            "Deployment ID must be 1-128 printable ASCII characters without whitespace")
+    return value
+
+
+def read_build_id(root):
+    """Return the build ID recorded by the last successful build, else None.
+
+    The ID lives in the build manifest (``manifest["build_id"]``); the
+    ``.pynext/BUILD_ID`` file holds the manifest-integrity seal (the
+    SHA-256 of the manifest bytes), not the build ID.
+    """
+    target = Path(root).resolve() / MANIFEST
+    try:
+        saved = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(saved, dict):
+        return None
+    value = saved.get("build_id")
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{%d}" % BUILD_ID_LENGTH, value):
+        return None
+    return value
+
+
 def _check_build_paths(root):
     build_dir = root / ".pynext"
     if build_dir.is_symlink() or (build_dir.exists() and not build_dir.is_dir()):
@@ -389,11 +461,28 @@ def discover(root):
             current = current / part
             dirs.append(current)
         layouts = [str((d / "layout.py").relative_to(root)) for d in dirs if (d / "layout.py").is_file()]
+        # Segment error boundaries (error.py / not-found.py / loading.py):
+        # the nearest file walking up from the route directory wins, like
+        # layouts. Only pages get boundaries; API routes keep the plain
+        # framework error responses.
+        if path.stem == "page":
+            boundaries = {key: _nearest_boundary(dirs, filename, root) for key, filename in
+                          (("error", "error.py"), ("not_found", "not-found.py"),
+                           ("loading", "loading.py"))}
+        else:
+            boundaries = {"error": None, "not_found": None, "loading": None}
         routes[pattern] = {"entry": str(path.relative_to(root)), "kind": path.stem,
-                           "layouts": layouts if path.stem == "page" else []}
+                           "layouts": layouts if path.stem == "page" else [], **boundaries}
     if not routes:
         raise ValueError("No page.py or route.py files found")
     router = validate_routes(routes)
+    # Global boundaries live at the app root. They are also the nearest
+    # boundary for every route (the walk above includes the app directory),
+    # but route misses have no route, so the global not-found needs its
+    # own top-level entry; the global error is the last-resort fallback
+    # when a nearer boundary fails to render.
+    global_error = _nearest_boundary([app_dir], "error.py", root)
+    global_not_found = _nearest_boundary([app_dir], "not-found.py", root)
     public_sources = discover_public(root)
     for path in list(routes) + list(public_sources):
         if path == "/_pynext" or path.startswith("/_pynext/"):
@@ -402,6 +491,7 @@ def discover(root):
     if conflicts:
         raise ValueError(f"Public file conflicts with a page or API route: {sorted(conflicts)[0]}")
     return {"schema_version": VERSION, "routes": {p: routes[p] for p in router.ordered_routes()},
+            "error": global_error, "not_found": global_not_found,
             "sources": {str(p.relative_to(root)): _hash(p) for p in files},
             "public_sources": public_sources, "client_sources": discover_client(root)}
 
@@ -501,7 +591,7 @@ def validate_routes(routes):
 
 
 
-def write_manifest(root, *, lock_timeout=LOCK_TIMEOUT_SECONDS):
+def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECONDS):
     """Build the project: discover, render static pages, write assets,
     the manifest, and finally BUILD_ID — each as a separate stage.
 
@@ -513,9 +603,12 @@ def write_manifest(root, *, lock_timeout=LOCK_TIMEOUT_SECONDS):
     never look like a completed build. ``BUILD_ID`` is written last
     (Next.js records its build id last for the same reason) and holds
     the SHA-256 of the manifest bytes; ``load_manifest`` checks it, so
-    a manifest from an interrupted build is rejected at start.
+    a manifest from an interrupted build is rejected at start. The manifest
+    also records the deterministic 16-hex ``build_id`` (source-hash prefix)
+    and the optional ``deployment_id`` served as skew-protection headers.
     """
     root = Path(root).resolve()
+    deployment_id = resolve_deployment_id(deployment_id)
     with BuildLock(root, timeout=lock_timeout):
         _preflight_checks(root)
         # Production env files are loaded before any user code runs, so static
@@ -524,6 +617,7 @@ def write_manifest(root, *, lock_timeout=LOCK_TIMEOUT_SECONDS):
         loaded = load_env(root, mode="production")
         manifest = _run_stage("discover", discover, root)
         app, rendered = _run_stage("render", _build_app_and_render, root, manifest)
+        isr_static_paths = _run_stage("isr-warmup", lambda: asyncio.run(_enumerate_isr_static_paths(app)))
         _run_stage("validate", _validate_unchanged, root, manifest)
         # Catch-all normalization over the enumerated static paths (reduced port
         # of Next.js normalizeCatchAllRoutes): report which static pages a
@@ -541,6 +635,8 @@ def write_manifest(root, *, lock_timeout=LOCK_TIMEOUT_SECONDS):
         manifest["isr_policies"] = app.isr_policies
         manifest["layout_policies"] = app.layout_policies
         manifest["isr_queries"] = app.isr_queries
+        manifest["ssg_fallback"] = app.ssg_fallback
+        manifest["isr_static_paths"] = isr_static_paths
         manifest["dynamic_modes"] = app.dynamic_modes
         manifest["client"] = app.client_manifest
         # Prerender report: dynamic accesses recorded while rendering SSG pages
@@ -554,12 +650,34 @@ def write_manifest(root, *, lock_timeout=LOCK_TIMEOUT_SECONDS):
         # which variables were inlined into the island bundles.
         manifest["env_files"] = list(loaded.files)
         manifest["public_env_keys"] = sorted(loaded.public_values)
+        # The build ID names this build's sources (deterministic, so a
+        # rebuild of unchanged sources keeps the ID); the deployment ID
+        # names the deployment the build belongs to, when one is configured.
+        # Both are recorded after the "sources changed during build" check,
+        # so the check still compares plain discover() output — and before
+        # the manifest bytes are rendered, so the BUILD_ID seal covers them.
+        manifest["build_id"] = generate_build_id(manifest)
+        manifest["deployment_id"] = deployment_id
         _run_stage("write-assets", _write_build_assets, root, manifest, rendered, app)
         manifest_bytes = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         _run_stage("write-manifest", _atomic_write, root / MANIFEST, manifest_bytes)
         _run_stage("write-build-id", _write_build_id, root, manifest_bytes)
         _run_stage("prune", _prune_orphans, root, manifest)
         return manifest
+
+
+def _nearest_boundary(dirs, filename, root):
+    """Nearest ``filename`` walking up from the route directory, else None.
+
+    ``dirs`` runs from the app directory down to the route directory, so
+    the reversed walk finds the closest boundary first. Returns the path
+    relative to the project root, like the ``layouts`` entries.
+    """
+    for directory in reversed(dirs):
+        candidate = directory / filename
+        if candidate.is_file():
+            return str(candidate.relative_to(root))
+    return None
 
 
 def _atomic_write(path, contents):
@@ -587,21 +705,30 @@ def _atomic_write(path, contents):
 def _segment_param(segment):
     """Parse one route segment.
 
-    Returns (name, kind) where kind is "dynamic", "catch_all" or
-    "optional", or None for a static segment.
+    Returns (name, kind, prefix, suffix) where kind is "dynamic",
+    "catch_all" or "optional", or None for a static segment. A dynamic
+    parameter may carry a static prefix and/or suffix, as in
+    ``v[version]`` or ``[name].json`` (Next.js PARAMETER_PATTERN in
+    ``get-dynamic-param.ts``); catch-all parameters may not.
     """
-    if not segment.startswith("["):
+    if "[" not in segment:
+        if "]" in segment:
+            raise ValueError(f"Invalid route segment: {segment}")
         return None
-    match = re.fullmatch(r"\[(\[)?(\.\.\.)?([A-Za-z0-9_-]+)\](\])?", segment)
+    match = re.fullmatch(r"([^[]*)\[(\[)?(\.\.\.)?([A-Za-z0-9_-]+)\](\])?(.*)", segment)
     if match is None:
         raise ValueError(f"Invalid route segment: {segment}")
-    double_open, dots, name, double_close = match.groups()
+    prefix, double_open, dots, name, double_close, suffix = match.groups()
     if bool(double_open) != bool(double_close):
         raise ValueError(f"Invalid route segment: {segment}")
     if double_open and not dots:
         raise ValueError(f"Optional catch-all must use [[...name]]: {segment}")
+    if "]" in prefix or "[" in suffix or "]" in suffix:
+        raise ValueError(f"Invalid route segment: {segment}")
     kind = "optional" if double_open else ("catch_all" if dots else "dynamic")
-    return name, kind
+    if kind != "dynamic" and (prefix or suffix):
+        raise ValueError(f"Catch-all parameters cannot have a prefix or suffix: {segment}")
+    return name, kind, prefix, suffix
 
 
 def _route_group(part):
@@ -623,10 +750,19 @@ def _route_group(part):
 def _materialize(pattern, params):
     segments = pattern.strip("/").split("/") if pattern != "/" else []
     keys = {}
+    seen = set()
     for segment in segments:
         parsed = _segment_param(segment)
         if parsed:
-            keys[parsed[0]] = parsed[1]
+            name, kind, _prefix, _suffix = parsed
+            # The Rust router rejects a repeated name in one route; check
+            # here too so _materialize is safe on its own. Names compare
+            # after stripping non-alphanumerics, like the router does.
+            comparable = re.sub(r"[^A-Za-z0-9]", "", name)
+            if comparable in seen:
+                raise ValueError(f"Repeated or ambiguous parameter name: {name}")
+            seen.add(comparable)
+            keys[name] = kind
     if not isinstance(params, dict) or set(params) != set(keys):
         raise ValueError(f"Static params for {pattern} must contain exactly {sorted(keys)}")
     output = []
@@ -635,7 +771,7 @@ def _materialize(pattern, params):
         if not parsed:
             output.append(segment)
             continue
-        name, kind = parsed
+        name, kind, prefix, suffix = parsed
         value = params[name]
         if kind == "catch_all":
             if not isinstance(value, list) or not value:
@@ -655,8 +791,59 @@ def _materialize(pattern, params):
                 part.encode("utf-8")
             except UnicodeEncodeError as exc:
                 raise ValueError(f"Invalid Unicode static parameter in {pattern}") from exc
-            output.append(part)
+            output.append(prefix + part + suffix)
     return "/" + "/".join(output)
+
+
+async def _materialize_params(app, pattern, generator):
+    """Call a ``generate_static_params`` generator and materialize its paths.
+
+    Shared by SSG rendering and ISR warmup enumeration so both validate
+    the same way: the generator must return a list, every entry must
+    materialize to a distinct reachable path, and no generated path may
+    be shadowed by a public file. Raises ``ValueError`` on any violation
+    so a bad generator fails the build instead of surfacing at request
+    time.
+    """
+    from .app import _invoke
+    params_list = [{}] if generator is None else await _invoke(generator)
+    if not isinstance(params_list, list):
+        raise ValueError(f"generate_static_params for {pattern} must return a list")
+    paths = []
+    seen = set()
+    for params in params_list:
+        path = _materialize(pattern, params)
+        if path in seen:
+            raise ValueError(f"Duplicate generated path: {path}")
+        seen.add(path)
+        if path in app.public_assets:
+            raise ValueError(f"Public file shadows a generated page: {path}")
+        match = app.router.matches(path)
+        if match is None or match[0] != pattern:
+            raise ValueError(f"Generated path {path} is not reachable through {pattern}")
+        paths.append(path)
+    return paths
+
+
+async def _enumerate_isr_static_paths(app):
+    """Enumerate (but do not render) ISR ``generate_static_params`` paths.
+
+    The paths are recorded in the manifest so ``pynext start`` can warm
+    the ISR cache from them; rendering itself happens at startup, in the
+    background, so a slow data source never blocks the build or the
+    server from starting.
+    """
+    enumerated = {}
+    total = 0
+    for pattern, generator in app.isr_generators.items():
+        if generator is None:
+            continue
+        paths = await _materialize_params(app, pattern, generator)
+        total += len(paths)
+        if total > MAX_STATIC_PAGES:
+            raise ValueError(f"Static page limit ({MAX_STATIC_PAGES}) exceeded")
+        enumerated[pattern] = paths
+    return enumerated
 
 
 async def _render_static_pages(app):
@@ -703,7 +890,15 @@ async def _render_static_pages(app):
                     body = bytearray()
                     try:
                         async with asyncio.timeout(MAX_STREAMED_STATIC_SECONDS):
+                            # The loading placeholder is for live clients only;
+                            # it must not be baked into the static page.
+                            index = 0
+                            loading_index = getattr(response, "_pynext_loading_index", None)
                             while (chunk := await response._next_chunk()) is not None:
+                                if index == loading_index:
+                                    index += 1
+                                    continue
+                                index += 1
                                 if len(body) + len(chunk) > MAX_STREAMED_STATIC_BYTES:
                                     raise ValueError("Streamed static page exceeds build size limit")
                                 body.extend(chunk)
@@ -786,6 +981,13 @@ def load_manifest(root):
         raise ValueError(f"Invalid build manifest {target}: expected a JSON object; rebuild the application")
     if saved.get("schema_version") != VERSION:
         raise ValueError("Incompatible manifest version; rebuild the application")
+    build_id = saved.get("build_id")
+    if build_id is not None and (not isinstance(build_id, str)
+                                 or not re.fullmatch(r"[0-9a-f]{%d}" % BUILD_ID_LENGTH, build_id)):
+        raise ValueError("Invalid build ID in manifest; rebuild the application")
+    deployment_id = saved.get("deployment_id")
+    if deployment_id is not None and not _validate_deployment_id(deployment_id):
+        raise ValueError("Invalid deployment ID in manifest; rebuild the application")
     # BUILD_ID is written last by a successful build and holds the
     # SHA-256 of the manifest bytes: a manifest left behind by a build
     # that died between writing it and finishing (or hand-edited since)
