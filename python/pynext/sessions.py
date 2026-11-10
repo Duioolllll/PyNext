@@ -81,6 +81,17 @@ _MAX_SESSION_BYTES = 16_384
 # format) carry no prefix, so the two formats are distinguishable on load.
 _ENCRYPTED_PREFIX = "v1:"
 _NONCE_BYTES = 12
+#: ``request.state`` key marking a WebSocket authorization pre-flight
+#: (set by ``Application._authorize_websocket`` on its synthetic GET).
+#: :meth:`SessionMiddleware.__call__` treats a marked request as
+#: read-only for the session: it still loads the session so the
+#: authorization check sees the identity, but it never persists a
+#: change — no save, no rotation, no invalidation. The pre-flight
+#: response is discarded, so a rotated token's ``Set-Cookie`` would
+#: never reach the client while the old token is already gone from
+#: the store (M-15). The key is framework-internal; app middleware
+#: must not set it on ordinary requests.
+WS_PREFLIGHT_STATE_KEY = "_pynext_ws_preflight"
 
 
 def _check_json_serializable(key, value):
@@ -941,6 +952,17 @@ class SessionMiddleware:
         # even when the handler forgets rotate_on_login().
         previous_user_id = session.get("user_id")
         response = await call_next(request)
+        if request.state.get(WS_PREFLIGHT_STATE_KEY):
+            # WebSocket authorization pre-flight: the synthetic response
+            # is discarded, so persisting here could only destroy state.
+            # A rotation would delete the old token while its Set-Cookie
+            # never reaches the client, an invalidation would delete a
+            # live session, and even a plain mutation would store data
+            # (for example a fresh CSRF token) the client never learns
+            # about. The pre-flight is therefore read-only: the session
+            # was loaded for the authorization check, and any mutation
+            # the chain made is dropped with the response.
+            return response
         if not session._invalidated:
             _auto_rotate_on_login(session, previous_user_id)
         changed = session._changed() if not session._invalidated else False

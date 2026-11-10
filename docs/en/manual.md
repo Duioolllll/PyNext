@@ -256,7 +256,7 @@ In the development version, the handshake accepts only a same-origin `Origin` by
 
 For PyNext to identify a trusted proxy on ASGI, the server must preserve the original peer in `scope["client"]`. Disable upstream proxy-header rewriting (for Uvicorn, use `--no-proxy-headers`) when PyNext is responsible for interpreting forwarded headers.
 
-Do not create, rotate or invalidate sessions in WebSocket authorization middleware. The pre-flight response is discarded, including `Set-Cookie`, so a new token will not reach the browser and a rotated old token may already have been removed. Perform login and session changes through ordinary HTTP endpoints before connecting.
+The WebSocket authorization pre-flight is read-only for the session: the session is loaded so the middleware chain and `@require_auth` can see the identity, but a rotation, invalidation or any other mutation made during the pre-flight is never persisted — the pre-flight response is discarded, including `Set-Cookie`, so a new token would not reach the browser and a rotated old token would already have been removed. Perform login and session changes through ordinary HTTP endpoints before connecting.
 
 For authorization pre-flight denials, ASGI sends `websocket.close` with code 1008 before acceptance; an ASGI server normally answers the handshake with HTTP 403. Axum maps pre-flight 401/403 responses to HTTP 403 and all other pre-flight responses or failures to 503. This mapping is separate from the built-in handshake rate limiter, which can return 429.
 
