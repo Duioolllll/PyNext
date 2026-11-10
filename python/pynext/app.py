@@ -2326,11 +2326,12 @@ class App:
         Layouts that opted out with ``@layout(dynamic=True)`` are still
         rendered on every request, exactly as before. Layouts must render
         their children exactly once; anything else fails before headers
-        are sent. Before the response is built, the page stream is
-        inspected with :func:`process_prelude`: a page that yields
-        nothing inside an empty shell fails here instead of going out as
-        a document holding only the client runtime script tag, while
-        headers can still become a 500. SSG consumes the stream during
+        are sent. When the shell is empty, the page stream is inspected
+        with :func:`process_prelude` before the response is built: a page
+        that yields nothing inside an empty shell fails here instead of
+        going out as a document holding only the client runtime script
+        tag, while headers can still become a 500. A non-empty shell
+        streams first with no inspection. SSG consumes the stream during
         the build. ISR streams its first generation while retaining a
         bounded copy for the cache.
 
@@ -2370,19 +2371,24 @@ class App:
             loading_html = await self._render_stream_chunk(node)
 
         # processPrelude-style inspection: look at the first page chunk
-        # without consuming the stream. A page that yields nothing inside
-        # an empty shell would otherwise go out as a document holding only
-        # the client runtime script tag; fail here, before headers are
-        # sent, instead. The runtime tag is boilerplate, not content, so
-        # it is stripped before the emptiness test. A non-empty shell is
-        # still a legitimate (if content-free) page.
-        prelude, prelude_is_empty = await process_prelude(chunks)
-        if (prelude_is_empty and not _strip_client_runtime(prefix)
-                and not _strip_client_runtime(suffix)):
-            raise ValueError(
-                f"Streaming page {pattern} rendered an empty document: "
-                "the page produced no content and the layout shell is empty"
-            )
+        # without consuming the stream — but only when the shell is
+        # empty. The error only fires for an empty page inside an empty
+        # shell, so a non-empty shell needs no inspection; inspecting
+        # first would also hold the shell back while the page's first
+        # chunk is still cooking, breaking shell-first streaming (a
+        # gated page's gate is only released once the shell arrives).
+        # The runtime tag is boilerplate, not content, so it is stripped
+        # before the emptiness test. A non-empty shell is still a
+        # legitimate (if content-free) page.
+        stream = chunks
+        if not _strip_client_runtime(prefix) and not _strip_client_runtime(suffix):
+            prelude, prelude_is_empty = await process_prelude(chunks)
+            if prelude_is_empty:
+                raise ValueError(
+                    f"Streaming page {pattern} rendered an empty document: "
+                    "the page produced no content and the layout shell is empty"
+                )
+            stream = prelude
 
         async def page_stream():
             suffix_sent = False
@@ -2391,7 +2397,7 @@ class App:
                     yield prefix
                 if loading_html:
                     yield loading_html
-                async for node in prelude:
+                async for node in stream:
                     html = await self._render_stream_chunk(node)
                     if html:
                         yield html
@@ -2410,7 +2416,7 @@ class App:
                     yield _STREAM_ERROR_MARKER.decode("ascii") + suffix
                 raise
             finally:
-                close = getattr(prelude, "aclose", None)
+                close = getattr(stream, "aclose", None)
                 if close is not None:
                     await close()
                 if tracker is not None:
