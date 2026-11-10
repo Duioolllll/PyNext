@@ -197,11 +197,15 @@ impl PageCache {
 
     fn fresh_remaining_at(&self, key: &str, now: Instant) -> Option<Duration> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = state.entries.get(key)?;
+        let &slot = state.index.get(key)?;
+        let entry = state.nodes[slot].as_ref().expect("live node");
         let age = now.saturating_duration_since(entry.generated_at);
         if age >= entry.fresh_for.saturating_add(entry.stale_for) {
-            let removed = state.entries.remove(key).expect("entry present");
-            state.total_bytes -= removed.body.len();
+            // Expired entries are dropped, like a lookup would (no evict
+            // hook: this is an expired-entry drop, not a capacity eviction).
+            state.index.remove(key);
+            let removed = state.take(slot);
+            state.total_size -= removed.size;
             return None;
         }
         if age >= entry.fresh_for {
