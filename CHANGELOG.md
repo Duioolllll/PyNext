@@ -2,6 +2,14 @@
 
 All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
 
+<<<<<<< HEAD
+=======
+## Unreleased
+
+- ISR lifetimes are now three axes: `expire` joins `revalidate` and `stale` as the absolute hard cap measured from generation. After `revalidate` an entry is served stale while one background regeneration runs; after `expire` it is never served again (`expire` must be greater than `revalidate`, `float("inf")` caps at one year). `@page(render="isr", ...)` also accepts a named `cache_life` profile (`default`, `seconds`, `minutes`, `hours`, `days`, `weeks`, `max`, matching Next.js `cacheLife` defaults) via `pynext.CACHE_LIFE_PROFILES`; policies written before `expire` keep their old meaning (`expire = revalidate + stale`). The SQLite backend now measures entry lifetimes and leases on the monotonic clock (wall-clock fallback across reboots) and bounds the table to 10,000 rows, purging expired rows and evicting the oldest on insert.
+
+
+>>>>>>> feat/nextjs-p1-cache-life
 ## 0.1.2 (2026-11-09)
 
 - Bound ASGI HTTP/WebSocket rate-limit decisions with one 64-check gate and a 2-second deadline, retain capacity until running callbacks finish, and discard expired/cancelled executor-queued checks before they can charge tokens. Callback failures and invalid decisions fail closed with 503.
