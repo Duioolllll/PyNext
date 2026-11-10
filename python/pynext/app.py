@@ -3496,7 +3496,11 @@ class App:
                 normalized = _decode_path(path, path.encode("utf-8"))
             except (ValueError, UnicodeError) as exc:
                 raise ValueError("Invalid middleware rewrite path") from exc
-            return dataclasses.replace(next_request, path=normalized, params={})
+            # The encoded path must follow the rewrite: _dispatch matches
+            # on raw_path when present, so a stale raw_path would route
+            # the rewritten request to the original URL.
+            encoded = quote(normalized, safe="/!$&'()*+,;=:@-._~")
+            return dataclasses.replace(next_request, path=normalized, raw_path=encoded, params={})
 
         async def _continue(index, current, next_request):
             nonlocal rewrites
