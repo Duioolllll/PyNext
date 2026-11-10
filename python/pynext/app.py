@@ -20,6 +20,7 @@ import traceback
 import uuid
 import warnings
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -60,6 +61,13 @@ from .observability import (
 from .proxy import ProxyTrust
 from .ratelimit import _is_exempt_path, rate_limited_response
 from .sessions import SessionMiddleware
+from .sync_dispatch import (
+    CALL_ASYNC,
+    CALL_ASYNC_GEN,
+    cache_call_kind,
+    cached_call_kind,
+    run_sync_with_context,
+)
 from .static import asset_response
 from .ws_origin import websocket_origin_allowed
 
@@ -249,16 +257,29 @@ def _check_signature(fn, allowed, label):
             raise ValueError(f"Unsupported required parameter {p.name!r} in {label}")
 
 
-async def _invoke(fn, **values):
+async def _invoke(fn, _app=None, **values):
+    """Invoke a page/layout/handler/generator callable.
+
+    The sync/async verdict is the one cached on the callable at
+    registration time (see :func:`pynext.sync_dispatch.cached_call_kind`),
+    not a fresh ``inspect`` per request. Sync callables always run through
+    the app's :meth:`App._invoke_sync` — the single sync entry point —
+    when an app is known, either from ``request._app`` or from the explicit
+    ``_app`` argument (build-time generators and prerenders have no
+    request). Only an app-less direct use falls back to a worker thread
+    with the caller's context copied, and that fallback never touches the
+    entry limiter because there is no app to account the work to.
+    """
     names = inspect.signature(fn).parameters
     kwargs = {key: value for key, value in values.items() if key in names}
-    if inspect.iscoroutinefunction(fn):
+    if cached_call_kind(fn) == CALL_ASYNC:
         return await fn(**kwargs)
     request = values.get("request")
-    if request is not None and request._app is not None:
-        result = await request._app._invoke_sync(fn, kwargs, request)
+    app = request._app if request is not None and request._app is not None else _app
+    if app is not None:
+        result = await app._invoke_sync(fn, kwargs, request)
     else:
-        result = await asyncio.to_thread(fn, **kwargs)
+        result = await run_sync_with_context(fn, **kwargs)
     return await result if inspect.isawaitable(result) else result
 
 
@@ -733,26 +754,61 @@ class App:
             self._inflight = 0
             self._inflight_streams = 0
             self._sync_active = 0
+            # Dedicated single-thread exit executor (C-P1-3c). Sync teardown
+            # work — cache close, shutdown cleanup — runs here through
+            # _run_exit_sync, never on the entry limiter: a shutdown must
+            # not wait behind saturated sync workers, and an in-flight
+            # request must not wait behind a teardown. FastAPI's
+            # dedicated 1-token exit_limiter (fastapi/concurrency.py)
+            # exists for the same deadlock avoidance; here the separation
+            # is a thread of its own, because the entry limiter counts
+            # threads, not tokens. Layout-shell release and the dynamic
+            # tracker __exit__ need no thread at all (loop-local dict /
+            # contextvar ops), so they never contend with either lane.
+            self._exit_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pynext-exit")
+            self._exit_executor_retired = False
             self._inflight_lock = threading.Lock()
             self._asgi_admission = DecisionGate(ASGI_DECISION_CAPACITY, ASGI_DECISION_TIMEOUT)
         except BaseException:
+            self._shutdown_exit_executor()
             self._release_modules()
             raise
 
-    async def _invoke_sync(self, fn, kwargs, request):
+    async def _invoke_sync(self, fn, kwargs, request=None):
         # Keep capacity occupied until the actual thread finishes, even if
         # the awaiter timed out. Cancellation cannot stop a Python thread.
-        request.check_cancelled()
+        # ``request`` is None for request-less invocations (build-time
+        # generate_static_params, prerenders): the same limiter still
+        # accounts the work, only the cancellation checks are skipped.
+        if request is not None:
+            request.check_cancelled()
         with self._inflight_lock:
             if self._sync_active >= self.sync_workers:
                 raise _SyncHandlerBusy()
             self._sync_active += 1
 
         def run():
-            request.check_cancelled()  # a cancelled queued job never starts
+            if request is not None:
+                request.check_cancelled()  # a cancelled queued job never starts
             return fn(**kwargs)
 
-        task = asyncio.create_task(asyncio.to_thread(run))
+        # Context propagation (C-P1-4): copy the calling context and run
+        # the sync callable inside it on the worker thread — Litestar's
+        # sync_to_thread shape (litestar/concurrency.py:37-40). The
+        # worker sees the request scope (request id, tracing, logging
+        # contextvars); ``asyncio.to_thread`` did this implicitly, and
+        # spelling it out keeps the guarantee when the executor changes
+        # (C-P1-1 moves this onto the app-owned sync pool, same shape).
+        # The executor future is awaited inside a real task, not via
+        # wrap_future on the concurrent future: with a wrapped future
+        # the done-callback below runs *after* the awaiting coroutine
+        # resumes, so _sync_active would still read busy when the next
+        # _invoke_sync acquires.
+        async def _run_on_pool():
+            return await run_sync_with_context(run)
+
+        task = asyncio.create_task(_run_on_pool())
 
         def finished(done):
             with self._inflight_lock:
@@ -760,15 +816,58 @@ class App:
             # A timed-out awaiter cannot retrieve a late exception/result.
             if not done.cancelled():
                 error = done.exception()
-                if error is None and request.cancelled and inspect.iscoroutine(done.result()):
+                if error is None and request is not None and request.cancelled and inspect.iscoroutine(done.result()):
                     done.result().close()
 
         task.add_done_callback(finished)
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
-            request._cancel_event.set()
+            if request is not None:
+                request._cancel_event.set()
             raise
+
+    async def _run_exit_sync(self, fn, *args, **kwargs):
+        """Run sync teardown work on the dedicated exit executor (C-P1-3c).
+
+        The exit lane never touches ``_sync_active`` or the entry limiter,
+        so teardown (cache close, shutdown cleanup) cannot deadlock
+        behind saturated sync workers — and a sync handler can never be
+        starved by a teardown holding an entry slot. The caller's context
+        is copied into the worker, as in :meth:`_invoke_sync`.
+        """
+        return await run_sync_with_context(
+            fn, *args, executor=self._ensure_exit_executor(), **kwargs)
+
+    def _ensure_exit_executor(self):
+        """Return a live exit executor, creating (or recreating) it if needed.
+
+        The pool is retired by :meth:`_shutdown_exit_executor`, but an App
+        can be restarted (startup → shutdown → startup, as the resources
+        tests exercise), so the next startup or teardown recreates it
+        instead of submitting to a dead pool — ``ThreadPoolExecutor``
+        raises ``RuntimeError`` after shutdown.
+        """
+        if getattr(self, "_exit_executor", None) is None or getattr(
+                self, "_exit_executor_retired", False):
+            self._exit_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pynext-exit")
+            self._exit_executor_retired = False
+        return self._exit_executor
+
+    def _shutdown_exit_executor(self):
+        """Stop the exit pool without waiting for stuck teardown work.
+
+        A running sync teardown cannot be cancelled (Python threads), so
+        shutdown never blocks on one; queued-but-unstarted work is
+        dropped. Safe to call before the pool exists, and safe to call
+        twice. Marks the pool retired so :meth:`_ensure_exit_executor`
+        recreates it if the app is restarted.
+        """
+        executor = getattr(self, "_exit_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._exit_executor_retired = True
 
     def configure_observability(self, config):
         """Apply a new observability config to this app (logging + metrics)."""
@@ -967,6 +1066,18 @@ class App:
                     getattr(layout_fn, "__pynext_layout_dynamic__", False) for layout_fn in layouts
                 )
                 self.entries[pattern] = (fn, layouts)
+                # Sync/async verdicts, cached once at registration (C-P1-3a):
+                # _invoke reads the stamp instead of inspecting the
+                # callable on every request. The stamp lives on the
+                # callable, like the __pynext_page__ / __pynext_layout__
+                # markers the decorators already set.
+                cache_call_kind(fn)
+                for layout_fn in layouts:
+                    cache_call_kind(layout_fn)
+                if mode == "ssg":
+                    generator = self.static_generators.get(pattern)
+                    if generator is not None:
+                        cache_call_kind(generator)
                 self.entry_layouts[pattern] = tuple(layout_relatives)
             else:
                 handlers = {}
@@ -988,6 +1099,11 @@ class App:
                 if ws_handler is not None:
                     self.websocket_entries[pattern] = ws_handler
                 self.entries[pattern] = handlers
+                # Sync/async verdicts, cached once at registration (C-P1-3a).
+                for handler_fn in handlers.values():
+                    cache_call_kind(handler_fn)
+                if ws_handler is not None:
+                    cache_call_kind(ws_handler)
         if production:
             from .build import read_static_pages
             if manifest.get("render_modes") != self.render_modes:
@@ -1124,6 +1240,9 @@ class App:
         if self._started:
             return
         self._draining = False
+        # A restart after a shutdown recreates the retired exit pool
+        # before anything can submit teardown work to it.
+        self._ensure_exit_executor()
         self.isr.open()
         try:
             for resource in self.resources.values():
@@ -1136,7 +1255,10 @@ class App:
                 except Exception:
                     log.exception("Resource cleanup after startup failure failed")
             self._resources_started.clear()
-            await self.isr.close()
+            # Cache teardown runs on the exit lane (C-P1-3c), not the
+            # entry limiter: startup may fail while sync workers are
+            # still busy, and the close must not wait behind them.
+            await self.isr.close(executor=self._ensure_exit_executor())
             raise
         self._started = True
 
@@ -1160,12 +1282,20 @@ class App:
         self._resources_started.clear()
         self._started = False
         try:
-            await self.isr.close()
+            # Cache teardown runs on the exit lane (C-P1-3c): closing the
+            # shared cache must not wait behind in-flight sync handlers.
+            # The pool is ensured live first, so a repeated shutdown (or a
+            # shutdown after a restart) never submits to a retired pool.
+            await self.isr.close(executor=self._ensure_exit_executor())
         except Exception as exc:
             if error is None:
                 error = exc
             else:
                 log.exception("Cache shutdown failed")
+        finally:
+            # The exit pool is retired only after the last teardown that
+            # uses it has finished (or failed).
+            self._shutdown_exit_executor()
         if error is not None:
             raise error
 
@@ -1464,7 +1594,7 @@ class App:
             paths = {pattern}
         else:
             try:
-                params_list = await _invoke(generator)
+                params_list = await _invoke(generator, _app=self)
                 paths = {_materialize(pattern, params) for params in params_list}
             except Exception:
                 log.warning("Cannot determine generated SSG paths for %s; "
@@ -1850,7 +1980,7 @@ class App:
 
     async def _render_page_inner(self, pattern, fn, layouts, request, params, query, csp_nonce,
                                  tracker=None):
-        if inspect.isasyncgenfunction(fn):
+        if cached_call_kind(fn) == CALL_ASYNC_GEN:
             # Calling an async generator function only creates the iterator;
             # its body runs when the stream is first pulled. Call it directly
             # instead of _invoke, which would run it on a worker thread.

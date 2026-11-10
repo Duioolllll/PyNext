@@ -36,6 +36,7 @@ from collections import OrderedDict
 from . import _native
 from .components import MAX_CACHE_SECONDS, _validate_tag, _validate_tag_expire, _validate_tags
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
+from .sync_dispatch import run_sync_with_context
 
 log = logging.getLogger("pynext")
 MAX_INFLIGHT = 128
@@ -1144,7 +1145,14 @@ class ISRCache:
             self.shared = RedisCacheBackend(self._cache_url)
         self._closed = False
 
-    async def close(self):
+    async def close(self, executor=None):
+        """Cancel in-flight generations and close the shared backend.
+
+        ``executor`` is the thread pool the blocking ``shared.close()``
+        runs on. Callers pass the app's exit executor (C-P1-3c) so cache
+        teardown never waits behind the sync entry limiter; ``None`` keeps
+        the loop's default executor, as before.
+        """
         self._closed = True
         tasks = list(self._tasks)
         for task in tasks:
@@ -1160,7 +1168,10 @@ class ISRCache:
         self._cached_paths.clear()
         self._loop = None
         if self.shared is not None:
-            await asyncio.to_thread(self.shared.close)
+            if executor is None:
+                await asyncio.to_thread(self.shared.close)
+            else:
+                await run_sync_with_context(self.shared.close, executor=executor)
             self.shared = None
 
     def _check_loop(self):
