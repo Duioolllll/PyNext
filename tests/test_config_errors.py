@@ -276,6 +276,12 @@ def test_production_render_mode_mismatch_names_manifest(tmp_path):
     manifest = json.loads(manifest_path.read_text())
     manifest["render_modes"]["/"] = "ssg"
     manifest_path.write_text(json.dumps(manifest))
+    # The edited manifest is a new build output, so its BUILD_ID seal
+    # must be refreshed too — otherwise load_manifest rejects it as an
+    # incomplete build before the render modes are even checked.
+    from pynext.build import build_id_for
+    (tmp_path / ".pynext" / "BUILD_ID").write_text(
+        build_id_for(manifest_path.read_bytes()) + "\n", encoding="utf-8")
     with pytest.raises(ValueError) as excinfo:
         create_app(tmp_path, production=True)
     message = str(excinfo.value)
