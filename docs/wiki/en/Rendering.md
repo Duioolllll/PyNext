@@ -32,6 +32,8 @@ def Page(params):
 
 Place this in `app/guides/[slug]/page.py`. Run `pynext build --dir PROJECT`. Only generated dynamic paths are served in production; other paths return **404**. A static route needs no generator. Builds are capped at **10,000** generated SSG pages. **SSG page functions must not accept `request`**; they render public content at build time.
 
+Static renders are tracked for dynamic accesses: `time.time()`, `datetime.now()`, `random.*`, `uuid.uuid4()`, and `Database.session()` reads during a prerender are recorded with the page position that read them. The default `@page(dynamic="auto")` keeps building and records the accesses in the build manifest's `dynamic_accesses` report with a warning; `@page(dynamic="error")` fails the build — or the ISR generation — on the first recorded access; `@page(render="ssg", dynamic="force-dynamic")` skips build-time generation and serves the page dynamically in production instead. `no_store()` marks a scope dynamic on purpose, and `mark_dynamic_access("...")` records anything else the automatic hooks cannot see (an external fetch, or a `from datetime import datetime` binding, which escapes the prerender patch). In development, requesting an SSG path that `generate_static_params()` would not produce logs a warning that it will 404 in production; `pynext dev --strict-ssg` (or `create_app(..., strict_ssg=True)`) answers 404 in development as well.
+
 ## ISR (public content)
 
 ~~~python

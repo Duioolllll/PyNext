@@ -115,7 +115,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                  header_read_timeout_ms=None, body_min_rate_bytes_per_sec=None,
                  trusted_proxies=(), cache_failure_policy=None,
                  shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout,
-                 max_waiting=None, config=None, cli_overrides=None):
+                 max_waiting=None, strict_ssg=False, config=None, cli_overrides=None):
     """Serve the app in development mode, replacing changed island bundles.
 
     Other file changes restart the server on the same port and reload open
@@ -143,6 +143,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
         "trusted_proxies": trusted_proxies,
         "cache_failure_policy": cache_failure_policy,
         "shutdown_timeout": shutdown_timeout, "max_waiting": max_waiting,
+        "strict_ssg": strict_ssg,
     }
 
     def refresh_settings():
@@ -189,6 +190,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                           security=settings["security"],
                           websocket_max_message=settings["websocket_max_message"],
                           hot_reload=True, trusted_proxies=settings["trusted_proxies"],
+                          strict_ssg=settings["strict_ssg"],
                           **({"cache_failure_policy": settings["cache_failure_policy"]}
                              if settings["cache_failure_policy"] is not None else {}))
 
@@ -576,28 +578,11 @@ def _build_parser():
                                  default=DEFAULT_CONFIG.shutdown_timeout,
                                  help="seconds to let in-flight requests finish and WebSockets close "
                                       "after SIGTERM before the server stops anyway (default 30; max 3600)")
+            command.add_argument("--strict-ssg", action="store_true",
+                                 help="development only: answer 404 for SSG paths that "
+                                      "generate_static_params would not produce, like production does, "
+                                      "instead of rendering them with a warning")
     return parser
-
-
-def main():
-    parser = _build_parser()
-    # Resolve the config before the real parse: the config file (plus the
-    # environment) seeds the parser defaults, and explicit CLI options
-    # override them by being present. A fatal config error fails here,
-    # before anything starts (exit code 2, no traceback).
-    explicit = _explicit_cli_values(parser, sys.argv)
-    command = explicit.get("command")
-    root = Path(explicit.get("dir", ".")).resolve()
-    resolved = None
-    cli_overrides = {}
-    if command in ("dev", "build", "start"):
-        cli_overrides = {key: explicit[dest] for dest, key in _CLI_CONFIG_MAP.items()
-                         if dest in explicit}
-        try:
-            resolved = load_config(root, command, cli_overrides=cli_overrides)
-        except ConfigError as exc:
-            parser.error(str(exc))
-        _apply_config_defaults(parser, resolved)
     args = parser.parse_args()
     # Repeatable options replace the config file list instead of adding
     # to it: the probe captured the CLI-only values for those.
@@ -694,7 +679,7 @@ def main():
                               cache_failure_policy=args.cache_failure_policy,
                               observability=obs_config, security=security,
                               websocket_max_message=args.ws_max_message_bytes,
-                              shutdown_timeout=args.shutdown_timeout)
+                              shutdown_timeout=args.shutdown_timeout, strict_ssg=args.strict_ssg)
         return run_supervisor(config, workers=args.workers)
     if args.command == "dev":
         try:
@@ -707,6 +692,7 @@ def main():
                                 trusted_proxies=args.trusted_proxy,
                                 shutdown_timeout=args.shutdown_timeout, max_waiting=args.max_waiting,
                                 config=resolved, cli_overrides=cli_overrides,
+                                strict_ssg=args.strict_ssg,
                                 **extra, **conn_kwargs))
         except KeyboardInterrupt:
             pass
@@ -720,7 +706,8 @@ def main():
                          **({"cache_failure_policy": args.cache_failure_policy}
                             if args.cache_failure_policy != "fail_open" else {}),
                          **({"websocket_max_message": args.ws_max_message_bytes}
-                            if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}), **extra)
+                            if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}),
+                         **({"strict_ssg": True} if args.strict_ssg else {}), **extra)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     try:

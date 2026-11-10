@@ -395,13 +395,20 @@ def _isr_query_keys(keys):
     return sorted(keys)
 
 
-def page(*, render="ssr", revalidate=None, stale=None, expire=None, cache_life=None, query_keys=()):
+def page(*, render="ssr", revalidate=None, stale=None, expire=None, cache_life=None, query_keys=(),
+         dynamic="auto"):
     """Declare a page. ISR pages take a lifetime in one of two forms:
     explicit numbers (``revalidate`` + ``stale`` and/or ``expire`` — see
     :func:`_isr_policy`) or a named profile (``cache_life="hours"`` — see
     :data:`CACHE_LIFE_PROFILES`). The two forms cannot be combined."""
     if render not in {"ssr", "ssg", "isr"}:
         raise ValueError("render must be 'ssr', 'ssg', or 'isr'")
+    if dynamic not in {"auto", "error", "force-dynamic"}:
+        raise ValueError("dynamic must be 'auto', 'error', or 'force-dynamic'")
+    if dynamic != "auto" and render == "ssr":
+        raise ValueError("dynamic is only valid for SSG and ISR pages")
+    if dynamic == "force-dynamic" and render != "ssg":
+        raise ValueError("dynamic='force-dynamic' is only valid for SSG pages")
     if render == "isr":
         if cache_life is not None:
             if revalidate is not None or stale is not None or expire is not None:
@@ -420,6 +427,7 @@ def page(*, render="ssr", revalidate=None, stale=None, expire=None, cache_life=N
         fn.__pynext_render__ = render
         fn.__pynext_cache_policy__ = policy
         fn.__pynext_cache_query__ = query_keys
+        fn.__pynext_dynamic__ = dynamic
         return fn
     return decorate
 

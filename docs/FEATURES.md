@@ -88,6 +88,10 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `load_env` | `pynext.env` |
 | `public_env_defines` | `pynext.env` |
 | `public_env_vars` | `pynext.env` |
+| `no_store` | `pynext.dynamic` |
+| `mark_dynamic_access` | `pynext.dynamic` |
+| `StaticGenBailoutError` | `pynext.dynamic` |
+| `is_prerender_bailout` | `pynext.dynamic` |
 
 ## Security defaults (`SecurityConfig`)
 
