@@ -5,7 +5,7 @@ from importlib.metadata import version as _distribution_version
 __version__ = _distribution_version("pynext-framework")
 
 from .app import App, create_app
-from .auth import require_auth, require_permission
+from .auth import LoginRateLimiter, require_auth, require_permission
 from .client_dsl import ClientDSLCompileError, compile_client_dsl
 from .components import CACHE_LIFE_PROFILES, h, fragment, island, layout, model_prop, page
 from .database import Database
@@ -47,6 +47,7 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "ObservabilityConfig", "MetricsCollector", "WebSocket", "WebSocketDisconnect", "MAX_WS_MESSAGE",
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
            "Session", "SessionMiddleware", "SQLiteSessionStore", "RedisSessionStore", "require_auth", "require_permission",
+           "LoginRateLimiter",
            "RedisRateLimiter", "WebSocketPubSub", "PubSubOverflow",
            "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies", "FAIL_OPEN", "FAIL_CLOSED",
            "LoadedEnv", "env_file_names", "load_env", "public_env_defines", "public_env_vars",

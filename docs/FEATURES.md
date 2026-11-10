@@ -79,6 +79,7 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `RedisSessionStore` | `pynext.sessions` |
 | `require_auth` | `pynext.auth` |
 | `require_permission` | `pynext.auth` |
+| `LoginRateLimiter` | `pynext.auth` |
 | `RedisRateLimiter` | `pynext.redis_rate` |
 | `WebSocketPubSub` | `pynext.pubsub` |
 | `PubSubOverflow` | `pynext.pubsub` |
