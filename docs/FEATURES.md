@@ -98,6 +98,10 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `fetch_cache_store_key` | `pynext.fetch_cache` |
 | `generate_fetch_cache_key` | `pynext.fetch_cache` |
 | `generate_simple_fetch_cache_key` | `pynext.fetch_cache` |
+| `MiddlewareScope` | `pynext.middleware` |
+| `RouteHas` | `pynext.middleware` |
+| `ScopedMiddleware` | `pynext.middleware` |
+| `scoped` | `pynext.middleware` |
 
 ## Security defaults (`SecurityConfig`)
 

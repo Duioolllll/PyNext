@@ -23,6 +23,7 @@ from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, Request, RequestCan
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_security_headers,
                    content_security_policy, csrf_protect, new_csrf_token, new_csp_nonce,
                    security_headers, set_csrf_cookie, sign_csrf_token, validate_csrf)
+from .middleware import MiddlewareScope, RouteHas, ScopedMiddleware, scoped
 from .observability import MetricsCollector, ObservabilityConfig
 from .proxy import ProxyTrust, ResolvedProxy, parse_trusted_proxies
 from .pubsub import PubSubOverflow, WebSocketPubSub
@@ -49,4 +50,5 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "LoadedEnv", "env_file_names", "load_env", "public_env_defines", "public_env_vars",
            "no_store", "mark_dynamic_access", "StaticGenBailoutError", "is_prerender_bailout",
            "FetchCacheDecision", "apply_fetch_revalidate", "decide_fetch_cache", "fetch_cache_store_key",
-           "generate_fetch_cache_key", "generate_simple_fetch_cache_key"]
+           "generate_fetch_cache_key", "generate_simple_fetch_cache_key",
+           "MiddlewareScope", "RouteHas", "ScopedMiddleware", "scoped"]

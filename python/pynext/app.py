@@ -40,6 +40,7 @@ from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Reque
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
+from .middleware import ScopedMiddleware
 from .observability import (
     MetricsCollector,
     ObservabilityConfig,
@@ -601,9 +602,12 @@ class App:
                 # SecurityConfig(csrf_enabled=False). Without sessions the
                 # default stays off (opt in with csrf_enabled=True or
                 # @csrf_protect) so token-less API clients keep working.
+                # A scoped SessionMiddleware still counts: unwrap the scope
+                # so CSRF auto-enable sees the middleware inside.
                 security = dataclasses.replace(
                     security,
-                    csrf_enabled=any(isinstance(item, SessionMiddleware)
+                    csrf_enabled=any(isinstance(item.middleware if isinstance(item, ScopedMiddleware)
+                                                 else item, SessionMiddleware)
                                      for item in self.middleware))
                 self.security = security
             if resources is None:

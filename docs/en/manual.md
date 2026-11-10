@@ -194,6 +194,32 @@ Static files, SSG pages and cached ISR responses are served directly by the nati
 
 The default CSP is `script-src 'self'; object-src 'none'`. With `SecurityConfig(csp_nonce_enabled=True)`, each dynamically rendered page gets a fresh per-request nonce: the header becomes `script-src 'self' 'nonce-<value>'; object-src 'none'`, and the same nonce is added to the island runtime `<script>` tag. The nonce differs on every response, so do not cache a nonce-bearing page yourself. Pre-rendered SSG pages, cached ISR responses and static files keep the static policy without a nonce: a nonce baked into shared HTML would be reused across responses, which defeats its purpose. ISR pages requested with a Cookie or Authorization header are rendered fresh per request, so they do get a nonce.
 
+## Middleware scopes
+
+Middleware runs as one global chain by default: every registered middleware runs for every request. Wrap one middleware with `pynext.scoped` to run it only when a condition holds (Next.js-style `has`/`missing` matchers):
+
+~~~python
+from pynext import Response, scoped
+
+async def require_token(request, call_next):
+    token = next((value for key, value in request.headers
+                  if key.lower() == b"x-token"), None)
+    if token != b"secret":
+        return Response("forbidden", status=403)
+    return await call_next(request)
+
+MIDDLEWARE = [
+    scoped(require_token, source="/api/[...rest]"),
+    scoped(require_token, source="/admin/[section]",
+           has=[{"type": "cookie", "key": "admin"}],
+           missing=[{"type": "query", "key": "preview"}]),
+]
+~~~
+
+`source` is a path pattern in PyNext route syntax (`/api/[...rest]`, `/admin/[id]`, `/docs/[[...path]]`). `has` conditions must all hold and `missing` conditions must all fail for the middleware to run. Each condition is `{"type": "header" | "query" | "cookie" | "host", "key": ..., "value": ...}` (`host` takes a `value` and no `key`). With no `value` the condition is an existence check; with a `value` it is a full-match regular expression. Out of scope, the middleware is skipped transparently: it never runs, and the rest of the chain proceeds as if it were not registered. The same scope gates the WebSocket pre-flight, so a scoped middleware applies to upgrades exactly as it does to HTTP.
+
+Scopes are compiled once at registration: an invalid pattern, key or regex raises `ValueError` when the app starts, not per request. Value regexes are capped at 1024 characters. The source is matched against the decoded path and, when the transport recorded one, the raw request target, so an encoded path cannot dodge a scoped middleware; a scope that cannot be evaluated (for example a malformed query string) runs the middleware rather than skipping it.
+
 ## Streaming API responses
 
 Return `StreamingResponse` from an API handler with an asynchronous iterable of strings or bytes. ASGI and Axum send chunks incrementally and close the iterator on completion, disconnect, or error. Each chunk is limited to 1 MiB. Do not set `Content-Length` or `Transfer-Encoding`; the server selects protocol framing. Axum allows one queued chunk and stops a stalled chunk or backpressure wait after 30 seconds. Once response headers are sent, an error ends the stream rather than changing its status. HEAD does not iterate the stream. This is not React/RSC streaming.
