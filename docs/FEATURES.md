@@ -132,7 +132,7 @@ Fields of `pynext.http.SecurityConfig` with their defaults.
 | `hsts_include_subdomains` | `True` |
 | `hsts_preload` | `False` |
 | `frame_options` | `'DENY'` |
-| `referrer_policy` | `'strict-origin-when-cross-origin'` |
+| `referrer_policy` | `'same-origin'` |
 | `permissions_policy` | `'camera=(), microphone=(), geolocation=()'` |
 | `csp_style_src` | `"'self'"` |
 | `csp_frame_ancestors` | `"'none'"` |

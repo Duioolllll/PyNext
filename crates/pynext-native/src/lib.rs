@@ -1505,7 +1505,20 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
             Ok(upgrade) => upgrade,
             Err(rejection) => {
-                return rejection.into_response();
+                // A failed upgrade is still an HTTP response: give it
+                // the same A1 security headers every other Rust-built
+                // response carries instead of axum's bare rejection.
+                let mut response = rejection.into_response();
+                for (name, value) in &state.security_headers {
+                    if let (Ok(name), Ok(value)) =
+                        (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+                    {
+                        if !response.headers().contains_key(&name) {
+                            response.headers_mut().insert(name, value);
+                        }
+                    }
+                }
+                return response;
             }
         };
         // Bound the protocol-level message size as well as the application

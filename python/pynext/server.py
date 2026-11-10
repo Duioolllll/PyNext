@@ -538,8 +538,25 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
         return _websocket_callback(app, loop, path, query, filter_internal_headers(headers), subprotocol)
 
     def ws_origin_callback(headers, peer_ip):
-        return websocket_origin_allowed(filter_internal_headers(headers), peer_ip, "http",
-                                        app.proxy_trust, app.security)
+        # Log denials here (the native branch answers 403 itself): a
+        # rejected handshake must be observable in the server log on
+        # this transport too, exactly like the ASGI handler logs its
+        # own 403. Exceptions propagate so Rust still fails closed
+        # with 503.
+        filtered = filter_internal_headers(headers)
+        allowed = websocket_origin_allowed(filtered, peer_ip, "http",
+                                           app.proxy_trust, app.security)
+        if not allowed:
+            origin = None
+            for name, value in filtered:
+                if (isinstance(name, (bytes, bytearray))
+                        and isinstance(value, (bytes, bytearray))
+                        and bytes(name).lower() == b"origin"):
+                    origin = bytes(value).decode("ascii", "replace")
+                    break
+            log.warning("WebSocket handshake denied by origin policy: origin=%r peer=%s",
+                        origin, peer_ip)
+        return allowed
 
     # One charge per request, including WebSocket handshakes. Rust runs
     # this before polling HTTP bodies or accepting upgrades. Health

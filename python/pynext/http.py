@@ -214,10 +214,23 @@ class SecurityConfig:
     pass ``csrf_cookie_secure=False`` to the app config and to
     :func:`set_csrf_cookie` (or use ``pynext dev``, which does that).
 
-    WebSocket handshakes require a same-origin ``Origin`` by default.
-    Additional origins can be listed in ``websocket_allowed_origins``;
-    ``websocket_allow_missing_origin`` opts non-browser clients without
-    the header in. Origin checking does not replace authentication.
+    WebSocket handshakes require a same-origin ``Origin`` by default,
+    on both the ASGI and the native (Axum) transports: the check runs
+    once, before the 101 response, in :func:`pynext.ws_origin.websocket_origin_allowed`,
+    and a denied handshake is answered HTTP 403 and logged (never a
+    silent close). Allowlist semantics: ``websocket_allowed_origins``
+    holds exact serialized HTTP(S) origins — scheme, host and port all
+    take part in the comparison, with the default port implied
+    (``https://client.example`` matches ``:443`` and nothing else);
+    ``*``, ``null``, userinfo, paths, queries and fragments are
+    rejected as values, and a request carrying a duplicate or
+    unparseable ``Origin`` (or duplicate ``Host``) is denied. Without
+    an allowlist hit the origin must equal the request's effective
+    origin (``Host`` header, resolved through :class:`ProxyTrust` for
+    trusted proxies only). A missing ``Origin`` is denied unless
+    ``websocket_allow_missing_origin`` opts non-browser clients in
+    explicitly. Origin checking does not replace authentication: the
+    header is client-controlled and can be forged or omitted.
     """
 
     csrf_enabled: bool | None = None
@@ -240,7 +253,7 @@ class SecurityConfig:
     hsts_include_subdomains: bool = True
     hsts_preload: bool = False
     frame_options: str | None = "DENY"
-    referrer_policy: str | None = "strict-origin-when-cross-origin"
+    referrer_policy: str | None = "same-origin"
     permissions_policy: str | None = "camera=(), microphone=(), geolocation=()"
     csp_style_src: str = "'self'"
     csp_frame_ancestors: str = "'none'"
