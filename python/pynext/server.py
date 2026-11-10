@@ -951,19 +951,22 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
 
     Graceful shutdown (B6), in order: the app stops advertising
     readiness (``/readyz`` starts returning 503), live WebSocket
-    sessions get a clean 1001 close, in-flight HTTP requests and
-    streaming bodies are waited out for up to ``shutdown_timeout``
-    seconds, background ISR regenerations get whatever of that same
-    budget is left to finish, the native server stops and drains its
-    connections (bounded by the same timeout), and finally the app
-    shuts its resources down. New connections are still accepted
-    during the drain, so a load balancer keeps reaching ``/healthz``
-    (200) and ``/readyz`` (503) while in-flight requests finish; the
-    listener closes only when the server stops. A request that is
-    still running when the timeout expires is abandoned: the server
-    stops anyway and the timeout is logged, rather than hanging the
-    shutdown forever. A background regeneration still running at that
-    point is cancelled the same way.
+    sessions get a clean 1001 close (at most 5s of the remaining
+    budget), in-flight HTTP requests and streaming bodies are waited
+    out together with background ISR regenerations — the two waits run
+    concurrently and share what is left of ``shutdown_timeout``, so a
+    slow in-flight wait cannot starve a regeneration that started
+    while serving stale — the native server then stops and drains its
+    connections with whatever of the same budget is left, and finally
+    the app shuts its resources down. The whole shutdown stays within
+    ``shutdown_timeout`` seconds of the stop request. New connections
+    are still accepted during the drain, so a load balancer keeps
+    reaching ``/healthz`` (200) and ``/readyz`` (503) while in-flight
+    requests finish; the listener closes only when the server stops.
+    A request that is still running when the timeout expires is
+    abandoned: the server stops anyway and the timeout is logged,
+    rather than hanging the shutdown forever. A background regeneration
+    still running at that point is cancelled the same way.
 
     Keep-alive policy: an idle keep-alive connection is closed after
     ``header_read_timeout_ms`` (default 10s) without a complete request
@@ -1026,40 +1029,56 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
         await stop_event.wait()
     finally:
         # Two-phase drain (C-P2-5): one shared shutdown budget starting
-        # here. First stop advertising readiness, then wait out what is
-        # already in flight, then let background work finish with what
-        # is left; whatever is still running is cancelled in
-        # app.shutdown(), so shutdown stays bounded instead of hanging
-        # on a stuck request or regeneration. New connections are still
-        # accepted during the drain (the listener closes only in
-        # server.stop() below): a load balancer must still reach
-        # /healthz (200) and /readyz (503) while in-flight requests
-        # finish, and a client without an idle keep-alive connection
-        # would otherwise be refused outright.
+        # here. Every stage gets only what is left of it, so the whole
+        # shutdown stays within shutdown_timeout instead of each stage
+        # taking a fresh full budget. First stop advertising readiness,
+        # then close WebSockets (at most 5s of the remaining budget),
+        # then wait out what is already in flight and let background
+        # work finish — concurrently, so a slow in-flight wait cannot
+        # starve the background wait: run sequentially, a regeneration
+        # that started while serving stale would be skipped entirely
+        # whenever the in-flight wait consumed the budget, exactly when
+        # it is most likely still running. Finally the native server
+        # stops with whatever is left for its connection drain.
+        # Whatever is still running is cancelled in app.shutdown(), so
+        # shutdown stays bounded instead of hanging on a stuck request
+        # or regeneration. New connections are still accepted during the
+        # drain (the listener closes only in server.stop() below): a
+        # load balancer must still reach /healthz (200) and /readyz
+        # (503) while in-flight requests finish, and a client without
+        # an idle keep-alive connection would otherwise be refused
+        # outright.
         drain_deadline = time.monotonic() + shutdown_timeout
         app.begin_drain()
         try:
-            await app.close_websockets(timeout=min(5.0, shutdown_timeout))
+            remaining = max(0.0, drain_deadline - time.monotonic())
+            await app.close_websockets(timeout=min(5.0, remaining))
         except Exception:
             log.exception("WebSocket drain failed")
         try:
-            if not await app.wait_for_inflight(shutdown_timeout):
-                log.warning("Proceeding with shutdown after %.1fs with requests still in flight",
-                            shutdown_timeout)
-        except Exception:
-            log.exception("Inflight drain wait failed")
-        try:
-            # Background work (C-P2-5): an ISR regeneration that started
-            # while serving stale gets the budget that is left to finish
-            # and publish its result; a regeneration still running when
-            # the budget runs out is cancelled by app.shutdown() below.
+            # In-flight requests and background ISR regenerations share
+            # the remaining budget concurrently (see above): neither
+            # waits for the other to finish first.
             remaining = drain_deadline - time.monotonic()
-            if remaining > 0 and not await app.isr.wait_for_background(remaining):
-                log.warning("Proceeding with shutdown with ISR regenerations still running")
+            if remaining > 0:
+                inflight_done, background_done = await asyncio.gather(
+                    app.wait_for_inflight(remaining),
+                    app.isr.wait_for_background(remaining),
+                    return_exceptions=True)
+                if isinstance(inflight_done, Exception):
+                    log.exception("Inflight drain wait failed", exc_info=inflight_done)
+                elif not inflight_done:
+                    log.warning("Proceeding with shutdown after %.1fs with requests still in flight",
+                                shutdown_timeout)
+                if isinstance(background_done, Exception):
+                    log.exception("Background drain wait failed", exc_info=background_done)
+                elif not background_done:
+                    log.warning("Proceeding with shutdown with ISR regenerations still running")
         except Exception:
-            log.exception("Background drain wait failed")
+            log.exception("Drain wait failed")
         try:
             if server is not None:
-                await asyncio.to_thread(server.stop)
+                remaining = max(0.0, drain_deadline - time.monotonic())
+                await asyncio.to_thread(server.stop, remaining)
         finally:
             await app.shutdown()

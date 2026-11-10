@@ -3281,7 +3281,9 @@ fn take_python_listener(_py: Python<'_>, _listener: Py<PyAny>) -> PyResult<std::
 
 #[pyclass]
 struct NativeServer {
-    shutdown: Option<oneshot::Sender<()>>,
+    // stop() may pass the shutdown budget that is left when it is
+    // called; None keeps the construction-time drain bound.
+    shutdown: Option<oneshot::Sender<Option<Duration>>>,
     thread: Option<JoinHandle<()>>,
     #[pyo3(get)]
     address: String,
@@ -3506,7 +3508,7 @@ impl NativeServer {
             .local_addr()
             .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?
             .to_string();
-        let (shutdown, rx) = oneshot::channel();
+        let (shutdown, rx) = oneshot::channel::<Option<Duration>>();
         // H-2: created here so both the server thread's state and this
         // handle share one fail-open counter.
         let rate_limit_fail_open = Arc::new(AtomicU64::new(0));
@@ -3607,14 +3609,15 @@ impl NativeServer {
                 // this handle; the router takes its own clone via with_state.
                 let limits = Arc::clone(&state);
                 let app = AxumRouter::new().fallback(any(dispatch)).with_state(state);
-                let mut shutdown = std::pin::pin!(async {
-                    let _ = rx.await;
-                });
+                // stop() may pass the shutdown budget that is left when
+                // it is called; None keeps the construction-time bound
+                // (used when the server is dropped without stop()).
+                let mut shutdown = std::pin::pin!(async { rx.await.ok().flatten() });
                 let mut connections = tokio::task::JoinSet::new();
                 let (connection_shutdown, _) = watch::channel(false);
-                loop {
+                let drain_override = loop {
                     tokio::select! {
-                        _ = &mut shutdown => break,
+                        override_value = &mut shutdown => break override_value,
                         accepted = listener.accept() => {
                             let (stream, peer_addr) = match accepted {
                                 Ok(pair) => pair,
@@ -3822,13 +3825,17 @@ impl NativeServer {
                         }
                         _ = connections.join_next(), if !connections.is_empty() => {}
                     }
-                }
+                };
                 let _ = connection_shutdown.send(true);
                 // Drain in-flight connections, bounded so `stop()` cannot
-                // hang on a stuck connection. The bound is the Python
-                // shutdown timeout (B6): serve() already waited that long
-                // for Python handlers, so this only covers connections
-                // whose close handshake is still in flight.
+                // hang on a stuck connection. The bound is the shutdown
+                // budget that is left when stop() is called (serve()
+                // passes what remains of its shared budget); a bare
+                // stop() or a drop falls back to the construction-time
+                // bound, which only covers connections whose close
+                // handshake is still in flight after serve() already
+                // waited for Python handlers.
+                let drain_timeout = drain_override.unwrap_or(drain_timeout);
                 let _ = tokio::time::timeout(drain_timeout, async {
                     while connections.join_next().await.is_some() {}
                 })
@@ -3854,9 +3861,21 @@ impl NativeServer {
         })
     }
 
-    fn stop(&mut self, py: Python<'_>) {
+    /// Stop the server, draining connections for at most ``timeout``
+    /// seconds when given; without one the drain bound the server was
+    /// constructed with applies. ``serve()`` passes the shutdown
+    /// budget that is left, so the whole shutdown stays within one
+    /// shared timeout instead of each stage taking a fresh budget.
+    #[pyo3(signature = (timeout=None))]
+    fn stop(&mut self, py: Python<'_>, timeout: Option<f64>) {
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            // Clamped like the construction-time value, so a negative
+            // or NaN budget becomes "no drain at all" instead of
+            // hanging the shutdown.
+            let drain = timeout.map(|secs| {
+                Duration::from_secs_f64(if secs.is_finite() { secs.max(0.0) } else { 0.0 })
+            });
+            let _ = shutdown.send(drain);
         }
         if let Some(thread) = self.thread.take() {
             py.detach(move || {
@@ -3875,7 +3894,7 @@ impl NativeServer {
 impl Drop for NativeServer {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            let _ = shutdown.send(None);
         }
     }
 }
