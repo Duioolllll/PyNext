@@ -4,9 +4,13 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
 
 ## Unreleased
 
+<<<<<<< HEAD
 - ISR lifetimes are now three axes: `expire` joins `revalidate` and `stale` as the absolute hard cap measured from generation. After `revalidate` an entry is served stale while one background regeneration runs; after `expire` it is never served again (`expire` must be greater than `revalidate`, `float("inf")` caps at one year). `@page(render="isr", ...)` also accepts a named `cache_life` profile (`default`, `seconds`, `minutes`, `hours`, `days`, `weeks`, `max`, matching Next.js `cacheLife` defaults) via `pynext.CACHE_LIFE_PROFILES`; policies written before `expire` keep their old meaning (`expire = revalidate + stale`). The SQLite backend now measures entry lifetimes and leases on the monotonic clock (wall-clock fallback across reboots) and bounds the table to 10,000 rows, purging expired rows and evicting the oldest on insert.
 
 - Segment config inheritance (Next.js `reduceAppConfig`): layouts can declare an ISR policy with `@layout(revalidate=..., stale=...)`; ISR pages inherit unset values from ancestor layouts and only win with a shorter `revalidate` / smaller `stale`. An ISR page with no `revalidate` anywhere in its layout chain fails at load; a longer page value is overridden with a build-time warning naming both files. Layout policies are recorded in the build manifest (schema version 10), so changing one requires a rebuild.
+=======
+- Add signal errors for pages (`not_found()`/`forbidden()`/`unauthorized()`/`redirect()` and the `NotFoundError`/`ForbiddenError`/`UnauthorizedError`/`RedirectError` classes): the dispatcher answers with the signal's response and counts it, but writes no error log. Real failures get a stable `sha256(type + message + stack)` digest; the 500 body and the error log line carry the same `request_id` and digest, and `lookup_error(digest)` restores the original error record (type, truncated message, sighting count) from a bounded in-process registry. `pynext_errors_total{route,error_type,digest}` counts errors by type and digest (well-known signal digests as labels; computed digests folded to `digest=""` in Prometheus and kept in the snapshot).
+>>>>>>> feat/nextjs-p1-errdigest
 
 ## 0.1.2 (2026-11-09)
 

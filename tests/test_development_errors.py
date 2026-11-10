@@ -36,7 +36,13 @@ def test_detailed_errors_are_opt_in_and_html_escaped(tmp_path, mode):
                     assert "<private error>" not in response.text
                     assert response.headers["cache-control"] == "no-store"
                 else:
-                    assert response.text == "Internal Server Error"
+                    # Production body carries the correlation id + digest,
+                    # never the exception itself.
+                    assert response.text.startswith("Internal Server Error (request_id: ")
+                    assert response.text.endswith(")")
+                    assert f"request_id: {response.headers['x-request-id']}" in response.text
+                    assert ", digest: " in response.text
+                    assert "<private error>" not in response.text
                 assert (await client.head("/")).content == b""
         finally:
             if server is not None:

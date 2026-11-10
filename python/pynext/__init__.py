@@ -13,6 +13,9 @@ from .django import DjangoBusyError, DjangoResource
 from .env import LoadedEnv, env_file_names, load_env, public_env_defines, public_env_vars
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN
 from .forms import UploadFile
+from .errors import (ForbiddenError, NotFoundError, RedirectError, SignalError, UnauthorizedError,
+                     compute_digest, digest_for_error, error_count, forbidden, get_digest_for_well_known_error,
+                     is_signal_error, lookup_error, not_found, redirect, unauthorized)
 from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_security_headers,
                    content_security_policy, csrf_protect, new_csrf_token, new_csp_nonce,
@@ -28,6 +31,10 @@ from .sessions import RedisSessionStore, Session, SessionMiddleware, SQLiteSessi
 __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layout", "model_prop", "page", "route", "websocket", "Database",
            "DjangoBusyError", "DjangoResource", "CACHE_LIFE_PROFILES",
            "BadRequest", "Request", "RequestCancelled", "Response", "JSONResponse", "StreamingResponse", "SecurityConfig",
+           "SignalError", "NotFoundError", "ForbiddenError", "UnauthorizedError", "RedirectError",
+           "not_found", "forbidden", "unauthorized", "redirect",
+           "is_signal_error", "get_digest_for_well_known_error", "compute_digest", "digest_for_error",
+           "error_count", "lookup_error",
            "csrf_protect", "new_csrf_token", "new_csp_nonce", "set_csrf_cookie", "sign_csrf_token",
            "validate_csrf",
            "content_security_policy", "security_headers", "apply_security_headers",

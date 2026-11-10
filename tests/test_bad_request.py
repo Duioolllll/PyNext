@@ -54,7 +54,12 @@ def test_request_parsing_errors_and_unexpected_errors(tmp_path, mode):
                 response = await client.put("/api/input")
                 assert response.status_code == 400 and response.text == "Bad Request"
                 response = await client.delete("/api/input")
-                assert response.status_code == 500 and response.text == "Internal Server Error"
+                assert response.status_code == 500
+                # Production 500 body: correlation id + digest, never the
+                # exception message.
+                assert response.text.startswith("Internal Server Error (request_id: ")
+                assert ", digest: " in response.text
+                assert "internal details" not in response.text
         finally:
             if server is not None:
                 await asyncio.to_thread(server.stop)
