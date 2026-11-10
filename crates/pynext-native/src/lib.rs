@@ -449,6 +449,24 @@ struct ServerState {
     header_read_timeout: Duration,
     // Minimum average body receive rate in bytes/second (0 disables).
     body_min_rate: usize,
+    // S-P1-14: total lifetime cap for one streaming response, from the
+    // first chunk to the last (0 disables). The per-chunk 30s timeout
+    // alone lets a client hold an execution slot forever by sending
+    // one byte every 29 seconds; the lifetime cap bounds that.
+    streaming_max_lifetime: Duration,
+    // S-P1-15: per-IP cap on concurrent body slots. The global
+    // body_capacity semaphore still applies; this stops one IP from
+    // rotating through all 16 body slots and 503ing legitimate uploads.
+    body_per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    max_body_per_ip: usize,
+    // S-P1-16: WebSocket idle timeout, maximum session lifetime, and
+    // the interval at which the server pings an idle session (0
+    // disables each). A ping unanswered for WS_PONG_TIMEOUT closes
+    // the session; accepted TCP connections also get OS keepalive
+    // probes (see the accept loop).
+    ws_idle_timeout: Duration,
+    ws_max_lifetime: Duration,
+    ws_ping_interval: Duration,
     static_pages: HashMap<String, Bytes>,
     public_assets: HashMap<String, PublicAsset>,
     client_assets: HashMap<String, Bytes>,
@@ -573,18 +591,36 @@ fn streaming_body(
     ip_guard: Option<IpExecutionGuard>,
     hold_stats: Arc<HoldTimeStats>,
     acquired_at: Instant,
+    max_lifetime: Duration,
 ) -> Body {
     let stream = Arc::new(stream);
     let (sender, receiver) = tokio_mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     let failed = Arc::new(AtomicBool::new(false));
+    let lifetime_exceeded = Arc::new(AtomicBool::new(false));
     let producer_failed = Arc::clone(&failed);
+    let producer_expired = Arc::clone(&lifetime_exceeded);
+    let started = tokio::time::Instant::now();
     tokio::spawn(async move {
         let _permit = permit;
         // The per-IP slot stays held until the stream ends, like the
         // global execution slot (H-5).
         let _ip_guard = ip_guard;
         loop {
-            let slot = match tokio::time::timeout(Duration::from_secs(30), sender.reserve()).await {
+            // S-P1-14: total lifetime cap, checked before every chunk.
+            // A stream that keeps trickling inside the per-chunk 30s
+            // timeout is cut off here, freeing its execution slot.
+            if !max_lifetime.is_zero() && started.elapsed() >= max_lifetime {
+                producer_expired.store(true, Ordering::Release);
+                break;
+            }
+            // Bound the reserve wait by the remaining lifetime too, so
+            // a stalled stream cannot overshoot the cap by a full 30s.
+            let reserve_timeout = if max_lifetime.is_zero() {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_secs(30).min(max_lifetime.saturating_sub(started.elapsed()))
+            };
+            let slot = match tokio::time::timeout(reserve_timeout, sender.reserve()).await {
                 Ok(Ok(slot)) => slot,
                 Ok(Err(_)) => break,
                 Err(_) => {
@@ -618,17 +654,25 @@ fn streaming_body(
         hold_stats.record(acquired_at.elapsed());
         close_stream(stream);
     });
-    let body =
-        futures_util::stream::unfold((receiver, failed), |(mut receiver, failed)| async move {
+    let body = futures_util::stream::unfold(
+        (receiver, failed, lifetime_exceeded),
+        |(mut receiver, failed, lifetime_exceeded)| async move {
             match receiver.recv().await {
-                Some(item) => Some((item, (receiver, failed))),
+                Some(item) => Some((item, (receiver, failed, lifetime_exceeded))),
+                None if lifetime_exceeded.swap(false, Ordering::AcqRel) => Some((
+                    Err(std::io::Error::other(
+                        "PyNext response stream lifetime exceeded",
+                    )),
+                    (receiver, failed, lifetime_exceeded),
+                )),
                 None if failed.swap(false, Ordering::AcqRel) => Some((
                     Err(std::io::Error::other("PyNext response stream stalled")),
-                    (receiver, failed),
+                    (receiver, failed, lifetime_exceeded),
                 )),
                 None => None,
             }
-        });
+        },
+    );
     Body::from_stream(body)
 }
 
@@ -1167,6 +1211,18 @@ async fn read_limited_body(
                 return Err(BodyReadError::TooLarge);
             }
             buf.extend_from_slice(&data);
+            // S-P1-15: cumulative rate check on every frame, not only
+            // while stalled. The stall branch below never fires for a
+            // client that sends 1 byte every 250 ms, because each byte
+            // arrives just before the 250 ms check would run; checking
+            // here closes that trickle bypass. The grace window still
+            // protects short bodies and slow starts.
+            if min_rate > 0
+                && started.elapsed() >= BODY_MIN_RATE_GRACE
+                && (buf.len() as f64) < min_rate as f64 * started.elapsed().as_secs_f64()
+            {
+                return Err(BodyReadError::TooSlow);
+            }
         }
     }
     Ok(Bytes::from(buf))
@@ -1279,6 +1335,11 @@ fn ws_close_frame(code: u16, reason: &str) -> Message {
     }))
 }
 
+/// Grace period for a pong after the server pings an idle WebSocket
+/// session (S-P1-16): a peer that never answers is half-open, so the
+/// session is closed instead of held forever.
+const WS_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Drive one upgraded WebSocket connection: forward frames to the Python
 /// handler's session inbox and forward the handler's outbox items as frames.
 /// The Python handler owns the application logic; this task only translates
@@ -1319,6 +1380,13 @@ async fn run_ws_session(
         }
     };
     let mut sent_close = false;
+    // S-P1-16: idle timeout, maximum lifetime, and ping/pong liveness.
+    // `last_activity` moves on any socket frame (including ping/pong)
+    // and on any frame sent to the peer; the 5s outgoing wait returning
+    // empty does not count as activity.
+    let started = tokio::time::Instant::now();
+    let mut last_activity = tokio::time::Instant::now();
+    let mut awaiting_pong_since: Option<tokio::time::Instant> = None;
     // Hold one outgoing wait across loop iterations. Recreating the wait
     // inside `select!` would drop it whenever a socket message wins, but
     // the dropped wait's blocking task keeps waiting on the outbox and can
@@ -1327,10 +1395,36 @@ async fn run_ws_session(
     // so a finished handler is noticed promptly.
     let mut outgoing_wait = Box::pin(ws_take_outgoing(&session, Duration::from_secs(5)));
     loop {
+        // S-P1-16: earliest of the idle deadline, the lifetime
+        // deadline, the next ping, and the pong grace expiry.
+        // Recomputed every iteration because activity moves the
+        // idle/ping deadlines.
+        let idle_deadline = if state.ws_idle_timeout.is_zero() {
+            None
+        } else {
+            Some(last_activity + state.ws_idle_timeout)
+        };
+        let max_deadline = if state.ws_max_lifetime.is_zero() {
+            None
+        } else {
+            Some(started + state.ws_max_lifetime)
+        };
+        let ping_deadline = if state.ws_ping_interval.is_zero() {
+            None
+        } else {
+            Some(last_activity + state.ws_ping_interval)
+        };
+        let pong_deadline = awaiting_pong_since.map(|since| since + WS_PONG_TIMEOUT);
+        let timer_deadline = [idle_deadline, max_deadline, ping_deadline, pong_deadline]
+            .into_iter()
+            .flatten()
+            .min();
         tokio::select! {
             message = socket.recv() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
+                        last_activity = tokio::time::Instant::now();
+                        awaiting_pong_since = None;
                         if text.len() > state.websocket_max_message {
                             let _ = socket.send(ws_close_frame(1009, "message too large")).await;
                             sent_close = true;
@@ -1344,6 +1438,8 @@ async fn run_ws_session(
                         }
                     }
                     Some(Ok(Message::Binary(data))) => {
+                        last_activity = tokio::time::Instant::now();
+                        awaiting_pong_since = None;
                         if data.len() > state.websocket_max_message {
                             let _ = socket.send(ws_close_frame(1009, "message too large")).await;
                             sent_close = true;
@@ -1367,9 +1463,14 @@ async fn run_ws_session(
                         break;
                     }
                     Some(Ok(Message::Ping(data))) => {
+                        last_activity = tokio::time::Instant::now();
+                        awaiting_pong_since = None;
                         let _ = socket.send(Message::Pong(data)).await;
                     }
-                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Pong(_))) => {
+                        last_activity = tokio::time::Instant::now();
+                        awaiting_pong_since = None;
+                    }
                     Some(Err(_)) | None => {
                         // Tungstenite rejects an over-limit message at the
                         // protocol level before it is delivered, so the
@@ -1391,11 +1492,13 @@ async fn run_ws_session(
                         if sent.is_err() {
                             break;
                         }
+                        last_activity = tokio::time::Instant::now();
                     }
                     Some(WsOutgoing::Bytes(data)) => {
                         if socket.send(Message::Binary(data.into())).await.is_err() {
                             break;
                         }
+                        last_activity = tokio::time::Instant::now();
                     }
                     Some(WsOutgoing::Close(code, reason)) => {
                         let _ = socket.send(ws_close_frame(code, &reason)).await;
@@ -1412,6 +1515,53 @@ async fn run_ws_session(
                     }
                 }
                 outgoing_wait = Box::pin(ws_take_outgoing(&session, Duration::from_secs(5)));
+            }
+            // S-P1-16: idle timeout, maximum lifetime, ping/pong.
+            _ = async {
+                match timer_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let now = tokio::time::Instant::now();
+                if let Some(deadline) = max_deadline {
+                    if now >= deadline {
+                        let _ = socket
+                            .send(ws_close_frame(1000, "session lifetime exceeded"))
+                            .await;
+                        sent_close = true;
+                        ws_call(&session, "_push_disconnect", WsPush::None).await;
+                        break;
+                    }
+                }
+                if let Some(since) = awaiting_pong_since {
+                    if now >= since + WS_PONG_TIMEOUT {
+                        let _ = socket
+                            .send(ws_close_frame(1011, "ping timeout"))
+                            .await;
+                        sent_close = true;
+                        ws_call(&session, "_push_disconnect", WsPush::None).await;
+                        break;
+                    }
+                }
+                if let Some(deadline) = idle_deadline {
+                    if now >= deadline {
+                        let _ = socket
+                            .send(ws_close_frame(1000, "idle timeout"))
+                            .await;
+                        sent_close = true;
+                        ws_call(&session, "_push_disconnect", WsPush::None).await;
+                        break;
+                    }
+                }
+                if let Some(deadline) = ping_deadline {
+                    if now >= deadline && awaiting_pong_since.is_none() {
+                        if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                            break;
+                        }
+                        awaiting_pong_since = Some(now);
+                    }
+                }
             }
         }
     }
@@ -1779,6 +1929,53 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     let body = if body.is_end_stream() {
         Bytes::new()
     } else {
+        // S-P1-15: per-IP cap on body slots, checked before the global
+        // semaphore so one IP rotating through uploads cannot take all
+        // 16 slots and 503 legitimate uploads. IPv4-mapped IPv6 counts
+        // under its IPv4 form, matching the accept loop. The guard
+        // lives until the body read finishes, then releases the slot.
+        let peer_ip = parts
+            .extensions
+            .get::<PeerAddr>()
+            .map(|peer| match peer.0.ip() {
+                IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                    Some(v4) => IpAddr::V4(v4),
+                    None => peer.0.ip(),
+                },
+                ip => ip,
+            });
+        let _body_ip_guard = match peer_ip {
+            Some(ip) => {
+                let admitted = {
+                    let mut counts = state
+                        .body_per_ip
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let count = counts.entry(ip).or_insert(0);
+                    if *count >= state.max_body_per_ip {
+                        false
+                    } else {
+                        *count += 1;
+                        true
+                    }
+                };
+                if !admitted {
+                    return close_with_unread_body(
+                        apply_path_headers_for_raw_path(
+                            busy_response(1, &state.security_headers),
+                            parts.uri.path(),
+                            &state.path_headers,
+                        ),
+                        parts.version,
+                    );
+                }
+                Some(PerIpBodyGuard {
+                    counts: Arc::clone(&state.body_per_ip),
+                    ip,
+                })
+            }
+            None => None,
+        };
         let _body_permit = match state.body_capacity.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -2088,6 +2285,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         .get::<PeerAddr>()
         .map(|peer| peer.0.ip().to_string());
     let security_headers = state.security_headers.clone();
+    // The bridge task moves `state`, so capture the streaming lifetime
+    // cap beforehand (S-P1-14).
+    let streaming_max_lifetime = state.streaming_max_lifetime;
     // The bridge task moves `state`, so merge this request's path headers
     // beforehand for the plain 500s built below; bridge responses already
     // carry their path headers from Python dispatch.
@@ -2167,9 +2367,14 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     drop(ip_guard);
                     Body::from(body)
                 }
-                BridgeBody::Streaming(stream) => {
-                    streaming_body(stream, permit, ip_guard, hold_stats, acquired_at)
-                }
+                BridgeBody::Streaming(stream) => streaming_body(
+                    stream,
+                    permit,
+                    ip_guard,
+                    hold_stats,
+                    acquired_at,
+                    streaming_max_lifetime,
+                ),
             };
             response
         }
@@ -2183,6 +2388,30 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 ),
                 &path_headers_for_request,
             )
+        }
+    }
+}
+
+/// RAII guard for one entry in the per-IP body-slot count (S-P1-15):
+/// created when a body intake is admitted, it decrements the count when
+/// the body read ends (success, rejection, or timeout) so a slot is
+/// never leaked.
+struct PerIpBodyGuard {
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl Drop for PerIpBodyGuard {
+    fn drop(&mut self) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
         }
     }
 }
@@ -2412,7 +2641,7 @@ struct NativeServer {
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, max_concurrent_per_ip=16, acquire_timeout_max_ms=None, fast_path_max_concurrent=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, max_concurrent_per_ip=16, acquire_timeout_max_ms=None, fast_path_max_concurrent=None, streaming_max_lifetime_secs=300, body_capacity_per_ip=4, ws_idle_timeout_secs=300, ws_max_lifetime_secs=3600, ws_ping_interval_secs=60))]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn new(
@@ -2453,6 +2682,11 @@ impl NativeServer {
         max_concurrent_per_ip: usize,
         acquire_timeout_max_ms: Option<u64>,
         fast_path_max_concurrent: Option<usize>,
+        streaming_max_lifetime_secs: u64,
+        body_capacity_per_ip: usize,
+        ws_idle_timeout_secs: u64,
+        ws_max_lifetime_secs: u64,
+        ws_ping_interval_secs: u64,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -2515,6 +2749,11 @@ impl NativeServer {
         if fast_path_max_concurrent == 0 || fast_path_max_concurrent > Semaphore::MAX_PERMITS {
             return Err(PyValueError::new_err(
                 "fast_path_max_concurrent is outside the supported range",
+            ));
+        }
+        if body_capacity_per_ip == 0 || body_capacity_per_ip > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "body_capacity_per_ip is outside the supported range",
             ));
         }
         if static_pages
@@ -2652,6 +2891,14 @@ impl NativeServer {
                     max_connections_per_ip,
                     header_read_timeout: Duration::from_millis(header_read_timeout_ms),
                     body_min_rate: body_min_rate_bytes_per_sec,
+                    // S-P1-14/15/16 (0 disables the streaming lifetime,
+                    // the WS idle timeout, the WS lifetime, and WS pings).
+                    streaming_max_lifetime: Duration::from_secs(streaming_max_lifetime_secs),
+                    body_per_ip: Arc::new(Mutex::new(HashMap::new())),
+                    max_body_per_ip: body_capacity_per_ip,
+                    ws_idle_timeout: Duration::from_secs(ws_idle_timeout_secs),
+                    ws_max_lifetime: Duration::from_secs(ws_max_lifetime_secs),
+                    ws_ping_interval: Duration::from_secs(ws_ping_interval_secs),
                     static_pages: static_pages
                         .into_iter()
                         .map(|(path, body)| (path, Bytes::from(body)))
@@ -2703,6 +2950,19 @@ impl NativeServer {
                                     continue;
                                 }
                             };
+                            // S-P1-16: TCP keepalive probes catch
+                            // half-open peers (idle WebSocket sessions
+                            // especially) that no application timeout can
+                            // see until it tries to write. Best-effort:
+                            // a platform that cannot set it keeps the
+                            // application-level ping/pong instead.
+                            {
+                                let keepalive = socket2::TcpKeepalive::new()
+                                    .with_time(Duration::from_secs(60))
+                                    .with_interval(Duration::from_secs(10));
+                                let _ = socket2::SockRef::from(&stream)
+                                    .set_tcp_keepalive(&keepalive);
+                            }
                             // Connection budget (A4): the total cap and the
                             // per-IP cap are enforced here, before any
                             // request is read, so a flood of idle or slow

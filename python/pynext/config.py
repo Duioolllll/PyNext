@@ -163,6 +163,15 @@ class PyNextConfig:
     max_concurrent_per_ip: int = 16
     header_read_timeout_ms: int = 10000
     body_min_rate_bytes_per_sec: int = 1024
+    # S-P1-14/15/16 DoS defences (serve()): total streaming-response
+    # lifetime, per-IP body-slot cap, WebSocket idle timeout, maximum
+    # WebSocket lifetime, and WebSocket ping interval. 0 disables the
+    # streaming lifetime and the WebSocket timeouts/pings.
+    streaming_max_lifetime_secs: int = 300
+    body_capacity_per_ip: int = 4
+    ws_idle_timeout_secs: int = 300
+    ws_max_lifetime_secs: int = 3600
+    ws_ping_interval_secs: int = 60
     # Lifecycle.
     shutdown_timeout: float = 30.0
     # C-P0-1: two worker processes by default, so one worker crashing (or
@@ -260,6 +269,11 @@ _SPECS = {
     "max_concurrent_per_ip": _Spec("int", 1, 1000000),
     "header_read_timeout_ms": _Spec("int", 0, 86400000),
     "body_min_rate_bytes_per_sec": _Spec("int", 0, 1000000000),
+    "streaming_max_lifetime_secs": _Spec("int", 0, 86400),
+    "body_capacity_per_ip": _Spec("int", 1, 1000000),
+    "ws_idle_timeout_secs": _Spec("int", 0, 86400),
+    "ws_max_lifetime_secs": _Spec("int", 0, 86400),
+    "ws_ping_interval_secs": _Spec("int", 0, 86400),
     "shutdown_timeout": _Spec("float", 0, 3600),
     "workers": _Spec("workers", 1, 64),
     "cache_backend": _Spec("str", choices=("memory", "sqlite", "redis")),
