@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from pynext import create_app, page
-from pynext.build import write_manifest
+from pynext.build import build_id_for, write_manifest
 from pynext.cache import ISRCache
 from pynext.cache import SQLiteCacheBackend
 from pynext.components import _validate_tag, _validate_tag_expire
@@ -458,7 +458,11 @@ def test_app_rejects_tag_change_without_rebuild(tmp_path):
     manifest_path = tmp_path / ".pynext" / "manifest.json"
     saved = json.loads(manifest_path.read_text(encoding="utf-8"))
     saved["isr_tags"]["/blog"] = ["post:43"]
-    manifest_path.write_text(json.dumps(saved), encoding="utf-8")
+    raw = json.dumps(saved).encode("utf-8")
+    manifest_path.write_bytes(raw)
+    # Re-sign the edited manifest so the BUILD_ID integrity check passes
+    # and the tag check is the one that fires.
+    (tmp_path / ".pynext" / "BUILD_ID").write_text(build_id_for(raw), encoding="utf-8")
     with pytest.raises(ValueError, match="ISR tags changed since build"):
         create_app(tmp_path, production=True)
 

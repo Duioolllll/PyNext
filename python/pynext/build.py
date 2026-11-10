@@ -14,6 +14,7 @@ from . import _native
 from .assets import discover_public
 from .catchall import normalize_catch_all_routes, verify_static_enumeration
 from .client import discover_client
+from .dynamic import StaticGenBailoutError, is_prerender_bailout
 from .env import load_env
 
 log = logging.getLogger("pynext")
@@ -185,11 +186,13 @@ def _run_stage(stage, func, *args, **kwargs):
 
     A :class:`BuildError` raised inside the stage (for example the
     aggregated render failures) already carries its stage and passes
-    through unchanged.
+    through unchanged, as does a :class:`StaticGenBailoutError`: a
+    prerender bailout stays distinguishable from a page bug (see
+    :func:`is_prerender_bailout`) instead of being wrapped.
     """
     try:
         return func(*args, **kwargs)
-    except BuildError:
+    except (BuildError, StaticGenBailoutError):
         raise
     except Exception as exc:
         raise BuildError(stage, str(exc) or exc.__class__.__name__) from exc
@@ -686,10 +689,18 @@ async def _render_static_pages(app):
             except Exception as exc:
                 failures.append((path if path is not None else f"{pattern} {params}", exc))
     if failures:
+        # A build whose every failure is a prerender bailout (dynamic
+        # access in dynamic="error" mode) fails with the bailout itself,
+        # as before staging: callers distinguish it from a page bug via
+        # is_prerender_bailout(), and the CLI still reports it cleanly
+        # (StaticGenBailoutError is a ValueError). Mixed or real page
+        # failures aggregate into one staged BuildError instead.
+        if all(is_prerender_bailout(exc) for _label, exc in failures):
+            raise failures[0][1]
         lines = "\n".join(f"  {label}: {exc}" for label, exc in failures)
         raise BuildError(
             "render",
-            f"{len(failures)} static page(s) failed to render:\n{lines}")
+            f"{len(failures)} static page(s) failed to render:\n{lines}") from failures[0][1]
     return rendered
 
 
