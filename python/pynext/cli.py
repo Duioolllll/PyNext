@@ -11,6 +11,7 @@ from .app import create_app
 from .build import write_manifest
 from .client import compile_client, discover_client
 from .env import load_env
+from .config import DEFAULT_CONFIG, ConfigError, load_config
 from .http import MAX_WS_MESSAGE, SecurityConfig
 from .observability import ObservabilityConfig
 from .ratelimit import RateLimiter
@@ -106,26 +107,106 @@ async def _reload_dev_client(app, root):
 
 
 async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
-                  body_capacity, body_timeout_ms, cache_backend="memory", cache_path=None,
-                 observability=None, rate_limit=None, security=None, websocket_max_message=MAX_WS_MESSAGE,
+                  body_capacity, body_timeout_ms, cache_backend=DEFAULT_CONFIG.cache_backend,
+                  cache_path=None,
+                 observability=None, rate_limit=None, security=None,
+                 websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
                  max_connections=None, max_connections_per_ip=None,
                  header_read_timeout_ms=None, body_min_rate_bytes_per_sec=None,
-                 trusted_proxies=(), cache_failure_policy=None, shutdown_timeout=30.0,
-                 max_waiting=None):
+                 trusted_proxies=(), cache_failure_policy=None,
+                 shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout,
+                 max_waiting=None, config=None, cli_overrides=None):
     """Serve the app in development mode, replacing changed island bundles.
 
     Other file changes restart the server on the same port and reload open
     pages. Broken edits retain the previous app or bundles until fixed.
+
+    When ``config`` (the resolved config main() loaded) is given, a
+    ``pynext.config.py`` edit is picked up on reload too: the settings are
+    re-resolved from the file before the app is recreated. A config error
+    is different from a code error — editing app files cannot fix it —
+    so it ends the dev loop instead of waiting for another change.
     """
-    conn_kwargs = {}
-    if max_connections is not None:
-        conn_kwargs["max_connections"] = max_connections
-    if max_connections_per_ip is not None:
-        conn_kwargs["max_connections_per_ip"] = max_connections_per_ip
-    if header_read_timeout_ms is not None:
-        conn_kwargs["header_read_timeout_ms"] = header_read_timeout_ms
-    if body_min_rate_bytes_per_sec is not None:
-        conn_kwargs["body_min_rate_bytes_per_sec"] = body_min_rate_bytes_per_sec
+    # Settings a config-file edit can change on reload. They start as the
+    # values main() resolved (CLI > env > file > defaults).
+    settings = {
+        "host": host, "max_concurrent": max_concurrent,
+        "acquire_timeout_ms": acquire_timeout_ms, "body_capacity": body_capacity,
+        "body_timeout_ms": body_timeout_ms, "cache_backend": cache_backend,
+        "cache_path": cache_path, "observability": observability,
+        "rate_limit": rate_limit, "security": security,
+        "websocket_max_message": websocket_max_message,
+        "max_connections": max_connections,
+        "max_connections_per_ip": max_connections_per_ip,
+        "header_read_timeout_ms": header_read_timeout_ms,
+        "body_min_rate_bytes_per_sec": body_min_rate_bytes_per_sec,
+        "trusted_proxies": trusted_proxies,
+        "cache_failure_policy": cache_failure_policy,
+        "shutdown_timeout": shutdown_timeout, "max_waiting": max_waiting,
+    }
+
+    def refresh_settings():
+        """Re-read ``pynext.config.py`` into ``settings``; False on config error."""
+        if config is None:
+            return True
+        try:
+            fresh = load_config(root, "dev", cli_overrides=cli_overrides)
+        except ConfigError as exc:
+            print(f"PyNext config error: {exc}", file=sys.stderr)
+            return False
+        for warning in fresh.warnings:
+            print(f"PyNext config warning: {warning}", file=sys.stderr)
+        values = fresh.values
+        try:
+            limiter = _limiter_from_config(values)
+            sec = _security_from_config(values, production=False)
+        except ValueError as exc:
+            print(f"PyNext config error: {exc}", file=sys.stderr)
+            return False
+        settings.update({
+            "host": values.host, "max_concurrent": values.max_concurrent,
+            "acquire_timeout_ms": values.acquire_timeout_ms,
+            "body_capacity": values.body_capacity, "body_timeout_ms": values.body_timeout_ms,
+            "cache_backend": values.cache_backend, "cache_path": values.cache_path,
+            "observability": _observability_from_config(fresh), "rate_limit": limiter,
+            "security": sec, "websocket_max_message": values.websocket_max_message,
+            "max_connections": values.max_connections,
+            "max_connections_per_ip": values.max_connections_per_ip,
+            "header_read_timeout_ms": values.header_read_timeout_ms,
+            "body_min_rate_bytes_per_sec": values.body_min_rate_bytes_per_sec,
+            "trusted_proxies": values.trusted_proxies,
+            "cache_failure_policy": values.cache_failure_policy,
+            "shutdown_timeout": values.shutdown_timeout, "max_waiting": values.max_waiting,
+        })
+        return True
+
+    def create_dev_app():
+        """Create the dev app from the current settings."""
+        return create_app(root, production=False, cache_backend=settings["cache_backend"],
+                          cache_path=settings["cache_path"],
+                          observability=settings["observability"],
+                          rate_limit=settings["rate_limit"], debug=True,
+                          security=settings["security"],
+                          websocket_max_message=settings["websocket_max_message"],
+                          hot_reload=True, trusted_proxies=settings["trusted_proxies"],
+                          **({"cache_failure_policy": settings["cache_failure_policy"]}
+                             if settings["cache_failure_policy"] is not None else {}))
+
+    def serve_kwargs(stop_server):
+        """serve() keyword arguments from the current settings."""
+        kwargs = {"stop_event": stop_server,
+                  "observability": settings["observability"],
+                  "shutdown_timeout": settings["shutdown_timeout"],
+                  "on_ready": record_address, "max_waiting": settings["max_waiting"]}
+        # Only forward a connection limit that differs from serve()'s
+        # default; an unset limit stays at the default.
+        for key in ("max_connections", "max_connections_per_ip",
+                    "header_read_timeout_ms", "body_min_rate_bytes_per_sec"):
+            if (settings[key] is not None
+                    and settings[key] != getattr(DEFAULT_CONFIG, key)):
+                kwargs[key] = settings[key]
+        return kwargs
+
     watcher = Watcher(root)
     watched = ", ".join(str(path.relative_to(root)) for path in watcher.watch_roots())
     print(f"PyNext dev watching {watched or 'nothing'} for changes", flush=True)
@@ -142,24 +223,19 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
         while True:
             if app is None:
                 try:
-                    app = create_app(root, production=False, cache_backend=cache_backend, cache_path=cache_path,
-                               observability=observability, rate_limit=rate_limit, debug=True, security=security,
-                               websocket_max_message=websocket_max_message, hot_reload=True,
-                               trusted_proxies=trusted_proxies,
-                               **({"cache_failure_policy": cache_failure_policy}
-                                  if cache_failure_policy is not None else {}))
+                    app = create_dev_app()
                 except Exception:
                     traceback.print_exc()
                     print("PyNext dev: fix the error above; watching for changes...", flush=True)
                     await watcher.wait_for_change()
                     continue
             stop_server = asyncio.Event()
-            server_task = asyncio.create_task(serve(app, host, current_port, max_concurrent,
-                                                    acquire_timeout_ms, body_capacity, body_timeout_ms,
-                                                    stop_event=stop_server, observability=observability,
-                                                    shutdown_timeout=shutdown_timeout,
-                                                    on_ready=record_address, max_waiting=max_waiting,
-                                                    **conn_kwargs))
+            server_task = asyncio.create_task(serve(app, settings["host"], current_port,
+                                                    settings["max_concurrent"],
+                                                    settings["acquire_timeout_ms"],
+                                                    settings["body_capacity"],
+                                                    settings["body_timeout_ms"],
+                                                    **serve_kwargs(stop_server)))
             new_app = None
             while new_app is None:
                 changed = await _wait_for_change(watcher, server_task)
@@ -176,13 +252,12 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                         print("PyNext dev: keeping previous island modules; fix the error above.", flush=True)
                     continue
                 print(f"PyNext dev: change detected ({', '.join(changed)}); reloading...", flush=True)
+                if not refresh_settings():
+                    # A broken config cannot be fixed by editing app files.
+                    print("PyNext dev: fix the configuration error above and restart.", flush=True)
+                    return
                 try:
-                    new_app = create_app(root, production=False, cache_backend=cache_backend, cache_path=cache_path,
-                               observability=observability, rate_limit=rate_limit, debug=True, security=security,
-                               websocket_max_message=websocket_max_message, hot_reload=True,
-                               trusted_proxies=trusted_proxies,
-                               **({"cache_failure_policy": cache_failure_policy}
-                                  if cache_failure_policy is not None else {}))
+                    new_app = create_dev_app()
                 except Exception:
                     traceback.print_exc()
                     print("PyNext dev: keeping the previous version running; "
@@ -215,7 +290,165 @@ def _positive_float(value):
         raise argparse.ArgumentTypeError("--rate-limit-window must be a number > 0")
     return number
 
-def main():
+
+# Config-file keys a command-line option can override, by argparse dest.
+# Precedence is CLI > environment > config file > DEFAULT_CONFIG (see
+# config.load_config). Dests not listed here (``--dir``, ``--standalone``)
+# are not settings and never come from a config file.
+_CLI_CONFIG_MAP = {
+    "host": "host",
+    "port": "port",
+    "max_concurrent": "max_concurrent",
+    "acquire_timeout_ms": "acquire_timeout_ms",
+    "max_waiting": "max_waiting",
+    "body_capacity": "body_capacity",
+    "body_timeout_ms": "body_timeout_ms",
+    "max_connections": "max_connections",
+    "max_connections_per_ip": "max_connections_per_ip",
+    "header_read_timeout_ms": "header_read_timeout_ms",
+    "body_min_rate_bytes_per_sec": "body_min_rate_bytes_per_sec",
+    "cache_backend": "cache_backend",
+    "cache_path": "cache_path",
+    "cache_failure_policy": "cache_failure_policy",
+    "structured_logs": "structured_logs",
+    "metrics": "metrics",
+    "tracing": "tracing",
+    "workers": "workers",
+    "rate_limit": "rate_limit",
+    "rate_limit_window": "rate_limit_window",
+    "rate_limit_ipv6_prefix_len": "rate_limit_ipv6_prefix_len",
+    "rate_limit_backend": "rate_limit_backend",
+    "rate_limit_failure_policy": "rate_limit_failure_policy",
+    "trusted_proxy": "trusted_proxies",
+    "rate_limit_exempt_path": "rate_limit_exempt_paths",
+    "csrf": "csrf_enabled",
+    "csrf_signing_key": "csrf_signing_key",
+    "csrf_cookie_secure": "csrf_cookie_secure",
+    "cors_origin": "cors_allowed_origins",
+    "cors_credentials": "cors_allow_credentials",
+    "csp_nonce": "csp_nonce_enabled",
+    "ws_max_message_bytes": "websocket_max_message",
+    "ws_allowed_origin": "websocket_allowed_origins",
+    "ws_allow_missing_origin": "websocket_allow_missing_origin",
+    "shutdown_timeout": "shutdown_timeout",
+}
+
+#: Repeatable options. A CLI value replaces the config file list instead
+#: of appending to it (see main()).
+_APPEND_DESTS = ("trusted_proxy", "rate_limit_exempt_path", "cors_origin", "ws_allowed_origin")
+
+
+def _subparsers(parser):
+    """The sub-parsers of ``parser`` (``init`` / ``build`` / ``dev`` / ``start``)."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            yield from action.choices.values()
+
+
+def _explicit_cli_values(parser, argv):
+    """``{dest: value}`` for options actually present on the command line.
+
+    argparse cannot tell "flag given with the default value" from "flag
+    absent", so probe-parse once with the config-overridable defaults
+    suppressed: only explicitly given options survive in the namespace.
+    The probe runs the same type converters as the real parse, so an
+    invalid value fails here with the same exit code 2.
+    """
+    actions = [action for sub in _subparsers(parser) for action in sub._actions
+               if action.dest in _CLI_CONFIG_MAP]
+    saved = [action.default for action in actions]
+    for action in actions:
+        action.default = argparse.SUPPRESS
+    try:
+        namespace, _ = parser.parse_known_args(argv[1:])
+    finally:
+        for action, default in zip(actions, saved):
+            action.default = default
+    return vars(namespace)
+
+
+def _apply_config_defaults(parser, resolved):
+    """Seed each sub-parser's defaults from the resolved config.
+
+    An option the user then gives on the command line still wins:
+    argparse only uses a default when the flag is absent.
+    """
+    values = resolved.values
+    for sub in _subparsers(parser):
+        for action in sub._actions:
+            key = _CLI_CONFIG_MAP.get(action.dest)
+            if key is None:
+                continue
+            value = getattr(values, key)
+            if isinstance(value, tuple):
+                value = list(value)
+            action.default = value
+
+
+def _limiter_from_config(values):
+    """Build the rate limiter for the resolved config (None disables it)."""
+    if values.rate_limit < 1:
+        return None
+    limiter_type = RedisRateLimiter if values.rate_limit_backend == "redis" else RateLimiter
+    options = ({"namespace": os.environ.get("PYNEXT_RATE_LIMIT_NAMESPACE", "default"),
+                "failure_policy": values.rate_limit_failure_policy}
+               if values.rate_limit_backend == "redis" else {})
+    return limiter_type(values.rate_limit, values.rate_limit_window,
+                        trusted_proxies=list(values.trusted_proxies),
+                        exempt_paths=tuple(values.rate_limit_exempt_paths),
+                        ipv6_prefix_len=values.rate_limit_ipv6_prefix_len, **options)
+
+
+def _security_from_config(values, production):
+    """Build the SecurityConfig for the resolved config (or None).
+
+    None means no security option was set anywhere, so create_app uses
+    its own default SecurityConfig (which reads the CSRF key from the
+    environment). This keeps the no-flags call shape unchanged.
+    """
+    if (values.csrf_enabled is None and values.csrf_signing_key is None
+            and values.csrf_cookie_secure is None and not values.cors_allowed_origins
+            and not values.cors_allow_credentials and not values.csp_nonce_enabled
+            and not values.websocket_allowed_origins
+            and not values.websocket_allow_missing_origin):
+        return None
+    return SecurityConfig(
+        csrf_enabled=values.csrf_enabled,
+        csrf_signing_key=values.csrf_signing_key,
+        csrf_cookie_secure=(values.csrf_cookie_secure if values.csrf_cookie_secure is not None
+                            else production),
+        cors_allowed_origins=tuple(values.cors_allowed_origins),
+        cors_allow_credentials=values.cors_allow_credentials,
+        websocket_allowed_origins=tuple(values.websocket_allowed_origins),
+        websocket_allow_missing_origin=values.websocket_allow_missing_origin,
+        csp_nonce_enabled=values.csp_nonce_enabled)
+
+
+def _observability_from_config(resolved):
+    """Build the ObservabilityConfig, or None when nothing overrides the env.
+
+    None preserves the old call shape: create_app reads ``PYNEXT_*``
+    itself. A config-file or CLI value for any observability key forces
+    an explicit config, with the environment merged underneath.
+    """
+    values = resolved.values
+    if not any(resolved.source_of(key) in ("cli", "file")
+               for key in ("structured_logs", "metrics", "tracing", "log_level")):
+        return None
+    config = ObservabilityConfig.from_env()
+    if values.structured_logs is not None:
+        config.structured_logs = values.structured_logs
+    if values.metrics is not None:
+        config.metrics = values.metrics
+    if values.tracing is not None:
+        config.tracing = values.tracing
+    if values.log_level is not None:
+        config.log_level = values.log_level
+    return config
+
+
+def _build_parser():
+    """Build the ``pynext`` argument parser (defaults from DEFAULT_CONFIG)."""
     parser = argparse.ArgumentParser(prog="pynext")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a minimal application")
@@ -227,22 +460,22 @@ def main():
             command.add_argument("--standalone", action="store_true", help="create a Linux standalone directory")
             command.add_argument("--standalone-dir", default=None, help="new output directory for --standalone")
         if name != "build":
-            command.add_argument("--host", default="127.0.0.1")
-            command.add_argument("--port", type=_port, default=3000)
+            command.add_argument("--host", default=DEFAULT_CONFIG.host)
+            command.add_argument("--port", type=_port, default=DEFAULT_CONFIG.port)
             command.add_argument("--max-concurrent", type=_bounded(1, MAX_CONCURRENT, "--max-concurrent"),
-                                 default=64,
+                                 default=DEFAULT_CONFIG.max_concurrent,
                                  help="in-flight requests before new ones wait for a slot (1-1000000)")
             command.add_argument("--acquire-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--acquire-timeout-ms"),
-                                 default=1000,
+                                 default=DEFAULT_CONFIG.acquire_timeout_ms,
                                  help="how long a request waits for a slot before getting a 503 (0-86400000)")
             command.add_argument("--max-waiting", type=_bounded(0, MAX_WAITING, "--max-waiting"), default=None,
                                  help="requests waiting for an execution slot before new ones get a 503"
                                       " (default: min(--max-concurrent, 64); 0 waits for nobody; max 1000000)")
             command.add_argument("--body-capacity", type=_bounded(1, MAX_BODY_CAPACITY, "--body-capacity"),
-                                 default=16,
+                                 default=DEFAULT_CONFIG.body_capacity,
                                  help="concurrent request bodies being read before new ones get a 503 (1-1000000)")
             command.add_argument("--body-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--body-timeout-ms"),
-                                 default=10000,
+                                 default=DEFAULT_CONFIG.body_timeout_ms,
                                  help="how long a request body may take to arrive before a 408 (0-86400000)")
             command.add_argument("--max-connections", type=_bounded(1, MAX_CONNECTIONS, "--max-connections"),
                                  default=None,
@@ -261,14 +494,15 @@ def main():
                                                "--body-min-rate-bytes-per-sec"), default=None,
                                  help="minimum average body receive rate in bytes/second after a 2s grace "
                                       "window; slower bodies get a 408 (0 disables; max 1000000000)")
-            command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis"), default="memory",
+            command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis"),
+                                 default=DEFAULT_CONFIG.cache_backend,
                                  help="ISR page cache backend: process-local memory (default) or a"
                                       " shared SQLite file or Redis via PYNEXT_REDIS_URL")
             command.add_argument("--cache-path", default=None,
                                  help="SQLite cache file for --cache-backend sqlite;"
                                       " defaults to <project>/.pynext/isr-cache.sqlite3")
             command.add_argument("--cache-failure-policy", choices=("fail_open", "fail_closed"),
-                                 default="fail_open",
+                                 default=DEFAULT_CONFIG.cache_failure_policy,
                                  help="shared ISR cache behaviour when its backend is unavailable:"
                                       " fail_open serves from the local cache (default);"
                                       " fail_closed answers 503 instead")
@@ -281,23 +515,28 @@ def main():
             command.add_argument("--tracing", dest="tracing",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="emit OpenTelemetry spans when the opentelemetry packages are installed (default: off)")
-            command.add_argument("--workers", type=_bounded(1, MAX_WORKERS, "--workers"), default=1,
+            command.add_argument("--workers", type=_bounded(1, MAX_WORKERS, "--workers"),
+                                 default=DEFAULT_CONFIG.workers,
                                  help="worker processes sharing the port (default 1: single process; max 64); "
                                       "a supervisor restarts crashed workers")
-            command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"), default=0,
+            command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"),
+                                 default=DEFAULT_CONFIG.rate_limit,
                                  help="requests allowed per client per --rate-limit-window (0 disables)")
-            command.add_argument("--rate-limit-window", type=_positive_float, default=60.0,
+            command.add_argument("--rate-limit-window", type=_positive_float,
+                                 default=DEFAULT_CONFIG.rate_limit_window,
                                  help="rate limit window in seconds")
             command.add_argument("--rate-limit-ipv6-prefix-len",
-                                 type=_bounded(0, 128, "--rate-limit-ipv6-prefix-len"), default=64,
+                                 type=_bounded(0, 128, "--rate-limit-ipv6-prefix-len"),
+                                 default=DEFAULT_CONFIG.rate_limit_ipv6_prefix_len,
                                  help="IPv6 prefix length sharing one rate-limit bucket (default 64;"
                                       " 48 groups a whole /48 into one bucket, which stops a /48"
                                       " holder minting fresh buckets, but also throttles every host"
                                       " sharing that prefix together)")
-            command.add_argument("--rate-limit-backend", choices=("memory", "redis"), default="memory",
+            command.add_argument("--rate-limit-backend", choices=("memory", "redis"),
+                                 default=DEFAULT_CONFIG.rate_limit_backend,
                                  help="per-process memory (default) or Redis via PYNEXT_REDIS_URL")
             command.add_argument("--rate-limit-failure-policy", choices=("fail_open", "fail_closed"),
-                                 default="fail_closed",
+                                 default=DEFAULT_CONFIG.rate_limit_failure_policy,
                                  help="Redis rate limiter behaviour when Redis is unavailable:"
                                       " fail_closed answers 503 (default);"
                                       " fail_open admits the request")
@@ -327,16 +566,47 @@ def main():
                                  help="allow credentials for configured CORS origins")
             command.add_argument("--csp-nonce", action="store_true", help="enable CSP nonces on dynamic pages")
             command.add_argument("--ws-max-message-bytes", type=_at_least(1, "--ws-max-message-bytes"),
-                                 default=MAX_WS_MESSAGE, help="WebSocket message limit in bytes (max 16777216)")
+                                 default=DEFAULT_CONFIG.websocket_max_message,
+                                 help="WebSocket message limit in bytes (max 16777216)")
             command.add_argument("--ws-allowed-origin", action="append", default=[], metavar="ORIGIN",
                                  help="allow an additional WebSocket origin (repeatable)")
             command.add_argument("--ws-allow-missing-origin", action="store_true",
                                  help="allow WebSocket clients that omit Origin")
             command.add_argument("--shutdown-timeout", type=_bounded(0, MAX_SHUTDOWN_TIMEOUT, "--shutdown-timeout"),
-                                 default=30,
+                                 default=DEFAULT_CONFIG.shutdown_timeout,
                                  help="seconds to let in-flight requests finish and WebSockets close "
                                       "after SIGTERM before the server stops anyway (default 30; max 3600)")
+    return parser
+
+
+def main():
+    parser = _build_parser()
+    # Resolve the config before the real parse: the config file (plus the
+    # environment) seeds the parser defaults, and explicit CLI options
+    # override them by being present. A fatal config error fails here,
+    # before anything starts (exit code 2, no traceback).
+    explicit = _explicit_cli_values(parser, sys.argv)
+    command = explicit.get("command")
+    root = Path(explicit.get("dir", ".")).resolve()
+    resolved = None
+    cli_overrides = {}
+    if command in ("dev", "build", "start"):
+        cli_overrides = {key: explicit[dest] for dest, key in _CLI_CONFIG_MAP.items()
+                         if dest in explicit}
+        try:
+            resolved = load_config(root, command, cli_overrides=cli_overrides)
+        except ConfigError as exc:
+            parser.error(str(exc))
+        _apply_config_defaults(parser, resolved)
     args = parser.parse_args()
+    # Repeatable options replace the config file list instead of adding
+    # to it: the probe captured the CLI-only values for those.
+    for dest in _APPEND_DESTS:
+        if dest in explicit:
+            setattr(args, dest, explicit[dest])
+    if resolved is not None:
+        for warning in resolved.warnings:
+            print(f"PyNext config warning: {warning}", file=sys.stderr)
     root = Path(args.dir).resolve()
     if args.command == "init":
         try:
@@ -370,13 +640,17 @@ def main():
         load_env(root, mode="production" if args.command == "start" else "development")
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
-    obs_config = None
+    # args already carry the resolved values (the config seeded the parser
+    # defaults), so the helpers below just read them back out.
+    values = resolved.values if resolved is not None else DEFAULT_CONFIG
+    obs_config = _observability_from_config(resolved) if resolved is not None else None
     if (args.structured_logs is not None or args.metrics is not None
             or args.tracing is not None):
-        # Only pass a config explicitly when a CLI flag overrides the
-        # environment: create_app() already reads the same PYNEXT_* variables,
-        # so the default path stays exactly the old call shape.
-        obs_config = ObservabilityConfig.from_env()
+        # CLI flags override the config: create_app() already reads the
+        # same PYNEXT_* variables, so the default path stays exactly the
+        # old call shape.
+        if obs_config is None:
+            obs_config = ObservabilityConfig.from_env()
         if args.structured_logs is not None:
             obs_config.structured_logs = args.structured_logs
         if args.metrics is not None:
@@ -384,45 +658,22 @@ def main():
         if args.tracing is not None:
             obs_config.tracing = args.tracing
     try:
-        limiter_type = RedisRateLimiter if args.rate_limit_backend == "redis" else RateLimiter
-        options = ({"namespace": os.environ.get("PYNEXT_RATE_LIMIT_NAMESPACE", "default"),
-                    "failure_policy": args.rate_limit_failure_policy}
-                   if args.rate_limit_backend == "redis" else {})
-        limiter = (limiter_type(args.rate_limit, args.rate_limit_window,
-                                trusted_proxies=args.trusted_proxy,
-                                exempt_paths=tuple(args.rate_limit_exempt_path),
-                                ipv6_prefix_len=args.rate_limit_ipv6_prefix_len, **options)
-                   if args.rate_limit >= 1 else None)
-        security = (SecurityConfig(csrf_enabled=args.csrf,
-                                   csrf_signing_key=args.csrf_signing_key,
-                                   csrf_cookie_secure=(args.csrf_cookie_secure
-                                                      if args.csrf_cookie_secure is not None
-                                                      else args.command == "start"),
-                                   cors_allowed_origins=tuple(args.cors_origin),
-                                   cors_allow_credentials=args.cors_credentials,
-                                   websocket_allowed_origins=tuple(args.ws_allowed_origin),
-                                   websocket_allow_missing_origin=args.ws_allow_missing_origin,
-                                   csp_nonce_enabled=args.csp_nonce)
-                    if (args.csrf is not None or args.csrf_signing_key is not None or
-                        args.csrf_cookie_secure is not None or args.cors_origin or
-                        args.cors_credentials or args.csp_nonce or args.ws_allowed_origin or
-                        args.ws_allow_missing_origin) else None)
+        limiter = _limiter_from_config(values)
+        security = _security_from_config(values, production=args.command == "start")
     except ValueError as exc:
         parser.error(str(exc))
     extra = {"observability": obs_config} if obs_config is not None else {}
     # Connection limits keep the historical serve() call shape when no flag
     # is given (see test_cli_without_observability_flags_keeps_old_call_shape):
-    # only explicitly set limits are forwarded, the rest stay at serve()'s
-    # defaults.
+    # only a value that differs from serve()'s default is forwarded — a
+    # config-file value equal to the default is the default, so omitting it
+    # changes nothing, and an unset limit stays at serve()'s default.
     conn_kwargs = {}
-    if args.max_connections is not None:
-        conn_kwargs["max_connections"] = args.max_connections
-    if args.max_connections_per_ip is not None:
-        conn_kwargs["max_connections_per_ip"] = args.max_connections_per_ip
-    if args.header_read_timeout_ms is not None:
-        conn_kwargs["header_read_timeout_ms"] = args.header_read_timeout_ms
-    if args.body_min_rate_bytes_per_sec is not None:
-        conn_kwargs["body_min_rate_bytes_per_sec"] = args.body_min_rate_bytes_per_sec
+    for key in ("max_connections", "max_connections_per_ip",
+                "header_read_timeout_ms", "body_min_rate_bytes_per_sec"):
+        value = getattr(args, key)
+        if value is not None and value != getattr(DEFAULT_CONFIG, key):
+            conn_kwargs[key] = value
     if args.workers > 1:
         config = WorkerConfig(root=str(root), host=args.host, port=args.port,
                               production=args.command == "start",
@@ -455,6 +706,7 @@ def main():
                                 websocket_max_message=args.ws_max_message_bytes,
                                 trusted_proxies=args.trusted_proxy,
                                 shutdown_timeout=args.shutdown_timeout, max_waiting=args.max_waiting,
+                                config=resolved, cli_overrides=cli_overrides,
                                 **extra, **conn_kwargs))
         except KeyboardInterrupt:
             pass

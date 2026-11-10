@@ -135,7 +135,7 @@ CLI defaults of `None` defer to server defaults; see the manual for scope and un
 | `--max-connections` | `None` |
 | `--max-connections-per-ip` | `None` |
 | `--max-waiting` | `None` |
-| `--shutdown-timeout` | `30` |
+| `--shutdown-timeout` | `30.0` |
 
 ## Health endpoints
 

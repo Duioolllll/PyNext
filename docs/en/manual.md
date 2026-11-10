@@ -60,6 +60,56 @@ async def Page(params):
 
 `h(tag, attrs, *children)` builds an HTML tree; strings are escaped. It is buffered SSR by default; a page may also stream UI chunks (see Streaming SSR below). It is not an arbitrary raw-HTML API.
 
+## Configuration file (`pynext.config.py`)
+
+Settings that used to live only on the command line can also be set in a
+`pynext.config.py` file at the project root. The file defines one `config`
+dict of plain data:
+
+~~~python
+# pynext.config.py
+config = {
+    "port": 4000,
+    "max_concurrent": 128,
+    "cache_backend": "sqlite",
+    "cors_allowed_origins": ["https://example.com"],
+}
+~~~
+
+Precedence is explicit CLI options > environment variables (`PYNEXT_*`) >
+config file > built-in defaults, so a CLI flag always wins over the file.
+Repeatable options (`--trusted-proxy`, `--cors-origin`,
+`--ws-allowed-origin`, `--rate-limit-exempt-path`) replace the file's
+list instead of adding to it.
+
+The file is loaded and validated when `pynext dev`, `pynext build` or
+`pynext start` runs. Unknown keys only warn (with a "did you mean …?"
+hint for near misses) and are ignored; a wrong type, an out-of-range
+value or an invalid security value (for example a too-short
+`csrf_signing_key`) fails startup with exit code 2 and a message naming
+the setting — the server never starts with a broken config. Two
+combinations warn: `cache_path` is only used with `cache_backend`
+`"sqlite"`, and `workers` above 1 with the `memory` cache backend keeps
+a separate ISR cache per worker. In dev mode the file is watched:
+editing it reloads the server, and a broken edit ends the dev loop with
+a config error instead of waiting for another change (editing app files
+cannot fix a broken config).
+
+All settings and their defaults live in one place in code,
+`pynext.config.DEFAULT_CONFIG`. Its fields are the full key list: host,
+port, max_concurrent, acquire_timeout_ms, max_waiting, body_capacity,
+body_timeout_ms, max_connections, max_connections_per_ip,
+header_read_timeout_ms, body_min_rate_bytes_per_sec, shutdown_timeout,
+workers, cache_backend, cache_path, cache_failure_policy, rate_limit,
+rate_limit_window, rate_limit_backend, rate_limit_ipv6_prefix_len,
+rate_limit_failure_policy, rate_limit_exempt_paths, trusted_proxies,
+csrf_enabled, csrf_signing_key, csrf_cookie_secure, cors_allowed_origins,
+cors_allow_credentials, csp_nonce_enabled, websocket_max_message,
+websocket_allowed_origins, websocket_allow_missing_origin,
+structured_logs, metrics, tracing, log_level. The environment variables
+read are `PYNEXT_STRUCTURED_LOGS`, `PYNEXT_METRICS`, `PYNEXT_TRACING`,
+`PYNEXT_LOG_LEVEL` and `PYNEXT_CSRF_SIGNING_KEY`.
+
 ## Application imports and migration
 
 Page, layout and API modules may use package-relative imports, such as `from .helpers import title`. Each app receives its own module namespace; the framework no longer prepends the project root to process-wide `sys.path`. If a root-based absolute import stops working after upgrading from v0.5, change it to a relative import or install your project as a Python package. Third-party packages must be installed in the environment.

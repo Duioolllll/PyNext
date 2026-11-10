@@ -28,6 +28,7 @@ from .client import compile_client, read_client_artifacts
 from .components import _isr_policy, _isr_query_keys, _node, bind_islands
 from .env import load_env
 from .build import discover, load_manifest
+from .config import DEFAULT_CONFIG
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
@@ -344,10 +345,11 @@ def _module_key(root, relative):
 
 
 class App:
-    def __init__(self, root, manifest, *, production=False, security=None, cache_backend="memory",
+    def __init__(self, root, manifest, *, production=False, security=None,
+                 cache_backend=DEFAULT_CONFIG.cache_backend,
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
                  resources=None, cache_url=None, cache_failure_policy=None,
-                 websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
+                 websocket_max_message=DEFAULT_CONFIG.websocket_max_message, hot_reload=False,
                  trusted_proxies=None, sync_workers=32):
         if isinstance(sync_workers, bool) or not isinstance(sync_workers, int) or not 1 <= sync_workers <= 1024:
             raise ValueError("sync_workers must be an integer from 1 to 1024")
@@ -1662,9 +1664,11 @@ class App:
         await _send_response(response, send, config=self.security, production=self.production)
 
 
-def create_app(root=".", *, production=False, security=None, cache_backend="memory", cache_path=None,
+def create_app(root=".", *, production=False, security=None, cache_backend=DEFAULT_CONFIG.cache_backend,
+               cache_path=None,
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
-               cache_failure_policy=None, websocket_max_message=MAX_WS_MESSAGE, hot_reload=False,
+               cache_failure_policy=None, websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
+               hot_reload=False,
                trusted_proxies=None, sync_workers=32):
     root = Path(root).resolve()
     # .env files are loaded before the manifest is read or user code runs,

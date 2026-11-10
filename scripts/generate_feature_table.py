@@ -176,10 +176,28 @@ def session_stores() -> list[str]:
     )
 
 
+def _config_defaults() -> dict[str, str]:
+    """``{field: literal default}`` for ``PyNextConfig`` in config.py.
+
+    CLI defaults now read from ``DEFAULT_CONFIG`` (the single default
+    source), so a default written as ``DEFAULT_CONFIG.<field>`` resolves
+    to the literal value declared on the dataclass.
+    """
+    tree = _parse(ROOT / "python" / "pynext" / "config.py")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "PyNextConfig":
+            return {stmt.target.id: ast.unparse(stmt.value)
+                    for stmt in node.body
+                    if isinstance(stmt, ast.AnnAssign)
+                    and isinstance(stmt.target, ast.Name) and stmt.value is not None}
+    return {}
+
+
 def server_controls() -> list[tuple[str, str]]:
     """Extract selected operational CLI controls and their declared defaults."""
     wanted = {"--max-waiting", "--max-connections", "--max-connections-per-ip", "--shutdown-timeout"}
     rows = {}
+    config_defaults = _config_defaults()
     for node in ast.walk(_parse(ROOT / "python" / "pynext" / "cli.py")):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "add_argument"):
@@ -188,6 +206,8 @@ def server_controls() -> list[tuple[str, str]]:
             name = _const(arg)
             if name in wanted:
                 default = next((ast.unparse(kw.value) for kw in node.keywords if kw.arg == "default"), "-")
+                if default.startswith("DEFAULT_CONFIG."):
+                    default = config_defaults.get(default.split(".", 1)[1], default)
                 rows[name] = default
     return sorted(rows.items())
 
