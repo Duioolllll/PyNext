@@ -311,3 +311,70 @@ def test_session_changed_names_key_mutated_in_place():
     session["tags"].append(object())
     with pytest.raises(TypeError, match="'tags'"):
         session._changed()
+
+
+def _cookie_flags(set_cookie):
+    """Split a Set-Cookie value into its lower-cased flag parts."""
+    return {part.strip().lower() for part in set_cookie.split(";")}
+
+
+def test_session_cookie_secure_defaults(tmp_path):
+    """S-P0-4: the default session cookie is Secure + HttpOnly + SameSite=Lax.
+
+    The defaults live on ``SessionMiddleware`` itself (``secure=True``,
+    ``same_site="Lax"``, ``HttpOnly`` always set), so an app that
+    installs the middleware without arguments gets the safe cookie —
+    and the token is stored server-side under its SHA-256 hash.
+    """
+    from pynext.sessions import _key
+
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite3")
+    assert SessionMiddleware(store).secure is True
+    assert SessionMiddleware(store).same_site == "Lax"
+    assert len(_key("x" * 43)) == 64  # SHA-256 hex digest, not SHA-1
+    api = tmp_path / "app" / "api"
+    (api / "token").mkdir(parents=True)
+    (api / "token" / "route.py").write_text(
+        'from pynext import JSONResponse, route\n@route("GET")\n'
+        'def get(request): return JSONResponse({"token": request.state["session"].csrf_token()})\n'
+    )
+    app = create_app(tmp_path, middleware=[SessionMiddleware(store)])
+
+    async def run():
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://test") as client:
+                response = await client.get("/api/token")
+                flags = _cookie_flags(response.headers["set-cookie"])
+                assert "secure" in flags
+                assert "httponly" in flags
+                assert "samesite=lax" in flags
+        finally:
+            await app.isr.close()
+    asyncio.run(run())
+
+
+def test_session_cookie_secure_opt_out_is_explicit(tmp_path):
+    """S-P0-4: plain-http local dev opts out with an explicit ``secure=False``."""
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite3")
+    assert SessionMiddleware(store, secure=False).secure is False
+    api = tmp_path / "app" / "api"
+    (api / "token").mkdir(parents=True)
+    (api / "token" / "route.py").write_text(
+        'from pynext import JSONResponse, route\n@route("GET")\n'
+        'def get(request): return JSONResponse({"token": request.state["session"].csrf_token()})\n'
+    )
+    app = create_app(tmp_path, middleware=[SessionMiddleware(store, secure=False)])
+
+    async def run():
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://test") as client:
+                response = await client.get("/api/token")
+                flags = _cookie_flags(response.headers["set-cookie"])
+                assert "secure" not in flags
+                assert "httponly" in flags
+                assert "samesite=lax" in flags
+        finally:
+            await app.isr.close()
+    asyncio.run(run())

@@ -211,3 +211,104 @@ def test_axum_origin_callback_timeout_fails_closed(tmp_path, monkeypatch):
             await asyncio.to_thread(server.stop)
             await app.isr.close()
     asyncio.run(run())
+
+
+def test_asgi_origin_denial_returns_403_and_logs(tmp_path, caplog):
+    """S-P0-7: an ASGI origin denial is an observable HTTP 403, not a silent close.
+
+    Same answer as the native upgrade branch (403 + security headers),
+    plus a log line naming the origin, so a CSWSH attempt shows up in
+    the logs. The handler still never runs.
+    """
+    import logging
+
+    async def run():
+        app = _app(tmp_path)
+        module = app._module("app/ws/route.py")
+
+        async def attempt(headers):
+            sent = []
+
+            async def receive():
+                return {"type": "websocket.connect"}
+
+            async def send(message):
+                sent.append(message)
+
+            scope = {"type": "websocket", "path": "/ws", "scheme": "ws",
+                     "headers": headers, "client": ("127.0.0.1", 1234), "query_string": b""}
+            await app(scope, receive, send)
+            return sent
+
+        try:
+            with caplog.at_level(logging.WARNING, logger="pynext"):
+                caplog.clear()
+                sent = await attempt([(b"host", b"app.example"),
+                                      (b"origin", b"http://evil.example")])
+                assert sent[0]["type"] == "websocket.http.response.start"
+                assert sent[0]["status"] == 403
+                headers = {name.decode("ascii").lower(): value.decode("ascii")
+                           for name, value in sent[0]["headers"]}
+                assert headers["x-content-type-options"] == "nosniff"
+                assert headers["x-frame-options"] == "DENY"
+                assert headers["referrer-policy"] == "same-origin"
+                assert sent[1] == {"type": "websocket.http.response.body", "body": b"Forbidden"}
+                assert len(module.calls) == 0
+                assert any("denied by origin policy" in record.message
+                           and "evil.example" in record.message
+                           for record in caplog.records)
+                # A missing Origin is denied (and logged) the same way
+                # when the missing-origin opt-in is off (the default).
+                caplog.clear()
+                sent = await attempt([(b"host", b"app.example")])
+                assert sent[0]["type"] == "websocket.http.response.start"
+                assert sent[0]["status"] == 403
+                assert any("denied by origin policy" in record.message
+                           for record in caplog.records)
+                assert len(module.calls) == 0
+        finally:
+            await app.isr.close()
+    asyncio.run(run())
+
+
+def test_axum_failed_upgrade_still_carries_security_headers(tmp_path):
+    """S-P0-3: even axum's failed-upgrade rejection carries the A1 headers.
+
+    A handshake missing ``Sec-WebSocket-Key`` fails inside
+    ``WebSocketUpgrade::from_request_parts`` — past origin and auth —
+    and used to return axum's bare rejection with no security headers.
+    """
+    async def run():
+        app = _app(tmp_path)
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            def attempt(headers):
+                lines = ["GET /ws HTTP/1.1", f"Host: {server.address}",
+                         "Upgrade: websocket", "Connection: Upgrade", *headers, "", ""]
+                with socket.create_connection(
+                        (server.address.rsplit(":", 1)[0],
+                         int(server.address.rsplit(":", 1)[1])), timeout=5) as conn:
+                    conn.settimeout(5)
+                    conn.sendall("\r\n".join(lines).encode("ascii"))
+                    result = b""
+                    while b"\r\n\r\n" not in result:
+                        chunk = conn.recv(4096)
+                        assert chunk
+                        result += chunk
+                head, _, _ = result.partition(b"\r\n\r\n")
+                status = int(head.split(b" ", 2)[1])
+                headers = {line.split(b":", 1)[0].decode("ascii").strip().lower():
+                           line.split(b":", 1)[1].decode("ascii").strip()
+                           for line in head.split(b"\r\n")[1:] if b":" in line}
+                return status, headers
+
+            status, headers = await asyncio.to_thread(
+                attempt, [f"Origin: http://{server.address}"])
+            assert status == 400
+            assert headers["x-content-type-options"] == "nosniff"
+            assert headers["x-frame-options"] == "DENY"
+            assert headers["referrer-policy"] == "same-origin"
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())

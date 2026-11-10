@@ -455,7 +455,12 @@ class SessionMiddleware:
     """Attach ``request.state['session']`` and persist changes before sending headers.
 
     The session cookie is ``HttpOnly`` and ``Secure`` by default with
-    ``SameSite=Lax``. A request that presents the cookie name more than
+    ``SameSite=Lax`` — the safe defaults (S-P0-4): a cookie issued over
+    plain HTTP would be sent in cleartext, so ``Secure`` stays on
+    unless the app opts out explicitly. For plain-``http://`` local
+    development pass ``secure=False`` (and only there: never ship a
+    production app with it). Tokens are stored server-side under their
+    SHA-256 hash, never in cleartext. A request that presents the cookie name more than
     once (duplicate ``Cookie`` headers or a duplicated name in one
     header) is treated as having no session at all — fail-closed, so an
     attacker cannot smuggle a chosen session id past the single-value

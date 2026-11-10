@@ -2495,7 +2495,26 @@ class App:
         peer_ip = client[0] if client else None
         if not websocket_origin_allowed(scope.get("headers", []), peer_ip, scope.get("scheme") or "ws",
                                         self.proxy_trust, self.security):
-            await send({"type": "websocket.close", "code": 1008})
+            # A denied handshake is observable, not silent: HTTP 403
+            # (the same answer the native upgrade branch gives) plus a
+            # log line, so a CSWSH attempt shows up in the logs instead
+            # of looking like a dropped connection. The handler never
+            # runs.
+            origin = None
+            for name, value in scope.get("headers", []) or []:
+                if (isinstance(name, (bytes, bytearray))
+                        and isinstance(value, (bytes, bytearray))
+                        and bytes(name).lower() == b"origin"):
+                    origin = bytes(value).decode("ascii", "replace")
+                    break
+            log.warning("WebSocket handshake denied by origin policy: path=%s origin=%r peer=%s",
+                        path, origin, peer_ip)
+            denied = Response("Forbidden", status=403)
+            apply_path_headers(denied, path, path_headers=self.path_headers)
+            apply_security_headers(denied, config=self.security, production=self.production)
+            await send({"type": "websocket.http.response.start", "status": denied.status,
+                        "headers": denied.headers})
+            await send({"type": "websocket.http.response.body", "body": denied.body})
             return
         offered = scope.get("subprotocols", [])
         if not isinstance(offered, (list, tuple)) or any(not isinstance(value, str) for value in offered):
