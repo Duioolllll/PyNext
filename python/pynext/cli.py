@@ -608,6 +608,13 @@ def _build_parser():
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
         print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
+        coverage = manifest.get("catch_all_coverage") or {}
+        shadowed = coverage.get("shadowed") or {}
+        dynamic_only = coverage.get("dynamic_only") or []
+        if shadowed or dynamic_only:
+            print(f"Catch-all coverage: {len(shadowed)} static page(s) also match a catch-all "
+                  f"route (the static page wins); {len(dynamic_only)} catch-all route(s) serve "
+                  f"only paths generate_static_params did not enumerate")
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
             try:
