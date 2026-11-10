@@ -317,8 +317,13 @@ def test_cli_build_reports_lock_contention(tmp_path, monkeypatch, capsys):
 
 def test_cli_build_lock_timeout_reaches_subprocess(tmp_path):
     make_app(tmp_path)
+    # The holder must outlive the CLI subprocess's startup (interpreter +
+    # pynext import), which takes seconds under load; a 5s hold raced
+    # with it and the CLI then acquired the released lock and succeeded.
+    # The holder is terminated in `finally`, so the long hold costs no
+    # extra time when the test passes.
     holder = subprocess.Popen(
-        [sys.executable, "-c", _HOLDER_SCRIPT, str(tmp_path), "5"],
+        [sys.executable, "-c", _HOLDER_SCRIPT, str(tmp_path), "30"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         assert holder.stdout.readline().strip().startswith("locked")
@@ -329,6 +334,7 @@ def test_cli_build_lock_timeout_reaches_subprocess(tmp_path):
         assert result.returncode == 2
         assert "another build is already running" in result.stderr
     finally:
+        holder.terminate()
         holder.wait(timeout=10)
 
 
