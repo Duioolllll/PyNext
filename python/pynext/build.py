@@ -51,6 +51,13 @@ def discover(root):
     # symlink under app/ instead, like discover_public does for public/.
     for current, dirs, files in os.walk(app_dir, followlinks=False):
         dirs[:] = [name for name in dirs if name != "__pycache__"]
+        for name in dirs:
+            if name.startswith("@"):
+                raise ValueError(
+                    f"Parallel routes (@slot) are not supported: {Path(current) / name}; "
+                    "rename the directory without the @ prefix or remove it — "
+                    f"a @slot directory would otherwise silently become a literal /{name} "
+                    "URL segment")
         for name in dirs + files:
             if (Path(current) / name).is_symlink():
                 raise ValueError(f"App symlink is not allowed: {Path(current) / name}")
@@ -70,6 +77,10 @@ def discover(root):
     for path in files:
         if path.parent == root:
             continue
+        if path.name == "default.py":
+            raise ValueError(
+                f"Parallel routes are not supported: {path}; a default.py slot "
+                "fallback has no effect, remove the file")
         if path.name not in ("page.py", "route.py"):
             continue
         relative_parent = path.parent.relative_to(app_dir)
@@ -94,7 +105,7 @@ def discover(root):
                            "layouts": layouts if path.stem == "page" else []}
     if not routes:
         raise ValueError("No page.py or route.py files found")
-    router = _native.Router(list(routes))
+    router = validate_routes(routes)
     public_sources = discover_public(root)
     for path in list(routes) + list(public_sources):
         if path == "/_pynext" or path.startswith("/_pynext/"):
@@ -105,6 +116,99 @@ def discover(root):
     return {"schema_version": VERSION, "routes": {p: routes[p] for p in router.ordered_routes()},
             "sources": {str(p.relative_to(root)): _hash(p) for p in files},
             "public_sources": public_sources, "client_sources": discover_client(root)}
+
+
+# Fix guidance for the router's error messages, keyed by the message
+# fragment the Rust router reports. Wording follows Next.js
+# build/validate-app-paths.ts and shared/lib/router/utils/sorted-routes.ts
+# so users can search for the error text.
+_ROUTE_FIX_HINTS = (
+    ("Different slug names for the same dynamic path",
+     "Use the same parameter name for the same dynamic path in every route "
+     "(for example, use [id] in all routes under /blog instead of mixing [id] and [slug])."),
+    ("Catch-all must be the last part of the URL",
+     "Move the [...name] segment to the end of the route."),
+    ("Cannot combine a catch-all and an optional catch-all",
+     "Use either [...name] or [[...name]] at the same level, not both."),
+    ("Duplicate route",
+     "Remove one of the page.py/route.py files that map to this path."),
+    ("Repeated or ambiguous parameter name",
+     "Rename one of the parameters so each name appears only once in the route."),
+    ("Optional catch-all must use [[...name]]",
+     "Write the optional catch-all as [[...name]]."),
+    ("Optional or malformed route parameters are not supported",
+     "Write an optional catch-all as [[...name]]; a single optional parameter [[name]] "
+     "is not supported."),
+    ("Invalid parameter name",
+     "Use only letters, digits, _ and - in parameter names."),
+    ("Malformed route segment",
+     "Write dynamic segments as [name], [...name] or [[...name]]."),
+    ("Route must be an absolute normalized path",
+     "Route patterns must start with / and must not contain // or a trailing slash."),
+    ("Invalid route path",
+     "Route patterns must not contain . or .. segments or ?, #, \\ or NUL characters."),
+)
+
+
+def _fix_hint(message):
+    for fragment, hint in _ROUTE_FIX_HINTS:
+        if fragment in message:
+            return hint
+    return "Fix the route pattern and rebuild."
+
+
+def _validate_route_pattern(pattern):
+    """Python-side checks whose messages the Rust router cannot give.
+
+    The Rust router rejects these too, but only with a generic message;
+    here the cause is named the way Next.js names it.
+    """
+    if pattern == "/":
+        return
+    for segment in pattern.strip("/").split("/"):
+        if "…" in segment:
+            raise ValueError(
+                f"Detected a three-dot character ('…') in the route segment {segment!r} "
+                f"of {pattern}: did you mean ('...')?")
+        # "[...rest]" is a catch-all, not a name starting with a period:
+        # only "[.id]" / "[..id]" spellings are erroneous periods.
+        if segment.startswith("[.") and not segment.startswith("[..."):
+            raise ValueError(
+                f"Segment names may not start with erroneous periods ('.') in {pattern}: "
+                f"rename the parameter in {segment!r}.")
+
+
+def validate_routes(routes):
+    """Build-time route validation (Next.js validate-app-paths.ts layer).
+
+    ``routes`` maps each pattern to its spec (with ``"entry"``, the source
+    file relative to the project root). Every failure names the pattern,
+    the file it came from and how to fix it, so a bad route fails the
+    build with an actionable message instead of a bare router error.
+    Returns the built native router.
+    """
+    for pattern, spec in routes.items():
+        try:
+            _validate_route_pattern(pattern)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid route {pattern} (from {spec['entry']}): {exc}") from exc
+    try:
+        return _native.Router(list(routes))
+    except ValueError as exc:
+        # Attribute the failure to the route that introduced it: rebuild
+        # incrementally so the message can name the offending file.
+        built = []
+        for pattern in routes:
+            try:
+                _native.Router([*built, pattern])
+            except ValueError as inner:
+                entry = routes[pattern]["entry"]
+                raise ValueError(
+                    f"Invalid route {pattern} (from {entry}): {inner}. "
+                    f"Fix: {_fix_hint(str(inner))}") from inner
+            built.append(pattern)
+        raise
 
 
 def write_manifest(root):
@@ -201,6 +305,8 @@ def _route_group(part):
         return None
     match = re.fullmatch(r"\(([A-Za-z0-9_-]+)\)", part)
     if match is None:
+        if part in ("(.)", "(..)", "(...)", "(..)(..)"):
+            raise ValueError(f"Invalid route group: {part} (interception routes are not supported)")
         raise ValueError(f"Invalid route group: {part}")
     return match.group(1)
 

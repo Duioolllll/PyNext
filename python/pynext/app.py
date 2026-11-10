@@ -308,6 +308,22 @@ async def _run_while_connected(work, receive):
         await asyncio.gather(task, disconnect, return_exceptions=True)
 
 
+def _typed_params(raw_params, kinds):
+    """Collapse matched parameter values to the handler's types.
+
+    ``raw_params`` maps each name to its list of matched segments and
+    ``kinds`` maps the same names to the kind the router recorded for
+    them (``"dynamic"``, ``"catch_all"`` or ``"optional"`` — see
+    ``Router.matches``). Catch-all and optional catch-all parameters stay
+    lists; a dynamic parameter becomes its single segment. The kinds
+    must come from the router, never from a substring test on the
+    pattern: ``"[...a]"`` is a substring of ``"/[a]/[...a2]"`` and would
+    misclassify the dynamic ``a`` as a list.
+    """
+    return {k: v if kinds.get(k) in ("catch_all", "optional") else v[0]
+            for k, v in raw_params.items()}
+
+
 def _decode_path(path, raw_path=None):
     if raw_path is not None:
         if re.search(br"%(?![0-9a-fA-F]{2})|%(?:2[fF]|5[cC]|00)", raw_path):
@@ -1163,9 +1179,9 @@ class App:
         if match is None:
             route_var.set("__not_found__")
             return Response("Not Found", status=404)
-        pattern, raw_params = match
+        pattern, raw_params, kinds = match
         route_var.set(pattern)
-        params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
+        params = _typed_params(raw_params, kinds)
         request = Request(request.method, request.path, request.query_string, request.headers, request.body,
                           params, self, request.state, request._cancel_event)
         spec = self.manifest["routes"][pattern]
@@ -1358,11 +1374,11 @@ class App:
         match = self.router.matches(path)
         if match is None:
             return Response("Not Found", status=404)
-        pattern, raw_params = match
+        pattern, raw_params, kinds = match
         handler = self.websocket_entries.get(pattern)
         if handler is None:
             return Response("Not Found", status=404)
-        params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
+        params = _typed_params(raw_params, kinds)
         request = Request("GET", path, bytes(query_string),
                           tuple((bytes(name), bytes(value)) for name, value in headers),
                           b"", params, self, {})
@@ -1400,10 +1416,10 @@ class App:
         handler = None
         params = {}
         if match is not None:
-            pattern, raw_params = match
+            pattern, raw_params, kinds = match
             handler = self.websocket_entries.get(pattern)
             if handler is not None:
-                params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
+                params = _typed_params(raw_params, kinds)
         if handler is None:
             # No route, or a route with no WebSocket handler: refuse the
             # handshake with a policy-violation close instead of hanging.

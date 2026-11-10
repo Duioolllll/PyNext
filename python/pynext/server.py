@@ -9,7 +9,7 @@ import threading
 import time
 
 from . import _native
-from .app import _decode_path, _invoke
+from .app import _decode_path, _invoke, _typed_params
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
                    WebSocketDisconnect, _RequestCancellation, apply_security_headers, security_headers)
 from .observability import begin_request_context, queue_wait_var
@@ -148,11 +148,11 @@ def _websocket_callback(app, loop, path, query, headers, subprotocol=None):
     match = app.router.matches(path)
     if match is None:
         raise RuntimeError(f"No WebSocket route for {path}")
-    pattern, raw_params = match
+    pattern, raw_params, kinds = match
     handler = app.websocket_entries.get(pattern)
     if handler is None:
         raise RuntimeError(f"No WebSocket handler for {path}")
-    params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
+    params = _typed_params(raw_params, kinds)
     session = _WsSession(loop, app.websocket_max_message)
 
     async def receive():

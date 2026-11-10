@@ -34,6 +34,15 @@ struct PyRouter {
     inner: Router,
 }
 
+/// A matched route as exposed to Python: the route pattern, each
+/// parameter's matched segments, and each parameter's kind
+/// (`"dynamic"`, `"catch_all"` or `"optional"`).
+type PyRouteMatch = (
+    String,
+    HashMap<String, Vec<String>>,
+    HashMap<String, String>,
+);
+
 #[pymethods]
 impl PyRouter {
     #[new]
@@ -47,8 +56,14 @@ impl PyRouter {
         self.inner.routes().to_vec()
     }
 
-    fn matches(&self, path: &str) -> Option<(String, HashMap<String, Vec<String>>)> {
-        self.inner.matches(path)
+    fn matches(&self, path: &str) -> Option<PyRouteMatch> {
+        self.inner.matches(path).map(|(pattern, params, kinds)| {
+            (
+                pattern,
+                params,
+                kinds.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
+            )
+        })
     }
 }
 
@@ -1263,7 +1278,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         let Some(path) = static_path(parts.uri.path()) else {
             return plain_response(StatusCode::NOT_FOUND, "Not Found", &state.security_headers);
         };
-        let Some((pattern, _)) = state.websocket_router.matches(&path) else {
+        let Some((pattern, _, _)) = state.websocket_router.matches(&path) else {
             return plain_response(StatusCode::NOT_FOUND, "Not Found", &state.security_headers);
         };
         if !state.websocket_paths.contains(&pattern) {
