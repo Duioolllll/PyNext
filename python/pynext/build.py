@@ -1166,10 +1166,17 @@ def _parse_route_pattern(pattern):
         if parsed is None:
             prefix.append(("static", segment))
         else:
-            name, kind = parsed
+            name, kind, seg_prefix, seg_suffix = parsed
             if kind != "dynamic":
                 raise ValueError(f"Catch-all must be the last part of the URL: {pattern}")
-            prefix.append(("dynamic", name))
+            if seg_prefix or seg_suffix:
+                # Affixed parameter (v[version], [name].json): it only
+                # matches values carrying that prefix/suffix, so for
+                # coverage it behaves like a distinct literal, not a
+                # bare dynamic segment that matches any value.
+                prefix.append(("static", segment))
+            else:
+                prefix.append(("dynamic", name))
     return prefix, tail
 
 
