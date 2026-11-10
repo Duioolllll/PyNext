@@ -521,18 +521,34 @@ def page(*, render="ssr", revalidate=None, stale=None, expire=None, cache_life=N
     return decorate
 
 
-def layout(fn=None, *, revalidate=None, stale=None, expire=None):
+def layout(fn=None, *, revalidate=None, stale=None, expire=None, dynamic=False):
     """Mark a layout function, optionally declaring a section ISR policy.
 
     Both ``@layout`` and ``@layout(revalidate=60, stale=120)`` work. A policy
     on a layout is the default for ISR pages below it: a page (or nearer
     layout) only wins with a shorter value, per ``reduce_segment_config``.
     Non-ISR pages ignore the policy.
+
+    Layouts receive only ``children`` — never the request or route
+    params — so the layout shell (the layouts applied to a marker in
+    place of the page) is the same for every request to a route and the
+    framework renders it once and caches it per route. Treat
+    ``children`` as opaque and render it exactly once: the shell is
+    built with a placeholder where the page goes, so a layout that
+    inspects its children would see the placeholder, not the page.
+    A layout that reads other mutable state (a clock, a database, a
+    global counter) must opt out with ``@layout(dynamic=True)``: its
+    shell is rendered on every request instead of being cached.
     """
+    if not isinstance(dynamic, bool):
+        raise TypeError("dynamic must be a bool")
     policy = _partial_isr_policy(revalidate, stale, expire)
     def decorate(target):
+        if not callable(target):
+            raise TypeError("layout must decorate a function")
         target.__pynext_layout__ = True
         target.__pynext_layout_policy__ = policy
+        target.__pynext_layout_dynamic__ = dynamic
         return target
     if fn is None:
         return decorate

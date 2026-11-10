@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import dataclasses
 import hashlib
 import hmac
@@ -324,6 +325,35 @@ class _ISRStreamingResponse(StreamingResponse):
         # not execute its finally block (notably on HEAD and early disconnect).
         self._feed.detach()
         await super().aclose()
+
+
+def _substitute_shell_marker(node, marker, page_tree):
+    """Return ``(tree, count)`` with the marker text node swapped for ``page_tree``.
+
+    The input tree is never mutated: every dict and list on the path is
+    rebuilt, so a cached shell template stays pristine for the next
+    request. ``count`` is the number of marker nodes replaced; a valid
+    shell renders its children exactly once, so callers require 1.
+    """
+    if isinstance(node, dict):
+        if node.get("kind") == "text" and node.get("value") == marker:
+            return page_tree, 1
+        result = {}
+        count = 0
+        for key, value in node.items():
+            new_value, found = _substitute_shell_marker(value, marker, page_tree)
+            result[key] = new_value
+            count += found
+        return result, count
+    if isinstance(node, list):
+        result = []
+        count = 0
+        for child in node:
+            new_child, found = _substitute_shell_marker(child, marker, page_tree)
+            result.append(new_child)
+            count += found
+        return result, count
+    return node, 0
 
 
 async def _send_response(response, send, *, config=None, production=True):
@@ -739,6 +769,9 @@ class App:
         self.production = production
         self.router = _native.Router(list(manifest["routes"]))
         self.entries = {}
+        self._layout_shells = {}
+        self._layout_shell_locks = {}
+        self._layout_shell_dynamic = {}
         self.websocket_entries = {}
         self.render_modes = {}
         self.dynamic_modes = {}
@@ -908,6 +941,9 @@ class App:
                     elif not is_dynamic and generator is not None:
                         raise ValueError(f"Static SSG page {spec['entry']} cannot export generate_static_params")
                     self.static_generators[pattern] = generator
+                self._layout_shell_dynamic[pattern] = any(
+                    getattr(layout_fn, "__pynext_layout_dynamic__", False) for layout_fn in layouts
+                )
                 self.entries[pattern] = (fn, layouts)
                 self.entry_layouts[pattern] = tuple(spec["layouts"])
             else:
@@ -973,6 +1009,21 @@ class App:
             self.asset_etags[path] = f'"{hashlib.sha256(body).hexdigest()}"'
         for path, body in self.client_assets.items():
             self.metrics.observe_island_bundle(path, len(body))
+        # Cached shells embed island module URLs from the old manifest.
+        self.invalidate_layout_shell()
+
+    def invalidate_layout_shell(self, pattern=None):
+        """Drop cached layout shells for one ``pattern`` or for all routes.
+
+        Layout source changes create a new app, so the cache is normally
+        fresh; this is for the cases where a running app outlives its
+        inputs — :meth:`update_dev_client` calls it when hot reload swaps
+        the client manifest. Dynamic layouts are never cached.
+        """
+        if pattern is None:
+            self._layout_shells.clear()
+        else:
+            self._layout_shells.pop(pattern, None)
 
     def _module(self, path):
         key = _module_key(self.root, path)
@@ -1529,44 +1580,124 @@ class App:
         payload = json.dumps(bound, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         return await asyncio.to_thread(_native.render, payload)
 
+
+    async def _layout_shell(self, pattern, layouts):
+        """Return the cached layout shell entry for ``pattern``.
+
+        The entry holds the layouts applied once to a marker text node
+        (the unbound shell tree, plus a rendered prefix/suffix split
+        once a streaming page needs it). Layouts only receive
+        ``children``, so the shell cannot depend on the request or the
+        route params; a layout that reads other mutable state must opt
+        out with ``@layout(dynamic=True)``, in which case this returns
+        None and the caller renders the shell on every request. Returns
+        the entry dict, or None for dynamic layouts.
+        """
+        if self._layout_shell_dynamic.get(pattern, False):
+            return None
+        entry = self._layout_shells.get(pattern)
+        if entry is not None:
+            return entry
+        lock = self._layout_shell_locks.get(pattern)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._layout_shell_locks[pattern] = lock
+        async with lock:
+            entry = self._layout_shells.get(pattern)
+            if entry is not None:
+                return entry
+            # The marker is framework-generated, not a page read: suppress
+            # it so it is never misreported as the page being dynamic.
+            with suppress_dynamic_tracking():
+                marker = "__pynext_shell_" + uuid.uuid4().hex + "__"
+            shell = {"kind": "text", "value": marker}
+            for layout_fn in reversed(layouts):
+                shell = await _invoke(layout_fn, children=shell)
+                if not isinstance(shell, dict):
+                    raise TypeError(
+                        f"Layout for {pattern} must return a render node dict, "
+                        f"got {type(shell).__name__}"
+                    )
+            entry = {"tree": shell, "marker": marker, "prefix": None, "suffix": None}
+            self._layout_shells[pattern] = entry
+            return entry
+
+    async def _render_shell_split(self, pattern, shell, marker):
+        """Bind and render a shell tree, splitting it around its marker.
+
+        Returns ``(prefix, suffix)``. Raises ValueError unless the
+        marker renders exactly once — the same "children exactly once"
+        invariant the streaming path has always enforced.
+        """
+        bound = bind_islands(shell, self.client_manifest, dev_id=self._dev_id)
+        payload = json.dumps(bound, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        html = await asyncio.to_thread(_native.render, payload)
+        parts = html.split(marker)
+        if len(parts) != 2:
+            raise ValueError(
+                f"Layout for {pattern} must render its children exactly once"
+            )
+        prefix, suffix = parts
+        if shell.get("tag", "").lower() == "html":
+            prefix = "<!DOCTYPE html>" + prefix
+        return prefix, suffix
+
+    async def _layout_shell_html(self, pattern, entry):
+        """Return the cached ``(prefix, suffix)`` HTML split for a shell entry.
+
+        The split is derived lazily: binding the shell alone can fail
+        for shapes that only become valid once the page is substituted
+        (for example a layout without a ``<body>`` whose page provides
+        one), so buffered pages never pay for it — they substitute into
+        the tree and bind the composed tree instead.
+        """
+        if entry["prefix"] is not None:
+            return entry["prefix"], entry["suffix"]
+        lock = self._layout_shell_locks.get(pattern)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._layout_shell_locks[pattern] = lock
+        async with lock:
+            if entry["prefix"] is not None:
+                return entry["prefix"], entry["suffix"]
+            prefix, suffix = await self._render_shell_split(
+                pattern, copy.deepcopy(entry["tree"]), entry["marker"])
+            entry["prefix"], entry["suffix"] = prefix, suffix
+            return prefix, suffix
+
     async def _streaming_page_response(self, pattern, chunks, layouts, tracker=None):
         """Wrap an async iterable of UI nodes in a StreamingResponse.
 
-        The layout shell is rendered once with a marker in place of the page
-        children, then split into a prefix and a suffix around the marker.
-        The prefix is sent first, each page chunk is serialized and sent as
-        it arrives, and the suffix closes the document. Layouts must render
-        their children exactly once; anything else fails before headers are
-        sent. SSG consumes the stream during the build. ISR streams its first
-        generation while retaining a bounded copy for the cache.
+        The layout shell is rendered once per route and cached; the
+        cached prefix is sent first, each page chunk is serialized and
+        sent as it arrives, and the cached suffix closes the document.
+        Layouts that opted out with ``@layout(dynamic=True)`` are still
+        rendered on every request, exactly as before. Layouts must render
+        their children exactly once; anything else fails before headers
+        are sent. SSG consumes the stream during the build. ISR streams
+        its first generation while retaining a bounded copy for the cache.
 
         When ``tracker`` is given, the stream owns it: ``page_stream()``
         exits it when the body is fully consumed or the stream is closed,
         so dynamic accesses in later chunks are still recorded.
         """
-        # The marker is framework-generated, not a page read: suppress it so
-        # it is never misreported as the page being dynamic.
-        with suppress_dynamic_tracking():
-            marker = "__pynext_stream_" + uuid.uuid4().hex + "__"
-        shell = {"kind": "text", "value": marker}
-        for layout_fn in reversed(layouts):
-            shell = await _invoke(layout_fn, children=shell)
-            if not isinstance(shell, dict):
-                raise TypeError(
-                    f"Layout for {pattern} must return a render node dict, "
-                    f"got {type(shell).__name__}"
-                )
-        shell = bind_islands(shell, self.client_manifest, dev_id=self._dev_id)
-        payload = json.dumps(shell, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        html = await asyncio.to_thread(_native.render, payload)
-        parts = html.split(marker)
-        if len(parts) != 2:
-            raise ValueError(
-                f"Layout for streaming page {pattern} must render its children exactly once"
-            )
-        prefix, suffix = parts
-        if shell.get("tag", "").lower() == "html":
-            prefix = "<!DOCTYPE html>" + prefix
+        entry = await self._layout_shell(pattern, layouts)
+        if entry is None:
+            # The marker is framework-generated, not a page read: suppress
+            # it so it is never misreported as the page being dynamic.
+            with suppress_dynamic_tracking():
+                marker = "__pynext_stream_" + uuid.uuid4().hex + "__"
+            shell = {"kind": "text", "value": marker}
+            for layout_fn in reversed(layouts):
+                shell = await _invoke(layout_fn, children=shell)
+                if not isinstance(shell, dict):
+                    raise TypeError(
+                        f"Layout for {pattern} must return a render node dict, "
+                        f"got {type(shell).__name__}"
+                    )
+            prefix, suffix = await self._render_shell_split(pattern, shell, marker)
+        else:
+            prefix, suffix = await self._layout_shell_html(pattern, entry)
 
         async def page_stream():
             try:
@@ -1700,10 +1831,24 @@ class App:
         tree = result
         if not isinstance(tree, dict):
             raise TypeError(f"Page {pattern} must return a render node dict, got {type(tree).__name__}")
-        for layout_fn in reversed(layouts):
-            tree = await _invoke(layout_fn, children=tree, request=request)
-            if not isinstance(tree, dict):
-                raise TypeError(f"Layout for {pattern} must return a render node dict, got {type(tree).__name__}")
+        entry = await self._layout_shell(pattern, layouts)
+        if entry is None:
+            # Dynamic layouts: render the shell on every request.
+            for layout_fn in reversed(layouts):
+                tree = await _invoke(layout_fn, children=tree, request=request)
+                if not isinstance(tree, dict):
+                    raise TypeError(f"Layout for {pattern} must return a render node dict, got {type(tree).__name__}")
+        else:
+            # Substitute the page into the cached shell instead of
+            # re-invoking the layouts, then bind the composed tree as
+            # before so island binding and the client runtime land in
+            # exactly the same places (and the per-request CSP nonce
+            # still covers the runtime script).
+            tree, replaced = _substitute_shell_marker(entry["tree"], entry["marker"], tree)
+            if replaced != 1:
+                raise ValueError(
+                    f"Layout for {pattern} must render its children exactly once"
+                )
         tree = bind_islands(tree, self.client_manifest, dev_id=self._dev_id)
         payload = json.dumps(tree, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         # One fresh nonce per rendered response. Cached renders must not get
