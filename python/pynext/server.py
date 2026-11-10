@@ -367,6 +367,16 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     A 503 after the full wait carries ``Retry-After`` of
     ``ceil(acquire_timeout_ms / 1000)`` seconds (at least 1); a 503 for
     a full wait queue carries ``Retry-After: 1``.
+
+    Saturation metrics (roadmap C-P1-6): the bridge samples the in-flight
+    depth on every entry (queue-depth histogram) and the sync-worker gauge
+    (``app._sync_active`` / ``app.sync_workers``, read under the app's
+    in-flight lock) on entry and exit; the slot-wait histogram is recorded
+    once per request by dispatch (``observe_request`` with
+    ``queue_wait_ms``). Together they separate the 503 causes — Rust slot
+    saturation (503s, short Python queue waits), GIL/loop serialisation
+    (long queue waits, sync workers idle), sync-worker saturation
+    (``pynext_sync_workers_active`` pinned at capacity).
     """
     _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
                             body_capacity, body_timeout_ms, max_connections,
@@ -445,10 +455,35 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
             response._native_context = contextvars.copy_context()
         return response
 
+    def _sample_sync_workers():
+        """Best-effort sample of the sync-worker gauge (C-P1-6).
+
+        Reads ``app._sync_active`` / ``app.sync_workers`` under the app's
+        in-flight lock — the same lock ``_invoke_sync`` uses — so the
+        sample is consistent. Never raises: observability must not break
+        request handling. Called on bridge entry and exit, so the recorded
+        maximum is a lower bound on the true peak.
+        """
+        try:
+            metrics = getattr(app, "metrics", None)
+            if metrics is None:
+                return
+            lock = getattr(app, "_inflight_lock", None)
+            if lock is None:
+                return
+            with lock:
+                active = getattr(app, "_sync_active", None)
+                capacity = getattr(app, "sync_workers", None)
+            if isinstance(active, int) and isinstance(capacity, int):
+                metrics.observe_sync_workers(active, capacity)
+        except Exception:
+            pass
+
     def bridge(method, raw_path, query, headers, body, cancellation, client_ip=None):
         # The native header-stage callback has already charged this
         # request, before acquiring body or Python execution capacity.
         app.metrics.observe_queue_enter()
+        _sample_sync_workers()
         with app._inflight_lock:
             app._inflight += 1
         try:
@@ -457,6 +492,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
             with app._inflight_lock:
                 app._inflight -= 1
             app.metrics.observe_queue_exit()
+            _sample_sync_workers()
 
     def _bridge_inner(method, raw_path, query, headers, body, cancellation, client_ip=None):
         submitted_at = time.monotonic()

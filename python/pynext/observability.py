@@ -30,6 +30,25 @@ Design notes
 * Queue wait is measured on the Axum path only: the bridge records when a
   request is submitted to the Python loop and the handler records when it
   starts running. The ASGI path has no such queue, so its queue wait is 0.
+* C-P1-6 saturation metrics: every recorded queue wait also lands in a
+  slot-wait histogram (``pynext_queue_wait_ms_bucket``), every bridge entry
+  samples the in-flight depth into a queue-depth histogram, and the bridge
+  samples the sync-worker gauge (``app._sync_active`` / ``app.sync_workers``,
+  read under the app's in-flight lock). Together with the per-status request
+  counts they let the next benchmark tell the 503 causes apart: Rust slot
+  saturation shows up as 503s with short Python queue waits, GIL/loop
+  serialisation as long queue waits with few busy sync workers, and sync
+  worker saturation as ``sync_workers_active`` pinned at capacity.
+* Secret scrubbing (S-P1-8 / S-P1-29, Django ``SafeExceptionReporterFilter``
+  parity): :func:`scrub_post_parameters` masks POST parameters whose names
+  match ``API|AUTH|TOKEN|KEY|SECRET|PASS|SIGNATURE|HTTP_COOKIE``, and the
+  ``@sensitive_variables`` / ``@sensitive_post_parameters`` decorators mark
+  individual names for masking. :func:`scrub_text` applies the same key
+  patterns (plus ``Bearer``/``Basic`` credentials) to free text, and the
+  JSON formatter runs every log message, exception body and extra field
+  through it, so ``log.exception`` can no longer leak a secret or raw user
+  input that happens to contain one. Scrubbing is pattern-based, not a
+  full allowlist: a bare secret with no key next to it is not recognised.
 """
 import contextlib
 import contextvars
@@ -57,6 +76,19 @@ __all__ = [
     "begin_request_context",
     "span",
     "is_tracing_available",
+    # Secret scrubbing (S-P1-8 / S-P1-29).
+    "SECRET_MASK",
+    "SENSITIVE_POST_PARAM_RE",
+    "is_sensitive_key",
+    "scrub_post_parameters",
+    "scrub_text",
+    "scrub_log_value",
+    "scrub_locals",
+    "sensitive_variables",
+    "sensitive_post_parameters",
+    # Saturation histograms (C-P1-6).
+    "SLOT_WAIT_BUCKETS_MS",
+    "QUEUE_DEPTH_BUCKETS",
 ]
 
 log = logging.getLogger("pynext")
@@ -68,6 +100,159 @@ SENSITIVE_KEYS = frozenset({
     "refresh-token", "session", "sessionid", "csrf", "body", "headers",
     "query", "query_string", "raw_url", "url",
 })
+
+# -- Secret scrubbing (S-P1-8 / S-P1-29) ----------------------------------
+# Django SafeExceptionReporterFilter parity (django/views/debug.py:113):
+# POST parameter names matching this pattern are replaced with SECRET_MASK
+# in error reports and logs. The same pattern drives the free-text scrubber
+# below, extended with COOKIE/SESSION/CREDENTIAL so "key=value" text in an
+# exception body is masked too.
+SECRET_MASK = "********************"  # 20 asterisks, Django parity
+SENSITIVE_POST_PARAM_RE = re.compile(
+    r"API|AUTH|TOKEN|KEY|SECRET|PASS|SIGNATURE|HTTP_COOKIE", re.IGNORECASE
+)
+# "key = value" / "key: 'value'" / '"key": "value"' — group 1 keeps the key
+# and separator (and opening quote), the value is replaced by SECRET_MASK.
+# The value stops at a quote, whitespace, comma, semicolon or brace so a
+# trailing quote/comma survives the replacement. A "Bearer <token>" /
+# "Basic <credentials>" value is consumed whole, so
+# "Authorization: Bearer <token>" does not leak the token after "Bearer"
+# is masked.
+_KEY_VALUE_RE = re.compile(
+    r"((?:\"|')?"
+    r"[A-Za-z0-9_.\-]*?(?:API|AUTH|TOKEN|KEY|SECRET|PASS|SIGNATURE|HTTP_COOKIE|COOKIE|SESSION|CREDENTIAL)[A-Za-z0-9_.\-]*"
+    r"(?:\"|')?\s*[:=]\s*(?:\"|')?)"
+    r"(?:(?:Bearer|Basic)\s+)?[^\"'\s,;}\]]+",
+    re.IGNORECASE,
+)
+# "Bearer <token>" / "Basic <credentials>" with no key next to them.
+_BEARER_RE = re.compile(
+    r"((?:Bearer|Basic)\s+)[A-Za-z0-9_.\-~+/=]+", re.IGNORECASE
+)
+
+# Histogram bucket upper bounds (C-P1-6). Slot-wait buckets are
+# milliseconds; queue-depth buckets are in-flight request counts. Values
+# above the last bound land in the "+Inf" bucket.
+SLOT_WAIT_BUCKETS_MS = (1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
+                        1000.0, 2500.0, 5000.0, 10000.0)
+QUEUE_DEPTH_BUCKETS = (0, 1, 2, 4, 8, 16, 32, 64, 128)
+
+
+def is_sensitive_key(name):
+    """True when a parameter/field name looks like it holds a secret."""
+    text = str(name)
+    return bool(SENSITIVE_POST_PARAM_RE.search(text)) or text.lower() in SENSITIVE_KEYS
+
+
+def _scrub_mapping(mapping, extra_sensitive=()):
+    extra = {str(item).lower() for item in extra_sensitive}
+    scrubbed = {}
+    for key, value in mapping.items():
+        if str(key).lower() in extra or is_sensitive_key(key):
+            scrubbed[key] = SECRET_MASK
+        elif isinstance(value, dict):
+            scrubbed[key] = _scrub_mapping(value, extra_sensitive)
+        else:
+            scrubbed[key] = value
+    return scrubbed
+
+
+def scrub_post_parameters(params, extra_sensitive=()):
+    """Return a copy of POST parameters with secrets masked (S-P1-8).
+
+    Any key matching ``API|AUTH|TOKEN|KEY|SECRET|PASS|SIGNATURE|HTTP_COOKIE``
+    (case-insensitive, substring) — or named in ``extra_sensitive`` (e.g. a
+    view's ``@sensitive_post_parameters`` list) — has its value replaced by
+    ``SECRET_MASK``. Nested mappings are scrubbed the same way. The input
+    is never mutated. Non-mapping input is returned unchanged.
+    """
+    if not isinstance(params, dict):
+        return params
+    return _scrub_mapping(params, extra_sensitive)
+
+
+def sensitive_variables(*names):
+    """Mark local variables as sensitive (Django ``@sensitive_variables``).
+
+    The decorator only records the names on the function
+    (``__sensitive_variables__``); :func:`scrub_locals` applies the marking
+    when an error report is built from the function's frame locals.
+    """
+    def decorator(func):
+        func.__sensitive_variables__ = frozenset(names)
+        return func
+    return decorator
+
+
+def sensitive_post_parameters(*names):
+    """Mark POST parameters as sensitive (Django ``@sensitive_post_parameters``).
+
+    Records the names on the function (``__sensitive_post_parameters__``);
+    pass them as ``extra_sensitive`` to :func:`scrub_post_parameters`.
+    """
+    def decorator(func):
+        func.__sensitive_post_parameters__ = frozenset(names)
+        return func
+    return decorator
+
+
+def scrub_locals(func, local_vars):
+    """Return a copy of ``local_vars`` with sensitive entries masked.
+
+    Names declared via ``@sensitive_variables`` on ``func`` are masked, as
+    are any names matching the sensitive-key pattern — so a handler that
+    forgets the decorator still does not leak ``api_key`` from its frame.
+    ``func`` may be None (pattern-only scrubbing). The input is not mutated.
+    """
+    if not isinstance(local_vars, dict):
+        return local_vars
+    declared = set()
+    if func is not None:
+        declared = {str(item).lower()
+                    for item in getattr(func, "__sensitive_variables__", ())}
+    scrubbed = {}
+    for key, value in local_vars.items():
+        if str(key).lower() in declared or is_sensitive_key(key):
+            scrubbed[key] = SECRET_MASK
+        else:
+            scrubbed[key] = value
+    return scrubbed
+
+
+def scrub_text(text):
+    """Mask secret values embedded in free text (S-P1-29).
+
+    Replaces the value in ``key=value`` / ``key: value`` / JSON
+    ``"key": "value"`` pairs whose key looks sensitive, and any
+    ``Bearer``/``Basic`` credential. Anything else — including a bare secret
+    with no key next to it — is left untouched, so callers must not log raw
+    secrets in the first place. Non-string input is returned unchanged.
+    """
+    if not isinstance(text, str):
+        return text
+    scrubbed = _KEY_VALUE_RE.sub(lambda m: m.group(1) + SECRET_MASK, text)
+    return _BEARER_RE.sub(lambda m: m.group(1) + SECRET_MASK, scrubbed)
+
+
+def scrub_log_value(value, _depth=0):
+    """Recursively scrub a structured-log extra value (S-P1-29).
+
+    Mapping keys that look sensitive are masked wholesale; string leaves
+    go through :func:`scrub_text`; anything else passes through. Depth is
+    capped so a self-referential value cannot recurse forever (the leaf is
+    replaced by its repr, scrubbed).
+    """
+    if _depth > 5:
+        return scrub_text(repr(value)) if isinstance(value, str) else repr(value)
+    if isinstance(value, dict):
+        return {key: SECRET_MASK if is_sensitive_key(key)
+                else scrub_log_value(item, _depth + 1)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub_log_value(item, _depth + 1) for item in value]
+    if isinstance(value, str):
+        return scrub_text(value)
+    return value
 
 _TRACEPARENT_RE = re.compile(
     r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$"
@@ -193,14 +378,23 @@ def begin_request_context(headers):
 
 
 class JsonFormatter(logging.Formatter):
-    """One JSON object per line. Sensitive extra fields are dropped."""
+    """One JSON object per line. Sensitive extra fields are dropped.
+
+    S-P1-29: the message, the formatted exception body and every surviving
+    extra field also pass through the secret scrubber, so a secret embedded
+    in an exception message or in a nested extra value (``{"params":
+    {"api_key": ...}}``) is masked instead of logged verbatim. Fields whose
+    own name is sensitive are still dropped outright (see SENSITIVE_KEYS);
+    the scrubber only handles secrets smuggled inside otherwise-safe
+    fields.
+    """
 
     def format(self, record):
         data = {
             "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": scrub_text(record.getMessage()),
         }
         request_id = request_id_var.get()
         if request_id:
@@ -221,13 +415,14 @@ class JsonFormatter(logging.Formatter):
                 continue
             if key.lower() in SENSITIVE_KEYS:
                 continue
+            value = scrub_log_value(value)
             try:
                 json.dumps(value)
             except (TypeError, ValueError):
-                value = repr(value)
+                value = scrub_text(repr(value))
             data[key] = value
         if record.exc_info and record.exc_info[0] is not None:
-            data["exception"] = self.formatException(record.exc_info)
+            data["exception"] = scrub_text(self.formatException(record.exc_info))
         return json.dumps(data, ensure_ascii=False, default=repr)
 
 
@@ -249,6 +444,27 @@ def configure_logging(config=None):
         logger.setLevel(logging.INFO)
     logger._pynext_observability_configured = True
     return logger
+
+
+def _bucket_index(value, boundaries):
+    """Index of the first bucket whose upper bound is >= ``value``.
+
+    ``len(boundaries)`` means the value belongs in the "+Inf" bucket.
+    """
+    import bisect
+    return bisect.bisect_left(boundaries, value)
+
+
+def _histogram_snapshot(counts, boundaries, total):
+    """Cumulative Prometheus-style bucket counts plus count/sum."""
+    cumulative = 0
+    buckets = []
+    for bound, count in zip(boundaries, counts):
+        cumulative += count
+        buckets.append({"le": bound, "count": cumulative})
+    cumulative += counts[len(boundaries)] if len(counts) > len(boundaries) else 0
+    buckets.append({"le": "+Inf", "count": cumulative})
+    return {"buckets": buckets, "count": cumulative, "sum": round(total, 3)}
 
 
 def _percentiles(samples):
@@ -285,6 +501,18 @@ class MetricsCollector:
         self._lock = threading.Lock()
         self._requests = {}  # route -> {"count", "status": Counter-ish, "latency": deque, "bytes": int}
         self._queue_waits = deque(maxlen=self._MAX_SAMPLES)
+        # C-P1-6 saturation histograms. Slot waits are recorded once, in
+        # observe_request (the dispatch finally block), which is the single
+        # recording point for both the ASGI and the Axum paths — recording
+        # them in server.py too would double-count. Queue depth is sampled
+        # at bridge entry (observe_queue_enter); sync-worker activity is
+        # sampled by server.py's bridge (observe_sync_workers).
+        self._slot_wait_buckets = [0] * (len(SLOT_WAIT_BUCKETS_MS) + 1)
+        self._slot_wait_total_ms = 0.0
+        self._queue_depth_buckets = [0] * (len(QUEUE_DEPTH_BUCKETS) + 1)
+        self._queue_depth_total = 0
+        self._queue_depth_samples = 0
+        self._sync_workers = {"active": 0, "capacity": None, "max_active": 0}
         self._queue_current = 0
         self._queue_max = 0
         self._python_ms_total = 0.0
@@ -345,6 +573,12 @@ class MetricsCollector:
             entry["bytes"] += int(response_bytes or 0)
             if queue_wait_ms is not None:
                 self._queue_waits.append(float(queue_wait_ms))
+                # C-P1-6: slot-wait histogram (single recording point; see
+                # __init__). The deque above feeds percentiles, the buckets
+                # feed the Prometheus histogram and the 503-cause split.
+                wait = float(queue_wait_ms)
+                self._slot_wait_buckets[_bucket_index(wait, SLOT_WAIT_BUCKETS_MS)] += 1
+                self._slot_wait_total_ms += wait
             if python_ms is not None:
                 self._python_ms_total += float(python_ms)
                 self._python_ms_count += 1
@@ -366,12 +600,38 @@ class MetricsCollector:
         with self._lock:
             self._queue_current += 1
             self._queue_max = max(self._queue_max, self._queue_current)
+            # C-P1-6: in-flight depth seen by the arriving request. This is
+            # the queue-length distribution the next benchmark reads: a
+            # depth histogram piled up at the top bucket while 503s climb
+            # means the Rust execution slots are saturated before Python.
+            self._queue_depth_buckets[_bucket_index(self._queue_current, QUEUE_DEPTH_BUCKETS)] += 1
+            self._queue_depth_total += self._queue_current
+            self._queue_depth_samples += 1
 
     def observe_queue_exit(self):
         if not self.enabled:
             return
         with self._lock:
             self._queue_current = max(0, self._queue_current - 1)
+
+    def observe_sync_workers(self, active, capacity=None):
+        """Record a sample of busy sync-handler workers (C-P1-6).
+
+        Sampled, not exact: the bridge reads ``app._sync_active`` on
+        request entry/exit, so ``max_active`` is a lower bound on the true
+        peak — but a gauge pinned at ``capacity`` across samples is still
+        an unambiguous sync-worker saturation signal, and it stays
+        separable from long queue waits with idle sync workers (GIL/loop
+        serialisation). ``capacity`` is the app's ``sync_workers`` limit.
+        """
+        if not self.enabled:
+            return
+        with self._lock:
+            self._sync_workers["active"] = max(0, int(active))
+            if capacity is not None:
+                self._sync_workers["capacity"] = int(capacity)
+            self._sync_workers["max_active"] = max(
+                self._sync_workers["max_active"], self._sync_workers["active"])
 
     def observe_worker_start(self):
         if not self.enabled:
@@ -449,7 +709,16 @@ class MetricsCollector:
                     "max": self._queue_max,
                     "waits_ms": _percentiles(list(self._queue_waits)),
                     "wait_samples": len(self._queue_waits),
+                    # C-P1-6: cumulative buckets; "le" is ms for waits,
+                    # in-flight requests for depth.
+                    "wait_histogram_ms": _histogram_snapshot(
+                        self._slot_wait_buckets, SLOT_WAIT_BUCKETS_MS,
+                        self._slot_wait_total_ms),
+                    "depth_histogram": _histogram_snapshot(
+                        self._queue_depth_buckets, QUEUE_DEPTH_BUCKETS,
+                        float(self._queue_depth_total)),
                 },
+                "sync_workers": dict(self._sync_workers),
                 "python_ms": {
                     "total": round(self._python_ms_total, 3),
                     "count": self._python_ms_count,
@@ -524,7 +793,32 @@ class MetricsCollector:
         lines += ["# HELP pynext_python_execution_queue_length Current Python execution queue depth.",
                   "# TYPE pynext_python_execution_queue_length gauge",
                   f'pynext_python_execution_queue_length {snap["queue"]["current"]}',
-                  "# HELP pynext_island_bundles_total_bytes Total island bundle bytes.",
+                  "# HELP pynext_queue_wait_ms Slot/Python-loop wait before the handler starts, in milliseconds.",
+                  "# TYPE pynext_queue_wait_ms histogram"]
+        wait_hist = snap["queue"]["wait_histogram_ms"]
+        for bucket in wait_hist["buckets"]:
+            lines.append(f'pynext_queue_wait_ms_bucket{{le="{bucket["le"]}"}} {bucket["count"]}')
+        lines.append(f'pynext_queue_wait_ms_sum {wait_hist["sum"]}')
+        lines.append(f'pynext_queue_wait_ms_count {wait_hist["count"]}')
+        lines += ["# HELP pynext_python_execution_queue_depth In-flight depth observed when a request entered the bridge.",
+                  "# TYPE pynext_python_execution_queue_depth histogram"]
+        depth_hist = snap["queue"]["depth_histogram"]
+        for bucket in depth_hist["buckets"]:
+            lines.append(f'pynext_python_execution_queue_depth_bucket{{le="{bucket["le"]}"}} {bucket["count"]}')
+        lines.append(f'pynext_python_execution_queue_depth_sum {depth_hist["sum"]}')
+        lines.append(f'pynext_python_execution_queue_depth_count {depth_hist["count"]}')
+        sync_workers = snap["sync_workers"]
+        lines += ["# HELP pynext_sync_workers_active Sync handler workers currently busy (sampled at bridge entry/exit).",
+                  "# TYPE pynext_sync_workers_active gauge",
+                  f'pynext_sync_workers_active {sync_workers["active"]}',
+                  "# HELP pynext_sync_workers_max_active Maximum sync handler workers simultaneously busy since start (sampled).",
+                  "# TYPE pynext_sync_workers_max_active gauge",
+                  f'pynext_sync_workers_max_active {sync_workers["max_active"]}']
+        if sync_workers["capacity"] is not None:
+            lines += ["# HELP pynext_sync_workers_capacity Sync handler worker capacity.",
+                      "# TYPE pynext_sync_workers_capacity gauge",
+                      f'pynext_sync_workers_capacity {sync_workers["capacity"]}']
+        lines += ["# HELP pynext_island_bundles_total_bytes Total island bundle bytes.",
                   "# TYPE pynext_island_bundles_total_bytes gauge",
                   f'pynext_island_bundles_total_bytes {snap["island_bundles_total_bytes"]}']
         return "\n".join(lines) + "\n"

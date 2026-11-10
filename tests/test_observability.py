@@ -213,6 +213,195 @@ def test_native_server_records_queue_wait_and_worker_start():
     assert snap["workers"]["starts"] == 1
 
 
+# -- saturation metrics (C-P1-6) ------------------------------------------
+
+def test_slot_wait_histogram_buckets():
+    collector = MetricsCollector()
+    for wait_ms in (0.5, 3.0, 30.0, 300.0, 3000.0, 20000.0):
+        collector.observe_request("/x", "GET", 200, 1.0, queue_wait_ms=wait_ms)
+    hist = collector.snapshot()["queue"]["wait_histogram_ms"]
+    assert hist["count"] == 6
+    assert hist["sum"] == round(0.5 + 3.0 + 30.0 + 300.0 + 3000.0 + 20000.0, 3)
+    buckets = {bucket["le"]: bucket["count"] for bucket in hist["buckets"]}
+    assert buckets[1.0] == 1      # 0.5
+    assert buckets[5.0] == 2      # +3.0
+    assert buckets[50.0] == 3     # +30.0
+    assert buckets[500.0] == 4    # +300.0
+    assert buckets[5000.0] == 5   # +3000.0
+    assert buckets["+Inf"] == 6   # +20000.0
+    text = collector.prometheus_text()
+    assert 'pynext_queue_wait_ms_bucket{le="1.0"} 1' in text
+    assert 'pynext_queue_wait_ms_bucket{le="+Inf"} 6' in text
+    assert "pynext_queue_wait_ms_count 6" in text
+
+
+def test_queue_depth_histogram_samples_entry_depth():
+    collector = MetricsCollector()
+    collector.observe_queue_enter()  # depth 1
+    collector.observe_queue_enter()  # depth 2
+    collector.observe_queue_enter()  # depth 3
+    collector.observe_queue_exit()
+    collector.observe_queue_enter()  # depth 3 again
+    snap = collector.snapshot()
+    assert snap["queue"]["current"] == 3
+    assert snap["queue"]["max"] == 3
+    hist = snap["queue"]["depth_histogram"]
+    assert hist["count"] == 4
+    buckets = {bucket["le"]: bucket["count"] for bucket in hist["buckets"]}
+    assert buckets[0] == 0
+    assert buckets[1] == 1
+    assert buckets[2] == 2
+    assert buckets[4] == 4
+    assert buckets["+Inf"] == 4
+    assert 'pynext_python_execution_queue_depth_bucket{le="4"} 4' in collector.prometheus_text()
+
+
+def test_sync_workers_gauge_tracks_active_capacity_and_max():
+    collector = MetricsCollector()
+    collector.observe_sync_workers(5, 32)
+    snap = collector.snapshot()["sync_workers"]
+    assert snap == {"active": 5, "capacity": 32, "max_active": 5}
+    collector.observe_sync_workers(31, 32)
+    collector.observe_sync_workers(2)  # capacity remembered, max kept
+    snap = collector.snapshot()["sync_workers"]
+    assert snap == {"active": 2, "capacity": 32, "max_active": 31}
+    text = collector.prometheus_text()
+    assert "pynext_sync_workers_active 2" in text
+    assert "pynext_sync_workers_capacity 32" in text
+    assert "pynext_sync_workers_max_active 31" in text
+    disabled = MetricsCollector(enabled=False)
+    disabled.observe_sync_workers(9, 32)
+    assert disabled.snapshot() == {"enabled": False}
+
+
+def test_native_server_samples_sync_workers_and_depth_histogram():
+    async def run():
+        app = create_app(EXAMPLE)
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=5,
+                                         trust_env=False) as client:
+                assert (await client.get("/")).status_code == 200
+                assert (await client.get("/api/users")).status_code == 200
+        finally:
+            await asyncio.to_thread(server.stop)
+        return app.metrics.snapshot()
+    snap = _run(run())
+    # One depth sample per bridge entry, one wait sample per dispatch.
+    assert snap["queue"]["depth_histogram"]["count"] == 2
+    assert snap["queue"]["wait_histogram_ms"]["count"] == 2
+    assert snap["queue"]["current"] == 0
+    assert snap["sync_workers"]["capacity"] == 32
+    assert snap["sync_workers"]["active"] == 0
+    assert snap["sync_workers"]["max_active"] >= 0
+
+
+# -- secret scrubbing (S-P1-8 / S-P1-29) -----------------------------------
+
+def test_scrub_post_parameters_masks_sensitive_keys():
+    from pynext.observability import SECRET_MASK, scrub_post_parameters
+    params = {
+        "username": "bob",
+        "api_key": "sk-live-123",
+        "API_TOKEN": "tok-456",
+        "password": "hunter2",
+        "x-auth-token": "tok-789",
+        "HTTP_COOKIE": "session=abc",
+        "signature": "sig-1",
+        "nested": {"client_secret": "shh", "keep": "yes"},
+    }
+    scrubbed = scrub_post_parameters(params)
+    assert scrubbed["username"] == "bob"
+    assert scrubbed["nested"]["keep"] == "yes"
+    for key in ("api_key", "API_TOKEN", "password", "x-auth-token",
+                "HTTP_COOKIE", "signature"):
+        assert scrubbed[key] == SECRET_MASK, key
+    assert scrubbed["nested"]["client_secret"] == SECRET_MASK
+    # The input mapping is not mutated.
+    assert params["api_key"] == "sk-live-123"
+    assert params["nested"]["client_secret"] == "shh"
+    # Explicitly declared names are masked too, and non-mappings pass through.
+    assert scrub_post_parameters(
+        {"one_time_code": "123456"}, extra_sensitive=("one_time_code",)
+    )["one_time_code"] == SECRET_MASK
+    assert scrub_post_parameters(None) is None
+
+
+def test_sensitive_decorators_and_scrub_locals():
+    from pynext.observability import (
+        SECRET_MASK, scrub_locals, sensitive_post_parameters, sensitive_variables,
+    )
+
+    @sensitive_variables("db_password")
+    @sensitive_post_parameters("one_time_code")
+    def handler(db_password, one_time_code, username):
+        return db_password, one_time_code, username
+
+    assert "db_password" in handler.__sensitive_variables__
+    assert "one_time_code" in handler.__sensitive_post_parameters__
+    scrubbed = scrub_locals(handler, {
+        "db_password": "hunter2", "api_key": "sk-1",
+        "username": "bob", "one_time_code": "123456",
+    })
+    assert scrubbed["db_password"] == SECRET_MASK
+    assert scrubbed["api_key"] == SECRET_MASK  # pattern match, no decorator needed
+    assert scrubbed["username"] == "bob"
+    # A parameter declared sensitive for POST is a local like any other
+    # only when the decorator says so; scrub_locals covers the
+    # @sensitive_variables names, the POST list is honoured by
+    # scrub_post_parameters instead.
+    assert scrubbed["one_time_code"] == "123456"
+    assert scrub_locals(None, {"token": "t", "ok": 1}) == {"token": SECRET_MASK, "ok": 1}
+
+
+def test_scrub_text_masks_key_value_and_bearer_credentials():
+    from pynext.observability import SECRET_MASK, scrub_text
+    assert scrub_text("api_key=sk-live-123") == f"api_key={SECRET_MASK}"
+    assert scrub_text('{"token": "tok-456", "n": 1}') == (
+        f'{{"token": "{SECRET_MASK}", "n": 1}}')
+    assert scrub_text("Authorization: Bearer tok-xyz-999") == (
+        f"Authorization: {SECRET_MASK}")
+    assert scrub_text("got Bearer tok-xyz-999 back") == f"got Bearer {SECRET_MASK} back"
+    assert scrub_text("password: hunter2; user=bob") == (
+        f"password: {SECRET_MASK}; user=bob")
+    assert scrub_text("nothing secret here") == "nothing secret here"
+    assert scrub_text(42) == 42
+
+
+def test_json_formatter_scrubs_exception_body_and_nested_extras():
+    from pynext.observability import SECRET_MASK
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonFormatter())
+    logger = logging.getLogger("pynext.test-observability-scrub")
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        try:
+            raise ValueError("login failed: password=hunter2 for user bob; "
+                             "upstream said Authorization: Bearer tok-xyz-999")
+        except ValueError:
+            logger.exception(
+                "request failed: api_key=sk-live-abc123",
+                extra={"params": {"api_key": "zzz", "q": "hello"},
+                       "route": "/login"})
+        line = stream.getvalue().strip()
+    finally:
+        logger.removeHandler(handler)
+    record = json.loads(line)
+    assert record["route"] == "/login"
+    assert record["params"] == {"api_key": SECRET_MASK, "q": "hello"}
+    assert record["message"] == f"request failed: api_key={SECRET_MASK}"
+    assert "hunter2" not in line
+    assert "tok-xyz-999" not in line
+    assert "sk-live-abc123" not in line
+    assert "zzz" not in line
+    assert SECRET_MASK in line
+    assert "bob" in line  # non-secret user input is preserved
+    assert "ValueError: login failed" in record["exception"]
+
+
 def test_isr_cache_metrics(tmp_path):
     directory = tmp_path / "app" / "blog" / "[slug]"
     directory.mkdir(parents=True)
