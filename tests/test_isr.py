@@ -222,8 +222,10 @@ def test_isr_shared_render_does_not_inherit_request_context(tmp_path):
 
 
 def test_rust_cache_bounds_and_isolation():
-    cache = _native.PageCache(2, 6, 3)
-    other = _native.PageCache(2, 6, 3)
+    # Entry size is key length + body length, so "a"/"one" and "b"/"two"
+    # are 4 bytes each and fit together in max_bytes=8.
+    cache = _native.PageCache(2, 8, 3)
+    other = _native.PageCache(2, 8, 3)
     assert cache.insert("a", b"one", 10, 0)
     assert other.lookup("a")[0] == "miss"
     assert cache.insert("b", b"two", 10, 0)
@@ -232,6 +234,28 @@ def test_rust_cache_bounds_and_isolation():
     assert cache.lookup("b")[0] == "miss"
     assert not cache.insert("a", b"large", 10, 0)
     assert cache.lookup("a") == ("fresh", b"one")
+
+
+def test_rust_cache_evicts_least_recently_used():
+    cache = _native.PageCache(2, 100, 100)
+    assert cache.insert("a", b"one", 10, 0)
+    assert cache.insert("b", b"two", 10, 0)
+    # Touching "a" makes it most recently used; "b" is evicted next.
+    assert cache.lookup("a") == ("fresh", b"one")
+    assert cache.insert("c", b"tri", 10, 0)
+    assert cache.lookup("b")[0] == "miss"
+    assert cache.lookup("a") == ("fresh", b"one")
+    assert cache.lookup("c") == ("fresh", b"tri")
+
+
+def test_rust_cache_size_accounts_for_key_length():
+    # Sizes are key + body: "aa"+4 = 6, "bbbb"+4 = 8. Bodies alone
+    # (4 + 4 = 8) would fit in max_bytes=10; with keys they do not.
+    cache = _native.PageCache(100, 10, 100)
+    assert cache.insert("aa", b"1234", 10, 0)
+    assert cache.insert("bbbb", b"1234", 10, 0)
+    assert cache.lookup("aa")[0] == "miss"
+    assert cache.lookup("bbbb") == ("fresh", b"1234")
 
 
 @pytest.mark.parametrize("kwargs", [
