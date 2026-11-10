@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote_to_bytes
 
 from .forms import parse_form
-from .ws_origin import canonical_origin
+from .ws_origin import canonical_origin, parse_origin_pattern
 
 
 class BadRequest(Exception):
@@ -192,8 +192,15 @@ class SecurityConfig:
 
     WebSocket handshakes require a same-origin ``Origin`` by default.
     Additional origins can be listed in ``websocket_allowed_origins``;
-    ``websocket_allow_missing_origin`` opts non-browser clients without
-    the header in. Origin checking does not replace authentication.
+    an entry may be an exact origin or a wildcard pattern in the
+    Next.js Server Actions ``allowedOrigins`` form: ``*`` matches exactly
+    one DNS label (``https://*.example.com``) and ``**`` — only as the
+    leftmost label — matches one or more leading labels
+    (``https://**.example.com``). Scheme and effective port must still
+    match exactly, and a pattern must keep at least two literal labels,
+    so ``https://*.com`` is rejected. ``websocket_allow_missing_origin``
+    opts non-browser clients without the header in. Origin checking does
+    not replace authentication.
     """
 
     csrf_enabled: bool | None = None
@@ -242,7 +249,7 @@ class SecurityConfig:
         if isinstance(self.websocket_allowed_origins, (str, bytes)):
             raise TypeError("websocket_allowed_origins must be a sequence of origins")
         self.websocket_allowed_origins = tuple(self.websocket_allowed_origins)
-        origin_keys = [canonical_origin(origin) for origin in self.websocket_allowed_origins]
+        origin_keys = [parse_origin_pattern(origin) for origin in self.websocket_allowed_origins]
         if any(origin is None for origin in origin_keys):
             raise ValueError("websocket_allowed_origins must contain valid HTTP(S) origins")
         key = self.csrf_signing_key
@@ -1264,6 +1271,13 @@ class Request:
 
 
 class Response:
+    """A finished ("closing") response: the body is fully materialized.
+
+    Nothing more will ever be written to it — the stream is already closed
+    at construction time. Contrast :class:`StreamingResponse`, whose body
+    is still open (a "non-closing" stream) until its iterator ends.
+    """
+
     def __init__(self, body=b"", *, status=200, headers=(), media_type="text/plain; charset=utf-8",
                  csp_nonce=None):
         if not 100 <= status <= 599:
@@ -1309,7 +1323,16 @@ MAX_STREAM_CHUNK = 1_048_576
 
 
 class StreamingResponse(Response):
-    """A response produced by an asynchronous iterable, one bounded chunk at a time."""
+    """An open ("non-closing") response: chunks arrive from an async iterator.
+
+    The stream stays open until the iterator ends or :meth:`aclose` is
+    called — unlike :class:`Response`, whose body is complete at
+    construction. This is the "non-closing" side of the boundary Next.js
+    draws with ``createUnclosingStream``/``createClosingStream``: a tee
+    consumer (see ``_ISRStreamFeed`` in ``app.py``) must be given the
+    non-closing side so the producer can keep feeding the other consumer
+    after this stream ends.
+    """
 
     def __init__(self, content, *, status=200, headers=(), media_type="application/octet-stream"):
         if status < 200 or status in (204, 304):

@@ -24,6 +24,10 @@ http://127.0.0.1:3000/、/about、/guides/intro、/news/example、/hydrate、/st
 
 `pynext dev --dir examples/basic` はビルドなしでソースを提供し、`app/`・`islands/`・`public/`・`pynext.config.py` の変更時に同じポートでサーバーを再起動します。`pynext start` はビルド manifest を使い、追跡対象のソースが変わると再ビルドを要求します。Island を使わないアプリには Node と esbuild は不要です。上記はリポジトリからのインストールであり、PyPI 公開を意味しません。
 
+### ビルドモード
+
+通常の `pynext build` は island バンドルのコンパイルと静的ページの生成の両方を行います。`pynext build --only-islands` は island のコンパイルのみ、`pynext build --only-static` は以前のコンパイル結果を使った静的ページの生成のみを行います。部分ビルドでは `pynext start` は不足している段階を示して起動を拒否します。`pynext build --static-only` は SSG ページ・public アセット・island バンドルを `.pynext/export`（`--export-dir` で変更可）にプレーンなファイルとして書き出し、`python -m http.server` でサーバーなしに提供できます。動的 SSR・ISR・API ルートがあるアプリは拒否されます。詳細は英語マニュアルを参照してください。
+
 開発監視はネイティブ通知とファイルハッシュを使い、必要ならポーリングに切り替えます。JS/TS island の変更は該当モジュールを再ビルドし、ページ全体を再読み込みせず交換します。以前のクリーンアップが実行され、その island の状態は初期化されることがあります。他のソース変更ではサーバーを再起動してページを再読み込みします。壊れた変更では前の正常な版を維持します。`--port 0` のポートは再起動後も維持します。
 
 ## プロジェクト構造とルーティング
@@ -172,7 +176,7 @@ async def stream():
 
 `route.py` は HTTP ハンドラとあわせて `@websocket` ハンドラを 1 つエクスポートできます。ハンドラは `WebSocket` を受け取り、送受信の前に `await websocket.accept()` を呼ぶ必要があります。テキストとバイナリのメッセージをやり取りでき、相手が切断すると `receive()` で `WebSocketDisconnect` が発生するため、接続ごとのクリーンアップは `finally` ブロックに書きます。
 
-開発版は ASGI・Axum で接続前に `Origin` を検査し、既定では同一オリジンのみを許可します。追加する HTTP(S) オリジンは `SecurityConfig(websocket_allowed_origins=("https://client.example",))` を `create_app(..., security=...)` に渡すか、`--ws-allowed-origin https://client.example` を繰り返し指定します。スキームと既定以外のポートを含め、`*` と `null` は使えません。`Origin` を送らない既存の非ブラウザークライアントには `websocket_allow_missing_origin=True` または `--ws-allow-missing-origin` が必要です。公開済み 0.1.0 にはこの検査はありません。`Origin` は偽装・省略できます。ハンドシェイクの前に、アップグレード要求にはグローバルミドルウェアチェーン（セッションミドルウェアを含む）とハンドラの `@require_auth`/`@require_permission` ポリシーが ASGI・Axum の両方で適用され、拒否されたアップグレードは 101 応答の前に拒否されます（Axum は HTTP 403、ASGI は close 1008）。そのためハンドラは実行されません。身元の確立（例: ログインルートで `session["user_id"]` を設定すること）は引き続きアプリの責任であり、セッション以外の資格情報方式（トークンなど）はミドルウェアで検証してください。プロキシ利用時は実際のプロキシだけを `--trusted-proxy` で指定し、クライアント由来の転送ヘッダーをプロキシが上書きするよう設定してください。
+開発版は ASGI・Axum で接続前に `Origin` を検査し、既定では同一オリジンのみを許可します。追加する HTTP(S) オリジンは `SecurityConfig(websocket_allowed_origins=("https://client.example",))` を `create_app(..., security=...)` に渡すか、`--ws-allowed-origin https://client.example` を繰り返し指定します。スキームと既定以外のポートを含めます。`null` は使えません。ワイルドカードパターンも使えます：`*` は DNS ラベル1つ（`https://*.example.com`）、`**` は先頭ラベルでのみ1つ以上の先頭ラベル（`https://**.example.com`）に一致し、`https://*.com` のようにドメイン全体に一致するパターンは拒否されます。`Origin` を送らない既存の非ブラウザークライアントには `websocket_allow_missing_origin=True` または `--ws-allow-missing-origin` が必要です。公開済み 0.1.0 にはこの検査はありません。`Origin` は偽装・省略できます。ハンドシェイクの前に、アップグレード要求にはグローバルミドルウェアチェーン（セッションミドルウェアを含む）とハンドラの `@require_auth`/`@require_permission` ポリシーが ASGI・Axum の両方で適用され、拒否されたアップグレードは 101 応答の前に拒否されます（Axum は HTTP 403、ASGI は close 1008）。そのためハンドラは実行されません。身元の確立（例: ログインルートで `session["user_id"]` を設定すること）は引き続きアプリの責任であり、セッション以外の資格情報方式（トークンなど）はミドルウェアで検証してください。プロキシ利用時は実際のプロキシだけを `--trusted-proxy` で指定し、クライアント由来の転送ヘッダーをプロキシが上書きするよう設定してください。
 
 ASGI で PyNext が信頼プロキシを識別するには、サーバーが `scope["client"]` に元の接続元を保持する必要があります。PyNext で転送ヘッダーを解釈する場合は、ASGI サーバー側での先行処理を無効にしてください（Uvicorn は `--no-proxy-headers`）。
 

@@ -519,10 +519,21 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     if limiter is not None:
         def rate_limit_callback(path, headers, peer_ip):
             headers = filter_internal_headers(headers)
+            # One observation per decision (P2-2), mirroring
+            # App._rate_limit_denied on ASGI. This runs on a Rust thread
+            # before dispatch, so only the counter is recorded here — the
+            # per-request log line / span cannot see it.
             if _is_exempt_path(limiter, path):
+                app.metrics.observe_rate_limit("exempt")
                 return True, None
             key = limiter.key_for(peer_ip, headers)
-            return limiter.allow(key)
+            try:
+                allowed, retry_after = limiter.allow(key)
+            except Exception:
+                app.metrics.observe_rate_limit("error")
+                raise
+            app.metrics.observe_rate_limit("allowed" if allowed else "denied")
+            return allowed, retry_after
 
     async def _ws_auth_decision(path, query, headers):
         # True allows the upgrade, False denies it (403), None is a

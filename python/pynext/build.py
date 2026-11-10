@@ -1,11 +1,38 @@
-"""Discover and validate the build inputs, then write a versioned manifest."""
+"""Discover and validate the build inputs, then write a versioned manifest.
+
+Build modes (Next.js ``experimentalBuildMode`` equivalent, track E P3-12):
+
+- ``compile`` (``pynext build --only-islands``): bundle the island modules
+  with esbuild and record them in the manifest, without rendering static
+  pages. Static pages rendered by an earlier build are reused when the
+  sources still match; when the island digests changed, the reused pages
+  are stale (they embed the old bundle digests), so the ``generate`` stage
+  is dropped from the manifest until it runs again.
+- ``generate`` (``pynext build --only-static``): render the static pages
+  (and public assets) from the island bundles of an earlier compile, without
+  re-running esbuild. Island sources must be unchanged since that compile.
+- ``full`` (plain ``pynext build``): both stages, as before.
+
+A manifest records the stages it completed in ``stages``; ``load_manifest``
+refuses a partial manifest so ``pynext start`` fails with an actionable
+message instead of serving a half-built app. Manifests written before this
+feature have no ``stages`` key and are treated as complete.
+
+Static-only export (``pynext build --static-only``) is intentionally narrow:
+it exports the rendered SSG pages, public assets and island bundles into a
+plain directory servable with ``python -m http.server``. It is *not* a
+full ``output: export`` port (REPORT.md §4.3): apps with dynamic SSR, ISR
+or API routes are refused instead of being silently degraded.
+"""
 import hashlib
 import asyncio
+import inspect
 import json
 import logging
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -13,9 +40,11 @@ from pathlib import Path
 from . import _native
 from .assets import discover_public
 from .catchall import normalize_catch_all_routes, verify_static_enumeration
-from .client import discover_client
+from .client import PREFIX as CLIENT_PREFIX
+from .client import discover_client, read_client_artifacts
 from .dynamic import StaticGenBailoutError, is_prerender_bailout
 from .env import load_env
+from .sortable_routes import sort_routes
 
 log = logging.getLogger("pynext")
 
@@ -314,6 +343,12 @@ def _prune_orphans(root, manifest):
             log.warning("Build prune skipped %s: %s", entry, exc)
     return pruned
 
+# Build stages, in the order they run. A full build completes both.
+STAGES = ("compile", "generate")
+# Keys of a manifest that describe the discovered sources. Two builds agree
+# on these exactly when nothing relevant changed between them.
+_DISCOVER_KEYS = ("schema_version", "routes", "sources", "public_sources", "client_sources")
+
 
 def _hash(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -387,6 +422,37 @@ def read_build_id(root):
     return value
 
 
+def _short_repr(value, limit=200):
+    """One-line repr of a config value, truncated so a huge user value
+    cannot flood the error message."""
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _config_error(summary, details=(), fixes=()):
+    """Format a config/route conflict error: what happened, where, and how
+    to fix it.
+
+    Follows the Next.js ensure-static shape: the conflicting values with
+    their source files, then a "Possible fixes" list. ``details`` is a
+    sequence of (label, value) pairs; both ``details`` and ``fixes`` may
+    be empty.
+    """
+    lines = [summary]
+    for label, value in details:
+        lines.append(f"  {label}: {value}")
+    if fixes:
+        lines.append("Possible fixes:")
+        for fix in fixes:
+            lines.append(f"  - {fix}")
+    return "\n".join(lines)
+
+
+def _source_label(path):
+    """Display project source paths consistently without changing file keys."""
+    return str(path).replace("\\", "/")
+
+
 def _check_build_paths(root):
     build_dir = root / ".pynext"
     if build_dir.is_symlink() or (build_dir.exists() and not build_dir.is_dir()):
@@ -448,13 +514,33 @@ def discover(root):
         # not appear in the URL; layouts inside a group still apply.
         parts = []
         for part in relative_parent.parts:
-            if _route_group(part) is None:
+            try:
+                group = _route_group(part)
+            except ValueError as exc:
+                raise ValueError(_config_error(
+                    str(exc),
+                    [("file", _source_label(path.relative_to(root))), ("segment", part)],
+                    ["Rename the directory to a valid route group like (name)",
+                     "Remove the parentheses to make it a literal URL segment"])) from exc
+            if group is None:
                 parts.append(part)
         pattern = "/" + "/".join(parts)
         if pattern in routes:
-            if routes[pattern]["kind"] != path.stem:
-                raise ValueError(f"A page and an API cannot share a path: {pattern}")
-            raise ValueError(f"Duplicate route path: {pattern}")
+            entry = _source_label(path.relative_to(root))
+            existing = routes[pattern]
+            if existing["kind"] != path.stem:
+                page_entry = entry if path.stem == "page" else _source_label(existing["entry"])
+                api_entry = entry if path.stem == "route" else _source_label(existing["entry"])
+                raise ValueError(_config_error(
+                    f"A page and an API cannot share a path: {pattern}",
+                    [("page", page_entry), ("API route", api_entry)],
+                    ["Move one of the files to a different route directory",
+                     "Delete the file you do not need"]))
+            raise ValueError(_config_error(
+                f"Duplicate route path: {pattern}",
+                [("first", _source_label(existing["entry"])), ("second", entry)],
+                ["Keep only one of the two files",
+                 "Move one of them to a different route directory"]))
         dirs = [app_dir]
         current = app_dir
         for part in relative_parent.parts:
@@ -474,7 +560,11 @@ def discover(root):
         routes[pattern] = {"entry": str(path.relative_to(root)), "kind": path.stem,
                            "layouts": layouts if path.stem == "page" else [], **boundaries}
     if not routes:
-        raise ValueError("No page.py or route.py files found")
+        raise ValueError(_config_error(
+            "No page.py or route.py files found",
+            [("app directory", "app")],
+            ["Add an app/page.py file with a @page() Page function",
+             "Add an app/route.py file with @route handlers"]))
     router = validate_routes(routes)
     # Global boundaries live at the app root. They are also the nearest
     # boundary for every route (the walk above includes the app directory),
@@ -486,11 +576,26 @@ def discover(root):
     public_sources = discover_public(root)
     for path in list(routes) + list(public_sources):
         if path == "/_pynext" or path.startswith("/_pynext/"):
-            raise ValueError(f"Reserved PyNext path: {path}")
+            source = _source_label(routes[path]["entry"]) if path in routes else f"public{path}"
+            raise ValueError(_config_error(
+                f"Reserved PyNext path: {path}",
+                [("source", source)],
+                ["Rename the route or public file so its URL does not start with /_pynext"]))
     conflicts = set(public_sources).intersection(routes)
     if conflicts:
-        raise ValueError(f"Public file conflicts with a page or API route: {sorted(conflicts)[0]}")
-    return {"schema_version": VERSION, "routes": {p: routes[p] for p in router.ordered_routes()},
+        path = sorted(conflicts)[0]
+        raise ValueError(_config_error(
+            f"Public file conflicts with a page or API route: {path}",
+            [("public file", f"public{path}"), ("route", _source_label(routes[path]["entry"]))],
+            ["Rename or move the public file so its URL does not match the route",
+             "Move or rename the route"]))
+    # The manifest lists routes in specificity order. The trie already
+    # produces that order (Router.ordered_routes), but sorting here through
+    # the shared comparator (pynext.sortable_routes, translated from
+    # Next.js sortable-routes.ts) makes the manifest order an explicit,
+    # documented rule instead of an emergent property of the trie; the
+    # property test in tests/test_sortable_routes.py pins the two equal.
+    return {"schema_version": VERSION, "routes": {p: routes[p] for p in sort_routes(router.ordered_routes())},
             "error": global_error, "not_found": global_not_found,
             "sources": {str(p.relative_to(root)): _hash(p) for p in files},
             "public_sources": public_sources, "client_sources": discover_client(root)}
@@ -589,9 +694,115 @@ def validate_routes(routes):
             built.append(pattern)
         raise
 
+def _normalize_stages(stages):
+    """Validate a requested stage set and return it in canonical order."""
+    if stages is None:
+        return list(STAGES)
+    selected = [stage for stage in STAGES if stage in set(stages)]
+    if not selected or len(selected) != len(set(stages)):
+        raise ValueError(
+            f"Build stages must be a non-empty subset of {list(STAGES)}: {sorted(stages)!r}")
+    return selected
 
 
-def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECONDS):
+def _read_manifest_file(root):
+    """Read the existing manifest, or None when no build exists yet."""
+    target = root / MANIFEST
+    if not target.is_file():
+        return None
+    try:
+        saved = json.loads(target.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"Invalid build manifest {target}: {exc}; rebuild the application") from exc
+    if not isinstance(saved, dict):
+        raise ValueError(
+            f"Invalid build manifest {target}: expected a JSON object; rebuild the application")
+    if saved.get("schema_version") != VERSION:
+        raise ValueError("Incompatible manifest version; rebuild the application")
+    return saved
+
+
+def _write_manifest_file(root, manifest):
+    target = root / MANIFEST
+    _atomic_write(target, (json.dumps(manifest, ensure_ascii=False, indent=2) +
+                           "\n").encode("utf-8"))
+
+
+def _write_client_files(root, client_assets):
+    for path, body in client_assets.items():
+        digest = path.rsplit("/", 1)[1].removesuffix(".js")
+        _atomic_write(root / ".pynext" / "static" / f"{digest}.js", body)
+
+
+def _write_public_files(root, public_assets):
+    assets = {}
+    for path, (body, media_type) in public_assets.items():
+        digest = hashlib.sha256(body).hexdigest()
+        _atomic_write(root / ".pynext" / "static" / f"{digest}.asset", body)
+        assets[path] = {"sha256": digest, "content_type": media_type}
+    return assets
+
+
+def _write_static_files(root, rendered):
+    static_pages = {}
+    for path, (pattern, body) in rendered.items():
+        digest = hashlib.sha256(body).hexdigest()
+        destination = root / ".pynext" / "static" / f"{digest}.html"
+        _atomic_write(destination, body)
+        static_pages[path] = {"pattern": pattern, "sha256": digest}
+    return static_pages
+
+
+def _check_sources_unchanged(root, manifest):
+    if discover(root) != manifest:
+        raise ValueError("Application sources changed during build; retry the build")
+
+def _finish_manifest(root, manifest, app, rendered, *, previous=None, deployment_id=None):
+    """Fill a discovered manifest with build outputs and write it.
+
+    ``rendered`` is the ``_render_static_pages`` result (or None for a
+    compile-only build, which reuses the previous static pages). ``previous``
+    is the manifest of an earlier build whose static pages/assets may be
+    reused; it is ignored when ``rendered`` is given. The manifest records
+    the same policy keys a full build records, so a production app can
+    start from it, plus the deterministic ``build_id``, the
+    ``deployment_id`` and the BUILD_ID seal ``load_manifest`` checks.
+    """
+    manifest["render_modes"] = app.render_modes
+    manifest["isr_policies"] = app.isr_policies
+    manifest["layout_policies"] = app.layout_policies
+    manifest["isr_queries"] = app.isr_queries
+    manifest["ssg_fallback"] = app.ssg_fallback
+    manifest["dynamic_modes"] = app.dynamic_modes
+    manifest["isr_tags"] = app.isr_tags
+    manifest["client"] = app.client_manifest
+    # Prerender report, as in a full build (empty when every static page
+    # stayed static). ISR accesses recorded later at runtime are not part
+    # of the build manifest.
+    manifest["dynamic_accesses"] = {pattern: accesses for pattern, accesses in app.dynamic_accesses.items()
+                                    if accesses}
+    manifest["isr_static_paths"] = asyncio.run(_enumerate_isr_static_paths(app))
+    if rendered is None:
+        if previous is not None:
+            manifest["static_pages"] = previous.get("static_pages", {})
+            manifest["assets"] = previous.get("assets", {})
+        else:
+            manifest["static_pages"] = {}
+            manifest["assets"] = {}
+    else:
+        manifest["static_pages"] = _write_static_files(root, rendered)
+        manifest["assets"] = _write_public_files(root, app.public_assets)
+    _write_client_files(root, app.client_assets)
+    manifest["build_id"] = generate_build_id(manifest)
+    manifest["deployment_id"] = deployment_id
+    manifest_bytes = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    _atomic_write(root / MANIFEST, manifest_bytes)
+    _write_build_id(root, manifest_bytes)
+    return manifest
+
+
+def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECONDS, stages=None):
     """Build the project: discover, render static pages, write assets,
     the manifest, and finally BUILD_ID — each as a separate stage.
 
@@ -606,9 +817,23 @@ def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECOND
     a manifest from an interrupted build is rejected at start. The manifest
     also records the deterministic 16-hex ``build_id`` (source-hash prefix)
     and the optional ``deployment_id`` served as skew-protection headers.
+
+    ``stages`` selects a partial build (Next.js ``experimentalBuildMode``):
+    ``("compile",)`` compiles island bundles without rendering static
+    pages (``pynext build --only-islands``) and ``("generate",)`` renders
+    static pages from an earlier compile's bundles
+    (``pynext build --only-static``). The default is both stages, a full
+    build. A partial build records which stages it completed in
+    ``manifest["stages"]``; ``load_manifest`` refuses a manifest whose
+    generate stage never ran.
     """
     root = Path(root).resolve()
+    selected = _normalize_stages(stages)
     deployment_id = resolve_deployment_id(deployment_id)
+    if selected == ["compile"]:
+        return _write_compile_only_manifest(root, deployment_id=deployment_id, lock_timeout=lock_timeout)
+    if selected == ["generate"]:
+        return _write_generate_only_manifest(root, deployment_id=deployment_id, lock_timeout=lock_timeout)
     with BuildLock(root, timeout=lock_timeout):
         _preflight_checks(root)
         # Production env files are loaded before any user code runs, so static
@@ -616,9 +841,19 @@ def write_manifest(root, deployment_id=None, *, lock_timeout=LOCK_TIMEOUT_SECOND
         # before loadConfig in the same way).
         loaded = load_env(root, mode="production")
         manifest = _run_stage("discover", discover, root)
+        # Unreachable routes: a route no request can ever match (fully
+        # shadowed by higher-priority routes) is a build warning, not an
+        # error — the app still builds, but the route is dead code.
+        for route, shadowers in find_unreachable_routes(manifest["routes"]).items():
+            print(
+                f"warning: unreachable route {route} is shadowed by "
+                f"{', '.join(shadowers)} and can never match a request",
+                file=sys.stderr,
+            )
         app, rendered = _run_stage("render", _build_app_and_render, root, manifest)
         isr_static_paths = _run_stage("isr-warmup", lambda: asyncio.run(_enumerate_isr_static_paths(app)))
         _run_stage("validate", _validate_unchanged, root, manifest)
+        manifest["stages"] = list(STAGES)
         # Catch-all normalization over the enumerated static paths (reduced port
         # of Next.js normalizeCatchAllRoutes): report which static pages a
         # catch-all route would also match and which catch-all routes serve only
@@ -678,6 +913,164 @@ def _nearest_boundary(dirs, filename, root):
         if candidate.is_file():
             return str(candidate.relative_to(root))
     return None
+
+def _write_compile_only_manifest(root, *, deployment_id=None, lock_timeout=LOCK_TIMEOUT_SECONDS):
+    """Compile island bundles without rendering static pages."""
+    with BuildLock(root, timeout=lock_timeout):
+        _preflight_checks(root)
+        # Production env files are loaded before any user code runs, so static
+        # rendering and island bundling both see them (Next.js loads .env
+        # before loadConfig in the same way).
+        load_env(root, mode="production")
+        manifest = _run_stage("discover", discover, root)
+        # Unreachable routes: a route no request can ever match (fully
+        # shadowed by higher-priority routes) is a build warning, not an
+        # error — the app still builds, but the route is dead code.
+        for route, shadowers in find_unreachable_routes(manifest["routes"]).items():
+            print(
+                f"warning: unreachable route {route} is shadowed by "
+                f"{', '.join(shadowers)} and can never match a request",
+                file=sys.stderr,
+            )
+        # Loading user code is an intentional build step; the App also validates
+        # the routes and computes the render modes / ISR policies.
+        from .app import App
+        app = App(root, manifest)
+        previous = _read_manifest_file(root)
+        previous_client = previous.get("client") if isinstance(previous, dict) else None
+        reused = (previous is not None and isinstance(previous_client, dict) and
+                  isinstance(previous_client.get("bundles"), dict) and
+                  {key: previous.get(key) for key in _DISCOVER_KEYS} ==
+                  {key: manifest.get(key) for key in _DISCOVER_KEYS})
+        _run_stage("validate", _validate_unchanged, root, manifest)
+        if reused:
+            # Static pages embed island bundle digests, so they stay valid only
+            # while the bundles are unchanged. A changed digest drops the
+            # generate stage: the pages are stale until they are re-rendered.
+            old_digests = {previous.get("client", {}).get("runtime"),
+                           *previous.get("client", {}).get("bundles", {}).values()}
+            new_digests = {app.client_manifest.get("runtime"),
+                           *app.client_manifest.get("bundles", {}).values()}
+            previous_stages = previous.get("stages") or list(STAGES)
+            stages = [stage for stage in STAGES
+                      if stage == "compile" or
+                      (stage in previous_stages and old_digests == new_digests)]
+        else:
+            previous = None
+            stages = ["compile"]
+        manifest["stages"] = stages
+        return _finish_manifest(root, manifest, app, None, previous=previous,
+                                deployment_id=deployment_id)
+
+
+def _write_generate_only_manifest(root, *, deployment_id=None, lock_timeout=LOCK_TIMEOUT_SECONDS):
+    """Render static pages from the island bundles of an earlier compile."""
+    with BuildLock(root, timeout=lock_timeout):
+        _preflight_checks(root)
+        load_env(root, mode="production")
+        manifest = _run_stage("discover", discover, root)
+        previous = _read_manifest_file(root)
+        if previous is None:
+            raise ValueError("No previous build found; run `pynext build --only-islands` first")
+        if "compile" not in (previous.get("stages") or list(STAGES)):
+            raise ValueError(
+                "Island bundles were not compiled; run `pynext build --only-islands` first")
+        if previous.get("client_sources") != manifest["client_sources"]:
+            raise ValueError("Island sources changed since the last compile; "
+                             "run `pynext build --only-islands` first")
+        client_manifest, client_assets = read_client_artifacts(root, previous)
+        # Loading user code and running its generators are intentional build steps.
+        # The client bundles are reused from the previous compile, so esbuild
+        # does not run again.
+        from .app import App
+        app = App(root, manifest, reuse_client=(client_manifest, client_assets))
+        rendered = asyncio.run(_render_static_pages(app))
+        _run_stage("validate", _validate_unchanged, root, manifest)
+        previous_stages = previous.get("stages") or list(STAGES)
+        manifest["stages"] = [stage for stage in STAGES
+                              if stage == "generate" or stage in previous_stages]
+        return _finish_manifest(root, manifest, app, rendered, deployment_id=deployment_id)
+def export_static(root, manifest=None, output=None):
+    """Export a static-only site: SSG pages, public assets, island bundles.
+
+    The output directory holds plain files (``index.html`` per page, public
+    assets at their URL paths, island bundles under ``_pynext/static/``) and
+    is servable with ``python -m http.server --directory <output>`` without
+    a PyNext server. Apps with dynamic SSR, ISR or API routes are refused:
+    there is no server to run them, and silently dropping them would ship a
+    broken site. This is deliberately not a full ``output: export`` port.
+    """
+    root = Path(root).resolve()
+    if manifest is None:
+        manifest = load_manifest(root)
+    dynamic = sorted(pattern for pattern, mode in manifest.get("render_modes", {}).items()
+                     if mode != "ssg")
+    api = sorted(pattern for pattern, spec in manifest.get("routes", {}).items()
+                 if spec.get("kind") == "route")
+    if dynamic or api:
+        blocked = [f"{pattern} (render={manifest['render_modes'][pattern]})" for pattern in dynamic]
+        blocked += [f"{pattern} (API route)" for pattern in api]
+        raise ValueError("Static-only export cannot include dynamic routes: " + ", ".join(blocked) +
+                         "; make them SSG or remove them first")
+    static_dir = root / ".pynext" / "static"
+    output = Path(output) if output is not None else root / ".pynext" / "export"
+    if not output.is_absolute():
+        output = (root / output).resolve()
+    if output.is_symlink():
+        raise ValueError(f"Export directory must not be a symbolic link: {output}")
+    if output == root or root / "app" in output.parents or root / "public" in output.parents:
+        raise ValueError(f"Export directory must not overlap the application sources: {output}")
+    if output.exists() and any(output.iterdir()):
+        if output != root / ".pynext" / "export":
+            raise ValueError(
+                f"Export directory is not empty: {output}; remove it or choose another directory")
+        shutil.rmtree(output)
+    output.mkdir(parents=True, exist_ok=True)
+    try:
+        pages = 0
+        for path, entry in sorted(manifest.get("static_pages", {}).items()):
+            digest = entry["sha256"]
+            body = _read_static_file(static_dir, f"{digest}.html", digest)
+            relative = ("index.html" if path == "/" else
+                        "/".join(path.strip("/").split("/")) + "/index.html")
+            target = output / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+            pages += 1
+        assets = 0
+        for path, entry in sorted(manifest.get("assets", {}).items()):
+            digest = entry["sha256"]
+            body = _read_static_file(static_dir, f"{digest}.asset", digest)
+            target = output / path.lstrip("/")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+            assets += 1
+        bundles = 0
+        client = manifest.get("client", {})
+        if not isinstance(client, dict) or not isinstance(client.get("bundles", {}), dict):
+            raise ValueError("Invalid client manifest; rebuild the application")
+        for digest in {client.get("runtime"), *client.get("bundles", {}).values()}:
+            if digest is None:
+                continue
+            body = _read_static_file(static_dir, f"{digest}.js", digest)
+            target = output / CLIENT_PREFIX.lstrip("/") / f"{digest}.js"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+            bundles += 1
+    except BaseException:
+        shutil.rmtree(output, ignore_errors=True)
+        raise
+    return {"pages": pages, "assets": assets, "bundles": bundles, "output": str(output)}
+
+
+def _read_static_file(static_dir, name, digest):
+    file = static_dir / name
+    if not file.resolve().is_relative_to(static_dir.resolve()) or not file.is_file():
+        raise ValueError(f"Missing build output {name}; rebuild the application")
+    body = file.read_bytes()
+    if hashlib.sha256(body).hexdigest() != digest:
+        raise ValueError(f"Build output {name} failed integrity check; rebuild the application")
+    return body
 
 
 def _atomic_write(path, contents):
@@ -747,12 +1140,213 @@ def _route_group(part):
     return match.group(1)
 
 
-def _materialize(pattern, params):
+# Unreachable-route detection (REPORT.md §2.3 P2, tracks/a-routing.md
+# §2.10). Adapted from Next.js `isRoutePatternCovered()` /
+# `patternCoversAtLength()` / `prefixCovers()` in
+# `shared/lib/router/utils/interception-routes.ts`, with one difference:
+# Next.js only asks whether some ordinary route matches the same URLs,
+# while PyNext must also ask whether that route *wins* the trie match
+# (static > dynamic > catch-all > optional catch-all, with backtracking).
+# A route is unreachable only when every path it could match is both
+# matched and won by another route. Partial shadowing is normal -- e.g.
+# `/docs/[...path]` loses its one-segment paths to `/docs/[slug]` but
+# still serves longer paths -- and is not reported.
+#
+# The check is symbolic: for a fixed-length candidate there is a single
+# length to test, and for an unbounded candidate (catch-all tail) the
+# step kinds are uniform past both prefixes, so one unbounded stealer
+# covering at max(min lengths) covers every longer length, and only the
+# finite lengths below that need per-length checks.
+
+# Trie-step kind ranks: the smaller rank wins when two routes first
+# diverge on the same path. "end" is the endpoint reached when a pattern
+# stops exactly at the end of the path; it beats an optional catch-all
+# that would match zero further segments.
+_STEP_RANK = {"static": 0, "dynamic": 1, "catch_all": 2, "optional": 3, "end": -1}
+
+
+def _parse_route_pattern(pattern):
+    """Split a route pattern into (prefix, tail).
+
+    prefix is a list of ("static", literal) / ("dynamic", name) steps;
+    tail is None (fixed length), "catch_all" or "optional".
+    """
+    segments = pattern.strip("/").split("/") if pattern != "/" else []
+    tail = None
+    if segments:
+        last = segments[-1]
+        if last.startswith("[[...") and last.endswith("]]"):
+            tail = "optional"
+            segments = segments[:-1]
+        elif last.startswith("[...") and last.endswith("]"):
+            tail = "catch_all"
+            segments = segments[:-1]
+    prefix = []
+    for segment in segments:
+        parsed = _segment_param(segment)
+        if parsed is None:
+            prefix.append(("static", segment))
+        else:
+            name, kind, seg_prefix, seg_suffix = parsed
+            if kind != "dynamic":
+                raise ValueError(f"Catch-all must be the last part of the URL: {pattern}")
+            if seg_prefix or seg_suffix:
+                # Affixed parameter (v[version], [name].json): it only
+                # matches values carrying that prefix/suffix, so for
+                # coverage it behaves like a distinct literal, not a
+                # bare dynamic segment that matches any value.
+                prefix.append(("static", segment))
+            else:
+                prefix.append(("dynamic", name))
+    return prefix, tail
+
+
+def _pattern_min_length(parsed):
+    prefix, tail = parsed
+    return len(prefix) + (1 if tail == "catch_all" else 0)
+
+
+def _pattern_accepts_length(parsed, length):
+    prefix, tail = parsed
+    if tail is None:
+        return length == len(prefix)
+    return length >= _pattern_min_length(parsed)
+
+
+def _step_kind(parsed, index):
+    """Kind of the trie step a pattern takes at path position `index`.
+
+    Returns ("static", literal), ("dynamic",), ("catch_all",) or
+    ("optional",). Past the fixed prefix an unbounded pattern is in its
+    tail, which consumes every remaining position.
+    """
+    prefix, tail = parsed
+    if index < len(prefix):
+        kind, value = prefix[index]
+        return (kind, value) if kind == "static" else (kind,)
+    if tail == "catch_all":
+        return ("catch_all",)
+    if tail == "optional":
+        return ("optional",)
+    return ("end",)
+
+
+def _covers_at_length(stealer, candidate, length):
+    """Whether `stealer` matches and wins every length-`length` path that
+    `candidate` matches.
+
+    The stealer must accept `length` (the caller only asks about lengths
+    the candidate accepts). A static step only matches paths whose
+    segment is exactly that literal, so a stealer can take a static step
+    only where the candidate has the identical static step; a dynamic
+    step or a tail matches any value. The winner is decided by the first
+    position where the two patterns take different trie steps: the
+    smaller kind rank wins. If every step agrees, an endpoint beats an
+    optional catch-all that would match zero further segments.
+    """
+    if not _pattern_accepts_length(stealer, length):
+        return False
+    divergence = None
+    for index in range(length):
+        stealer_step = _step_kind(stealer, index)
+        candidate_step = _step_kind(candidate, index)
+        if stealer_step[0] == "static":
+            # Only the paths with exactly this literal are matched.
+            if stealer_step != candidate_step:
+                return False
+        elif stealer_step[0] in ("catch_all", "optional"):
+            # A tail consumes the rest, so it matches any values from
+            # here on; only the kind at this position can still diverge.
+            if divergence is None and stealer_step[0] != candidate_step[0]:
+                divergence = (stealer_step[0], candidate_step[0])
+            break
+        if divergence is None and stealer_step[0] != candidate_step[0]:
+            divergence = (stealer_step[0], candidate_step[0])
+    if divergence is not None:
+        return _STEP_RANK[divergence[0]] < _STEP_RANK[divergence[1]]
+    # Every step agreed. A catch-all has already consumed its segments,
+    # so it counts as ended; only an optional tail whose prefix ends
+    # exactly here can still match zero further segments.
+    stealer_end = "optional" if stealer[1] == "optional" and len(stealer[0]) == length else "end"
+    candidate_end = "optional" if candidate[1] == "optional" and len(candidate[0]) == length else "end"
+    return _STEP_RANK[stealer_end] < _STEP_RANK[candidate_end]
+
+
+def _shadowing_routes(pattern, others):
+    """Routes that together leave `pattern` no path it can win, or [].
+
+    `others` is a list of (route, parsed pattern) pairs.
+    """
+    min_length = _pattern_min_length(pattern)
+    if pattern[1] is None:
+        for route, other in others:
+            if _covers_at_length(other, pattern, min_length):
+                return [route]
+        return []
+    start = None
+    tail_shadow = None
+    for route, other in others:
+        if other[1] is None:
+            continue
+        first_covered = max(min_length, _pattern_min_length(other))
+        if _covers_at_length(other, pattern, first_covered):
+            if start is None or first_covered < start:
+                start, tail_shadow = first_covered, route
+    if start is None:
+        return []
+    shadowers = [tail_shadow]
+    for length in range(min_length, start):
+        for route, other in others:
+            if _covers_at_length(other, pattern, length):
+                shadowers.append(route)
+                break
+        else:
+            return []
+    return shadowers
+
+
+def find_unreachable_routes(routes):
+    """Return {route: [shadowing routes]} for routes that can never match.
+
+    `routes` is an iterable of route patterns; a manifest "routes" dict
+    works because iterating it yields the patterns. A route is reported
+    only when *every* path it could match is matched and won by another
+    route -- partial shadowing is normal and is not reported.
+    """
+    parsed = {}
+    for route in routes:
+        parsed[route] = _parse_route_pattern(route)
+    unreachable = {}
+    for route, pattern in parsed.items():
+        others = [(other, other_pattern) for other, other_pattern in parsed.items()
+                  if other != route]
+        shadowers = _shadowing_routes(pattern, others)
+        if shadowers:
+            unreachable[route] = sorted(shadowers)
+    return unreachable
+
+
+def _materialize(pattern, params, entry=None):
+    """Materialize a route pattern with concrete parameter values.
+
+    ``entry`` is the source file (``app/.../page.py``) naming the route;
+    it is only used to name the file in error details, so ``url_for()``
+    (which has no file) calls without it.
+    """
+    # Details prefix naming the source file, empty when there is no file.
+    file_detail = [("file", _source_label(entry))] if entry is not None else []
     segments = pattern.strip("/").split("/") if pattern != "/" else []
     keys = {}
     seen = set()
     for segment in segments:
-        parsed = _segment_param(segment)
+        try:
+            parsed = _segment_param(segment)
+        except ValueError as exc:
+            raise ValueError(_config_error(
+                str(exc),
+                file_detail + [("pattern", pattern)],
+                ["Use [name], [...name], or [[...name]] with a name matching [A-Za-z0-9_-]+",
+                 "Remove the brackets to make it a literal URL segment"])) from exc
         if parsed:
             name, kind, _prefix, _suffix = parsed
             # The Rust router rejects a repeated name in one route; check
@@ -764,7 +1358,11 @@ def _materialize(pattern, params):
             seen.add(comparable)
             keys[name] = kind
     if not isinstance(params, dict) or set(params) != set(keys):
-        raise ValueError(f"Static params for {pattern} must contain exactly {sorted(keys)}")
+        got = sorted(params) if isinstance(params, dict) else f"{type(params).__name__}: {_short_repr(params)}"
+        raise ValueError(_config_error(
+            f"Static params for {pattern} must contain exactly {sorted(keys)}",
+            file_detail + [("got", got)],
+            [f"Return one dict per path with exactly these keys: {sorted(keys)}"]))
     output = []
     for segment in segments:
         parsed = _segment_param(segment)
@@ -775,22 +1373,35 @@ def _materialize(pattern, params):
         value = params[name]
         if kind == "catch_all":
             if not isinstance(value, list) or not value:
-                raise ValueError(f"Catch-all parameter {name} must be a nonempty list")
+                raise ValueError(_config_error(
+                    f"Catch-all parameter {name} must be a nonempty list",
+                    file_detail + [("pattern", pattern), ("got", _short_repr(value))],
+                    [f"Return a nonempty list of strings for {name!r} in generate_static_params"]))
             values = value
         elif kind == "optional":
             if not isinstance(value, list):
-                raise ValueError(f"Optional catch-all parameter {name} must be a list")
+                raise ValueError(_config_error(
+                    f"Optional catch-all parameter {name} must be a list",
+                    file_detail + [("pattern", pattern), ("got", _short_repr(value))],
+                    [f"Return a list of strings for {name!r} in generate_static_params (use [] for no segments)"]))
             values = value
         else:
             values = [value]
         for part in values:
             if (not isinstance(part, str) or not part or part in {".", ".."} or
                     any(c in "/\\?#" or ord(c) < 32 or ord(c) == 127 for c in part)):
-                raise ValueError(f"Invalid static parameter in {pattern}: {part!r}")
+                raise ValueError(_config_error(
+                    f"Invalid static parameter in {pattern}: {part!r}",
+                    file_detail + [("parameter", name)],
+                    ["Use a nonempty string without /, \\, ?, #, or control characters",
+                     "Use '.' or '..' only as literal route segments, not as parameter values"]))
             try:
                 part.encode("utf-8")
             except UnicodeEncodeError as exc:
-                raise ValueError(f"Invalid Unicode static parameter in {pattern}") from exc
+                raise ValueError(_config_error(
+                    f"Invalid Unicode static parameter in {pattern}",
+                    file_detail + [("parameter", name), ("got", _short_repr(part))],
+                    ["Return a valid UTF-8 string for the parameter"])) from exc
             output.append(prefix + part + suffix)
     return "/" + "/".join(output)
 
@@ -806,21 +1417,41 @@ async def _materialize_params(app, pattern, generator):
     time.
     """
     from .app import _invoke
+    entry = _source_label(app.manifest["routes"][pattern]["entry"])
     params_list = [{}] if generator is None else await _invoke(generator)
     if not isinstance(params_list, list):
-        raise ValueError(f"generate_static_params for {pattern} must return a list")
+        raise ValueError(_config_error(
+            f"generate_static_params for {pattern} must return a list",
+            [("file", entry), ("got", f"{type(params_list).__name__}: {_short_repr(params_list)}")],
+            ["Return a list of dicts, one per path (use [] when the route has no paths)"]))
     paths = []
     seen = set()
+    seen_params = {}
     for params in params_list:
-        path = _materialize(pattern, params)
+        path = _materialize(pattern, params, entry)
         if path in seen:
-            raise ValueError(f"Duplicate generated path: {path}")
+            raise ValueError(_config_error(
+                f"Duplicate generated path: {path}",
+                [("file", entry), ("pattern", pattern),
+                 ("first", _short_repr(seen_params[path])),
+                 ("second", _short_repr(params))],
+                ["Make generate_static_params return unique parameter sets"]))
         seen.add(path)
+        seen_params[path] = params
         if path in app.public_assets:
-            raise ValueError(f"Public file shadows a generated page: {path}")
+            raise ValueError(_config_error(
+                f"Public file shadows a generated page: {path}",
+                [("public file", f"public{path}"),
+                 ("generated by", f"{entry} ({pattern})")],
+                ["Rename or move the public file",
+                 f"Change generate_static_params in {entry} so it does not generate {path}"]))
         match = app.router.matches(path)
         if match is None or match[0] != pattern:
-            raise ValueError(f"Generated path {path} is not reachable through {pattern}")
+            raise ValueError(_config_error(
+                f"Generated path {path} is not reachable through {pattern}",
+                [("file", entry), ("parameters", _short_repr(params))],
+                ["Return only parameter values that match the route pattern",
+                 "Check that the parameter names match the [param] segments of the route"]))
         paths.append(path)
     return paths
 
@@ -857,35 +1488,78 @@ async def _render_static_pages(app):
     would be a 404 in production — but the report is complete and the
     good pages were all rendered.
     """
-    from .app import _invoke
+    from .app import _invoke, _strip_client_runtime
     from .http import StreamingResponse
     rendered = {}
+    rendered_params = {}
     failures = []
     for pattern, generator in app.static_generators.items():
         if app.dynamic_modes.get(pattern) == "force-dynamic":
             # Never generated at build time; served dynamically instead.
             continue
+        entry = _source_label(app.manifest["routes"][pattern]["entry"])
         try:
             params_list = [{}] if generator is None else await _invoke(generator)
         except Exception as exc:
             failures.append((f"{pattern} (generate_static_params)", exc))
             continue
         if not isinstance(params_list, list):
-            raise ValueError(f"generate_static_params for {pattern} must return a list")
+            raise ValueError(_config_error(
+                f"generate_static_params for {pattern} must return a list",
+                [("file", entry), ("got", f"{type(params_list).__name__}: {_short_repr(params_list)}")],
+                ["Return a list of dicts, one per path (use [] when the route has no paths)"]))
         if len(params_list) + len(rendered) > MAX_STATIC_PAGES:
-            raise ValueError(f"Static page limit ({MAX_STATIC_PAGES}) exceeded")
+            raise ValueError(_config_error(
+                f"Static page limit ({MAX_STATIC_PAGES}) exceeded",
+                [("file", entry), ("pattern", pattern),
+                 ("pages", f"{len(rendered)} already rendered + {len(params_list)} from this route")],
+                ["Return fewer paths from generate_static_params",
+                 "Split the route into smaller routes"]))
         for params in params_list:
             path = None
             try:
-                path = _materialize(pattern, params)
+                path = _materialize(pattern, params, entry)
                 if path in rendered:
-                    raise ValueError(f"Duplicate generated path: {path}")
+                    raise ValueError(_config_error(
+                        f"Duplicate generated path: {path}",
+                        [("file", entry), ("pattern", pattern),
+                         ("first", _short_repr(rendered_params[path])),
+                         ("second", _short_repr(params))],
+                        ["Make generate_static_params return unique parameter sets"]))
                 if path in app.public_assets:
-                    raise ValueError(f"Public file shadows a generated page: {path}")
+                    raise ValueError(_config_error(
+                        f"Public file shadows a generated page: {path}",
+                        [("public file", f"public{path}"),
+                         ("generated by", f"{entry} ({pattern})")],
+                        ["Rename or move the public file",
+                         f"Change generate_static_params in {entry} so it does not generate {path}"]))
                 match = app.router.matches(path)
                 if match is None or match[0] != pattern:
-                    raise ValueError(f"Generated path {path} is not reachable through {pattern}")
-                response = await app.render_page(pattern, None, params)
+                    raise ValueError(_config_error(
+                        f"Generated path {path} is not reachable through {pattern}",
+                        [("file", entry), ("parameters", _short_repr(params))],
+                        ["Return only parameter values that match the route pattern",
+                         "Check that the parameter names match the [param] segments of the route"]))
+                # The prelude inspection in _streaming_page_response pulls the
+                # first chunk inside render_page, so for streaming pages the
+                # build time limit must cover the render call too — otherwise a
+                # page that never yields would stall the build past the limit
+                # instead of failing it. Non-streaming pages keep their
+                # previous (unbounded) render.
+                fn, _layouts = app.entries[pattern]
+                if inspect.isasyncgenfunction(fn):
+                    try:
+                        async with asyncio.timeout(MAX_STREAMED_STATIC_SECONDS):
+                            response = await app.render_page(pattern, None, params)
+                    except asyncio.TimeoutError as exc:
+                        raise ValueError(_config_error(
+                            f"Streamed static page for {path} exceeded the build time limit "
+                            f"({MAX_STREAMED_STATIC_SECONDS}s)",
+                            [("file", entry), ("pattern", pattern)],
+                            ["Reduce the page content or make it render faster",
+                             "Split the page into smaller pages"])) from exc
+                else:
+                    response = await app.render_page(pattern, None, params)
                 if isinstance(response, StreamingResponse):
                     body = bytearray()
                     try:
@@ -900,19 +1574,50 @@ async def _render_static_pages(app):
                                     continue
                                 index += 1
                                 if len(body) + len(chunk) > MAX_STREAMED_STATIC_BYTES:
-                                    raise ValueError("Streamed static page exceeds build size limit")
+                                    raise ValueError(_config_error(
+                                        f"Streamed static page {path} exceeds build size limit "
+                                        f"({MAX_STREAMED_STATIC_BYTES} bytes)",
+                                        [("file", entry), ("pattern", pattern)],
+                                        ["Split the page or reduce its content"]))
                                 body.extend(chunk)
                     except asyncio.TimeoutError as exc:
-                        raise ValueError(
+                        raise ValueError(_config_error(
                             f"Streamed static page for {path} exceeded the build time limit "
-                            f"({MAX_STREAMED_STATIC_SECONDS}s)") from exc
+                            f"({MAX_STREAMED_STATIC_SECONDS}s)",
+                            [("file", entry), ("pattern", pattern)],
+                            ["Reduce the page content or make it render faster",
+                             "Split the page into smaller pages"])) from exc
                     finally:
                         await response.aclose()
+                    # Byte-level backstop for the prelude inspection in
+                    # _streaming_page_response: a page that yields nodes which
+                    # serialize to nothing would otherwise be written out as a
+                    # file holding only the client runtime script tag. The tag
+                    # is boilerplate, not content, so it is stripped before the
+                    # emptiness test. Fail the build instead of shipping it.
+                    body_text = bytes(body).decode("utf-8", "replace")
+                    if not _strip_client_runtime(body_text):
+                        raise ValueError(_config_error(
+                            f"Static page {path} rendered an empty document",
+                            [("file", entry), ("pattern", pattern)],
+                            ["Return content from the page instead of yielding nothing",
+                             "Add content to the layout shell so the document is not empty"]))
                     rendered[path] = (pattern, bytes(body))
                 else:
                     if len(response.body) > MAX_STATIC_PAGE_BYTES:
-                        raise ValueError("Static page exceeds build size limit")
+                        raise ValueError(_config_error(
+                            f"Static page {path} exceeds build size limit "
+                            f"({MAX_STATIC_PAGE_BYTES} bytes)",
+                            [("file", entry), ("pattern", pattern)],
+                            ["Split the page or reduce its content"]))
+                    if not _strip_client_runtime(response.body.decode("utf-8", "replace")):
+                        raise ValueError(_config_error(
+                            f"Static page {path} rendered an empty document",
+                            [("file", entry), ("pattern", pattern)],
+                            ["Return content from the page instead of yielding nothing",
+                             "Add content to the layout shell so the document is not empty"]))
                     rendered[path] = (pattern, response.body)
+                rendered_params[path] = params
             except Exception as exc:
                 failures.append((path if path is not None else f"{pattern} {params}", exc))
     if failures:
@@ -1000,6 +1705,18 @@ def load_manifest(root):
     if recorded != build_id_for(target.read_bytes()):
         raise ValueError("Incomplete build: BUILD_ID is missing or does not match the manifest; "
                          "run `pynext build` again")
+    stages = saved.get("stages")
+    if stages is not None:
+        # Manifests written before build stages existed have no key and are
+        # treated as complete builds.
+        if not isinstance(stages, list) or not set(stages) <= set(STAGES):
+            raise ValueError("Invalid build stages in manifest; rebuild the application")
+        if "compile" not in stages:
+            raise ValueError("Island bundles were not compiled; "
+                             "run `pynext build --only-islands` or a full `pynext build` first")
+        if "generate" not in stages:
+            raise ValueError("Static pages were not generated; "
+                             "run `pynext build --only-static` or a full `pynext build` first")
     expected = discover(root)
     if {key: saved.get(key) for key in expected} != expected:
         raise ValueError("Application sources changed since build; run `pynext build` again")

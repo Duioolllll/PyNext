@@ -2,12 +2,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import assert_type, cast
 
 from pynext import (
-    App, Database, DjangoResource, JSONResponse, RateLimiter, Request, Response, SecurityConfig,
-    Session, SessionMiddleware, SQLiteSessionStore, StreamingResponse, WebSocket,
+    App, Database, DjangoResource, JSONResponse, MiddlewareResult, RateLimiter, Request, Response,
+    SecurityConfig, Session, SessionMiddleware, SQLiteSessionStore, StreamingResponse, WebSocket,
     WebSocketPubSub, create_app, csrf_protect, fragment, h, island, page,
     __version__, require_auth, route, websocket,
 )
-from pynext.types import RenderNode
+from pynext.types import Middleware, NextHandler, RenderNode
 
 
 @route("POST")
@@ -51,6 +51,23 @@ async def resources(django: DjangoResource, broker: WebSocketPubSub) -> None:
     async with broker.subscribe("topic") as subscription:
         assert_type(await subscription.receive(), str | bytes)
 
+
+async def redirecting_middleware(request: Request, call_next: NextHandler) -> Response | MiddlewareResult:
+    if request.path == "/old":
+        return MiddlewareResult.redirect("/new")
+    return await call_next(request)
+
+
+# A middleware returning a MiddlewareResult is a valid Middleware.
+redirecting: Middleware = redirecting_middleware
+
+continued = MiddlewareResult.next(Request("GET", "/"))
+assert_type(continued.request, Request | None)
+assert_type(continued.response, Response | None)
+terminal = MiddlewareResult.response(Response("done"))
+assert_type(terminal, MiddlewareResult)
+assert_type(terminal.response, Response | None)
+assert_type(MiddlewareResult.response(response=Response("done")), MiddlewareResult)
 
 app = create_app(".", security=SecurityConfig(cors_allowed_origins=("https://client.example",)),
                  resources={"db": Database()}, middleware=[SessionMiddleware(SQLiteSessionStore("session.db"))])

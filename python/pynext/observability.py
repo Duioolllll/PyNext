@@ -80,6 +80,15 @@ trace_span_id_var = contextvars.ContextVar("pynext_trace_span_id", default=None)
 route_var = contextvars.ContextVar("pynext_route", default=None)
 queue_wait_var = contextvars.ContextVar("pynext_queue_wait_ms", default=None)
 render_ms_var = contextvars.ContextVar("pynext_render_ms", default=None)
+# Middleware/security decision for the current request (P2-2, §3.3 #18):
+# set by ``App._run_middleware`` / ``App._rate_limit_denied`` so the access
+# log line and the ``pynext.request`` span carry the decision. The values
+# are bounded outcome words (never paths or user input), so they are safe
+# as log fields and span attributes.
+middleware_outcome_var = contextvars.ContextVar("pynext_middleware_outcome", default=None)
+middleware_actor_var = contextvars.ContextVar("pynext_middleware_actor", default=None)
+middleware_rewrote_path_var = contextvars.ContextVar("pynext_middleware_rewrote_path", default=None)
+rate_limit_outcome_var = contextvars.ContextVar("pynext_rate_limit_outcome", default=None)
 _otel_context_var = contextvars.ContextVar("pynext_otel_context", default=None)
 
 
@@ -172,6 +181,10 @@ def begin_request_context(headers):
         (route_var, route_var.set(None)),
         (queue_wait_var, queue_wait_var.set(None)),
         (render_ms_var, render_ms_var.set(None)),
+        (middleware_outcome_var, middleware_outcome_var.set(None)),
+        (middleware_actor_var, middleware_actor_var.set(None)),
+        (middleware_rewrote_path_var, middleware_rewrote_path_var.set(None)),
+        (rate_limit_outcome_var, rate_limit_outcome_var.set(None)),
     )
     context = _extract_otel_context(headers) if parsed is not None else None
     # Clear any inherited request context when this request has no valid
@@ -293,6 +306,8 @@ class MetricsCollector:
         self._rust_ms_count = 0
         self._cache = {"hit": 0, "miss": 0, "stale": 0, "busy": 0}
         self._regeneration = {"success": 0, "failure": 0, "started": 0}
+        self._rate_limit = {"allowed": 0, "denied": 0, "exempt": 0, "error": 0}
+        self._middleware = {"continued": 0, "short_circuited": 0, "error": 0}
         self._workers = {"starts": 0, "timeouts": 0, "unavailable": 0}
         self._bundles = {}  # client asset path -> size in bytes
         # Error counts, joint key (route, error_type, digest); digest is ""
@@ -403,6 +418,39 @@ class MetricsCollector:
         with self._lock:
             self._regeneration[outcome] += 1
 
+    # -- middleware / security decisions ----------------------------------
+    def observe_rate_limit(self, outcome):
+        """Count one rate-limit admission decision.
+
+        Outcomes: ``allowed`` (token consumed), ``denied`` (429),
+        ``exempt`` (exempt path, no token charged), ``error`` (the
+        decision itself failed, fail closed with 503). Observed at the
+        decision on both transports, so a denied request is counted even
+        though it never reaches dispatch — and an exempt 404 shows up as
+        an ``exempt`` decision next to a 404 in the request counters,
+        which is the shape a B-1 style bypass takes. Unknown outcomes
+        are ignored so a typo can never corrupt the counters.
+        """
+        if not self.enabled or outcome not in self._rate_limit:
+            return
+        with self._lock:
+            self._rate_limit[outcome] += 1
+
+    def observe_middleware(self, outcome):
+        """Count one middleware-chain outcome.
+
+        Outcomes: ``continued`` (the chain reached the terminal),
+        ``short_circuited`` (a middleware answered on its own), ``error``
+        (a middleware raised or violated the chain contract). A failure
+        in the handler behind the terminal still counts as ``continued``:
+        the chain continued; the 500 is the handler's failure, not the
+        middleware's. Unknown outcomes are ignored.
+        """
+        if not self.enabled or outcome not in self._middleware:
+            return
+        with self._lock:
+            self._middleware[outcome] += 1
+
     # -- sizes ------------------------------------------------------------
     def observe_island_bundle(self, path, size_bytes):
         if not self.enabled:
@@ -462,6 +510,8 @@ class MetricsCollector:
                 },
                 "cache": dict(self._cache),
                 "regeneration": dict(self._regeneration),
+                "rate_limit": dict(self._rate_limit),
+                "middleware": dict(self._middleware),
                 "workers": dict(self._workers),
                 "island_bundles": bundle_sizes,
                 "island_bundles_total_bytes": sum(bundle_sizes.values()),
@@ -495,6 +545,14 @@ class MetricsCollector:
                   "# TYPE pynext_regeneration_total counter"]
         for outcome, count in snap["regeneration"].items():
             lines.append(f'pynext_regeneration_total{{outcome="{outcome}"}} {count}')
+        lines += ["# HELP pynext_rate_limit_total Rate-limit admission decisions, by outcome.",
+                  "# TYPE pynext_rate_limit_total counter"]
+        for outcome, count in snap["rate_limit"].items():
+            lines.append(f'pynext_rate_limit_total{{outcome="{outcome}"}} {count}')
+        lines += ["# HELP pynext_middleware_total Middleware chain outcomes, by outcome.",
+                  "# TYPE pynext_middleware_total counter"]
+        for outcome, count in snap["middleware"].items():
+            lines.append(f'pynext_middleware_total{{outcome="{outcome}"}} {count}')
         lines += ["# HELP pynext_worker_total Worker starts, timeouts and unavailability.",
                   "# TYPE pynext_worker_total counter"]
         for outcome, count in snap["workers"].items():

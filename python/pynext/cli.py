@@ -8,7 +8,7 @@ import traceback
 from pathlib import Path
 
 from .app import create_app
-from .build import write_manifest
+from .build import export_static, write_manifest
 from .client import compile_client, discover_client
 from .env import load_env
 from .config import DEFAULT_CONFIG, ConfigError, load_config
@@ -16,11 +16,11 @@ from .http import MAX_WS_MESSAGE, SecurityConfig
 from .observability import ObservabilityConfig
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
-from .scaffold import init_project
+from .scaffold import TEMPLATES, init_project
 from .server import (MAX_BODY_CAPACITY, MAX_BODY_MIN_RATE_BYTES_PER_SEC,
                      MAX_CONCURRENT, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP,
                      MAX_SHUTDOWN_TIMEOUT, MAX_TIMEOUT_MS, MAX_WAITING, serve)
-from .supervisor import MAX_WORKERS, WorkerConfig, run_supervisor
+from .supervisor import MAX_WORKERS, WorkerConfig, decide_auto_workers, run_supervisor
 from .standalone import build_standalone
 from .watch import Watcher
 
@@ -77,6 +77,30 @@ def _bounded(minimum, maximum, label):
             raise argparse.ArgumentTypeError(f"{label} must be an integer <= {maximum}")
         return number
     return convert
+
+
+def _workers(value):
+    """argparse type for --workers: an integer in [1, MAX_WORKERS] or "auto".
+
+    "auto" resolves later, in main(), via decide_auto_workers() — the
+    machine's CPU/memory count is only read once the rest of the flags
+    have parsed, so a bad --workers value still fails fast at parse
+    time. Error wording keeps the existing "[1, 64]" / ">= 1" / "<= 64"
+    messages (test_cli asserts on them) with 'auto' added to the
+    not-an-integer case.
+    """
+    if value == "auto":
+        return value
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--workers must be an integer in [1, 64] or 'auto'") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("--workers must be an integer >= 1")
+    if number > MAX_WORKERS:
+        raise argparse.ArgumentTypeError("--workers must be an integer <= 64")
+    return number
 
 
 async def _wait_for_change(watcher, server_task):
@@ -465,6 +489,13 @@ def _build_parser():
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a minimal application")
     init.add_argument("--dir", default=".", help="application project directory")
+    init.add_argument("--template", choices=TEMPLATES, default="basic",
+                      help="project template: basic (default), islands (browser counter island),"
+                           " or api (example JSON route)")
+    init.add_argument("--with-middleware", action="store_true",
+                      help="also create an example middleware.py")
+    init.add_argument("--no-gitignore", action="store_true",
+                      help="do not create a .gitignore")
     for name in ("build", "dev", "start"):
         command = sub.add_parser(name)
         command.add_argument("--dir", default=".", help="application project directory")
@@ -480,6 +511,20 @@ def _build_parser():
             command.add_argument("--deployment-id", default=None, metavar="ID",
                                  help="deployment label recorded in the manifest and sent as "
                                       "X-PyNext-Deployment-Id (also via PYNEXT_DEPLOYMENT_ID)")
+            command.add_argument("--only-islands", action="store_true",
+                                 help="compile only: bundle the island modules and update the manifest"
+                                      " without rendering static pages (Next.js 'compile' build mode)")
+            command.add_argument("--only-static", action="store_true",
+                                 help="generate only: render the static pages from the island bundles of"
+                                      " an earlier compile, without re-running the bundler"
+                                      " (Next.js 'generate' build mode)")
+            command.add_argument("--static-only", action="store_true",
+                                 help="export a static-only site (SSG pages, public assets and island"
+                                      " bundles) to a directory servable without a server; refuses apps"
+                                      " with dynamic, ISR or API routes")
+            command.add_argument("--export-dir", default=None,
+                                 help="output directory for --static-only"
+                                      " (default: <project>/.pynext/export)")
         if name != "build":
             command.add_argument("--host", default=DEFAULT_CONFIG.host)
             command.add_argument("--port", type=_port, default=DEFAULT_CONFIG.port)
@@ -536,9 +581,10 @@ def _build_parser():
             command.add_argument("--tracing", dest="tracing",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="emit OpenTelemetry spans when the opentelemetry packages are installed (default: off)")
-            command.add_argument("--workers", type=_bounded(1, MAX_WORKERS, "--workers"),
+            command.add_argument("--workers", type=_workers,
                                  default=DEFAULT_CONFIG.workers,
-                                 help="worker processes sharing the port (default 1: single process; max 64); "
+                                 help="worker processes sharing the port (default 1: single process; max 64; "
+                                      "'auto' picks from CPU cores and available memory, max 8); "
                                       "a supervisor restarts crashed workers")
             command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"),
                                  default=DEFAULT_CONFIG.rate_limit,
@@ -629,8 +675,12 @@ def main():
     resolved = None
     cli_overrides = {}
     if command in ("dev", "build", "start"):
+        # "auto" is not a config value: it resolves later, in main(),
+        # via decide_auto_workers(), so it must not reach load_config's
+        # integer validation for "workers".
         cli_overrides = {key: explicit[dest] for dest, key in _CLI_CONFIG_MAP.items()
-                         if dest in explicit}
+                         if dest in explicit
+                         and not (key == "workers" and explicit[dest] == "auto")}
         try:
             resolved = load_config(root, command, cli_overrides=cli_overrides)
         except ConfigError as exc:
@@ -648,23 +698,57 @@ def main():
     root = Path(args.dir).resolve()
     if args.command == "init":
         try:
-            init_project(root)
+            init_project(root, template=args.template, with_middleware=args.with_middleware,
+                         gitignore=not args.no_gitignore)
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
-        print(f"Created a PyNext app in {root}")
+        print(f"Created a PyNext app in {root} (template: {args.template})")
+        print()
+        print("Next steps:")
+        print(f"  cd {root}")
+        print("  pynext dev    # serve the source with reload")
+        print("  pynext build  # render static pages and bundle islands")
+        print("  pynext start  # serve the production build")
+        if args.template == "islands":
+            print("Islands need Node.js and esbuild for `pynext build`.")
         return
     if args.command == "build":
         if args.standalone_dir and not args.standalone:
             parser.error("--standalone-dir requires --standalone")
+        if args.only_islands and args.only_static:
+            parser.error("--only-islands and --only-static are mutually exclusive; "
+                         "run a plain `pynext build` for both stages")
+        if args.static_only and (args.only_islands or args.only_static):
+            parser.error("--static-only runs a complete build first; combine it with "
+                         "neither --only-islands nor --only-static")
+        if args.export_dir and not args.static_only:
+            parser.error("--export-dir requires --static-only")
+        if args.standalone and (args.only_islands or args.only_static):
+            parser.error("--standalone requires a complete build; combine it with "
+                         "neither --only-islands nor --only-static")
         try:
             # write_manifest and build_standalone each take the build
             # lock, so a second build waits (up to --lock-timeout) and a
             # standalone copy always sees one consistent, completed build.
-            manifest = write_manifest(root, deployment_id=args.deployment_id, lock_timeout=args.lock_timeout)
-            print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'} "
-              f"(build {manifest['build_id']})")
+            # Partial builds take only the stage they need; the full build
+            # also records the deployment id. (The call shapes differ per
+            # mode so the CLI tests can stub write_manifest per mode.)
+            if args.only_islands:
+                manifest = write_manifest(root, stages=("compile",))
+            elif args.only_static:
+                manifest = write_manifest(root, stages=("generate",))
+            else:
+                manifest = write_manifest(root, deployment_id=args.deployment_id, lock_timeout=args.lock_timeout)
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
+        if args.only_islands:
+            print(f"Compiled {len(manifest['client']['bundles'])} island bundles in {root / '.pynext'}")
+        elif args.only_static:
+            print(f"Generated {len(manifest['static_pages'])} static pages in {root / '.pynext'}")
+        else:
+            build_id = manifest.get("build_id")
+            suffix = f" (build {build_id})" if build_id else ""
+            print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}{suffix}")
         coverage = manifest.get("catch_all_coverage") or {}
         shadowed = coverage.get("shadowed") or {}
         dynamic_only = coverage.get("dynamic_only") or []
@@ -672,6 +756,14 @@ def main():
             print(f"Catch-all coverage: {len(shadowed)} static page(s) also match a catch-all "
                   f"route (the static page wins); {len(dynamic_only)} catch-all route(s) serve "
                   f"only paths generate_static_params did not enumerate")
+        if args.static_only:
+            output = Path(args.export_dir) if args.export_dir else None
+            try:
+                summary = export_static(root, manifest, output)
+            except (OSError, ValueError) as exc:
+                parser.error(str(exc))
+            print(f"Exported {summary['pages']} static pages to {summary['output']}")
+            print(f"Serve with: python -m http.server --directory {summary['output']}")
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
             try:
@@ -718,7 +810,17 @@ def main():
         value = getattr(args, key)
         if value is not None and value != getattr(DEFAULT_CONFIG, key):
             conn_kwargs[key] = value
-    if args.workers > 1:
+    if args.workers == "auto":
+        decision = decide_auto_workers()
+        workers = decision.count
+        # The track (E P2-10) asks for the decision basis on one startup
+        # line: the resolved count and what capped it. Printed here, not
+        # in run_supervisor, so an auto decision of 1 — the
+        # single-process path, no supervisor — is reported too.
+        print(f"PyNext workers: {decision.describe()}", flush=True)
+    else:
+        workers = args.workers
+    if workers > 1:
         config = WorkerConfig(root=str(root), host=args.host, port=args.port,
                               production=args.command == "start",
                               max_concurrent=args.max_concurrent,
@@ -739,7 +841,7 @@ def main():
                               observability=obs_config, security=security,
                               websocket_max_message=args.ws_max_message_bytes,
                               shutdown_timeout=args.shutdown_timeout, strict_ssg=args.strict_ssg)
-        return run_supervisor(config, workers=args.workers)
+        return run_supervisor(config, workers=workers)
     if args.command == "dev":
         try:
             asyncio.run(run_dev(root, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,

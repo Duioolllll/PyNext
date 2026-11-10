@@ -24,6 +24,16 @@ http://127.0.0.1:3000/, /about, /guides/intro, /news/example, /hydrate, /strateg
 
 `pynext dev --dir examples/basic`는 빌드 없이 소스를 제공하며 `app/`·`islands/`·`public/`·`pynext.config.py` 변경 시 같은 포트로 서버를 다시 시작합니다. `pynext start`는 빌드 manifest를 사용하며 추적하는 소스가 바뀌면 재빌드를 요구합니다. island가 없는 앱에는 Node와 esbuild가 필요하지 않습니다. 설치 안내의 기준은 저장소 소스이며 PyPI 배포를 의미하지 않습니다.
 
+### 빌드 모드
+
+일반 `pynext build`는 두 빌드 단계를 모두 수행합니다. island 번들을 esbuild로 묶는 컴파일 단계와 정적 페이지를 렌더링하는 생성 단계입니다. 두 단계는 따로 실행할 수 있습니다(Next.js `experimentalBuildMode`의 `compile`/`generate` 분리 상당).
+
+- `pynext build --only-islands`는 island만 묶어 manifest를 갱신하고 정적 페이지는 렌더링하지 않습니다. 소스가 그대로면 이전 빌드의 정적 페이지를 재사용합니다. island 번들이 바뀌면 이전 페이지는 낡은 번들 digest를 포함하므로 stale이 되어, 페이지를 다시 렌더링할 때까지 manifest에서 생성 단계가 빠집니다.
+- `pynext build --only-static`은 이전 컴파일의 island 번들로 정적 페이지만 렌더링하고 esbuild를 다시 실행하지 않습니다. 이전 컴파일이 없거나 그 뒤 island 소스가 바뀌었으면 실패하므로, 그 경우 `--only-islands`를 먼저 실행합니다.
+- `pynext start`는 부분 빌드를 거부하고 빠진 단계를 알려주므로, 절반만 빌드된 앱이 실수로 서비스되지 않습니다.
+
+`pynext build --static-only`는 정적 전용 사이트를 내보냅니다. 렌더링된 SSG 페이지·public 자산·island 번들을 일반 파일로 배치합니다(페이지마다 `index.html` 하나, 자산은 URL 경로 그대로, 번들은 `_pynext/static/` 아래). 기본 출력은 `.pynext/export`(`--export-dir <dir>`로 변경 가능)이며, PyNext 서버 없이 `python -m http.server --directory <dir>`로 서빙할 수 있습니다. 의도적으로 좁은 모드이며 완전한 정적 내보내기가 아닙니다. 동적 SSR·ISR·API 라우트가 있는 앱은 조용히 빠뜨리는 대신 거부합니다. `--static-only`는 완전한 빌드를 먼저 수행하므로 `--only-islands`·`--only-static`·`--standalone`과 함께 쓸 수 없습니다.
+
 개발 감시기는 네이티브 파일 이벤트와 해시를 사용하고 필요하면 폴링으로 대체합니다. JS/TS island 수정은 영향받은 모듈만 다시 빌드해 문서 새로고침 없이 교체합니다. 이전 정리 함수가 호출되며 해당 island 상태는 초기화될 수 있습니다. 다른 소스 변경은 서버를 재시작하고 열린 문서를 새로고침합니다. 잘못된 수정은 이전 정상 버전을 유지합니다. `--port 0`으로 시작해도 재시작 시 처음 할당된 포트를 재사용합니다.
 
 ## 프로젝트 구조와 라우팅
@@ -219,7 +229,7 @@ async def stream():
 
 `route.py`는 HTTP 핸들러와 함께 `@websocket` 핸들러를 하나 내보낼 수 있습니다. 핸들러는 `WebSocket`을 받아 보내거나 받기 전에 `await websocket.accept()`를 호출해야 합니다. 텍스트와 바이너리 메시지를 주고받을 수 있으며, 상대가 연결을 끊으면 `receive()`에서 `WebSocketDisconnect`가 발생하므로 연결별 정리는 `finally` 블록에 둡니다.
 
-개발 버전은 ASGI·Axum에서 연결을 수락하기 전에 `Origin`을 검사하며, 기본적으로 같은 출처만 허용합니다. 다른 HTTP(S) 출처는 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`를 `create_app(..., security=...)`에 전달하거나 `--ws-allowed-origin https://client.example`을 반복 지정하세요. 스킴과 기본값이 아닌 포트를 포함하며 `*`와 `null`은 허용하지 않습니다. `Origin`을 생략하는 기존 비브라우저 클라이언트는 `websocket_allow_missing_origin=True` 또는 `--ws-allow-missing-origin`으로 명시적으로 허용해야 합니다. 공개된 0.1.0 패키지에는 이 검사가 없습니다. 클라이언트는 `Origin`을 위조하거나 생략할 수 있습니다. 핸드셰이크 전에는 업그레이드 요청에 전역 미들웨어 체인(세션 미들웨어 포함)과 핸들러의 `@require_auth`/`@require_permission` 정책이 ASGI·Axum 모두에서 적용되며, 거부된 업그레이드는 101 응답 전에 차단됩니다(Axum은 HTTP 403, ASGI는 close 1008). 따라서 핸들러는 실행되지 않습니다. 신원 확립(예: 로그인 라우트에서 `session["user_id"]` 설정)은 여전히 앱의 책임이며, 세션 외의 자격 증명 방식(예: 토큰)은 미들웨어에서 검증해야 합니다. 프록시 뒤에서는 실제 프록시만 `--trusted-proxy`로 지정하고 클라이언트가 보낸 전달 헤더를 프록시가 덮어쓰도록 설정하세요.
+개발 버전은 ASGI·Axum에서 연결을 수락하기 전에 `Origin`을 검사하며, 기본적으로 같은 출처만 허용합니다. 다른 HTTP(S) 출처는 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`를 `create_app(..., security=...)`에 전달하거나 `--ws-allowed-origin https://client.example`을 반복 지정하세요. 스킴과 기본값이 아닌 포트를 포함합니다. `null`은 허용하지 않으며, 와일드카드 패턴도 쓸 수 있습니다: `*`는 DNS 레이블 하나(`https://*.example.com`), `**`는 맨 앞 레이블에서만 하나 이상의 앞부분 레이블(`https://**.example.com`)과 일치하고, `https://*.com`처럼 전체 도메인을 가리는 패턴은 거부됩니다. `Origin`을 생략하는 기존 비브라우저 클라이언트는 `websocket_allow_missing_origin=True` 또는 `--ws-allow-missing-origin`으로 명시적으로 허용해야 합니다. 공개된 0.1.0 패키지에는 이 검사가 없습니다. 클라이언트는 `Origin`을 위조하거나 생략할 수 있습니다. 핸드셰이크 전에는 업그레이드 요청에 전역 미들웨어 체인(세션 미들웨어 포함)과 핸들러의 `@require_auth`/`@require_permission` 정책이 ASGI·Axum 모두에서 적용되며, 거부된 업그레이드는 101 응답 전에 차단됩니다(Axum은 HTTP 403, ASGI는 close 1008). 따라서 핸들러는 실행되지 않습니다. 신원 확립(예: 로그인 라우트에서 `session["user_id"]` 설정)은 여전히 앱의 책임이며, 세션 외의 자격 증명 방식(예: 토큰)은 미들웨어에서 검증해야 합니다. 프록시 뒤에서는 실제 프록시만 `--trusted-proxy`로 지정하고 클라이언트가 보낸 전달 헤더를 프록시가 덮어쓰도록 설정하세요.
 
 ASGI에서 PyNext가 신뢰 프록시를 판정하려면 서버가 `scope["client"]`에 원래 피어 주소를 보존해야 합니다. PyNext가 전달 헤더를 해석할 때는 ASGI 서버의 선행 프록시 헤더 처리를 끄세요(Uvicorn은 `--no-proxy-headers`).
 
@@ -346,7 +356,7 @@ CLI 플래그 `--structured-logs` / `--no-structured-logs`, `--metrics` / `--no-
 
 전달된 주소는 오른쪽부터 신뢰하는 프록시를 거슬러 가장 가까운 비신뢰 주소를 사용합니다. 모든 중간 프록시를 정확히 등록해야 합니다. 프로세스당 버킷은 최대 10,000개이며, 모두 사용 중이면 새 주소가 가장 오래된 버킷을 내보내고 들어갑니다(기존 주소가 429를 받지는 않습니다). 신규 주소 생성은 윈도우당 최대 10,000개까지의 전역 슬라이딩 윈도우로 제한합니다. 버킷 점수는 Redis `TIME`에서 가져온 정수 마이크로초입니다. 두 스크립트가 같은 마이크로초를 읽을 수 있는데, 그 경우 동점인 버킷은 똑같이 오래된 것이므로 버킷 키 기준으로 결정적으로 내보낼 버킷을 정합니다. 내보내진 소유자는 거부되지 않고 다음 요청에서 새 버킷을 받습니다. 점수는 최대 1년 윈도우를 훨씬 넘어서도 정확한 정수로 유지됩니다(현재 epoch 기준 마지막 자리 단위는 0.25 µs). 따라서 수 분에서 수 시간의 현실적인 윈도우는 배정밀도 한계의 영향을 받지 않습니다. IPv6 주소는 /64 접두사별로 버킷을 공유합니다. 이 묶음은 트레이드오프입니다. /48 전체를 가진 공격자는 서로 다른 /64를 65,536개 만들어 테이블과 신규 주소 윈도우를 채울 수 있고, 그러면 진짜 신규 주소는 윈도우가 지날 때까지 거부됩니다(내보내진 기존 주소는 거부되지 않습니다). `--rate-limit-ipv6-prefix-len 48`은 /48 전체를 하나의 버킷으로 묶어 이 공격을 막지만, 해당 접두사를 공유하는 모든 호스트가 하나의 버킷을 공유하므로 붐비는 /48에서는 무고한 사용자까지 함께 제한됩니다. 기본값은 64로 유지됩니다. `--rate-limit-exempt-path`(예: `/healthz`)로 지정한 경로는 속도 제한을 건너뜁니다.
 
-여러 워커: `pynext start --workers 4`는 하나의 리스너를 공유하는 워커 수퍼바이저를 실행합니다. `--port 0`으로 시작하면 할당된 포트를 워커 재시작 시에도 유지합니다. 워커의 인터프리터와 이벤트 루프는 독립적이며 메모리 캐시와 기본 요청 제한은 워커별입니다. SQLite·Redis ISR과 Redis 요청 제한은 공유할 수 있습니다. 수퍼바이저가 실패한 워커를 재시작하고 종료를 조정합니다. 처리 중 중단된 요청은 실패하므로 재시도해야 합니다. 공유 리스너 워커의 실행과 재시작은 Linux·macOS·Windows CI에서 검사하며, 신호 기반 수퍼바이저 검사는 Linux·macOS에서 수행합니다.
+여러 워커: `pynext start --workers 4`는 하나의 리스너를 공유하는 워커 수퍼바이저를 실행합니다. `--workers auto`는 개수를 머신에서 정합니다. CPU 코어당 1개, 가용 메모리 1GiB당 최대 1개, 상한 8개, 최소 1개이며, 결정 근거는 시작 로그 한 줄(`PyNext workers: auto -> ...`)에 남습니다. `--port 0`으로 시작하면 할당된 포트를 워커 재시작 시에도 유지합니다. 워커의 인터프리터와 이벤트 루프는 독립적이며 메모리 캐시와 기본 요청 제한은 워커별입니다. SQLite·Redis ISR과 Redis 요청 제한은 공유할 수 있습니다. 수퍼바이저가 실패한 워커를 재시작하고 종료를 조정합니다. 처리 중 중단된 요청은 실패하므로 재시도해야 합니다. 공유 리스너 워커의 실행과 재시작은 Linux·macOS·Windows CI에서 검사하며, 신호 기반 수퍼바이저 검사는 Linux·macOS에서 수행합니다.
 
 ## 환경 파일(`.env`)
 

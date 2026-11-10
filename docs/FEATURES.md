@@ -111,6 +111,13 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `MiddlewareScope` | `pynext.middleware` |
 | `RouteHas` | `pynext.middleware` |
 | `scoped` | `pynext.middleware` |
+| `url_for` | `pynext.routing` |
+| `preprocess_pathname` | `pynext.routing` |
+| `add_base_path` | `pynext.routing` |
+| `MiddlewareResult` | `pynext.middleware` |
+| `rewrite_request` | `pynext.middleware` |
+| `redirect_response` | `pynext.middleware` |
+| `MAX_MIDDLEWARE_REWRITES` | `pynext.middleware` |
 
 ## Security defaults (`SecurityConfig`)
 
