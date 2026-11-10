@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote_to_bytes
 
 from .forms import parse_form
-from .ws_origin import canonical_origin
+from .ws_origin import canonical_origin, parse_origin_pattern
 
 
 class BadRequest(Exception):
@@ -191,8 +191,15 @@ class SecurityConfig:
 
     WebSocket handshakes require a same-origin ``Origin`` by default.
     Additional origins can be listed in ``websocket_allowed_origins``;
-    ``websocket_allow_missing_origin`` opts non-browser clients without
-    the header in. Origin checking does not replace authentication.
+    an entry may be an exact origin or a wildcard pattern in the
+    Next.js Server Actions ``allowedOrigins`` form: ``*`` matches exactly
+    one DNS label (``https://*.example.com``) and ``**`` — only as the
+    leftmost label — matches one or more leading labels
+    (``https://**.example.com``). Scheme and effective port must still
+    match exactly, and a pattern must keep at least two literal labels,
+    so ``https://*.com`` is rejected. ``websocket_allow_missing_origin``
+    opts non-browser clients without the header in. Origin checking does
+    not replace authentication.
     """
 
     csrf_enabled: bool | None = None
@@ -241,7 +248,7 @@ class SecurityConfig:
         if isinstance(self.websocket_allowed_origins, (str, bytes)):
             raise TypeError("websocket_allowed_origins must be a sequence of origins")
         self.websocket_allowed_origins = tuple(self.websocket_allowed_origins)
-        origin_keys = [canonical_origin(origin) for origin in self.websocket_allowed_origins]
+        origin_keys = [parse_origin_pattern(origin) for origin in self.websocket_allowed_origins]
         if any(origin is None for origin in origin_keys):
             raise ValueError("websocket_allowed_origins must contain valid HTTP(S) origins")
         key = self.csrf_signing_key
