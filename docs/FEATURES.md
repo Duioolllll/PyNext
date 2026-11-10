@@ -92,6 +92,7 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `AuthorizationPolicy` | `pynext.auth` |
 | `authorization_policy` | `pynext.auth` |
 | `state_changing_get` | `pynext.routing` |
+| `LoginRateLimiter` | `pynext.auth` |
 | `RedisRateLimiter` | `pynext.redis_rate` |
 | `WebSocketPubSub` | `pynext.pubsub` |
 | `PubSubOverflow` | `pynext.pubsub` |

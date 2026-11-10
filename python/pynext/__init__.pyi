@@ -1,7 +1,7 @@
 __version__: str
 
 from .app import App as App, create_app as create_app
-from .auth import AuthorizationPolicy as AuthorizationPolicy, authorization_policy as authorization_policy, require_auth as require_auth, require_permission as require_permission, require_scope as require_scope
+from .auth import AuthorizationPolicy as AuthorizationPolicy, LoginRateLimiter as LoginRateLimiter, authorization_policy as authorization_policy, require_auth as require_auth, require_permission as require_permission, require_scope as require_scope
 from .client_dsl import ClientDSLCompileError as ClientDSLCompileError, compile_client_dsl as compile_client_dsl
 from .components import SafeString as SafeString, h as h, fragment as fragment, island as island, layout as layout, mark_safe as mark_safe, model_prop as model_prop, page as page
 from .database import Database as Database
