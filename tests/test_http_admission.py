@@ -274,7 +274,12 @@ def test_encoded_question_mark_cannot_bypass_exempt_path(tmp_path, mode):
                 assert (await client.get("/input?query=1")).status_code == 200
                 assert (await client.get("/input%3Fother")).status_code == 429
                 assert (await client.get("/input/child")).status_code == 200
-                assert (await client.get("/input/child%3Fvalue")).status_code == 404
+                # The encoded question mark is now a matchable parameter
+                # value (two-stage param decoding re-escapes it), so the
+                # catch-all matches instead of the old 404. The path is
+                # still under the exempt "/input" prefix, so it is not
+                # charged — the bypass check above (429) is unaffected.
+                assert (await client.get("/input/child%3Fvalue")).status_code == 200
         finally:
             if server is not None:
                 await asyncio.to_thread(server.stop)

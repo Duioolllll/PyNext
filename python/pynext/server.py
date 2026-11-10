@@ -9,7 +9,7 @@ import threading
 import time
 
 from . import _native
-from .app import _decode_path, _invoke, _typed_params
+from .app import _decode_path, _invoke, _split_request_path, _typed_params
 from .config import DEFAULT_CONFIG
 from .errors import SignalError, digest_for_error
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
@@ -394,14 +394,15 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
 
     async def _call_inner(method, raw_path, query, headers, body, client_ip=None, cancel_event=None):
         try:
-            path = _decode_path(raw_path, raw_path.encode("ascii"))
+            path, encoded_path = _split_request_path(raw_path, raw_path.encode("ascii"))
         except (ValueError, UnicodeError):
             response = Response("Bad Request", status=400)
         else:
             try:
                 request = Request(method.upper(), path, bytes(query),
                                   tuple((bytes(k), bytes(v)) for k, v in headers), bytes(body), _app=app,
-                                  _cancel_event=cancel_event if cancel_event is not None else _RequestCancellation())
+                                  _cancel_event=cancel_event if cancel_event is not None else _RequestCancellation(),
+                                  raw_path=encoded_path)
                 # Trust-resolved client identity (A6, pynext.proxy), same
                 # values as on ASGI: without trusted proxies these are just
                 # the direct connection values. The native listener is plain
