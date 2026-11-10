@@ -2147,6 +2147,15 @@ class ISRCache:
             self._task_leases = {}
             self._tasks = set()
             self._variant_paths = OrderedDict()
+            # Tag invalidation state (same as the cache_backend path below):
+            # ``_key_tags`` / ``_key_generated_at`` record which tags each
+            # cached key carries and when its current entry was generated,
+            # so a tag invalidation can retire in-flight generations and
+            # reclassify process-local hits without consulting the backend.
+            self._tag_manifest = {}
+            self._key_tags = OrderedDict()
+            self._key_generated_at = OrderedDict()
+            self._cached_paths = OrderedDict()
             self._loop = None
             self._closed = False
             self.namespace = namespace
