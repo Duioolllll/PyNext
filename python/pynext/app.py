@@ -59,7 +59,7 @@ from .observability import (
 )
 from .proxy import ProxyTrust
 from .ratelimit import _is_exempt_path, rate_limited_response
-from .sessions import SessionMiddleware
+from .sessions import SessionMiddleware, WS_PREFLIGHT_STATE_KEY
 from .static import asset_response
 from .ws_origin import websocket_origin_allowed
 
@@ -2397,11 +2397,17 @@ class App:
         the Rust upgrade — so handlers that need the identity must re-derive
         it from the socket (for example from a session cookie the
         middleware already validated, or from a token checked in
-        middleware). The check itself is identical on ASGI and native.
-        Middleware must not rotate or invalidate the session during this
-        pre-flight: the pre-flight response is discarded, so a rotated
-        token's ``set-cookie`` would never reach the client while the
-        old token is already gone from the store.
+        middleware). The check itself is identical on ASGI and native. The pre-flight
+        is read-only for the session (M-15): the synthetic request carries
+        ``sessions.WS_PREFLIGHT_STATE_KEY`` in its state, and
+        ``SessionMiddleware`` loads the session for the authorization check
+        but skips persisting it — no save, no rotation, no invalidation —
+        because the pre-flight response is discarded and a rotated token's
+        ``set-cookie`` would never reach the client while the old token is
+        already gone from the store. Middleware may read the session during
+        the pre-flight, but any mutation it makes is dropped with the
+        response; perform login and session changes through ordinary HTTP
+        endpoints before connecting.
         """
         # Match on the per-segment decoded form (Next.js
         # decodePathParams) so the pre-flight checks the same route the
@@ -2423,7 +2429,7 @@ class App:
         params = _typed_params(raw_params, kinds)
         request = Request("GET", path, bytes(query_string),
                           tuple((bytes(name), bytes(value)) for name, value in headers),
-                          b"", params, self, {}, raw_path=raw_path or "")
+                          b"", params, self, {WS_PREFLIGHT_STATE_KEY: True}, raw_path=raw_path or "")
         terminal_reached = False
         seen = {}
 
