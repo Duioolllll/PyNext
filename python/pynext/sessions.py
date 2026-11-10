@@ -1,5 +1,58 @@
-"""Server-side sessions with opaque cookies and SQLite version fencing."""
+"""Server-side sessions with opaque cookies and SQLite version fencing.
+
+Session payload protection (S-P1-25 / M-16)
+--------------------------------------------
+Session payloads (``user_id``, ``permissions``, CSRF token) used to be
+stored in plaintext in the SQLite file and in Redis, so anyone who could
+read the store (a backup, a shared Redis, a world-readable SQLite file)
+learned every session's contents. Two layers now protect them:
+
+1. **AEAD encryption (opt-in, via a key).** Pass ``encryption_key`` (or
+   ``encryption_keys`` for rotation) to :class:`SQLiteSessionStore` /
+   :class:`RedisSessionStore`, or set the ``PYNEXT_SESSION_KEY``
+   environment variable. Payloads are then sealed with AES-256-GCM
+   (``cryptography`` package, ``pynext-framework[encryption]``) before
+   they reach the store and unsealed on load. The nonce is fresh and
+   random per save, and the ciphertext is bound to the session id
+   (AAD = SHA-256 of the token), so a sealed payload cannot be
+   transplanted onto another session id.
+2. **Store hardening (always on).** The SQLite file (and its WAL files)
+   are created/tightened to mode ``0600``, and a plaintext ``redis://``
+   URL logs a warning recommending ``rediss://`` (TLS) or a Unix socket.
+
+Key handling
+------------
+* A key is 32 raw bytes, or a base64 / hex string decoding to 32 bytes.
+  Anything else is a ``ValueError`` at store construction (fail-closed:
+  a misconfigured key is refused instead of silently storing plaintext).
+* If a key is configured but ``cryptography`` is not installed, store
+  construction raises ``ValueError`` telling the operator to install
+  ``pynext-framework[encryption]`` — again fail-closed, never silent
+  plaintext.
+* If no key is configured, payloads are still stored in plaintext (the
+  historical format) and a warning is logged once per store: encryption
+  is opt-in so existing deployments keep working, but the operator is
+  told how to turn it on.
+* Key rotation: pass ``encryption_keys=[new_key, old_key]``. Saves always
+  use the first (current) key; loads try every key, so sessions sealed
+  under the old key keep working and are re-sealed under the new key on
+  their next save. Once every live session has been re-saved (after at
+  most one ``max_age`` window), drop the old key.
+* Removing the key entirely invalidates sessions sealed under it: their
+  rows fail to decode and load raises ``ValueError`` ("invalid session
+  data"), exactly like corrupt stored data today. Rotate keys; do not
+  silently drop them.
+
+Backwards compatibility
+------------------------
+Plaintext rows written before encryption was enabled have no envelope
+prefix and keep loading unchanged; their next save re-seals them under
+the current key. Encrypted rows are prefixed ``v1:`` so the two formats
+are unambiguous. The token identifier itself is unchanged (unsalted
+SHA-256 of the opaque token); only the payload is sealed.
+"""
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
@@ -8,6 +61,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import time
 from collections.abc import MutableMapping
 from pathlib import Path
@@ -20,6 +74,11 @@ log = logging.getLogger("pynext")
 _COOKIE_TOKEN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _COOKIE_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _MAX_SESSION_BYTES = 16_384
+
+# Envelope prefix for AEAD-sealed payloads. Plaintext rows (the historical
+# format) carry no prefix, so the two formats are distinguishable on load.
+_ENCRYPTED_PREFIX = "v1:"
+_NONCE_BYTES = 12
 
 
 def _check_json_serializable(key, value):
@@ -58,19 +117,213 @@ def _key(token):
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
-class SQLiteSessionStore:
-    """SQLite session store; connections are opened per operation for worker safety."""
+def _parse_session_key(material, *, where="encryption key"):
+    """Normalize key material to 32 raw bytes, or raise ``ValueError``.
 
-    def __init__(self, path):
+    Accepts raw 32-byte keys, a base64 string decoding to 32 bytes, or a
+    64-hex-character string. Anything else is refused fail-closed: a
+    short or mistyped key must never silently weaken (or disable) the
+    seal.
+    """
+    if isinstance(material, (bytes, bytearray)):
+        raw = bytes(material)
+        if len(raw) != 32:
+            raise ValueError(f"{where} must be 32 bytes")
+        return raw
+    if isinstance(material, str):
+        text = material.strip()
+        try:
+            raw = base64.b64decode(text, validate=True)
+        except Exception:
+            raw = None
+        if raw is None or len(raw) != 32:
+            try:
+                raw = bytes.fromhex(text)
+            except ValueError:
+                raw = None
+            if raw is None or len(raw) != 32:
+                raise ValueError(
+                    f"{where} must be 32 raw bytes, a base64 string, or "
+                    "64 hex characters decoding to 32 bytes"
+                ) from None
+        return raw
+    raise TypeError(f"{where} must be bytes or str")
+
+
+def _resolve_session_keys(encryption_key=None, encryption_keys=None):
+    """Resolve the configured session encryption keys.
+
+    Returns a list of 32-byte keys (first = current, rest = retired keys
+    still accepted for decryption), or ``None`` when encryption is not
+    configured. Explicit arguments win over the ``PYNEXT_SESSION_KEY``
+    environment variable; ``encryption_keys`` wins over ``encryption_key``.
+    """
+    materials = None
+    if encryption_keys is not None:
+        if isinstance(encryption_keys, (bytes, str)) or not hasattr(encryption_keys, "__iter__"):
+            raise TypeError("encryption_keys must be a sequence of keys")
+        materials = list(encryption_keys)
+        if len(materials) == 0:
+            raise ValueError("encryption_keys must not be empty")
+    elif encryption_key is not None:
+        materials = [encryption_key]
+    else:
+        env = os.environ.get("PYNEXT_SESSION_KEY")
+        if env:
+            materials = [env]
+    if materials is None:
+        return None
+    return [_parse_session_key(m, where=f"encryption key #{i + 1}")
+            for i, m in enumerate(materials)]
+
+
+class SessionPayloadCipher:
+    """AES-256-GCM seal for session payloads (S-P1-25 / M-16).
+
+    One instance holds the current key plus any retired keys accepted
+    for decryption (key rotation). ``seal`` always uses the current
+    (first) key; ``unseal`` tries each key in order. The ciphertext is
+    bound to the session id via AAD (SHA-256 of the token), so a sealed
+    payload cannot be replayed under a different session id.
+    """
+
+    def __init__(self, keys):
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        except ImportError as exc:
+            raise ValueError(
+                "Session payload encryption requires the cryptography "
+                "package: install pynext-framework[encryption]"
+            ) from exc
+        self._aeads = [AESGCM(key) for key in keys]
+
+    def seal(self, plaintext, token):
+        """Seal ``plaintext`` (bytes) for ``token``; returns an ASCII string."""
+        nonce = secrets.token_bytes(_NONCE_BYTES)
+        aad = hashlib.sha256(token.encode("ascii")).digest()
+        sealed = self._aeads[0].encrypt(nonce, plaintext, aad)
+        return _ENCRYPTED_PREFIX + base64.b64encode(nonce + sealed).decode("ascii")
+
+    def unseal(self, sealed_text, token):
+        """Unseal a string produced by :meth:`seal`; raises ``ValueError``.
+
+        Every failure — bad prefix handling aside, wrong key, truncated
+        or tampered data, wrong session id — surfaces as ``ValueError``
+        ("invalid session data"), the same as corrupt stored data, so
+        callers need no new error path.
+        """
+        from cryptography.exceptions import InvalidTag
+        try:
+            raw = base64.b64decode(sealed_text[len(_ENCRYPTED_PREFIX):], validate=True)
+        except Exception as exc:
+            raise ValueError("invalid session data") from exc
+        if len(raw) <= _NONCE_BYTES:
+            raise ValueError("invalid session data")
+        nonce, ciphertext = raw[:_NONCE_BYTES], raw[_NONCE_BYTES:]
+        aad = hashlib.sha256(token.encode("ascii")).digest()
+        for aead in self._aeads:
+            try:
+                return aead.decrypt(nonce, ciphertext, aad)
+            except InvalidTag:
+                continue
+            except Exception as exc:
+                raise ValueError("invalid session data") from exc
+        raise ValueError("invalid session data")
+
+
+def _make_session_cipher(encryption_key=None, encryption_keys=None):
+    """Build a :class:`SessionPayloadCipher` from the configured keys.
+
+    Returns ``None`` (and logs a plaintext warning) when no key is
+    configured. Raises ``ValueError`` fail-closed when a key is
+    configured but unusable (bad format, or ``cryptography`` missing).
+    """
+    keys = _resolve_session_keys(encryption_key, encryption_keys)
+    if keys is None:
+        log.warning(
+            "Session payloads are stored in plaintext. Set the "
+            "PYNEXT_SESSION_KEY environment variable (or pass "
+            "encryption_key to the session store) to seal them with "
+            "AES-256-GCM, and prefer rediss:// for Redis."
+        )
+        return None
+    return SessionPayloadCipher(keys)
+
+
+def _seal_payload(cipher, plaintext, token):
+    """Seal ``plaintext`` (bytes) when a cipher is configured, else pass through."""
+    if cipher is None:
+        return plaintext
+    return cipher.seal(plaintext, token).encode("ascii")
+
+
+def _unseal_payload(cipher, raw, token):
+    """Unseal stored ``raw`` (bytes/str) for ``token``; returns plaintext bytes.
+
+    Encrypted rows (``v1:`` prefix) require a configured cipher holding a
+    key that seals them; plaintext rows pass through unchanged. A sealed
+    row with no usable key, or a tampered sealed row, raises
+    ``ValueError`` ("invalid session data") — it is never silently
+    treated as an empty session.
+    """
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8")
+    else:
+        text = raw
+    if not text.startswith(_ENCRYPTED_PREFIX):
+        # Historical plaintext format: loads unchanged (lazy migration —
+        # the next save re-seals it when a cipher is configured).
+        return text.encode("utf-8")
+    if cipher is None:
+        raise ValueError("invalid session data")
+    return cipher.unseal(text, token)
+
+
+def _tighten_sqlite_permissions(path):
+    """Best-effort: restrict the SQLite file (and WAL sidecars) to 0600.
+
+    The session store holds authentication-adjacent data, so the file
+    must not be world/group readable. Failures (e.g. a file owned by
+    another user) are logged, not raised: tightening is hardening, and
+    refusing to serve sessions over an un-tightenable file would turn a
+    permissions quirk into an outage.
+    """
+    for candidate in (path, path + "-wal", path + "-shm"):
+        try:
+            mode = stat.S_IMODE(os.stat(candidate).st_mode)
+        except OSError:
+            continue
+        if mode & 0o077:
+            try:
+                os.chmod(candidate, 0o600)
+            except OSError:
+                log.warning("Could not restrict session store file %s to 0600", candidate)
+
+
+
+class SQLiteSessionStore:
+    """SQLite session store; connections are opened per operation for worker safety.
+
+    ``encryption_key`` / ``encryption_keys`` (or the ``PYNEXT_SESSION_KEY``
+    environment variable) seal payloads with AES-256-GCM before they are
+    written — see the module docstring for the key format, rotation, and
+    backwards-compatibility rules. Without a key, payloads are stored in
+    the historical plaintext format and a warning is logged. The SQLite
+    file (and its WAL sidecars) is restricted to mode ``0600``.
+    """
+
+    def __init__(self, path, *, encryption_key=None, encryption_keys=None):
         if str(path) == ":memory:":
             raise ValueError("SQLite sessions require a persistent file")
         self.path = str(Path(path).resolve())
+        self._cipher = _make_session_cipher(encryption_key, encryption_keys)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.path, timeout=5) as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("CREATE TABLE IF NOT EXISTS pynext_sessions "
                        "(id TEXT PRIMARY KEY, payload TEXT NOT NULL, expires REAL NOT NULL, "
                        "version INTEGER NOT NULL)")
+        _tighten_sqlite_permissions(self.path)
 
     async def load(self, token):
         def read():
@@ -79,7 +332,7 @@ class SQLiteSessionStore:
                                  (_key(token), time.time())).fetchone()
             if row is None:
                 return None
-            payload = json.loads(row[0])
+            payload = json.loads(_unseal_payload(self._cipher, row[0], token))
             if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
                 raise ValueError("invalid session data")
             return payload["data"], payload.get("csrf"), row[1]
@@ -92,6 +345,7 @@ class SQLiteSessionStore:
                              separators=(",", ":"), allow_nan=False)
         if len(payload.encode("utf-8")) > _MAX_SESSION_BYTES:
             raise ValueError("session data exceeds 16384 bytes")
+        stored = _seal_payload(self._cipher, payload.encode("utf-8"), token).decode("utf-8")
 
         def write():
             with sqlite3.connect(self.path, timeout=5) as db:
@@ -103,20 +357,23 @@ class SQLiteSessionStore:
                         raise SessionConflict("session changed or expired")
                     version_to_save = 1
                     db.execute("INSERT INTO pynext_sessions VALUES (?, ?, ?, ?)",
-                               (_key(token), payload, expires, version_to_save))
+                               (_key(token), stored, expires, version_to_save))
                 elif version is None:
                     version_to_save = 1
                     db.execute("INSERT INTO pynext_sessions VALUES (?, ?, ?, ?)",
-                               (_key(token), payload, expires, version_to_save))
+                               (_key(token), stored, expires, version_to_save))
                 else:
                     version_to_save = version + 1
                     cursor = db.execute("UPDATE pynext_sessions SET payload=?, expires=?, version=? "
                                         "WHERE id=? AND version=? AND expires>?",
-                                        (payload, expires, version_to_save, _key(token), version, time.time()))
+                                        (stored, expires, version_to_save, _key(token), version, time.time()))
                     if cursor.rowcount != 1:
                         raise SessionConflict("session changed or expired")
                 return version_to_save
-        return await asyncio.to_thread(write)
+        result = await asyncio.to_thread(write)
+        # The first WAL write creates the -wal/-shm sidecars; tighten them too.
+        _tighten_sqlite_permissions(self.path)
+        return result
 
     async def delete(self, token):
         def remove():
@@ -137,14 +394,17 @@ class SQLiteSessionStore:
         return await asyncio.to_thread(purge)
 
 
-def _session_payload(data, csrf, version):
-    return json.dumps({"data": data, "csrf": csrf, "version": version}, ensure_ascii=False,
-                      separators=(",", ":"), allow_nan=False)
+def _session_payload(data, csrf, version, cipher=None, token=None):
+    raw = json.dumps({"data": data, "csrf": csrf, "version": version}, ensure_ascii=False,
+                     separators=(",", ":"), allow_nan=False)
+    if cipher is None:
+        return raw
+    return _seal_payload(cipher, raw.encode("utf-8"), token).decode("ascii")
 
 
-def _decode_session(raw):
+def _decode_session(raw, cipher=None, token=None):
     try:
-        payload = json.loads(raw)
+        payload = json.loads(_unseal_payload(cipher, raw, token))
     except (UnicodeError, ValueError) as exc:
         raise ValueError("invalid session data") from exc
     if (not isinstance(payload, dict) or not isinstance(payload.get("data"), dict)
@@ -188,14 +448,24 @@ class RedisSessionStore:
     successful delete. Fencing conflicts
     (:class:`SessionConflict`) and corrupt data (``ValueError``) are
     not outages and are never absorbed by either policy.
+
+    ``encryption_key`` / ``encryption_keys`` (or the ``PYNEXT_SESSION_KEY``
+    environment variable) seal payloads with AES-256-GCM before they are
+    written — see the module docstring for the key format, rotation, and
+    backwards-compatibility rules. Without a key, payloads are stored in
+    the historical plaintext format and a warning is logged. A plaintext
+    ``redis://`` URL also logs a warning recommending ``rediss://`` (TLS)
+    or a Unix socket, so session contents do not cross the network
+    unencrypted.
     """
 
     def __init__(self, url=None, *, client=None, key_prefix="pynext:session",
-                 failure_policy=None):
+                 failure_policy=None, encryption_key=None, encryption_keys=None):
         if not isinstance(key_prefix, str) or not key_prefix or len(key_prefix.encode("utf-8")) > 256:
             raise ValueError("session key prefix must be a nonempty string up to 256 bytes")
         self.key_prefix = key_prefix
         self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_CLOSED)
+        self._cipher = _make_session_cipher(encryption_key, encryption_keys)
         self._owns_client = client is None
         if client is not None:
             if not all(callable(getattr(client, name, None))
@@ -206,6 +476,12 @@ class RedisSessionStore:
             url = url or os.environ.get("PYNEXT_REDIS_URL")
             if not isinstance(url, str) or not url.startswith(("redis://", "rediss://", "unix://")):
                 raise ValueError("Redis sessions require a redis://, rediss:// or unix:// URL")
+            if url.startswith("redis://"):
+                log.warning(
+                    "Redis sessions use a plaintext redis:// URL: session "
+                    "traffic is unencrypted on the network. Prefer "
+                    "rediss:// (TLS) or a unix:// socket."
+                )
             try:
                 import redis
             except ImportError as exc:
@@ -240,7 +516,7 @@ class RedisSessionStore:
             raw = self.client.get(self._redis_key(token))
             if raw is None:
                 return None
-            payload = _decode_session(raw)
+            payload = _decode_session(raw, self._cipher, token)
             return payload["data"], payload.get("csrf"), payload["version"]
         try:
             return await asyncio.to_thread(read)
@@ -280,7 +556,7 @@ class RedisSessionStore:
             # Already expired: nothing to store, and load() reports a miss,
             # matching the SQLite store's expired row.
             return 1
-        if not self.client.set(self._redis_key(token), _session_payload(data, csrf, 1),
+        if not self.client.set(self._redis_key(token), _session_payload(data, csrf, 1, self._cipher, token),
                                nx=True, px=ttl_ms):
             raise SessionConflict("session already exists")
         return 1
@@ -293,13 +569,13 @@ class RedisSessionStore:
             raw = pipe.get(key)
             if raw is None:
                 raise SessionConflict("session changed or expired")
-            if _decode_session(raw)["version"] != version:
+            if _decode_session(raw, self._cipher, token)["version"] != version:
                 raise SessionConflict("session changed or expired")
             pipe.multi()
             if ttl_ms <= 0:
                 pipe.delete(key)
             else:
-                pipe.set(key, _session_payload(data, csrf, version + 1), px=ttl_ms)
+                pipe.set(key, _session_payload(data, csrf, version + 1, self._cipher, token), px=ttl_ms)
             pipe.execute()
             return version + 1
         except SessionConflict:
@@ -319,12 +595,12 @@ class RedisSessionStore:
             raw = pipe.get(old_key)
             if raw is None:
                 raise SessionConflict("session changed or expired")
-            if _decode_session(raw)["version"] != version:
+            if _decode_session(raw, self._cipher, previous_token)["version"] != version:
                 raise SessionConflict("session changed or expired")
             pipe.multi()
             pipe.delete(old_key)
             if ttl_ms > 0:
-                pipe.set(new_key, _session_payload(data, csrf, 1), px=ttl_ms)
+                pipe.set(new_key, _session_payload(data, csrf, 1, self._cipher, token), px=ttl_ms)
             pipe.execute()
             return 1
         except SessionConflict:
