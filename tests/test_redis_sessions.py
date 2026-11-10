@@ -517,7 +517,10 @@ def test_redis_session_store_fail_open_starts_ephemeral_session():
         new_token = _outage_token()
         assert await store.save(new_token, {"user_id": "alice"}, None, 2,
                                 time.time() + 60, previous_token=token) == 1
-        assert await store.delete(token) is None
+        # A failed delete under fail_open is queued for revocation on
+        # recovery (S-P1-20), so delete() reports False instead of None.
+        assert await store.delete(token) is False
+        assert len(store.pending_revocations) == 1
     asyncio.run(run())
 
 
@@ -630,6 +633,202 @@ def test_redis_session_outage_fail_open_keeps_reads_but_login_cannot_complete(tm
                 # no stored session means no stored CSRF token to match.
                 assert (await client.post("/api/logout",
                                           headers={"x-csrf-token": token})).status_code == 403
+        finally:
+            await app.isr.close()
+    asyncio.run(run())
+
+
+# ----------------------------------------------------------------------
+# S-P1-20 (M-11): Redis fail_open pending revocations.
+# ----------------------------------------------------------------------
+
+class _ToggleRedis(_FakeRedis):
+    """Fake Redis that can be taken down and brought back."""
+
+    def __init__(self):
+        super().__init__()
+        self.down = False
+
+    def _check(self):
+        if self.down:
+            raise ConnectionError("redis down (mock)")
+
+    def get(self, key):
+        self._check()
+        return super().get(key)
+
+    def set(self, *args, **kwargs):
+        self._check()
+        return super().set(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        self._check()
+        return super().delete(*args, **kwargs)
+
+    def pipeline(self):
+        self._check()
+        return super().pipeline()
+
+
+def _token_hash(token):
+    import hashlib
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+def test_redis_fail_open_delete_queues_revocation_and_flush_revokes():
+    """A logout during an outage is queued, not dropped (S-P1-20)."""
+    client = _ToggleRedis()
+    store = RedisSessionStore(client=client, failure_policy="fail_open")
+
+    async def run():
+        token = secrets.token_urlsafe(32)
+        assert await store.save(token, {"user_id": "alice"}, None, None, time.time() + 3600) == 1
+        assert await store.load(token) is not None
+        client.down = True
+        # The delete cannot reach Redis: report False and queue the hash.
+        assert await store.delete(token) is False
+        assert store.pending_revocations == (_token_hash(token),)
+        # While down the token still loads as a miss (fail_open), and the
+        # queue survives further failed operations.
+        assert await store.load(token) is None
+        assert await store.delete(token) is False
+        assert store.pending_revocations == (_token_hash(token),)
+        client.down = False
+        revoked, pending = await store.flush_pending_revocations()
+        assert (revoked, pending) == (1, 0)
+        assert store.pending_revocations == ()
+        assert await store.load(token) is None
+        # A successful delete reports True and queues nothing.
+        assert await store.delete(token) is True
+        assert store.pending_revocations == ()
+    asyncio.run(run())
+
+
+def test_redis_fail_open_rotation_failure_queues_old_token():
+    """A rotation that fails mid-outage queues the old id for revocation."""
+    client = _ToggleRedis()
+    store = RedisSessionStore(client=client, failure_policy="fail_open")
+
+    async def run():
+        old_token = secrets.token_urlsafe(32)
+        assert await store.save(old_token, {"user_id": "alice"}, None, None, time.time() + 3600) == 1
+        client.down = True
+        new_token = secrets.token_urlsafe(32)
+        # The rotation never happened: report the would-be version and
+        # queue the old id instead of leaving it valid until its TTL.
+        assert await store.save(new_token, {"user_id": "alice"}, None, 1,
+                                time.time() + 3600, previous_token=old_token) == 1
+        assert store.pending_revocations == (_token_hash(old_token),)
+        client.down = False
+        assert await store.flush_pending_revocations() == (1, 0)
+        assert await store.load(old_token) is None
+        # The new id was never stored: the session is ephemeral, as before.
+        assert await store.load(new_token) is None
+    asyncio.run(run())
+
+
+def test_redis_pending_revocations_flush_before_first_read_after_recovery():
+    """Recovery revokes before the next load, so the dead token gets no last read."""
+    client = _ToggleRedis()
+    store = RedisSessionStore(client=client, failure_policy="fail_open")
+
+    async def run():
+        token = secrets.token_urlsafe(32)
+        assert await store.save(token, {"user_id": "alice"}, None, None, time.time() + 3600) == 1
+        client.down = True
+        assert await store.delete(token) is False
+        client.down = False
+        # The first load after recovery already misses: the flush runs
+        # before the read, not after it.
+        assert await store.load(token) is None
+        assert store.pending_revocations == ()
+    asyncio.run(run())
+
+
+def test_redis_pending_revocation_queue_is_bounded():
+    store = RedisSessionStore(client=_FailingRedis(), failure_policy="fail_open",
+                              max_pending_revocations=2)
+
+    async def run():
+        tokens = [secrets.token_urlsafe(32) for _ in range(3)]
+        for token in tokens:
+            assert await store.delete(token) is False
+        assert len(store.pending_revocations) == 2
+        # The oldest entry was evicted; the two newest are retained.
+        assert _token_hash(tokens[0]) not in store.pending_revocations
+        assert _token_hash(tokens[1]) in store.pending_revocations
+        assert _token_hash(tokens[2]) in store.pending_revocations
+    asyncio.run(run())
+    # max_pending_revocations=0 disables queueing (revocation is lost).
+    store = RedisSessionStore(client=_FailingRedis(), failure_policy="fail_open",
+                              max_pending_revocations=0)
+
+    async def run_zero():
+        assert await store.delete(secrets.token_urlsafe(32)) is False
+        assert store.pending_revocations == ()
+    asyncio.run(run_zero())
+    with pytest.raises(ValueError, match="max_pending_revocations"):
+        RedisSessionStore(client=_FakeRedis(), max_pending_revocations=-1)
+
+
+def test_redis_store_preserves_created_at_across_update_and_rotation():
+    """The Redis payload carries the same lifetime anchors as SQLite (S-P1-9)."""
+    store = _fake_store()
+
+    async def run():
+        token = secrets.token_urlsafe(32)
+        before = time.time()
+        assert await store.save(token, {"value": 1}, "csrf-1", None, time.time() + 3600) == 1
+        first = await store.load(token)
+        assert first == ({"value": 1}, "csrf-1", 1)
+        assert before <= first.created_at <= time.time()
+        assert before <= first.last_seen <= time.time()
+        created_at = first.created_at
+        await asyncio.sleep(0.05)
+        assert await store.save(token, {"value": 2}, "csrf-1", 1, time.time() + 3600) == 2
+        second = await store.load(token)
+        assert second.created_at == created_at
+        assert second.last_seen > first.last_seen
+        new_token = secrets.token_urlsafe(32)
+        assert await store.save(new_token, {"value": 2}, "csrf-2", 2,
+                                time.time() + 3600, previous_token=token) == 1
+        assert (await store.load(new_token)).created_at == created_at
+        assert await store.load(token) is None
+    asyncio.run(run())
+
+
+def test_redis_fail_open_logout_queues_revocation_end_to_end(tmp_path):
+    """Logout during an outage still clears the cookie; the server session
+    is revoked on recovery instead of staying valid until its TTL."""
+    _build_session_api(tmp_path)
+    client = _ToggleRedis()
+    store = RedisSessionStore(client=client, failure_policy="fail_open")
+    # CSRF is off here so the logout reaches the middleware delete path
+    # even though the store is down (with CSRF on, the outage fails the
+    # CSRF check first — see the fail_open test above).
+    app = create_app(tmp_path, middleware=[SessionMiddleware(store, secure=False)],
+                     security=SecurityConfig(csrf_enabled=False))
+
+    async def run():
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://test") as first:
+                token = (await first.get("/api/token")).json()["token"]
+                assert (await first.post("/api/login",
+                                         headers={"x-csrf-token": token})).status_code == 200
+                cookie = first.cookies.get("pynext_session")
+                assert (await first.get("/api/private")).status_code == 200
+                client.down = True
+                assert (await first.post("/api/logout")).status_code == 200
+                assert first.cookies.get("pynext_session") in ("", None)
+                assert len(store.pending_revocations) == 1
+                client.down = False
+                # The old cookie is dead on the first request after recovery.
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                             base_url="http://test",
+                                             cookies={"pynext_session": cookie}) as stale:
+                    assert (await stale.get("/api/private")).status_code == 401
+                assert store.pending_revocations == ()
         finally:
             await app.isr.close()
     asyncio.run(run())

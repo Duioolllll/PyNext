@@ -119,6 +119,7 @@ Fields of `pynext.http.SecurityConfig` with their defaults.
 | `csrf_form_field` | `'csrf_token'` |
 | `csrf_cookie_secure` | `True` |
 | `csrf_cookie_samesite` | `'Lax'` |
+| `csrf_cookie_max_age` | `43200` |
 | `cors_allowed_origins` | `()` |
 | `cors_allowed_methods` | `('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS')` |
 | `cors_allowed_headers` | `('Content-Type', 'Authorization', 'X-CSRF-Token')` |
@@ -194,11 +195,32 @@ Strategies accepted by `island()` / `page()` in `pynext.components`.
 ## Session stores
 
 Store classes in `pynext.sessions` implementing `load` / `save` / `delete`.
+`load` returns a `SessionRecord` — a `(data, csrf, version)` tuple with
+`created_at` / `last_seen` timestamps the middleware uses for the
+absolute lifetime and idle timeout.
 
 | Store |
 | --- |
 | `RedisSessionStore` |
 | `SQLiteSessionStore` |
+
+Session lifetime defaults (`SessionMiddleware`): `max_age` 43200 seconds
+(12 hours, at most 30 days) is the sliding idle timeout and the cookie
+`Max-Age`; `absolute_max_age` 604800 seconds (7 days) is the hard cap
+measured from creation — rotation does not move it. An unchanged session
+is re-saved at most every `touch_interval` seconds (300) while the user
+is active, refreshing the idle deadline and the cookie. The double-submit
+CSRF cookie carries `Max-Age=csrf_cookie_max_age` (43200) and its
+signature embeds the issue time, so a stolen cookie value stops
+validating after that long. For sensitive actions, issue purpose-bound
+single-use tokens with `Session.issue_single_use_token()` and verify them
+with `Session.verify_single_use_token()` (one attempt, then consumed),
+and gate high-value actions on `Session.recently_authenticated()`
+(default 15 minutes; recorded by `rotate_on_login()`). Under
+`fail_open`, a Redis delete/rotation that fails is queued in
+`RedisSessionStore.pending_revocations` and revoked on recovery
+(`flush_pending_revocations()` drains it explicitly); `delete()` reports
+`True` when revoked now and `False` when queued.
 
 ## Explicit non-goals
 

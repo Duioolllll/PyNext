@@ -211,7 +211,11 @@ def test_shared_env_key_agrees_across_processes():
     key_a, signed_a = _spawn_worker_key_and_signature(env)
     key_b, signed_b = _spawn_worker_key_and_signature(env)
     assert key_a == key_b
-    assert signed_a == signed_b
+    # The signature now embeds its issue time (S-P1-21), so two workers
+    # signing seconds apart produce different values; what must agree is
+    # the key and cross-process validation, not the bytes.
+    assert signed_a.split(".")[0] == signed_b.split(".")[0] == "test-token-123"
+    assert signed_a.split(".")[1].isdigit() and signed_b.split(".")[1].isdigit()
     cfg_b = SecurityConfig(csrf_signing_key=bytes.fromhex(key_b))
     headers = ((b"cookie", f"pynext_csrf={signed_a}".encode()),
                (b"x-csrf-token", b"test-token-123"))

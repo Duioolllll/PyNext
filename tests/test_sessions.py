@@ -253,7 +253,12 @@ def test_session_size_cap_boundary_still_enforced(tmp_path):
 
     async def run():
         token = secrets.token_urlsafe(32)
-        overhead = len(json.dumps({"data": {"big": ""}, "csrf": None},
+        # The stored payload now also carries created_at/last_seen
+        # (S-P1-9); the boundary accounts for the longest timestamps,
+        # matching the store's own size check.
+        overhead = len(json.dumps({"data": {"big": ""}, "csrf": None,
+                                   "created_at": 9_999_999_999.999,
+                                   "last_seen": 9_999_999_999.999},
                                   ensure_ascii=False, separators=(",", ":")).encode())
         fits = "x" * (16_384 - overhead)
         assert await store.save(token, {"big": fits}, None, None, time.time() + 60) == 1

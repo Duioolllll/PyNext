@@ -19,4 +19,4 @@ from .pubsub import PubSubOverflow as PubSubOverflow, WebSocketPubSub as WebSock
 from .ratelimit import RateLimiter as RateLimiter
 from .redis_rate import RedisRateLimiter as RedisRateLimiter
 from .routing import route as route, websocket as websocket
-from .sessions import RedisSessionStore as RedisSessionStore, Session as Session, SessionMiddleware as SessionMiddleware, SQLiteSessionStore as SQLiteSessionStore
+from .sessions import RedisSessionStore as RedisSessionStore, Session as Session, SessionMiddleware as SessionMiddleware, SessionRecord as SessionRecord, SQLiteSessionStore as SQLiteSessionStore
