@@ -1911,12 +1911,14 @@ class App:
         except (ValueError, UnicodeError):
             await send({"type": "websocket.close", "code": 1008})
             return
-        try:
-            match_path = _normalize_path_for_matching(encoded_path)
-        except BadRequest:
-            await send({"type": "websocket.close", "code": 1008})
-            return
-        match = self.router.matches(match_path)
+        # Route lookup runs on the decoded path (unlike HTTP dispatch,
+        # which matches on the normalized encoded form): the router
+        # rejects a literal '?' in the path, so an encoded '%3F' that
+        # decodes to '?' is refused here with a policy-violation close
+        # before any rate-limit charge (B-1 / review #7). Matching on
+        # the normalized form would hide the '?' and let the handshake
+        # reach the rate limiter instead.
+        match = self.router.matches(path)
         handler = None
         params = {}
         if match is not None:

@@ -583,6 +583,35 @@ def _build_parser():
                                       "generate_static_params would not produce, like production does, "
                                       "instead of rendering them with a warning")
     return parser
+
+
+def main():
+    parser = _build_parser()
+    # Resolve the config before the real parse: the config file (plus the
+    # environment) seeds the parser defaults, and explicit CLI options
+    # override them by being present. A fatal config error fails here,
+    # before anything starts (exit code 2, no traceback).
+    explicit = _explicit_cli_values(parser, sys.argv)
+    command = explicit.get("command")
+    root = Path(explicit.get("dir", ".")).resolve()
+    # Load .env before config resolution: load_config() reads PYNEXT_*
+    # from the environment, so .env values must already be present.
+    # (create_app() loads it again on every (re)start, which also
+    # refreshes edited files in dev.)
+    try:
+        load_env(root, mode="production" if command == "start" else "development")
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    resolved = None
+    cli_overrides = {}
+    if command in ("dev", "build", "start"):
+        cli_overrides = {key: explicit[dest] for dest, key in _CLI_CONFIG_MAP.items()
+                         if dest in explicit}
+        try:
+            resolved = load_config(root, command, cli_overrides=cli_overrides)
+        except ConfigError as exc:
+            parser.error(str(exc))
+        _apply_config_defaults(parser, resolved)
     args = parser.parse_args()
     # Repeatable options replace the config file list instead of adding
     # to it: the probe captured the CLI-only values for those.
@@ -625,13 +654,7 @@ def _build_parser():
         return
     if args.ws_max_message_bytes > 16 * 1024 * 1024:
         parser.error("--ws-max-message-bytes must be at most 16777216")
-    # Load .env before anything reads PYNEXT_* from the environment
-    # (rate limiter, CSRF key, Redis URL): create_app() loads it again
-    # on every (re)start, which also refreshes edited files in dev.
-    try:
-        load_env(root, mode="production" if args.command == "start" else "development")
-    except (OSError, ValueError) as exc:
-        parser.error(str(exc))
+    # .env was already loaded in the prologue (before config resolution).
     # args already carry the resolved values (the config seeded the parser
     # defaults), so the helpers below just read them back out.
     values = resolved.values if resolved is not None else DEFAULT_CONFIG
