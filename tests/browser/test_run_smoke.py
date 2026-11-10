@@ -1,8 +1,11 @@
-"""Unit tests for the port-retry logic in run_smoke.py (no real server)."""
+"""Port retry and subprocess cleanup checks for run_smoke.py."""
 import socket
 import sys
+import time
 from pathlib import Path
 
+import httpx
+import psutil
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -108,3 +111,60 @@ def test_start_server_does_not_retry_a_server_that_never_becomes_ready(monkeypat
             log=None, timeout=0, popen=fake_popen,
         )
     assert len(created) == 1
+
+
+def test_axum_smoke_cleanup_leaves_no_server_processes(tmp_path, monkeypatch):
+    from pynext.build import write_manifest
+
+    project = tmp_path / "examples" / "basic"
+    app = project / "app"
+    app.mkdir(parents=True)
+    (app / "route.py").write_text(
+        'from pynext import Response, route\n@route("GET")\n'
+        'async def get(): return Response("ready")\n', encoding="utf-8")
+    write_manifest(project)
+    monkeypatch.setattr(run_smoke, "ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["run_smoke.py", "--mode", "axum"])
+    monkeypatch.delenv("PYNEXT_SERVER_PYTHON", raising=False)
+    # Exercise main's real server lifecycle without running Playwright.
+    monkeypatch.setattr(run_smoke.subprocess, "run", lambda *args, **kwargs: None)
+    processes = []
+    servers = []
+    start = run_smoke._start_server
+
+    def start_server(*args, **kwargs):
+        server, port = start(*args, **kwargs)
+        servers.append(server)
+        processes.append(psutil.Process(server.pid))
+        return server, port
+
+    def verify_http(base):
+        deadline = time.monotonic() + 15
+        with httpx.Client(base_url=base, trust_env=False, timeout=1) as client:
+            while True:
+                try:
+                    response = client.get("/")
+                    assert response.status_code == 200 and response.text == "ready"
+                    break
+                except httpx.TransportError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
+        processes.extend(processes[0].children(recursive=True))
+
+    monkeypatch.setattr(run_smoke, "_start_server", start_server)
+    monkeypatch.setattr(run_smoke, "verify_http", verify_http)
+    try:
+        run_smoke.main()
+        assert servers[0].poll() is not None
+        _, alive = psutil.wait_procs(processes, timeout=5)
+        assert not alive, f"Smoke runner leaked server processes: {[proc.pid for proc in alive]}"
+    finally:
+        # Clean up even if the regression returns on Windows, where killing
+        # a supervisor does not run its child shutdown path.
+        for process in processes:
+            try:
+                process.kill()
+            except psutil.NoSuchProcess:
+                pass
+        psutil.wait_procs(processes, timeout=5)
