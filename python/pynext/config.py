@@ -91,8 +91,11 @@ class PyNextConfig:
     host: str = "127.0.0.1"
     port: int = 3000
     # Request admission and body limits (serve()).
-    max_concurrent: int = 64
-    acquire_timeout_ms: int = 1000
+    # C-P0-2: raised together with the multi-worker default (C-P0-1) —
+    # the workers share one accept queue, so the per-process admission
+    # budget and the wait for a slot are sized for all workers at once.
+    max_concurrent: int = 128
+    acquire_timeout_ms: int = 3000
     max_waiting: int | None = None
     body_capacity: int = 16
     body_timeout_ms: int = 10000
@@ -103,7 +106,13 @@ class PyNextConfig:
     body_min_rate_bytes_per_sec: int = 1024
     # Lifecycle.
     shutdown_timeout: float = 30.0
-    workers: int = 1
+    # C-P0-1: two worker processes by default, so one worker crashing (or
+    # a rolling restart) does not take the server down. The memory ISR
+    # cache is per-process and is NOT shared between workers — use a
+    # shared cache backend ('sqlite' or 'redis') to share ISR entries
+    # across workers (see supervisor.py). Only the count changes here;
+    # the supervisor still spawns `workers` processes on one listener.
+    workers: int = 2
     # ISR cache.
     cache_backend: str = "memory"
     cache_path: str | None = None
@@ -334,14 +343,21 @@ def _validate_config_dict(raw, *, source):
     return cleaned, warnings
 
 
-def _cross_check(values, *, source):
-    """Warn about option combinations that are legal but surprising."""
+def _cross_check(values, *, source, workers_source="default"):
+    """Warn about option combinations that are legal but surprising.
+
+    The multi-worker memory-cache warning only fires when ``workers``
+    was set explicitly (file/env/cli): with the multi-worker default
+    (C-P0-1) it would otherwise warn on every startup even though the
+    user changed nothing.
+    """
     warnings = []
     if values.cache_path is not None and values.cache_backend != "sqlite":
         warnings.append(
             f"{source}: 'cache_path' is only used with cache_backend 'sqlite'; "
             f"it will be ignored with backend {values.cache_backend!r}")
-    if values.workers > 1 and values.cache_backend == "memory":
+    if (values.workers > 1 and values.cache_backend == "memory"
+            and workers_source != "default"):
         warnings.append(
             f"{source}: with workers={values.workers} and the memory ISR cache "
             "backend, each worker keeps its own ISR cache; use "
@@ -433,7 +449,8 @@ def load_config(root, phase, *, cli_overrides=None, env=None):
         sources[key] = "cli"
 
     values = PyNextConfig(**merged)
-    warnings.extend(_cross_check(values, source=str(config_file) if config_file else "config"))
+    warnings.extend(_cross_check(values, source=str(config_file) if config_file else "config",
+                                 workers_source=sources["workers"]))
     return ResolvedConfig(values=values, warnings=tuple(warnings),
                           config_file=config_file, phase=phase,
                           sources=MappingProxyType(sources))
