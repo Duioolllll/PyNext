@@ -112,6 +112,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                  observability=None, rate_limit=None, security=None,
                  websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
                  max_connections=None, max_connections_per_ip=None,
+                 max_concurrent_per_ip=None,
                  header_read_timeout_ms=None, body_min_rate_bytes_per_sec=None,
                  trusted_proxies=(), cache_failure_policy=None,
                  shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout,
@@ -138,6 +139,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
         "websocket_max_message": websocket_max_message,
         "max_connections": max_connections,
         "max_connections_per_ip": max_connections_per_ip,
+        "max_concurrent_per_ip": max_concurrent_per_ip,
         "header_read_timeout_ms": header_read_timeout_ms,
         "body_min_rate_bytes_per_sec": body_min_rate_bytes_per_sec,
         "trusted_proxies": trusted_proxies,
@@ -173,6 +175,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
             "security": sec, "websocket_max_message": values.websocket_max_message,
             "max_connections": values.max_connections,
             "max_connections_per_ip": values.max_connections_per_ip,
+            "max_concurrent_per_ip": values.max_concurrent_per_ip,
             "header_read_timeout_ms": values.header_read_timeout_ms,
             "body_min_rate_bytes_per_sec": values.body_min_rate_bytes_per_sec,
             "trusted_proxies": values.trusted_proxies,
@@ -203,6 +206,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
         # Only forward a connection limit that differs from serve()'s
         # default; an unset limit stays at the default.
         for key in ("max_connections", "max_connections_per_ip",
+                    "max_concurrent_per_ip",
                     "header_read_timeout_ms", "body_min_rate_bytes_per_sec"):
             if (settings[key] is not None
                     and settings[key] != getattr(DEFAULT_CONFIG, key)):
@@ -317,6 +321,7 @@ _CLI_CONFIG_MAP = {
     "body_timeout_ms": "body_timeout_ms",
     "max_connections": "max_connections",
     "max_connections_per_ip": "max_connections_per_ip",
+    "max_concurrent_per_ip": "max_concurrent_per_ip",
     "header_read_timeout_ms": "header_read_timeout_ms",
     "body_min_rate_bytes_per_sec": "body_min_rate_bytes_per_sec",
     "cache_backend": "cache_backend",
@@ -502,6 +507,12 @@ def _build_parser():
                                  type=_bounded(1, MAX_CONNECTIONS_PER_IP, "--max-connections-per-ip"),
                                  default=None,
                                  help="concurrent TCP connections allowed from one client IP (1-1000000)")
+            command.add_argument("--max-concurrent-per-ip",
+                                 type=_bounded(1, MAX_CONCURRENT, "--max-concurrent-per-ip"),
+                                 default=None,
+                                 help="execution slots one client IP may hold at once (1-1000000; "
+                                      "default 16, a quarter of the 64-slot pool, so one IP cannot "
+                                      "take every slot with slow requests)")
             command.add_argument("--header-read-timeout-ms",
                                  type=_bounded(0, MAX_TIMEOUT_MS, "--header-read-timeout-ms"),
                                  default=None,
@@ -539,7 +550,8 @@ def _build_parser():
                                       "a supervisor restarts crashed workers")
             command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"),
                                  default=DEFAULT_CONFIG.rate_limit,
-                                 help="requests allowed per client per --rate-limit-window (0 disables)")
+                                 help="requests allowed per client per --rate-limit-window "
+                                      "(default 300 per 60s; 0 disables)")
             command.add_argument("--rate-limit-window", type=_positive_float,
                                  default=DEFAULT_CONFIG.rate_limit_window,
                                  help="rate limit window in seconds")
@@ -565,7 +577,7 @@ def _build_parser():
                                       "client identity (repeatable; default: none trusted)")
             command.add_argument("--rate-limit-exempt-path", action="append", default=[], metavar="PATH",
                                  help="path prefix that skips rate limiting, e.g. /healthz "
-                                      "(repeatable; default: nothing is exempt)")
+                                      "(repeatable; default: /healthz and /readyz are exempt)")
             command.add_argument("--csrf", action=argparse.BooleanOptionalAction, default=None,
                                  help="protect state-changing API requests (default: auto — on when a "
                                       "session middleware is installed; --no-csrf opts out)")
@@ -642,6 +654,14 @@ def main():
     if resolved is not None:
         for warning in resolved.warnings:
             print(f"PyNext config warning: {warning}", file=sys.stderr)
+    if (command in ("dev", "start") and resolved is not None
+            and resolved.values.rate_limit < 1):
+        # H-1: opting out of the default throttle is a deliberate choice;
+        # say so at startup instead of silently serving unthrottled.
+        print("PyNext config warning: rate limiting is disabled (rate_limit=0); "
+              "the server has no framework-level throttle against brute force, "
+              "credential stuffing or scraping. Set rate_limit to a per-client "
+              "per-minute limit to enable it.", file=sys.stderr)
     root = Path(args.dir).resolve()
     if args.command == "init":
         try:
@@ -710,6 +730,7 @@ def main():
     # changes nothing, and an unset limit stays at serve()'s default.
     conn_kwargs = {}
     for key in ("max_connections", "max_connections_per_ip",
+                "max_concurrent_per_ip",
                 "header_read_timeout_ms", "body_min_rate_bytes_per_sec"):
         value = getattr(args, key)
         if value is not None and value != getattr(DEFAULT_CONFIG, key):

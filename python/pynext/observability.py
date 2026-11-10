@@ -294,6 +294,9 @@ class MetricsCollector:
         self._cache = {"hit": 0, "miss": 0, "stale": 0, "busy": 0}
         self._regeneration = {"success": 0, "failure": 0, "started": 0}
         self._workers = {"starts": 0, "timeouts": 0, "unavailable": 0}
+        # H-2: rate-limit decisions that could not be produced (decision
+        # gate full or deadline expired) and failed open instead of 503.
+        self._rate_limit = {"fail_open": 0}
         self._bundles = {}  # client asset path -> size in bytes
         # Error counts, joint key (route, error_type, digest); digest is ""
         # when the error has none. Computed digests are capped (see
@@ -403,6 +406,13 @@ class MetricsCollector:
         with self._lock:
             self._regeneration[outcome] += 1
 
+    def observe_rate_limit_fail_open(self):
+        """Count one rate-limit decision that failed open (H-2)."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._rate_limit["fail_open"] += 1
+
     # -- sizes ------------------------------------------------------------
     def observe_island_bundle(self, path, size_bytes):
         if not self.enabled:
@@ -463,6 +473,7 @@ class MetricsCollector:
                 "cache": dict(self._cache),
                 "regeneration": dict(self._regeneration),
                 "workers": dict(self._workers),
+                "rate_limit": dict(self._rate_limit),
                 "island_bundles": bundle_sizes,
                 "island_bundles_total_bytes": sum(bundle_sizes.values()),
             }
@@ -499,6 +510,9 @@ class MetricsCollector:
                   "# TYPE pynext_worker_total counter"]
         for outcome, count in snap["workers"].items():
             lines.append(f'pynext_worker_total{{outcome="{outcome}"}} {count}')
+        lines += ["# HELP pynext_rate_limit_fail_open_total Rate-limit decisions that could not be produced and failed open (H-2).",
+                  "# TYPE pynext_rate_limit_fail_open_total counter",
+                  f'pynext_rate_limit_fail_open_total {snap["rate_limit"]["fail_open"]}']
         lines += ["# HELP pynext_errors_total Errors, by route, exception type and digest.",
                   "# TYPE pynext_errors_total counter"]
         # Emit from the joint (route, error_type, digest) counts, not the

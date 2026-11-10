@@ -291,7 +291,7 @@ OpenTelemetry 追踪默认关闭且为可选项：安装 `opentelemetry-api`（�
 
 ## 限流
 
-限流是可选项，采用按进程的令牌桶：`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的请求返回 429，并带有以秒为单位的 `Retry-After` 头。WebSocket 握手也以同样方式限流：每次握手从同一个按 IP 划分的桶中消耗一个令牌，超限的握手返回 429 并带有 `Retry-After`。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失。使用 `--rate-limit-backend redis` 时桶在进程间共享；Redis 不可达时遵循故障策略：默认（`fail_closed`，`--rate-limit-failure-policy fail_closed`）返回 503，`fail_open` 则放行请求。配置的限流同样适用于两个适配器的静态文件、SSG 和新鲜的 ISR 页面。
+限流默认开启，采用按进程的令牌桶：`pynext start` 表示每个客户端 IP 每 60 秒允许 300 个请求，`--rate-limit 0` 可关闭（启动时会警告）。`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的请求返回 429，并带有以秒为单位的 `Retry-After` 头。WebSocket 握手也以同样方式限流：每次握手从同一个按 IP 划分的桶中消耗一个令牌，超限的握手返回 429 并带有 `Retry-After`。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失。使用 `--rate-limit-backend redis` 时桶在进程间共享；Redis 不可达时遵循故障策略：默认（`fail_closed`，`--rate-limit-failure-policy fail_closed`）返回 503，`fail_open` 则放行请求。配置的限流同样适用于两个适配器的静态文件、SSG 和新鲜的 ISR 页面。
 
 开发版本在两个适配器中均先根据请求头限流，再接收请求体，包括使用 `Expect: 100-continue` 的请求。准入时扣除一个令牌；后续上传中断、大小或速率超限、执行槽不足均不退还。Axum 的 HTTP 与 WebSocket 限流判定合计最多并发 64 个，期限为 2 秒；饱和、超时或意外错误返回 503 和 `Retry-After: 1`。该预算也适用于 `fail_open`，该策略只处理在期限内返回的后端故障。带未读请求体的 HTTP/1.1 拒绝连接会关闭，HTTP/2 的其他流仍可使用。健康检查绕过限流，豁免路径在严格解码后判定，编码后的问号仍属于路径，不作为查询分隔符。已发布的 0.1.0 不包含此改进。
 

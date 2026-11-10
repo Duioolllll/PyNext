@@ -938,6 +938,14 @@ def _allow_origin_value(origin, config):
     # exact origin must be echoed back.
     if "*" in config.cors_allowed_origins and not config.cors_allow_credentials:
         return "*"
+    if "*" in config.cors_allowed_origins and config.cors_allow_credentials:
+        # Defence in depth for the H-4 combination (config validation
+        # rejects it at startup, but a SecurityConfig built directly
+        # bypasses that): never echo an arbitrary request Origin when
+        # credentials are allowed. Returning "*" is safe here because
+        # browsers ignore a wildcard Allow-Origin on a credentialed
+        # request, so no cross-origin page can read the response.
+        return "*"
     return origin
 
 

@@ -313,7 +313,7 @@ def test_custom_exemption_override_is_preserved(tmp_path, mode):
     asyncio.run(run())
 
 
-def test_native_limiter_timeout_fails_closed_before_body(tmp_path):
+def test_native_limiter_timeout_fails_open_before_body(tmp_path):
     release = threading.Event()
     class SlowLimiter(RateLimiter):
         def allow(self, key):
@@ -328,10 +328,16 @@ def test_native_limiter_timeout_fails_closed_before_body(tmp_path):
             writer.write(b"POST /input HTTP/1.1\r\nHost: localhost\r\n"
                          b"Content-Length: 100\r\nExpect: 100-continue\r\n\r\n")
             await writer.drain()
+            # H-2: no decision within 2s, so the request is admitted
+            # (100) and answered (200) instead of 503ing.
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
-            assert head.startswith(b"HTTP/1.1 503 "), head
-            assert b"retry-after: 1\r\n" in head.lower()
-            assert app._module("app/input/route.py").calls == []
+            assert head.startswith(b"HTTP/1.1 100 "), head
+            writer.write(b"x" * 100)
+            await writer.drain()
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+            assert head.startswith(b"HTTP/1.1 200 "), head
+            assert server.rate_limit_fail_open_count() >= 1
+            assert app._module("app/input/route.py").calls == [b"x" * 100]
         finally:
             release.set()
             writer.close()
@@ -341,7 +347,7 @@ def test_native_limiter_timeout_fails_closed_before_body(tmp_path):
     asyncio.run(run())
 
 
-def test_http_and_websocket_share_64_retained_decision_slots(tmp_path):
+def test_http_and_websocket_share_64_slots_and_timeouts_fail_open(tmp_path):
     release = threading.Event()
     lock = threading.Lock()
     entered = 0
@@ -361,33 +367,43 @@ def test_http_and_websocket_share_64_retained_decision_slots(tmp_path):
             'from pynext import websocket\n@websocket\nasync def socket(websocket):\n'
             '    await websocket.accept()\n    await websocket.close()\n', encoding="utf-8")
         app = create_app(root, rate_limit=BlockedLimiter(1000, 60))
-        server = start_native(app, asyncio.get_running_loop(), port=0)
+        server = start_native(app, asyncio.get_running_loop(), port=0,
+                              # The decision gate is what this test fills;
+                              # lift the per-IP execution quota (default
+                              # 16) so it cannot 503 the burst first.
+                              max_concurrent_per_ip=64)
         host, port = server.address.rsplit(":", 1)
         connections = []
         async def open_request(websocket=False):
             reader, writer = await asyncio.open_connection(host, int(port))
             connections.append((reader, writer))
             upgrade = ("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
-                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n") if websocket else ""
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       f"Origin: http://{server.address}\r\n") if websocket else ""
             path = "/socket" if websocket else "/input"
             writer.write((f"GET {path} HTTP/1.1\r\nHost: {server.address}\r\n{upgrade}\r\n").encode())
             await writer.drain()
             return reader
         try:
-            # Mixed transports must occupy the SAME budget. Timed-out
-            # callbacks remain blocked, so their permits must stay held.
+            # Mixed transports must occupy the SAME budget. H-2: when no
+            # decision can be produced within 2s, the requests fail
+            # open instead of 503ing.
             readers = await asyncio.gather(*(open_request(i % 2 == 0) for i in range(64)))
             async with asyncio.timeout(10):
                 while entered != 64:
                     await asyncio.sleep(0.01)
-            heads = await asyncio.gather(*(asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5) for r in readers))
-            assert all(h.startswith(b"HTTP/1.1 503 ") for h in heads)
+            # The gate is still full (the 64 decisions are pending), so
+            # the 65th request of either transport is admitted without
+            # its callback ever being invoked.
             for websocket in (False, True):
                 reader = await open_request(websocket)
                 head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
-                assert head.startswith(b"HTTP/1.1 503 ")
-                assert b"retry-after: 1\r\n" in head.lower()
+                assert head.startswith(b"HTTP/1.1 200 " if not websocket else b"HTTP/1.1 101 "), head
                 assert entered == 64  # the 65th callback was never invoked
+            heads = await asyncio.gather(*(asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5) for r in readers))
+            for i, head in enumerate(heads):
+                assert head.startswith(b"HTTP/1.1 101 " if i % 2 == 0 else b"HTTP/1.1 200 "), head
+            assert server.rate_limit_fail_open_count() >= 66
             async with httpx.AsyncClient(base_url=f"http://{server.address}", trust_env=False) as client:
                 assert (await client.get("/healthz")).status_code == 200
                 release.set()

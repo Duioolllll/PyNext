@@ -49,7 +49,7 @@ async def request(app, *, websocket=False, path=None, raw_path=None, no_receive=
 
 
 @pytest.mark.parametrize("websocket", [False, True])
-def test_unmarked_blocking_callback_times_out_without_blocking_health(tmp_path, monkeypatch, websocket):
+def test_unmarked_blocking_callback_times_out_and_fails_open_without_blocking_health(tmp_path, monkeypatch, websocket):
     project(tmp_path)
     release = threading.Event()
     class Slow(RateLimiter):
@@ -62,13 +62,18 @@ def test_unmarked_blocking_callback_times_out_without_blocking_health(tmp_path, 
     async def exercise():
         app = create_app(tmp_path, rate_limit=Slow(1, 60))
         try:
-            sent = await asyncio.wait_for(request(app, websocket=websocket), 1)
-            assert sent[0]["status"] == 503
-            assert (b"retry-after", b"1") in sent[0]["headers"]
+            # H-2: no decision within the deadline, so the request is
+            # admitted instead of 503ing, and the miss is counted.
+            sent = await asyncio.wait_for(request(app, websocket=websocket, no_receive=False), 1)
+            if websocket:
+                assert sent[0]["type"] == "websocket.accept"
+            else:
+                assert sent[0]["status"] == 200
+                assert app._module("app/input/route.py").calls == [b""]
+            assert app.metrics.snapshot()["rate_limit"]["fail_open"] == 1
             assert not await app.wait_for_inflight(0)
             health = await asyncio.wait_for(request(app, path="/healthz", method="GET", no_receive=False), 1)
             assert health[0]["status"] == 200
-            assert app._module("app/input/route.py").calls == []
         finally:
             release.set()
             assert await app.wait_for_inflight(3)
@@ -76,7 +81,7 @@ def test_unmarked_blocking_callback_times_out_without_blocking_health(tmp_path, 
     asyncio.run(exercise())
 
 
-def test_http_and_websocket_share_64_slots_retained_after_timeout(tmp_path):
+def test_http_and_websocket_share_64_slots_and_timeouts_fail_open(tmp_path):
     project(tmp_path)
     release = threading.Event()
     calls = []
@@ -90,17 +95,24 @@ def test_http_and_websocket_share_64_slots_retained_after_timeout(tmp_path):
         app = create_app(tmp_path, rate_limit=Slow(1000, 60))
         tasks = []
         try:
-            tasks = [asyncio.create_task(request(app, websocket=i % 2 == 0)) for i in range(64)]
+            tasks = [asyncio.create_task(request(app, websocket=i % 2 == 0, no_receive=False)) for i in range(64)]
             await wait_until(lambda: app._asgi_admission.inflight == 64)
+            # H-2: the gate is full, so no decision can be produced for
+            # the next requests: they are admitted instead of 503ing.
             for websocket in (False, True):
-                sent = await asyncio.wait_for(request(app, websocket=websocket), 1)
-                assert sent[0]["status"] == 503
-                assert (b"retry-after", b"1") in sent[0]["headers"]
+                sent = await asyncio.wait_for(request(app, websocket=websocket, no_receive=False), 1)
+                if websocket:
+                    assert sent[0]["type"] == "websocket.accept"
+                else:
+                    assert sent[0]["status"] == 200
             results = await asyncio.wait_for(asyncio.gather(*tasks), 5)
-            assert all(result[0]["status"] == 503 for result in results)
+            assert all(
+                (result[0]["type"] == "websocket.accept" if result[0].get("type", "").startswith("websocket")
+                 else result[0]["status"] == 200)
+                for result in results)
             assert not await app.wait_for_inflight(0)
             # Timed-out running work still owns its slots.
-            assert (await asyncio.wait_for(request(app), 1))[0]["status"] == 503
+            assert (await asyncio.wait_for(request(app, no_receive=False), 1))[0]["status"] == 200
             before = len(calls)
             release.set()
             assert await app.wait_for_inflight(3)

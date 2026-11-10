@@ -99,6 +99,12 @@ class PyNextConfig:
     # Connection limits (serve()).
     max_connections: int = 1024
     max_connections_per_ip: int = 128
+    # Per-IP execution quota (serve()): at most this many requests from
+    # one client IP may hold an execution slot at once (H-5). The global
+    # pool is ``max_concurrent`` (64), so the default 16 is one quarter
+    # of the pool: a single IP can no longer take all 64 slots with slow
+    # requests and 503 every other user.
+    max_concurrent_per_ip: int = 16
     header_read_timeout_ms: int = 10000
     body_min_rate_bytes_per_sec: int = 1024
     # Lifecycle.
@@ -108,13 +114,20 @@ class PyNextConfig:
     cache_backend: str = "memory"
     cache_path: str | None = None
     cache_failure_policy: str = "fail_open"
-    # Rate limiting.
-    rate_limit: int = 0
+    # Rate limiting (H-1): on by default — 300 requests per client IP
+    # per 60-second window. A default deployment used to expose no
+    # framework-level throttle at all (``rate_limit=0``), so the only
+    # defence was the 64 execution slots, which reject attackers and
+    # legitimate users alike with 503. Set ``rate_limit=0`` to opt out
+    # (``pynext start`` then warns that throttling is disabled).
+    # Health probes are exempt by default so a load balancer can always
+    # reach /healthz and /readyz.
+    rate_limit: int = 300
     rate_limit_window: float = 60.0
     rate_limit_backend: str = "memory"
     rate_limit_ipv6_prefix_len: int = 64
     rate_limit_failure_policy: str = "fail_closed"
-    rate_limit_exempt_paths: tuple = ()
+    rate_limit_exempt_paths: tuple = ("/healthz", "/readyz")
     trusted_proxies: tuple = ()
     # Security.
     csrf_enabled: bool | None = None
@@ -175,6 +188,7 @@ _SPECS = {
     "body_timeout_ms": _Spec("int", 0, 86400000),
     "max_connections": _Spec("int", 1, 1000000),
     "max_connections_per_ip": _Spec("int", 1, 1000000),
+    "max_concurrent_per_ip": _Spec("int", 1, 1000000),
     "header_read_timeout_ms": _Spec("int", 0, 86400000),
     "body_min_rate_bytes_per_sec": _Spec("int", 0, 1000000000),
     "shutdown_timeout": _Spec("float", 0, 3600),
@@ -335,7 +349,20 @@ def _validate_config_dict(raw, *, source):
 
 
 def _cross_check(values, *, source):
-    """Warn about option combinations that are legal but surprising."""
+    """Warn about option combinations that are legal but surprising.
+
+    One combination is fatal, not just surprising (H-4):
+    ``cors_allowed_origins=["*"]`` with ``cors_allow_credentials=True``
+    would echo any request Origin back with credentials allowed, so an
+    arbitrary site could make credentialed (cookie-bearing) cross-origin
+    requests. Refuse it at startup; list the origins explicitly instead.
+    """
+    if "*" in values.cors_allowed_origins and values.cors_allow_credentials:
+        raise ConfigError(
+            f"{source}: 'cors_allowed_origins' contains '*' together with "
+            "'cors_allow_credentials=True'; that would allow any origin to "
+            "make credentialed cross-origin requests. List the allowed "
+            "origins explicitly instead of '*'.")
     warnings = []
     if values.cache_path is not None and values.cache_backend != "sqlite":
         warnings.append(

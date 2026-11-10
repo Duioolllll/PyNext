@@ -314,7 +314,8 @@ class _NativeStream:
 def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
                             body_capacity, body_timeout_ms, max_connections,
                             max_connections_per_ip, header_read_timeout_ms,
-                            body_min_rate_bytes_per_sec, shutdown_timeout):
+                            body_min_rate_bytes_per_sec, shutdown_timeout,
+                            max_concurrent_per_ip=DEFAULT_CONFIG.max_concurrent_per_ip):
     """Reject server limits that cannot reach the native server safely.
 
     Counts and timeouts cross into Rust as usize/u64/f64: a value past
@@ -329,6 +330,7 @@ def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
         ("body_capacity", body_capacity, 1, MAX_BODY_CAPACITY),
         ("max_connections", max_connections, 1, MAX_CONNECTIONS),
         ("max_connections_per_ip", max_connections_per_ip, 1, MAX_CONNECTIONS_PER_IP),
+        ("max_concurrent_per_ip", max_concurrent_per_ip, 1, MAX_CONCURRENT),
         ("acquire_timeout_ms", acquire_timeout_ms, 0, MAX_TIMEOUT_MS),
         ("body_timeout_ms", body_timeout_ms, 0, MAX_TIMEOUT_MS),
         ("header_read_timeout_ms", header_read_timeout_ms, 0, MAX_TIMEOUT_MS),
@@ -350,6 +352,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                  body_capacity=16, body_timeout_ms=10000, observability=None, *, reuse_port=False, listener=None,
                  max_connections=DEFAULT_MAX_CONNECTIONS,
                  max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
+                 max_concurrent_per_ip=DEFAULT_CONFIG.max_concurrent_per_ip,
                  header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                  body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
                  shutdown_timeout=30.0, max_waiting=None):
@@ -358,20 +361,24 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     Overload policy (roadmap C7): bounded wait, then reject. At most
     ``max_concurrent`` requests run Python handlers at once; further
     requests wait up to ``acquire_timeout_ms`` for a slot, then get
-    503 with ``Retry-After``. The wait queue holds at most ``max_waiting``
-    requests (``None`` keeps the default ``min(max_concurrent, 64)``;
-    0 means a slot must be free immediately). Each waiter can hold a
-    fully buffered request body, so the queue stays bounded: raising
-    ``max_waiting`` without raising ``acquire_timeout_ms`` does nothing,
-    and waiting indefinitely would trade 503s for memory exhaustion.
-    A 503 after the full wait carries ``Retry-After`` of
-    ``ceil(acquire_timeout_ms / 1000)`` seconds (at least 1); a 503 for
-    a full wait queue carries ``Retry-After: 1``.
+    503 with ``Retry-After``. ``max_concurrent_per_ip`` (H-5) caps how
+    many of those slots one client IP may hold at once (default 16, a
+    quarter of the 64-slot pool), so one IP cannot take every slot with
+    slow requests and 503 all other users. The wait queue holds at most
+    ``max_waiting`` requests (``None`` keeps the default
+    ``min(max_concurrent, 64)``; 0 means a slot must be free
+    immediately). Each waiter can hold a fully buffered request body,
+    so the queue stays bounded: raising ``max_waiting`` without raising
+    ``acquire_timeout_ms`` does nothing, and waiting indefinitely would
+    trade 503s for memory exhaustion. A 503 after the full wait carries
+    ``Retry-After`` of ``ceil(acquire_timeout_ms / 1000)`` seconds (at
+    least 1); a 503 for a full wait queue carries ``Retry-After: 1``.
     """
     _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
                             body_capacity, body_timeout_ms, max_connections,
                             max_connections_per_ip, header_read_timeout_ms,
-                            body_min_rate_bytes_per_sec, shutdown_timeout)
+                            body_min_rate_bytes_per_sec, shutdown_timeout,
+                            max_concurrent_per_ip)
     if observability is not None:
         app.configure_observability(observability)
     app.metrics.observe_worker_start()
@@ -557,6 +564,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 body_capacity=body_capacity, body_timeout_ms=body_timeout_ms,
                                 max_connections=max_connections,
                                 max_connections_per_ip=max_connections_per_ip,
+                                max_concurrent_per_ip=max_concurrent_per_ip,
                                 header_read_timeout_ms=header_read_timeout_ms,
                                 body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
                                 websocket_paths=sorted(app.websocket_routes),
@@ -585,6 +593,7 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                 reuse_port=False, on_ready=None, listener=None,
                 max_connections=DEFAULT_MAX_CONNECTIONS,
                 max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
+                max_concurrent_per_ip=DEFAULT_CONFIG.max_concurrent_per_ip,
                 header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                 body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
                 shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None):
@@ -635,6 +644,7 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               body_capacity, body_timeout_ms, observability=observability, reuse_port=reuse_port,
                               listener=listener, max_connections=max_connections,
                               max_connections_per_ip=max_connections_per_ip,
+                              max_concurrent_per_ip=max_concurrent_per_ip,
                               header_read_timeout_ms=header_read_timeout_ms,
                               body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
                               shutdown_timeout=shutdown_timeout, max_waiting=max_waiting)

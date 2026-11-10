@@ -83,13 +83,15 @@ class WorkerConfig:
     # Connection limits (A4); defaults mirror server.DEFAULT_*.
     max_connections: int = DEFAULT_CONFIG.max_connections
     max_connections_per_ip: int = DEFAULT_CONFIG.max_connections_per_ip
+    # Per-IP execution quota (H-5); defaults mirror server.DEFAULT_*.
+    max_concurrent_per_ip: int = DEFAULT_CONFIG.max_concurrent_per_ip
     header_read_timeout_ms: int = DEFAULT_CONFIG.header_read_timeout_ms
     body_min_rate_bytes_per_sec: int = DEFAULT_CONFIG.body_min_rate_bytes_per_sec
     max_waiting: int | None = None  # None keeps the native default min(max_concurrent, 64)
     rate_limit: int = DEFAULT_CONFIG.rate_limit  # 0 disables rate limiting
     rate_limit_window: float = DEFAULT_CONFIG.rate_limit_window
     rate_limit_backend: str = DEFAULT_CONFIG.rate_limit_backend
-    rate_limit_exempt_paths: tuple = ()
+    rate_limit_exempt_paths: tuple = DEFAULT_CONFIG.rate_limit_exempt_paths
     rate_limit_ipv6_prefix_len: int = DEFAULT_CONFIG.rate_limit_ipv6_prefix_len  # IPv6 bucket grouping (see ratelimit.py)
     trusted_proxies: tuple = ()
     # Shared-cache / observability settings, forwarded to each worker's
@@ -169,6 +171,7 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                         observability=config.observability,
                         max_connections=config.max_connections,
                         max_connections_per_ip=config.max_connections_per_ip,
+                        max_concurrent_per_ip=config.max_concurrent_per_ip,
                         header_read_timeout_ms=config.header_read_timeout_ms,
                         body_min_rate_bytes_per_sec=config.body_min_rate_bytes_per_sec,
                         shutdown_timeout=config.shutdown_timeout,
