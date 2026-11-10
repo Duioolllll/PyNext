@@ -45,6 +45,16 @@ global sliding window (at most ``max_new_keys_per_window`` new keys per
 the table to reset buckets. Existing keys are never denied by table
 pressure.
 
+Atomicity (S-P1-4): ``RateLimiter.allow`` holds a single
+``threading.Lock`` across the whole read-refill-decide-write step, so
+two threads can never interleave a check and a consume on the same
+bucket. That guarantee is per-process: the bucket table lives in this
+process's memory, so with ``--workers N`` each worker enforces its own
+copy of the limit and the effective limit is N times the configured
+one. A limit shared across workers needs ``RedisRateLimiter``
+(``redis_rate.py``), whose single Lua ``EVAL`` is the atomic unit —
+see ``tests/test_ratelimit_atomicity.py`` for the multi-worker proof.
+
 When a limiter is configured, static files and fresh ISR pages are also
 charged. Axum calls the Python decision callback from the Rust header
 stage and can send an allowed static response directly. Both adapters
@@ -146,6 +156,11 @@ class RateLimiter:
     ``limit`` is the burst size and the refill rate is ``limit`` tokens
     per ``window_seconds``. A key that has been idle long enough to refill
     completely is treated as fresh.
+
+    ``allow`` is atomic within this process: one lock covers the whole
+    get-refill-decide-set step (S-P1-4), so concurrent threads can never
+    over-admit a bucket. The table itself is per-process — see the module
+    docstring: a limit shared across workers needs ``RedisRateLimiter``.
     """
 
     def __init__(self, limit, window_seconds, *, trusted_proxies=(), exempt_paths=(),

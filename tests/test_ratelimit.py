@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import threading
 
 import httpx
 import pytest
@@ -539,3 +540,72 @@ def test_cli_passes_rate_limit_to_app(tmp_path, monkeypatch):
     assert seen[1][0] == "serve"
     assert seen[1][-2] == 30  # B6 graceful-shutdown default
     assert seen[1][-1] is None  # C7 max_waiting default
+
+
+# --- S-P1-4: atomicity (a limit must never over-admit under contention) ---
+
+
+def test_memory_limiter_is_atomic_under_threads():
+    """One lock covers get+refill+set: concurrent threads never over-admit.
+
+    With a check-then-set race, two threads can both see the last token
+    and both consume it, admitting more than the limit. The barrier makes
+    all threads hit the bucket at once, so a race would show up here.
+    """
+    limiter = RateLimiter(10, 60)
+    barrier = threading.Barrier(8)
+    admitted = []
+
+    def hammer():
+        barrier.wait(timeout=10)
+        count = 0
+        for _ in range(25):
+            allowed, _ = limiter.allow("shared")
+            count += bool(allowed)
+        admitted.append(count)
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert all(not thread.is_alive() for thread in threads)
+    assert sum(admitted) == 10
+
+
+def test_memory_limiter_multi_key_thread_safety():
+    """Concurrent keys stay isolated and the table stays bounded."""
+    limiter = RateLimiter(5, 60, max_buckets=32)
+    barrier = threading.Barrier(16)
+    admitted = {}
+
+    def hammer(index):
+        key = f"key-{index}"
+        barrier.wait(timeout=10)
+        count = 0
+        for _ in range(20):
+            allowed, _ = limiter.allow(key)
+            count += bool(allowed)
+        admitted[key] = count
+
+    threads = [threading.Thread(target=hammer, args=(index,)) for index in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert all(not thread.is_alive() for thread in threads)
+    assert admitted == {f"key-{index}": 5 for index in range(16)}
+    assert limiter.stats()["buckets"] == 16
+
+
+def test_memory_limiter_buckets_are_per_process():
+    """Two limiter instances do not share buckets (two workers, two limits).
+
+    The memory backend is per-process by design (S-P1-4): each worker
+    enforces its own copy of the limit. A limit shared across workers
+    needs RedisRateLimiter — see tests/test_ratelimit_atomicity.py.
+    """
+    first = RateLimiter(3, 60)
+    second = RateLimiter(3, 60)
+    assert [first.allow("k")[0] for _ in range(4)] == [True, True, True, False]
+    assert [second.allow("k")[0] for _ in range(4)] == [True, True, True, False]
