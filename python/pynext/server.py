@@ -10,7 +10,7 @@ import time
 
 from . import _native
 from .app import _decode_path, _invoke, _split_request_path, _typed_params
-from .config import DEFAULT_CONFIG
+from .config import DEFAULT_CONFIG, effective_allowed_hosts
 from .errors import SignalError, digest_for_error
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
                    WebSocketDisconnect, _RequestCancellation, apply_path_headers,
@@ -352,7 +352,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                  max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                  header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                  body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
-                 shutdown_timeout=30.0, max_waiting=None):
+                 shutdown_timeout=30.0, max_waiting=None, allowed_hosts=None):
     """Start the native server and return its handle.
 
     Overload policy (roadmap C7): bounded wait, then reject. At most
@@ -367,6 +367,14 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     A 503 after the full wait carries ``Retry-After`` of
     ``ceil(acquire_timeout_ms / 1000)`` seconds (at least 1); a 503 for
     a full wait queue carries ``Retry-After: 1``.
+
+    Host validation (S-P1-19, M-9): the native server rejects requests
+    whose Host header is missing or not on ``allowed_hosts`` with 400,
+    before any handler runs. ``allowed_hosts`` is a Django
+    ``ALLOWED_HOSTS`` list (``*``, ``.example.com``,
+    ``*.example.com``, exact hosts); ``None`` (the default) means the
+    loopback default plus the bind host
+    (``config.effective_allowed_hosts``).
     """
     _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
                             body_capacity, body_timeout_ms, max_connections,
@@ -574,6 +582,7 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 security_headers=security_headers(config=app.security,
                                                                   production=app.production),
                                 path_headers=app.path_headers.for_native(),
+                                allowed_hosts=list(effective_allowed_hosts(allowed_hosts, host)),
                                 drain_timeout_secs=shutdown_timeout)
 
 
@@ -587,7 +596,8 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                 max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                 header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                 body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
-                shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None):
+                shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None,
+                allowed_hosts=None):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
@@ -637,7 +647,8 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               max_connections_per_ip=max_connections_per_ip,
                               header_read_timeout_ms=header_read_timeout_ms,
                               body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
-                              shutdown_timeout=shutdown_timeout, max_waiting=max_waiting)
+                              shutdown_timeout=shutdown_timeout, max_waiting=max_waiting,
+                              allowed_hosts=allowed_hosts)
         print(f"PyNext listening on http://{server.address}", flush=True)
         # A standalone bundle records its provenance in
         # bundle-manifest.json next to the app dir; log it (and warn on

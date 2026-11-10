@@ -108,6 +108,10 @@ class WorkerConfig:
     # or a slow request can still be cut off mid-flight.
     shutdown_timeout: float = DEFAULT_CONFIG.shutdown_timeout
     shutdown_timeout: float = 30.0
+    # Host allowlist (S-P1-19, M-9): Django ALLOWED_HOSTS patterns from
+    # the config; empty means the loopback default (see
+    # config.effective_allowed_hosts).
+    allowed_hosts: tuple = ()
     # Dev-only: answer 404 (like production) for SSG paths that
     # generate_static_params would not produce, instead of merely warning.
     strict_ssg: bool = False
@@ -173,6 +177,7 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                         body_min_rate_bytes_per_sec=config.body_min_rate_bytes_per_sec,
                         shutdown_timeout=config.shutdown_timeout,
                         max_waiting=config.max_waiting,
+                        allowed_hosts=config.allowed_hosts,
                         on_ready=lambda _address: ready.set())
         finally:
             shutdown_task.cancel()

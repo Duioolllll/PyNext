@@ -115,7 +115,8 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                  header_read_timeout_ms=None, body_min_rate_bytes_per_sec=None,
                  trusted_proxies=(), cache_failure_policy=None,
                  shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout,
-                 max_waiting=None, strict_ssg=False, config=None, cli_overrides=None):
+                 max_waiting=None, strict_ssg=False, allowed_hosts=(),
+                 config=None, cli_overrides=None):
     """Serve the app in development mode, replacing changed island bundles.
 
     Other file changes restart the server on the same port and reload open
@@ -143,7 +144,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
         "trusted_proxies": trusted_proxies,
         "cache_failure_policy": cache_failure_policy,
         "shutdown_timeout": shutdown_timeout, "max_waiting": max_waiting,
-        "strict_ssg": strict_ssg,
+        "strict_ssg": strict_ssg, "allowed_hosts": allowed_hosts,
     }
 
     def refresh_settings():
@@ -178,6 +179,7 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
             "trusted_proxies": values.trusted_proxies,
             "cache_failure_policy": values.cache_failure_policy,
             "shutdown_timeout": values.shutdown_timeout, "max_waiting": values.max_waiting,
+            "allowed_hosts": values.allowed_hosts,
         })
         return True
 
@@ -207,6 +209,10 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
             if (settings[key] is not None
                     and settings[key] != getattr(DEFAULT_CONFIG, key)):
                 kwargs[key] = settings[key]
+        # An empty allowlist is serve()'s loopback default, so only a
+        # configured list is forwarded (S-P1-19).
+        if settings["allowed_hosts"]:
+            kwargs["allowed_hosts"] = settings["allowed_hosts"]
         return kwargs
 
     watcher = Watcher(root)
@@ -734,7 +740,8 @@ def main():
                               cache_failure_policy=args.cache_failure_policy,
                               observability=obs_config, security=security,
                               websocket_max_message=args.ws_max_message_bytes,
-                              shutdown_timeout=args.shutdown_timeout, strict_ssg=args.strict_ssg)
+                              shutdown_timeout=args.shutdown_timeout, strict_ssg=args.strict_ssg,
+                              allowed_hosts=values.allowed_hosts)
         return run_supervisor(config, workers=args.workers)
     if args.command == "dev":
         try:
@@ -748,6 +755,7 @@ def main():
                                 shutdown_timeout=args.shutdown_timeout, max_waiting=args.max_waiting,
                                 config=resolved, cli_overrides=cli_overrides,
                                 strict_ssg=args.strict_ssg,
+                                allowed_hosts=values.allowed_hosts,
                                 **extra, **conn_kwargs))
         except KeyboardInterrupt:
             pass
@@ -769,6 +777,7 @@ def main():
         asyncio.run(serve(app, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
                           args.body_capacity, args.body_timeout_ms,
                           shutdown_timeout=args.shutdown_timeout,
+                          **({"allowed_hosts": values.allowed_hosts} if values.allowed_hosts else {}),
                           **({"max_waiting": args.max_waiting} if args.max_waiting is not None else {}),
                           **extra, **conn_kwargs))
     except KeyboardInterrupt:

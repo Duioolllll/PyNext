@@ -19,7 +19,8 @@ import pytest
 
 from pynext import cli
 from pynext.app import create_app
-from pynext.config import DEFAULT_CONFIG, ConfigError, find_config_file, load_config
+from pynext.config import (DEFAULT_ALLOWED_HOSTS, DEFAULT_CONFIG, ConfigError,
+                          effective_allowed_hosts, find_config_file, load_config)
 from pynext.server import serve
 from pynext.supervisor import WorkerConfig
 
@@ -138,6 +139,20 @@ def test_load_config_unknown_key_warns_with_suggestion(tmp_path):
     ("{'websocket_allowed_origins': ['*']}", "invalid WebSocket origin '*'"),
     ("{'websocket_allowed_origins': 'https://example.com'}",
      "'websocket_allowed_origins' must be a list or tuple of strings"),
+    ("{'allowed_hosts': 'example.com'}",
+     "'allowed_hosts' must be a list or tuple of host patterns"),
+    ("{'allowed_hosts': [42]}",
+     "'allowed_hosts' must be a list or tuple of non-empty host patterns"),
+    ("{'allowed_hosts': ['https://example.com']}",
+     "has an invalid allowed host 'https://example.com'"),
+    ("{'allowed_hosts': ['example.com:3000']}",
+     "allowed host 'example.com:3000' must not include a port"),
+    ("{'allowed_hosts': ['exa mple.com']}",
+     "has an invalid allowed host 'exa mple.com'"),
+    ("{'allowed_hosts': ['.127.0.0.1']}",
+     "subdomain pattern '.127.0.0.1' must name a domain, not an IP literal"),
+    ("{'allowed_hosts': ['foo.*.example.com']}",
+     "has an invalid allowed host 'foo.*.example.com'"),
     ("{'cors_allowed_origins': ['not-an-origin']}", "invalid CORS origin 'not-an-origin'"),
     ("{'cors_allow_credentials': 1}", "'cors_allow_credentials' must be a bool"),
     ("{'trusted_proxies': '10.0.0.1'}", "'trusted_proxies' must be a list or tuple of strings"),
@@ -175,6 +190,38 @@ def test_load_config_accepts_boundary_and_list_values(tmp_path):
     assert resolved.values.cors_allowed_origins == ("*", "https://example.com")
     assert resolved.values.log_level == "DEBUG"
     assert resolved.warnings == ()
+
+
+def test_load_config_accepts_allowed_hosts(tmp_path):
+    write_config(tmp_path,
+                 "config = {'allowed_hosts': ['Example.COM', '.example.org', '*.example.net',\n"
+                 "          '127.0.0.1', '[::1]', 'localhost']}\n")
+    resolved = load_config(tmp_path, "dev", env={})
+    assert resolved.values.allowed_hosts == ("example.com", ".example.org", "*.example.net",
+                                             "127.0.0.1", "::1", "localhost")
+    assert resolved.warnings == ()
+
+
+def test_load_config_wildcard_allowed_hosts_warns(tmp_path):
+    write_config(tmp_path, "config = {'allowed_hosts': ['*']}\n")
+    resolved = load_config(tmp_path, "dev", env={})
+    assert resolved.values.allowed_hosts == ("*",)
+    assert len(resolved.warnings) == 1
+    assert "'allowed_hosts' contains '*'" in resolved.warnings[0]
+
+
+def test_effective_allowed_hosts():
+    # No explicit list: loopback only.
+    assert effective_allowed_hosts(()) == DEFAULT_ALLOWED_HOSTS
+    assert effective_allowed_hosts() == DEFAULT_ALLOWED_HOSTS
+    # A bind host that names a host joins the default; a wildcard bind
+    # (0.0.0.0 / ::) and a loopback bind add nothing.
+    assert effective_allowed_hosts((), "example.com") == (*DEFAULT_ALLOWED_HOSTS, "example.com")
+    assert effective_allowed_hosts((), "0.0.0.0") == DEFAULT_ALLOWED_HOSTS
+    assert effective_allowed_hosts((), "::") == DEFAULT_ALLOWED_HOSTS
+    assert effective_allowed_hosts((), "127.0.0.1") == DEFAULT_ALLOWED_HOSTS
+    # An explicit list wins as-is.
+    assert effective_allowed_hosts(["example.com"]) == ("example.com",)
 
 
 @pytest.mark.parametrize("text, fragment", [
