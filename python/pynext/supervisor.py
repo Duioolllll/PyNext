@@ -41,8 +41,11 @@ Scope and limits, stated plainly:
   must retry. Only the *server* survives, not the in-flight request.
 - The parent retains the listener, including a dynamically assigned port,
   so replacements accept on the same address after a restart.
-- The default is one worker, which is exactly the historical
-  single-process path: no supervisor process or shared listener.
+- The default is two workers for ``pynext start`` (a supervisor spawns
+  two processes on one listener); ``pynext dev`` defaults to the
+  single-process path instead — no supervisor process or shared
+  listener — unless workers are configured explicitly, and
+  ``--workers 1`` is exactly the historical single-process path.
 """
 import logging
 import multiprocessing
