@@ -9,7 +9,7 @@ def model_prop(name: str) -> RenderNode: ...
 def island(name: str, *, props: dict[str, JSONValue] | None = ..., fallback: Child = ...,
            hydrate: bool = ..., strategy: Literal["load", "visible", "idle", "interaction"] = ...,
            model: RenderNode | None = ...) -> RenderNode: ...
-def page(*, render: Literal["ssr", "ssg", "isr"] = ..., revalidate: int | None = ...,
+def page(*, render: Literal["ssr", "ssg", "isr"] = ..., revalidate: int | float | bool | None = ...,
          stale: int | None = ..., expire: int | float | None = ..., cache_life: str | None = ...,
          query_keys: Iterable[str] = ...,
          dynamic: Literal["auto", "error", "force-dynamic"] = ...,

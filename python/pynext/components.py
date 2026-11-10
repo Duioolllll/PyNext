@@ -257,11 +257,18 @@ CACHE_LIFE_PROFILES = {
 
 
 def _segment_value(name, value, *, allow_zero):
-    """Validate one ISR segment value; None means 'not set by this segment'."""
+    """Validate one ISR segment value; None means 'not set by this segment'.
+
+    ``revalidate=False`` is on-demand-only: the page never revalidates by
+    time and is regenerated only by an explicit ``revalidate()`` /
+    ``revalidate_tag()`` call. Only ``revalidate`` accepts False.
+    """
     if value is None:
         return None
     if value is False:
-        raise ValueError(f"{name}=False (on-demand ISR) is not supported yet")
+        if name == "revalidate":
+            return False
+        raise ValueError(f"{name}=False (on-demand ISR) is only valid for revalidate")
     if (isinstance(value, bool) or not isinstance(value, (int, float)) or
             value < 0 or (not allow_zero and value == 0) or value > MAX_CACHE_SECONDS
             or not math.isfinite(value)):
@@ -281,6 +288,12 @@ def _partial_isr_policy(revalidate, stale, expire=None):
     policy = {"revalidate": _segment_value("revalidate", revalidate, allow_zero=False),
               "stale": _segment_value("stale", stale, allow_zero=True),
               "expire": _segment_value("expire", expire, allow_zero=False)}
+    if policy["revalidate"] is False:
+        # On-demand-only: expire is meaningless (the entry never goes
+        # stale by time), so no hard-cap relationship is checked here;
+        # the final normalization in _isr_policy forces expire to the
+        # longest lifetime.
+        return policy
     if policy["revalidate"] is not None and policy["expire"] is not None:
         if policy["expire"] <= policy["revalidate"]:
             raise ValueError("expire must be greater than revalidate")
@@ -356,12 +369,24 @@ def _isr_policy(revalidate, stale=None, expire=None):
     ``expire=float("inf")`` means "no practical hard cap" and normalizes
     to one year, the largest expressible value (Next.js serializes
     Infinity as its ``INFINITE_CACHE`` sentinel the same way).
+
+    ``revalidate=False`` is on-demand-only: the entry never revalidates
+    by time and is regenerated only by an explicit ``revalidate()`` /
+    ``revalidate_tag()`` call. It normalizes to the longest lifetime a
+    backend accepts on every axis (``revalidate`` and ``expire`` both
+    become :data:`MAX_CACHE_SECONDS`); ``stale`` is validated and kept
+    for the record, and any ``expire`` is meaningless here.
     """
     if stale is None:
         stale = 60.0
         stale_explicit = False
     else:
         stale_explicit = True
+    if revalidate is False:
+        if (isinstance(stale, bool) or not isinstance(stale, (int, float)) or
+                stale < 0 or stale > MAX_CACHE_SECONDS or not math.isfinite(stale)):
+            raise ValueError(f"stale must be a finite non-negative number of seconds, at most {int(MAX_CACHE_SECONDS)}")
+        return {"revalidate": MAX_CACHE_SECONDS, "stale": float(stale), "expire": MAX_CACHE_SECONDS}
     for name, value, allow_zero in (("revalidate", revalidate, False), ("stale", stale, True)):
         if (isinstance(value, bool) or not isinstance(value, (int, float)) or
                 value < 0 or (not allow_zero and value == 0) or value > MAX_CACHE_SECONDS

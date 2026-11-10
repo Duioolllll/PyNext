@@ -111,9 +111,16 @@ def test_layout_policy_rejects_invalid_values(kwargs):
         layout(**kwargs)
 
 
-def test_layout_policy_rejects_false_with_on_demand_hint():
-    with pytest.raises(ValueError, match="not supported yet"):
-        layout(revalidate=False)
+def test_layout_policy_accepts_false_for_on_demand():
+    # On-demand ISR is supported now: a layout may declare
+    # revalidate=False and pages under it resolve to on-demand-only
+    # (the "not supported yet" rejection predates the ondemand merge).
+    @layout(revalidate=False)
+    def on_demand(children):
+        return children
+
+    assert on_demand.__pynext_layout_policy__ == {
+        "revalidate": False, "stale": None, "expire": None}
 
 
 def test_page_isr_may_omit_values_for_inheritance():

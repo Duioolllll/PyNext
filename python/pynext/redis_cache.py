@@ -50,6 +50,7 @@ local stale = tonumber(ARGV[3])
 local generated = tonumber(ARGV[9])
 if not generated or generated <= 0 then generated = now end
 redis.call('HSET', KEYS[1], 'body', ARGV[1], 'fresh_until', now+fresh,
+           'stale_until', now+fresh+stale, 'version', version+1,
            'tags', ARGV[7], 'generated_at', generated, 'path', ARGV[8])
 redis.call('PEXPIRE', KEYS[1], fresh+stale+tonumber(ARGV[6]))
 return 1
@@ -229,6 +230,62 @@ class RedisCacheBackend:
 
     def insert(self, key, body, fresh_seconds, stale_seconds, tags=()):
         return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None, tags=tags)
+
+    def get_tag_times(self, tags):
+        """Return ``{tag: (stale_at, expired_at)}`` in wall-clock seconds.
+
+        A missing tag maps to ``(None, None)``. Tag records share the
+        ``"stale_at,expired_at"`` millisecond encoding of
+        :meth:`revalidate_tag`.
+        """
+        try:
+            values = self.client.mget([self._tag_key(tag) for tag in tags])
+            out = {}
+            for tag, value in zip(tags, values):
+                if not value:
+                    out[tag] = (None, None)
+                    continue
+                try:
+                    stale_at, expired_at = (
+                        int(part) for part in value.decode("ascii").split(",", 1))
+                except (ValueError, UnicodeDecodeError):
+                    out[tag] = (None, None)
+                    continue
+                out[tag] = (stale_at / 1000, expired_at / 1000)
+            return out
+        except Exception as exc:
+            raise SharedCacheUnavailable("Redis cache tag lookup failed") from exc
+
+    def update_tag(self, tag, stale_at=None, expired_at=None):
+        """Record a tag invalidation: ``stale_at``/``expired_at`` are
+        wall-clock seconds, or ``None`` to leave that field unchanged."""
+        if stale_at is None and expired_at is None:
+            return
+        try:
+            seconds, microseconds = self.client.time()
+            now = seconds * 1000 + microseconds // 1000
+            old_stale, old_expired = None, None
+            value = self.client.get(self._tag_key(tag))
+            if value:
+                try:
+                    old_stale, old_expired = (
+                        int(part) / 1000 for part in value.decode("ascii").split(",", 1))
+                except (ValueError, UnicodeDecodeError):
+                    old_stale, old_expired = None, None
+            new_stale = stale_at if stale_at is not None else old_stale
+            new_expired = expired_at if expired_at is not None else old_expired
+            if new_stale is None:
+                new_stale = new_expired if new_expired is not None else now / 1000
+            if new_expired is None:
+                new_expired = new_stale
+            delay_ms = max(0, math.ceil(new_expired * 1000 - now))
+            ttl_ms = delay_ms + int(MAX_CACHE_SECONDS * 1000) + int(LEASE_TTL * 1000)
+            self.client.set(
+                self._tag_key(tag),
+                f"{math.ceil(new_stale * 1000)},{math.ceil(new_expired * 1000)}".encode("ascii"),
+                px=ttl_ms)
+        except Exception as exc:
+            raise SharedCacheUnavailable("Redis cache tag update failed") from exc
 
     def remove(self, key):
         try:

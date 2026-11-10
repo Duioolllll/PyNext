@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import hashlib
+import hmac
 import html
 import importlib.machinery
 import importlib.util
@@ -8,6 +9,7 @@ import inspect
 import json
 import keyword
 import logging
+import math
 import os
 import re
 import sys
@@ -26,7 +28,8 @@ from . import _native
 from .admission import DecisionGate
 from .assets import read_public_artifacts, read_public_sources
 from .auth import check_authorization
-from .cache import CacheBusy, ISRCache, SharedCacheUnavailable, dev_retention_policy
+from .cache import (MAX_CACHE_SECONDS, CacheBusy, ISRCache, SharedCacheUnavailable,
+                    dev_retention_policy, validate_cache_tag)
 from .client import compile_client, read_client_artifacts
 from .components import (_isr_policy, _isr_query_keys, _node, _partial_isr_policy, _validate_tags,
                         bind_islands, reduce_segment_config)
@@ -36,7 +39,7 @@ from .config import DEFAULT_CONFIG
 from .dynamic import (DYNAMIC_MODES, MAX_DYNAMIC_ACCESSES, format_dynamic_accesses,
                       suppress_dynamic_tracking, track_prerender)
 from .errors import SignalError, digest_for_error, error_count
-from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
+from .http import (SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_path_headers, apply_security_headers, compile_path_headers,
                    cors_preflight_response, filter_internal_headers, new_csp_nonce, validate_csrf)
@@ -505,6 +508,40 @@ def _layout_url_dir(module):
     return "/" + "/".join(url_parts)
 
 
+_ROUTE_GROUP_RE = re.compile(r"\([A-Za-z0-9_-]+\)")
+
+
+def _layout_scope(relative):
+    """Map a layout file (``app/blog/layout.py``) to its URL scope (``/blog``).
+
+    Route groups do not appear in the URL, so a layout inside ``(group)``
+    takes the scope of the directory the group sits in; the root layout
+    scopes to ``/``.
+    """
+    parts = Path(relative).parts[1:-1]
+    visible = [part for part in parts if not _ROUTE_GROUP_RE.fullmatch(part)]
+    return "/" + "/".join(visible) if visible else "/"
+
+
+def _layout_tag(scope):
+    return "_pynext_layout_" + scope
+
+
+def _implicit_path_tags(path):
+    """The implicit tag(s) an ISR entry for a concrete path carries.
+
+    ``revalidate(path)`` is tag invalidation for these tags. ``/`` and
+    ``/index`` are aliases of each other (Next.js ``revalidatePath``),
+    so invalidating either invalidates both.
+    """
+    tags = ["_pynext_path_" + path]
+    if path == "/":
+        tags.append("_pynext_path_/index")
+    elif path == "/index":
+        tags.append("_pynext_path_/")
+    return tags
+
+
 def _module_key(root, relative):
     # Casefold so the same file reached through a different case (e.g.
     # App/Page.py vs app/page.py on a case-insensitive filesystem) maps to
@@ -518,10 +555,18 @@ class App:
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
                  resources=None, cache_url=None, cache_failure_policy=None,
                  websocket_max_message=DEFAULT_CONFIG.websocket_max_message, hot_reload=False,
-                 trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None):
+                 trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None,
+                 revalidate_secret=None):
         if isinstance(sync_workers, bool) or not isinstance(sync_workers, int) or not 1 <= sync_workers <= 1024:
             raise ValueError("sync_workers must be an integer from 1 to 1024")
         self.sync_workers = sync_workers
+        # Secret for the POST /_pynext/revalidate webhook. None disables
+        # the endpoint (it answers 404). create_app() also reads
+        # PYNEXT_REVALIDATE_SECRET when no explicit secret is given.
+        if revalidate_secret is not None and (
+                not isinstance(revalidate_secret, str) or not revalidate_secret):
+            raise ValueError("revalidate_secret must be a non-empty string")
+        self.revalidate_secret = revalidate_secret
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
         if not isinstance(strict_ssg, bool):
@@ -801,24 +846,31 @@ class App:
                         raise ValueError(
                             f"ISR page {spec['entry']} must set revalidate or inherit it from a layout")
                     if effective["revalidate"] is False:
-                        raise ValueError(
-                            f"ISR page {spec['entry']} resolves to revalidate=False (on-demand ISR), "
-                            "which is not supported yet")
-                    # Reconcile stale/expire: they are two spellings of the
-                    # same window. A set expire is the hard cap and wins;
-                    # stale is derived from it. Without an expire, stale
-                    # (default 60) defines the window and expire follows.
-                    revalidate = effective["revalidate"]
-                    if effective["expire"] is not None:
-                        expire = effective["expire"]
-                        stale = expire - revalidate
-                    else:
+                        # On-demand-only ISR: never regenerates on a timer,
+                        # only explicit revalidate()/revalidate_tag() does.
+                        # _isr_policy normalizes it to the longest lifetime
+                        # (expire ignored, stale window 0).
                         stale = 60.0 if effective["stale"] is None else effective["stale"]
-                        expire = revalidate + stale
-                    try:
-                        policy = _isr_policy(revalidate, stale, expire)
-                    except ValueError as exc:
-                        raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
+                        try:
+                            policy = _isr_policy(False, stale, None)
+                        except ValueError as exc:
+                            raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
+                    else:
+                        # Reconcile stale/expire: they are two spellings of the
+                        # same window. A set expire is the hard cap and wins;
+                        # stale is derived from it. Without an expire, stale
+                        # (default 60) defines the window and expire follows.
+                        revalidate = effective["revalidate"]
+                        if effective["expire"] is not None:
+                            expire = effective["expire"]
+                            stale = expire - revalidate
+                        else:
+                            stale = 60.0 if effective["stale"] is None else effective["stale"]
+                            expire = revalidate + stale
+                        try:
+                            policy = _isr_policy(revalidate, stale, expire)
+                        except ValueError as exc:
+                            raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
                     self.isr_policies[pattern] = policy
                     if getattr(module, "generate_static_params", None) is not None:
                         raise ValueError(f"ISR page {spec['entry']} cannot export generate_static_params yet")
@@ -834,6 +886,12 @@ class App:
                             getattr(fn, "__pynext_cache_tags__", ())))
                     except ValueError as exc:
                         raise ValueError(f"Invalid ISR tags in {spec['entry']}: {exc}") from exc
+                    # Layout tags: an ISR page also carries one tag per
+                    # ancestor layout (scopes recorded in entry_layouts),
+                    # so invalidating a layout tag evicts the whole
+                    # subtree (webhook type="layout" via _layout_tag).
+                    self.isr_tags[pattern] = sorted(set(self.isr_tags[pattern]) |
+                        {_layout_tag(_layout_scope(relative)) for relative in spec["layouts"]})
                 else:
                     query_keys = []
                 if "query" in inspect.signature(fn).parameters and not query_keys:
@@ -1166,7 +1224,9 @@ class App:
         if (match is None or self.render_modes.get(match[0]) != "isr" or
                 path in self.public_assets or path in self.static_pages or path in self.client_assets):
             raise ValueError("Path does not match an ISR page")
-        return await self._invalidate_cached_path(path, match[0])
+        # _revalidate_decoded also invalidates the implicit path tags,
+        # so "/" reaches its "/index" alias (and vice versa).
+        return await self._revalidate_decoded(path, "page")
 
     async def _invalidate_cached_path(self, path, pattern):
         """Invalidate one concrete cached path of ``pattern``.
@@ -1179,6 +1239,110 @@ class App:
             _, existed = await self.isr.variant_generation(path, invalidate=True)
             return existed
         return await self.isr.invalidate(path)
+
+    def _check_revalidate_path(self, path, type):
+        """Validate a revalidation target without changing any cache.
+
+        Returns the decoded path. Raises ``TypeError``/``ValueError`` for
+        a bad path, a non-ISR page (``type="page"``), or an unknown layout
+        (``type="layout"``).
+        """
+        if type not in ("page", "layout"):
+            raise ValueError('revalidate type must be "page" or "layout"')
+        if not isinstance(path, str):
+            raise TypeError("ISR path must be a string")
+        path = _decode_path(path)
+        if path != "/" and path.endswith("/"):
+            raise ValueError("ISR path must not have a trailing slash")
+        if type == "layout":
+            try:
+                self._layout_module_for_path(path)
+            except ValueError:
+                raise ValueError("Path does not match a layout") from None
+            return path
+        match = self.router.matches(path)
+        if (match is None or self.render_modes.get(match[0]) != "isr" or
+                path in self.public_assets or path in self.static_pages or path in self.client_assets):
+            raise ValueError("Path does not match an ISR page")
+        return path
+
+    async def _revalidate_decoded(self, path, type):
+        """Invalidate an already-decoded, already-validated path."""
+        if type == "layout":
+            return await self.isr.invalidate_tag(_layout_tag(path)) > 0
+        match = self.router.matches(path)
+        if self.isr_queries.get(match[0]):
+            _, existed = await self.isr.variant_generation(path, invalidate=True)
+            return existed
+        evicted = 0
+        for tag in _implicit_path_tags(path):
+            evicted += await self.isr.invalidate_tag(tag)
+        removed = await self.isr.invalidate(path)
+        return removed or evicted > 0
+
+    async def _revalidate_webhook(self, request):
+        """Serve ``POST /_pynext/revalidate`` (on-demand revalidation).
+
+        Disabled (404) while no ``revalidate_secret`` is configured.
+        Otherwise the caller must present it as ``Authorization: Bearer
+        <secret>`` (constant-time comparison). The JSON body takes
+        ``paths`` (list of ISR paths, ``type`` ``"page"`` or ``"layout"``)
+        and/or ``tags`` (list of cache tags, with optional ``expire``
+        seconds for deferred tag expiry). Every target is validated
+        before anything is invalidated, so a bad request changes nothing.
+        """
+        if request.method != "POST":
+            return Response("Method Not Allowed", status=405, headers=[(b"allow", b"POST")])
+        if self.revalidate_secret is None:
+            return Response("Not Found", status=404)
+        auth = next((value for name, value in request.headers
+                     if name.lower() == b"authorization"), None)
+        token = auth.decode("ascii", errors="ignore") if auth is not None else ""
+        if not token.startswith("Bearer ") or not hmac.compare_digest(
+                token[len("Bearer "):], self.revalidate_secret):
+            return Response("Unauthorized", status=401,
+                            headers=[(b"www-authenticate", b"Bearer")])
+        try:
+            payload = json.loads(request.body)
+        except (ValueError, UnicodeDecodeError):
+            return Response("Bad Request", status=400)
+        if not isinstance(payload, dict) or set(payload) - {"paths", "tags", "type", "expire"}:
+            return Response("Bad Request", status=400)
+        paths = payload.get("paths", [])
+        tags = payload.get("tags", [])
+        revalidate_type = payload.get("type", "page")
+        expire = payload.get("expire")
+        if (not isinstance(paths, list) or not all(isinstance(item, str) for item in paths) or
+                not isinstance(tags, list) or not all(isinstance(item, str) for item in tags) or
+                revalidate_type not in ("page", "layout") or
+                (expire is not None and
+                 (isinstance(expire, bool) or not isinstance(expire, (int, float)))) or
+                (not paths and not tags) or (expire is not None and not tags)):
+            return Response("Bad Request", status=400)
+        try:
+            decoded_paths = [self._check_revalidate_path(path, revalidate_type) for path in paths]
+            for tag in tags:
+                validate_cache_tag(tag)
+            if expire is not None and (
+                    not math.isfinite(expire) or expire < 0 or expire > MAX_CACHE_SECONDS):
+                raise ValueError(
+                    "expire must be a finite number of seconds from 0 to "
+                    f"{int(MAX_CACHE_SECONDS)}")
+        except (TypeError, ValueError) as exc:
+            return Response(f"Bad Request: {exc}", status=400)
+        results = {}
+        evicted = 0
+        for path in decoded_paths:
+            invalidated = await self._revalidate_decoded(path, revalidate_type)
+            results[path] = invalidated
+            if invalidated:
+                evicted += 1
+        tag_counts = {}
+        for tag in tags:
+            count = await self.isr.invalidate_tag(tag, expire=expire)
+            tag_counts[tag] = count
+            evicted += count
+        return JSONResponse({"paths": results, "tags": tag_counts, "evicted_entries": evicted})
 
     async def revalidate_tag(self, tag, expire=None):
         """Invalidate every ISR entry carrying ``tag`` for this app instance.
@@ -1314,7 +1478,7 @@ class App:
         value inherits the currently effective policy. Both values are
         validated exactly like :func:`pynext.components.page` enforces
         them (``revalidate`` positive, ``stale`` non-negative, both at
-        most 604800 seconds). Raises :class:`ValueError` for a
+        most 31536000 seconds). Raises :class:`ValueError` for a
         non-ISR pattern or an invalid value.
 
         The override is process-local copy-on-write state: the build
@@ -1434,7 +1598,7 @@ class App:
             raise BadRequest("ISR query values are too large")
         return selected
 
-    async def _render_isr_cached(self, pattern, params, query, key, policy=None):
+    async def _render_isr_cached(self, pattern, params, query, key, policy=None, tags=None):
         feed = _ISRStreamFeed()
 
         async def render():
@@ -1459,8 +1623,10 @@ class App:
 
         if policy is None:
             policy = self.get_isr_policy(pattern)
+        if tags is None:
+            tags = tuple(self.isr_tags.get(pattern, ()))
         task = asyncio.create_task(self.isr.get_or_render(
-            key, policy, render, tags=self.isr_tags.get(pattern, ())))
+            key, policy, render, tags=tags))
 
         def observe(done):
             # A streamed request stops awaiting this task before generation
@@ -1796,6 +1962,9 @@ class App:
             return asset_response(request, body, "image/webp", etag,
                                   cache_control=b"public, max-age=0, must-revalidate",
                                   extra_headers=[(b"x-content-type-options", b"nosniff")])
+        if path == "/_pynext/revalidate":
+            route_var.set("__revalidate__")
+            return await self._revalidate_webhook(request)
         if path == "/_pynext" or path.startswith("/_pynext/"):
             route_var.set("__client__")
             if path not in self.client_assets:
@@ -1907,7 +2076,9 @@ class App:
                         # declared policy.
                         policy = dev_retention_policy(policy)
                     try:
-                        body = await self._render_isr_cached(pattern, params, query, cache_key, policy)
+                        tags = (tuple(self.isr_tags.get(pattern, ())) +
+                                tuple(_implicit_path_tags(path)))
+                        body = await self._render_isr_cached(pattern, params, query, cache_key, policy, tags)
                     except CacheBusy:
                         self.metrics.observe_cache("busy")
                         self.metrics.observe_regeneration("failure")
@@ -2382,15 +2553,18 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
                cache_failure_policy=None, websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
                hot_reload=False,
-               trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None):
+               trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None,
+               revalidate_secret=None):
     root = Path(root).resolve()
     # .env files are loaded before the manifest is read or user code runs,
     # so server code, middleware and island bundling all see them.
     load_env(root, mode="production" if production else "development")
+    if revalidate_secret is None:
+        revalidate_secret = os.environ.get("PYNEXT_REVALIDATE_SECRET") or None
     return App(root, load_manifest(root) if production else discover(root), production=production,
                security=security, cache_backend=cache_backend, cache_path=cache_path,
                observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
                resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
                websocket_max_message=websocket_max_message, hot_reload=hot_reload,
-            trusted_proxies=trusted_proxies, sync_workers=sync_workers, strict_ssg=strict_ssg,
-            headers=headers)
+               trusted_proxies=trusted_proxies, sync_workers=sync_workers, strict_ssg=strict_ssg,
+               headers=headers, revalidate_secret=revalidate_secret)

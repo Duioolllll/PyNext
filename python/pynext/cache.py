@@ -26,6 +26,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -102,6 +103,82 @@ def dev_retention_policy(policy):
     return {"revalidate": revalidate, "stale": MIN_PRERENDERABLE_EXPIRE - revalidate}
 
 
+# Tag invalidation (on-demand revalidation) follows Next.js's timestamp
+# manifest: a tag maps to the wall-clock seconds when it was last marked
+# stale and when it was last expired. Entries generated before a tag's
+# timestamp are affected; entries generated after it are not, so an
+# invalidation never applies retroactively. A tag row only needs to
+# outlive the entries it can affect (at most two max lifetimes).
+MAX_ISR_TAGS_PER_PAGE = 32
+_TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./:-]{0,255}\Z")
+
+
+def validate_cache_tag(tag):
+    """Validate one cache tag name (``page(tags=...)`` / ``revalidate_tag``).
+
+    Tags are 1-256 characters of letters, digits, ``_``, ``.``, ``/``,
+    ``:`` or ``-``. Names starting with ``_pynext_`` are reserved for the
+    framework's implicit path/layout tags; using the prefix yourself
+    aliases those tags.
+    """
+    if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
+        raise ValueError(
+            f"Invalid cache tag {tag!r}: use 1-256 characters of letters, digits,"
+            " '_', '.', '/', ':' or '-'")
+    return tag
+
+
+def validate_cache_tags(tags):
+    """Validate a page's ``tags`` argument and return a sorted deduped list."""
+    if isinstance(tags, (str, bytes)) or not isinstance(tags, (tuple, list)):
+        raise ValueError("tags must be a list or tuple of tag names")
+    if len(tags) > MAX_ISR_TAGS_PER_PAGE:
+        raise ValueError(f"At most {MAX_ISR_TAGS_PER_PAGE} tags per page")
+    return sorted({validate_cache_tag(tag) for tag in tags})
+
+
+def _validate_entry_tags(tags):
+    """Validate the tags attached to a stored ISR entry; return a sorted tuple.
+
+    User tags follow :func:`pynext.components._validate_tags` (at most 64,
+    duplicates rejected, same error messages). Framework-reserved
+    ``_pynext_*`` tags — the implicit path/layout tags the app attaches
+    at request time (``_pynext_path_/blog``, ``_pynext_layout_...``) —
+    start with an underscore, which the user-tag validator rejects, so
+    they are validated with :func:`validate_cache_tag` instead, whose
+    charset allows the leading underscore. ``None`` means no tags.
+    """
+    if tags is None:
+        return ()
+    if isinstance(tags, str) or not isinstance(tags, (tuple, list)):
+        raise ValueError("tags must be a list or tuple of at most 64 ISR tags")
+    validated = []
+    for tag in tags:
+        if isinstance(tag, str) and tag.startswith("_pynext_"):
+            validated.append(validate_cache_tag(tag))
+        else:
+            validated.append(_validate_tag(tag))
+    if len(validated) > 64:
+        raise ValueError("tags must be a list or tuple of at most 64 ISR tags")
+    if len(set(validated)) != len(validated):
+        raise ValueError("Duplicate ISR tag")
+    return tuple(sorted(validated))
+
+
+def _validate_invalidation_tag(tag):
+    """Validate a tag passed to ``revalidate_tag`` / ``invalidate_tag``.
+
+    User tags follow :func:`pynext.components._validate_tag`; the
+    framework's own ``_pynext_*`` path/layout tags (attached by the app
+    at request time) start with an underscore, which that validator
+    rejects, so they go through :func:`validate_cache_tag` instead.
+    Same split as :func:`_validate_entry_tags`.
+    """
+    if isinstance(tag, str) and tag.startswith("_pynext_"):
+        return validate_cache_tag(tag)
+    return _validate_tag(tag)
+
+
 class CacheBusy(Exception):
     pass
 
@@ -136,6 +213,20 @@ class CacheBackend:
         Backends without a shared store may keep the record process-local.
         """
         raise NotImplementedError
+
+    def get_tag_times(self, tags):
+        """Return ``{tag: (stale_at, expired_at)}`` in wall-clock seconds.
+
+        A missing tag maps to ``(None, None)``. Backends that cannot
+        reach their store raise :class:`SharedCacheUnavailable`.
+        """
+        raise NotImplementedError
+
+    def update_tag(self, tag, stale_at=None, expired_at=None):
+        """Record a tag invalidation: ``stale_at``/``expired_at`` are
+        wall-clock seconds, or ``None`` to leave that field unchanged."""
+        raise NotImplementedError
+
     def keys(self):
         """Return the raw keys this backend currently stores.
 
@@ -171,12 +262,27 @@ def normalize_isr_policy(policy):
     meaning with ``expire = revalidate + stale``. The effective
     stale-while-revalidate window handed to backends is therefore
     ``expire - revalidate`` (see :func:`policy_windows`).
+
+    ``revalidate=False`` is on-demand-only: the entry never revalidates
+    by time and is regenerated only by an explicit ``revalidate()`` /
+    ``revalidate_tag()`` call. It normalizes to the longest lifetime a
+    backend accepts on every axis, so the stored stale window is zero
+    (``expire - revalidate == 0``); ``stale`` is validated and kept for
+    the record, and any ``expire`` is meaningless here.
     """
     if not isinstance(policy, dict):
         raise ValueError("ISR policy must be a dict")
     revalidate = policy.get("revalidate")
     stale = policy.get("stale")
     expire = policy.get("expire", None)
+    if revalidate is False:
+        if (isinstance(stale, bool) or not isinstance(stale, (int, float))
+                or stale != stale or stale < 0 or stale > MAX_CACHE_SECONDS):
+            raise ValueError(
+                f"stale must be a finite non-negative number of seconds,"
+                f" at most {int(MAX_CACHE_SECONDS)}")
+        return {"revalidate": MAX_CACHE_SECONDS, "stale": float(stale),
+                "expire": MAX_CACHE_SECONDS}
     for name, value, allow_zero in (("revalidate", revalidate, False), ("stale", stale, True)):
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or value != value or value < 0 or (not allow_zero and value == 0)
@@ -194,6 +300,11 @@ def normalize_isr_policy(policy):
         # Next.js serializes Infinity as the INFINITE_CACHE sentinel; here
         # the 1-year bound is the largest expressible hard cap.
         expire = MAX_CACHE_SECONDS
+    if float(revalidate) == MAX_CACHE_SECONDS and float(expire) == MAX_CACHE_SECONDS:
+        # On-demand-only encoding (from ``revalidate=False``): fresh for
+        # the longest lifetime, never stale by time (stale window 0).
+        return {"revalidate": float(revalidate), "stale": float(stale),
+                "expire": float(expire)}
     if expire <= float(revalidate):
         raise ValueError("expire must be greater than revalidate")
     return {"revalidate": float(revalidate), "stale": float(stale), "expire": float(expire)}
@@ -210,11 +321,22 @@ def policy_windows(policy):
     return normalized["revalidate"], normalized["expire"] - normalized["revalidate"]
 
 
+_MAX_L1_SECONDS = 604_800.0
+"""Longest single window the native L1 PageCache accepts.
+
+Must match the ``fresh_seconds > 604_800.0`` guard in
+``crates/pynext-native/src/lib.rs``; ISR policies run to
+``MAX_CACHE_SECONDS``, so longer entries are clamped here rather
+than rejected.
+"""
+
+
 class MemoryCacheBackend(CacheBackend):
     """The original process-local backend, backed by the Rust PageCache."""
 
     def __init__(self, store=None):
         self._store = store if store is not None else _native.PageCache()
+        self._tags = {}
 
     @property
     def store(self):
@@ -226,10 +348,31 @@ class MemoryCacheBackend(CacheBackend):
     def insert(self, key, body, fresh_seconds, stale_seconds, tags=()):
         # Tags are tracked by ISRCache for this process-local backend; the
         # Rust store holds only the entry itself.
-        return self._store.insert(key, body, fresh_seconds, stale_seconds)
+        # The native PageCache accepts at most _MAX_L1_SECONDS per window
+        # while ISR policies run to MAX_CACHE_SECONDS; clamp so a
+        # long-lived entry still caches locally for a week instead of
+        # raising (the shared backend, when one is configured, keeps the
+        # full lifetime). A non-numeric duration is not storable.
+        try:
+            fresh = min(float(fresh_seconds), _MAX_L1_SECONDS)
+            stale = min(float(stale_seconds), _MAX_L1_SECONDS)
+        except (TypeError, ValueError):
+            return False
+        try:
+            return self._store.insert(key, body, fresh, stale)
+        except ValueError:
+            return False
 
     def remove(self, key):
         return self._store.remove(key)
+
+    def get_tag_times(self, tags):
+        return {tag: self._tags.get(tag, (None, None)) for tag in tags}
+
+    def update_tag(self, tag, stale_at=None, expired_at=None):
+        old_stale, old_expired = self._tags.get(tag, (None, None))
+        self._tags[tag] = (stale_at if stale_at is not None else old_stale,
+                           expired_at if expired_at is not None else old_expired)
 
 
 class SharedEntry:
@@ -587,7 +730,7 @@ class SQLiteCacheBackend(CacheBackend):
         if not _valid_durations(fresh_seconds, stale_seconds):
             return False
         try:
-            tags = _validate_tags(tags)
+            tags = _validate_entry_tags(tags)
         except ValueError:
             return False
         with self._lock:
@@ -707,6 +850,60 @@ class SQLiteCacheBackend(CacheBackend):
             except sqlite3.Error:
                 log.warning("Shared cache tag invalidation failed for %s", tag, exc_info=True)
                 return False
+
+    def get_tag_times(self, tags):
+        """Return ``{tag: (stale_at, expired_at)}`` in wall-clock seconds.
+
+        A missing tag maps to ``(None, None)``.
+        """
+        with self._lock:
+            try:
+                out = {}
+                for tag in tags:
+                    row = self._conn.execute(
+                        "SELECT stale_at, expired_at FROM tags WHERE tag = ?", (tag,)
+                    ).fetchone()
+                    out[tag] = (row[0], row[1]) if row is not None else (None, None)
+                return out
+            except sqlite3.Error as exc:
+                raise SharedCacheUnavailable("Shared cache tag lookup failed") from exc
+
+    def update_tag(self, tag, stale_at=None, expired_at=None):
+        """Record a tag invalidation: ``stale_at``/``expired_at`` are
+        wall-clock seconds, or ``None`` to leave that field unchanged.
+
+        The tags table stores NOT NULL timestamps, so a brand-new row
+        fills a missing field from the other given timestamp; when
+        neither is given there is nothing to record. Older rows are
+        pruned like in :meth:`revalidate_tag`.
+        """
+        if stale_at is None and expired_at is None:
+            return
+        with self._lock:
+            try:
+                now = time.time()
+                row = self._conn.execute(
+                    "SELECT stale_at, expired_at FROM tags WHERE tag = ?", (tag,)
+                ).fetchone()
+                if row is None:
+                    new_stale = stale_at if stale_at is not None else expired_at
+                    new_expired = expired_at if expired_at is not None else stale_at
+                else:
+                    new_stale = stale_at if stale_at is not None else row[0]
+                    new_expired = expired_at if expired_at is not None else row[1]
+                self._conn.execute(
+                    "INSERT INTO tags (tag, stale_at, expired_at) VALUES (?, ?, ?)"
+                    " ON CONFLICT(tag) DO UPDATE SET stale_at=excluded.stale_at,"
+                    " expired_at=excluded.expired_at",
+                    (tag, new_stale, new_expired),
+                )
+                self._conn.execute(
+                    "DELETE FROM tags WHERE expired_at < ?", (now - 2 * MAX_CACHE_SECONDS,)
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                raise SharedCacheUnavailable("Shared cache tag update failed") from exc
+
     def keys(self):
         """Return every stored entry key plus every variant-generation key.
 
@@ -982,10 +1179,16 @@ class ISRCache:
         # started before a tag invalidation but stored after it must be
         # judged by when its content was produced, not when it landed.
         try:
+            # Entry tags are namespaced like keys: the tag manifest
+            # records invalidations under ``namespace + tag`` (see
+            # :meth:`revalidate_tag`), so stored tags must carry the
+            # same prefix or a cross-worker invalidation never matches
+            # them on lookup.
+            namespaced_tags = [self.namespace + tag for tag in tags]
             return await asyncio.to_thread(
                 self.shared.insert_fenced, self.namespace + key, body,
                 policy["revalidate"], policy["stale"], expected_version, owner,
-                tags, generated_at, generated_mono,
+                namespaced_tags, generated_at, generated_mono,
             )
         except Exception:
             log.warning("Shared cache insert failed for %s", key, exc_info=True)
@@ -1017,6 +1220,27 @@ class ISRCache:
                 # the shared store never saw it.
                 raise SharedCacheUnavailable("Shared cache invalidation failed") from exc
             log.warning("Shared cache remove failed for %s", key, exc_info=True)
+            return False
+
+
+    def _store_insert(self, key, body, fresh_seconds, stale_seconds):
+        """Insert into the process-local L1, clamping to its native cap.
+
+        The native PageCache accepts at most ``_MAX_L1_SECONDS`` per
+        window (see ``crates/pynext-native/src/lib.rs``) and raises
+        ValueError beyond it, while ISR policies run to
+        ``MAX_CACHE_SECONDS``; clamp so a long-lived entry still caches
+        locally for a week instead of failing the request. Returns False
+        when the entry cannot be stored.
+        """
+        try:
+            fresh = min(float(fresh_seconds), _MAX_L1_SECONDS)
+            stale = min(float(stale_seconds), _MAX_L1_SECONDS)
+        except (TypeError, ValueError):
+            return False
+        try:
+            return self.store.insert(key, body, fresh, stale)
+        except ValueError:
             return False
 
     def _remember_key_tags(self, key, tags):
@@ -1053,24 +1277,16 @@ class ISRCache:
                 stale = True
         return "stale" if stale else "fresh"
 
-    async def revalidate_tag(self, tag, expire=None):
-        """Invalidate every cached entry carrying ``tag``.
+    def _apply_tag_invalidation(self, tag, expire):
+        """Record ``tag`` in the process-local manifest and evict or
+        retire matching local entries.
 
-        ``expire=None`` expires matching entries immediately; ``expire``
-        seconds keeps them merely stale (served once more while a
-        regeneration runs in the background) until that delay passes.
-        Entries generated after this call are unaffected. Generations
-        already in flight for a matching key are retired so they cannot
-        refill the cache with pre-invalidation content. With a shared
-        backend the record is stored there, so other workers see it;
-        with the memory backend it is process-local. Returns True when
-        the invalidation was recorded.
+        Returns the number of local entries evicted plus in-flight
+        generations retired. A deferred ``expire`` demotes entries to
+        stale instead of evicting them, so it retires only in-flight
+        generations. Shared backends record the same invalidation in
+        their own manifest; this only touches process-local state.
         """
-        tag = _validate_tag(tag)
-        expire = _validate_tag_expire(expire)
-        if self._closed:
-            raise CacheBusy("ISR cache is shutting down")
-        self._check_loop()
         now = time.time()
         self._tag_manifest[tag] = (now, now if expire is None else now + expire)
         # The process-local manifest is the memory backend's copy of the
@@ -1084,11 +1300,34 @@ class ISRCache:
         for old_tag in [t for t, (_, expired_at) in self._tag_manifest.items()
                         if expired_at < cutoff]:
             del self._tag_manifest[old_tag]
+        evicted = 0
         for key, tags in list(self._key_tags.items()):
             if tag in tags:
-                self._inflight.pop(key, None)
-                if expire is None:
-                    self.store.remove(key)
+                if self._inflight.pop(key, None) is not None:
+                    evicted += 1
+                if expire is None and self.store.remove(key):
+                    evicted += 1
+        return evicted
+
+    async def revalidate_tag(self, tag, expire=None):
+        """Invalidate every cached entry carrying ``tag``.
+
+        ``expire=None`` expires matching entries immediately; ``expire``
+        seconds keeps them merely stale (served once more while a
+        regeneration runs in the background) until that delay passes.
+        Entries generated after this call are unaffected. Generations
+        already in flight for a matching key are retired so they cannot
+        refill the cache with pre-invalidation content. With a shared
+        backend the record is stored there, so other workers see it;
+        with the memory backend it is process-local. Returns True when
+        the invalidation was recorded.
+        """
+        tag = _validate_invalidation_tag(tag)
+        expire = _validate_tag_expire(expire)
+        if self._closed:
+            raise CacheBusy("ISR cache is shutting down")
+        self._check_loop()
+        self._apply_tag_invalidation(tag, expire)
         if self.shared is None:
             return True
         try:
@@ -1099,6 +1338,34 @@ class ISRCache:
                 raise SharedCacheUnavailable("Shared cache tag invalidation failed") from exc
             log.warning("Shared cache tag invalidation failed for %s", tag, exc_info=True)
             return False
+
+    async def invalidate_tag(self, tag, *, expire=None):
+        """Invalidate every cached entry carrying ``tag`` (on-demand).
+
+        Same recording as :meth:`revalidate_tag`, but returns the number
+        of entries evicted from this worker's local cache (stored entries
+        plus generations retired mid-render) instead of a boolean.
+        Entries held by other workers are caught by the shared tag
+        manifest on their next lookup, so the count is a local lower
+        bound, not a global total. A deferred ``expire`` demotes entries
+        to stale instead of evicting them, so it returns 0 for stored
+        entries (in-flight generations are still retired).
+        """
+        tag = _validate_invalidation_tag(tag)
+        expire = _validate_tag_expire(expire)
+        if self._closed:
+            raise CacheBusy("ISR cache is shutting down")
+        self._check_loop()
+        evicted = self._apply_tag_invalidation(tag, expire)
+        if self.shared is not None:
+            try:
+                await asyncio.to_thread(
+                    self.shared.revalidate_tag, self.namespace + tag, expire)
+            except Exception as exc:
+                if self.failure_policy == FAIL_CLOSED:
+                    raise SharedCacheUnavailable("Shared cache tag invalidation failed") from exc
+                log.warning("Shared cache tag invalidation failed for %s", tag, exc_info=True)
+        return evicted
 
     async def invalidate(self, key):
         """Remove ``key`` from the local cache and, when configured, the shared store.
@@ -1251,7 +1518,14 @@ class ISRCache:
         while len(self._key_generated_at) > _MAX_LOCAL_VARIANT_PATHS:
             self._key_generated_at.popitem(last=False)
 
-    async def get_or_render(self, key, policy, render, tags=()):
+    async def get_or_render(self, key, policy, render, *, tags=None):
+        """Serve ``key`` from cache or render it once.
+
+        ``tags`` are the cache tags the generated entry is stored with;
+        when omitted they default to ``policy["tags"]`` (page tags
+        passed through the policy dict). Tag invalidation judges the
+        entry against these tags.
+        """
         loop = asyncio.get_running_loop()
         if self._closed:
             raise CacheBusy("ISR cache is shutting down")
@@ -1259,13 +1533,18 @@ class ISRCache:
             self._loop = loop
         elif self._loop is not loop:
             raise RuntimeError("An ISR app instance must use a single event loop")
-        tags = _validate_tags(tags)
+        if tags is None:
+            # Tags may ride in the policy dict (page tags); an explicit
+            # argument wins.
+            tags = policy.get("tags", ())
+        tags = _validate_entry_tags(tags)
         self._remember_key_tags(key, tags)
         # Normalize to the 3-axis policy, then hand the backends the two
         # windows they store: fresh_for = revalidate, stale_for =
         # expire - revalidate, so the SWR window runs up to the hard cap.
         # A pre-expire 2-key policy keeps its old meaning
-        # (expire = revalidate + stale).
+        # (expire = revalidate + stale). A revalidate=False policy
+        # normalizes to the longest lifetime (see normalize_isr_policy).
         fresh_for, stale_for = policy_windows(policy)
         policy = {"revalidate": fresh_for, "stale": stale_for}
         if not key.startswith("\0isr:"):
@@ -1320,7 +1599,7 @@ class ISRCache:
                     entry = await self._shared_entry(key)
                     if entry is not _SHARED_UNAVAILABLE and entry is not None and entry.status == "fresh":
                         if self._inflight.get(key) is asyncio.current_task():
-                            self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                            self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
                         return entry.body
                 response = await render()
                 if response.status != 200:
@@ -1340,7 +1619,7 @@ class ISRCache:
                         # Do not populate L1 after a shared write was rejected
                         # or after this app invalidated the running task.
                         if shared_stored and self._inflight.get(key) is asyncio.current_task():
-                            if self.store.insert(key, response.body, policy["revalidate"], policy["stale"]):
+                            if self._store_insert(key, response.body, policy["revalidate"], policy["stale"]):
                                 self._remember_key_generated(key, started_at)
                             else:
                                 log.warning("ISR cache insert failed for %s; page was served but not cached", key)
@@ -1372,7 +1651,7 @@ class ISRCache:
         if entry is not None and entry.status == "fresh":
             # Keep a local fallback for shared-store outages. Shared mode
             # still validates each hit against the authoritative store.
-            self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+            self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
             return entry.body
         task = self._inflight.get(key)
         if task is not None:
@@ -1419,7 +1698,7 @@ class ISRCache:
                 outcome, payload = await self._wait_for_shared(key, GENERATION_TIMEOUT)
                 if outcome == "fresh":
                     entry = payload
-                    self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                    self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
                     return entry.body
                 if outcome == "lease":
                     version, owner = payload
