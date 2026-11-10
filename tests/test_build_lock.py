@@ -36,10 +36,10 @@ _USAGE = namedtuple("usage", "total used free")
 # "locked" once it owns it. Runs with the test venv's python, where
 # pynext is installed.
 _HOLDER_SCRIPT = (
-    "import sys, time\n"
+    "import os, sys, time\n"
     "from pynext.build import BuildLock\n"
     "with BuildLock(sys.argv[1]):\n"
-    "    print('locked', flush=True)\n"
+    "    print(f'locked {os.getpid()}', flush=True)\n"
     "    time.sleep(float(sys.argv[2]))\n"
 )
 
@@ -107,16 +107,58 @@ def test_cross_process_build_lock_waits_then_succeeds(tmp_path):
         [sys.executable, "-c", _HOLDER_SCRIPT, str(tmp_path), "2"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
-        assert holder.stdout.readline().strip() == "locked"
-        holder_pid = int((tmp_path / ".pynext" / ".build.lock").read_text(encoding="utf-8").strip())
-        assert holder_pid == holder.pid
+        # The holder reports its own pid: on Windows the venv python.exe
+        # is a redirector that spawns the real interpreter as a child, so
+        # holder.pid (the redirector) is not the pid holding the lock.
+        # The lock file records the real holder pid (os.getpid() inside
+        # the holder), so compare against the printed pid, not holder.pid.
+        locked_line = holder.stdout.readline().strip()
+        assert locked_line.startswith("locked ")
+        holder_pid = int(locked_line.split()[1])
+        lock_pid = int((tmp_path / ".pynext" / ".build.lock").read_text(encoding="utf-8").strip())
+        assert lock_pid == holder_pid
         with pytest.raises(BuildLockError) as excinfo:
             write_manifest(tmp_path, lock_timeout=0)
-        assert str(holder.pid) in str(excinfo.value)
+        assert str(holder_pid) in str(excinfo.value)
         manifest = write_manifest(tmp_path, lock_timeout=10)
         assert manifest["static_pages"]
     finally:
         holder.wait(timeout=10)
+
+
+def test_cross_process_build_lock_pid_matches_real_holder_not_launcher(tmp_path):
+    """The lock file must record the real holder pid, not a launcher pid.
+
+    Regression: on Windows the venv python.exe is a redirector that spawns
+    the real interpreter as a child, so Popen(...).pid (the redirector)
+    differs from os.getpid() inside the holder (the real interpreter).
+    The holder reports its own pid in the "locked" line; the lock file
+    must match that pid. This test simulates the redirector on any
+    platform by spawning the holder through a wrapper process, so the
+    failure reproduces on Linux too if the test ever goes back to
+    comparing against the Popen pid.
+    """
+    make_app(tmp_path)
+    launcher_script = tmp_path / "launcher.py"
+    launcher_script.write_text(
+        "import subprocess, sys\n"
+        "child = subprocess.Popen(\n"
+        "    [sys.executable, '-c', " + repr(_HOLDER_SCRIPT) + ", sys.argv[1], sys.argv[2]])\n"
+        "sys.exit(child.wait())\n",
+        encoding="utf-8")
+    launcher = subprocess.Popen(
+        [sys.executable, str(launcher_script), str(tmp_path), "2"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        locked_line = launcher.stdout.readline().strip()
+        assert locked_line.startswith("locked ")
+        holder_pid = int(locked_line.split()[1])
+        # The launcher pid is a different process than the real holder.
+        assert launcher.pid != holder_pid
+        lock_pid = int((tmp_path / ".pynext" / ".build.lock").read_text(encoding="utf-8").strip())
+        assert lock_pid == holder_pid
+    finally:
+        launcher.wait(timeout=10)
 
 
 def test_precheck_rejects_low_disk_space(tmp_path, monkeypatch):
@@ -279,7 +321,7 @@ def test_cli_build_lock_timeout_reaches_subprocess(tmp_path):
         [sys.executable, "-c", _HOLDER_SCRIPT, str(tmp_path), "5"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
-        assert holder.stdout.readline().strip() == "locked"
+        assert holder.stdout.readline().strip().startswith("locked")
         result = subprocess.run(
             [sys.executable, "-m", "pynext.cli", "build", "--dir", str(tmp_path),
              "--lock-timeout", "0"],
