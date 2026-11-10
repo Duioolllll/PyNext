@@ -396,7 +396,10 @@ def normalize_isr_policy(policy):
         # the longest lifetime, never stale by time (stale window 0).
         return {"revalidate": float(revalidate), "stale": float(stale),
                 "expire": float(expire)}
-    if expire <= float(revalidate):
+    # A zero stale window (``stale=0``) legitimately yields
+    # ``expire == revalidate``; any other expire at or below revalidate
+    # is malformed (inconsistent with a positive stale window).
+    if expire < float(revalidate) or (expire == float(revalidate) and float(stale) != 0.0):
         raise ValueError("expire must be greater than revalidate")
     return {"revalidate": float(revalidate), "stale": float(stale), "expire": float(expire)}
 
@@ -679,8 +682,16 @@ class SharedCacheHandler(CacheHandler):
         """Like ``lookup`` but returns a versioned :class:`SharedEntry`."""
 
     @abstractmethod
-    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
-        """Store ``body`` only if the version/lease fences still hold."""
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
+        """Store ``body`` only if the version/lease fences still hold.
+
+        ``tags`` are attached to the entry so a later tag revalidation
+        can retire it; ``generated_at`` / ``generated_mono`` stamp it
+        with the render *start* time instead of the insert time (see
+        :meth:`SQLiteCacheBackend.insert_fenced`). Handlers whose store
+        has no monotonic clock may ignore ``generated_mono``.
+        """
 
     @abstractmethod
     def acquire_lease(self, key, owner, ttl=LEASE_TTL):
@@ -1034,9 +1045,11 @@ class SQLiteCacheHandler(SharedCacheHandler):
     def lookup_entry(self, key):
         return self.backend.lookup_entry(key)
 
-    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
         return self.backend.insert_fenced(key, body, fresh_seconds, stale_seconds,
-                                          expected_version, owner)
+                                          expected_version, owner, tags, generated_at,
+                                          generated_mono)
 
     def acquire_lease(self, key, owner, ttl=LEASE_TTL):
         return self.backend.acquire_lease(key, owner, ttl)
@@ -1214,9 +1227,11 @@ class RedisCacheHandler(SharedCacheHandler):
     def lookup_entry(self, key):
         return self.backend.lookup_entry(key)
 
-    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
         return self.backend.insert_fenced(key, body, fresh_seconds, stale_seconds,
-                                          expected_version, owner)
+                                          expected_version, owner, tags, generated_at,
+                                          generated_mono)
 
     def acquire_lease(self, key, owner, ttl=LEASE_TTL):
         return self.backend.acquire_lease(key, owner, ttl)
@@ -1966,6 +1981,22 @@ class _PlainHandlerSharedAdapter(SharedCacheHandler):
         self._versions = {}      # key -> int
         self._leases = {}        # key -> (owner, expires_at)
         self._generations = {}   # key -> (token, expires_at)
+        # Local entry metadata (key -> (tags, generated_at, generated_mono)):
+        # the wrapped handler's ``set`` takes a CacheEntry, whose
+        # ``tags``/``timestamp`` fields carry the tags and the render-start
+        # time — but handlers are free to re-stamp the write time (the
+        # built-in memory handler and the test dict handler both do), so
+        # the render-start instant is also kept here. ``lookup_entry``
+        # judges the entry by it, mirroring the SQLite backend's
+        # ``generated_at`` tag check. ``generated_mono`` has no CacheEntry
+        # field and no wall-clock consumer here; it is recorded for
+        # parity with the shared backends.
+        self._entry_meta = {}
+        # Mirror of the tag revalidation instants recorded through this
+        # adapter (same semantics as :class:`_TagManifest`): the handler
+        # classifies by its own write time, so the mirror lets
+        # ``lookup_entry`` re-judge by the render-start time instead.
+        self._tags = _TagManifest()
 
     # -- CacheHandler contract (delegated) -------------------------------
     def get(self, key, soft_tags=()):
@@ -1978,13 +2009,18 @@ class _PlainHandlerSharedAdapter(SharedCacheHandler):
         with self._lock:
             self._versions.pop(key, None)
             self._leases.pop(key, None)
+            self._entry_meta.pop(key, None)
         return self.handler.remove(key)
 
     def get_expiration(self, tags):
         return self.handler.get_expiration(tags)
 
     def update_tags(self, tags, durations=None):
-        return self.handler.update_tags(tags, durations)
+        result = self.handler.update_tags(tags, durations)
+        # Mirror the invalidation locally so lookup_entry can judge
+        # entries by their render-start time (see _entry_meta).
+        self._tags.update(tags, durations)
+        return result
 
     def refresh_tags(self):
         return self.handler.refresh_tags()
@@ -2002,29 +2038,72 @@ class _PlainHandlerSharedAdapter(SharedCacheHandler):
             return None
         with self._lock:
             version = self._versions.get(key, 0)
-        shared = _shared_entry_from_cache_entry(entry)
+            meta = self._entry_meta.get(key)
+        if meta is None:
+            shared = _shared_entry_from_cache_entry(entry)
+            shared.version = version
+            return shared
+        # Re-judge by the render-start time: the handler classified the
+        # entry by its own write time, so a generation that started
+        # before a tag invalidation but landed after it would look fresh
+        # to the handler. The local tag check can only demote (fresh ->
+        # stale/expired), never promote — an entry the handler already
+        # calls stale or expired stays that way.
+        tags, generated_at, _generated_mono = meta
+        now = time.time()
+        tag_state = _tag_status(tags, self._tags.times(tags) if tags else {},
+                                generated_at, now)
+        if tag_state == "expired":
+            return SharedEntry("expired", None, version, 0.0, 0.0)
+        if tag_state == "stale" or entry.tag_state == "stale":
+            tag_state = "stale"
+        else:
+            tag_state = entry.tag_state
+        corrected = CacheEntry(value=entry.value, tags=entry.tags, stale=entry.stale,
+                               timestamp=generated_at, expire=entry.expire,
+                               revalidate=entry.revalidate, tag_state=tag_state)
+        shared = _shared_entry_from_cache_entry(corrected)
         shared.version = version
         return shared
 
-    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
+        """Store ``body`` only if the version/lease fences still hold.
+
+        Tags and the render-start time travel in the :class:`CacheEntry`
+        handed to the wrapped handler (``tags`` / ``timestamp``), and
+        are also recorded in :attr:`_entry_meta`: handlers may re-stamp
+        the write time on ``set``, so the local record is what
+        :meth:`lookup_entry` judges freshness and tag staleness by —
+        the same role ``generated_at`` plays in
+        :meth:`SQLiteCacheBackend.insert_fenced`.
+        """
         if len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES or len(body) > MAX_CACHE_BODY_BYTES:
             return False
         if not _valid_durations(fresh_seconds, stale_seconds):
             return False
+        try:
+            tags = _validate_entry_tags(tags)
+        except ValueError:
+            return False
+        now = time.time()
+        gen_at = generated_at if generated_at is not None else now
+        gen_mono = generated_mono if generated_mono is not None else time.monotonic()
         with self._lock:
-            now = time.monotonic()
+            now_mono = time.monotonic()
             if owner is not None:
                 lease = self._leases.get(key)
-                if lease is None or lease[0] != owner or lease[1] <= now:
+                if lease is None or lease[0] != owner or lease[1] <= now_mono:
                     return False
             version = self._versions.get(key, 0)
             if expected_version is not None and version != expected_version:
                 return False
-            entry = CacheEntry(value=bytes(body), revalidate=float(fresh_seconds),
-                               stale=float(stale_seconds))
+            entry = CacheEntry(value=bytes(body), tags=tags, revalidate=float(fresh_seconds),
+                               stale=float(stale_seconds), timestamp=gen_at)
             if not self.handler.set(key, entry):
                 return False
             self._versions[key] = version + 1
+            self._entry_meta[key] = (tags, gen_at, gen_mono)
             return True
 
     def acquire_lease(self, key, owner, ttl=LEASE_TTL):

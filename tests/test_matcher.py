@@ -14,7 +14,7 @@ import pytest
 
 from pynext import (HeaderRule, Matcher, Response, ScopedMiddleware, create_app,
                     scoped_middleware)
-from pynext.build import write_manifest
+from pynext.build import BuildError, write_manifest
 from pynext.matcher import (compile_has_condition, compile_header_rules,
                             compile_matcher, compile_middleware_entries,
                             compile_scope)
@@ -358,10 +358,18 @@ def test_scoped_middleware_has_and_missing_conditions(tmp_path):
 
 
 def test_header_rules_apply_in_order_handler_wins(tmp_path):
+    # NB: create_app headers= are compiled twice — by compile_path_headers
+    # (router grammar: no '*' globs, see tests/test_path_headers.py) and by
+    # compile_header_rules (matcher grammar) — so sources here use the
+    # router grammar. '/api/[[...slug]]' matches '/api' itself plus any
+    # depth below, exactly like the matcher glob '/api/*'; '[...slug]'
+    # would NOT match '/api' itself. '*' globs stay valid for
+    # compile_matcher, scoped_middleware scopes and middleware.py HEADERS,
+    # which only go through the matcher grammar.
     make_project(tmp_path)
     app = create_app(tmp_path, production=True, headers=[
-        ("/api/*", {"Cache-Control": "no-store", "X-Rule": "first"}),
-        ("/api/*", {"X-Rule": "second", "X-Second": "yes"}),
+        ("/api/[[...slug]]", {"Cache-Control": "no-store", "X-Rule": "first"}),
+        ("/api/[[...slug]]", {"X-Rule": "second", "X-Second": "yes"}),
         ("/", {"X-Home": "1"}),
     ])
 
@@ -385,7 +393,7 @@ def test_header_rules_apply_in_order_handler_wins(tmp_path):
 def test_header_rule_does_not_overwrite_handler_header(tmp_path):
     make_project(tmp_path)
     app = create_app(tmp_path, production=True, headers=[
-        ("/api/*", {"X-Handler": "rule"}),
+        ("/api/[[...slug]]", {"X-Handler": "rule"}),
     ])
 
     async def run():
@@ -419,7 +427,7 @@ def test_header_rule_csp_replaces_default_but_not_explicit(tmp_path):
     )
     write_manifest(tmp_path)
     app = create_app(tmp_path, production=True, headers=[
-        ("/*", {"Content-Security-Policy": "default-src 'self'"}),
+        ("/[[...slug]]", {"Content-Security-Policy": "default-src 'self'"}),
     ])
 
     async def run():
@@ -437,7 +445,7 @@ def test_header_rules_apply_to_static_assets_and_404(tmp_path):
     make_project(tmp_path)
     app = create_app(tmp_path, production=True, headers=[
         ("/file.txt", {"X-Asset": "yes"}),
-        ("/*", {"X-Every": "yes"}),
+        ("/[[...slug]]", {"X-Every": "yes"}),
     ])
 
     async def run():
@@ -502,7 +510,12 @@ def test_invalid_middleware_py_headers_fail_startup(tmp_path):
 
 
 def test_invalid_middleware_py_middleware_fails_startup(tmp_path):
-    with pytest.raises(TypeError):
+    # write_manifest wraps any render-stage failure in BuildError (which
+    # subclasses ValueError), so a bad MIDDLEWARE entry surfaces as a
+    # BuildError naming the render stage, not the raw TypeError — same as
+    # the invalid-HEADERS case above, which passes only because BuildError
+    # is a ValueError. Match on the message to keep the cause precise.
+    with pytest.raises(BuildError, match="middleware entries must be async callables"):
         make_project(tmp_path, middleware_py='MIDDLEWARE = [lambda r, n: None]\n')
 
 
@@ -517,7 +530,7 @@ def test_scoped_middleware_and_headers_on_both_transports(tmp_path, mode):
 
     app = create_app(tmp_path, production=True,
                      middleware=[scoped_middleware(api_only, match="/api/*")],
-                     headers=[("/api/*", {"Cache-Control": "no-store"})])
+                     headers=[("/api/[[...slug]]", {"Cache-Control": "no-store"})])
 
     async def run():
         server = None
