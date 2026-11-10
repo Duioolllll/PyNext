@@ -68,7 +68,15 @@ class BuildLockError(BuildError):
 
 
 def _flock_nonblocking(file):
-    """Take an exclusive, non-blocking lock on an open file. True when taken."""
+    """Take an exclusive, non-blocking lock on an open file. True when taken.
+
+    The lock always covers byte 0: on Windows ``msvcrt.locking`` locks
+    the range starting at the current file position (unlike POSIX
+    ``flock``, which locks the whole file), so the position is pinned
+    first — otherwise the lock and the later unlock would target
+    different bytes and the unlock would fail.
+    """
+    file.seek(0)
     if fcntl is not None:
         try:
             fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -84,6 +92,15 @@ def _flock_nonblocking(file):
 
 
 def _funlock(file):
+    """Release the lock taken by :func:`_flock_nonblocking`.
+
+    Seeks to byte 0 first, for the same reason as the lock: the unlock
+    must target the byte the lock was taken on. Unlocking the range at
+    the end of the written pid (where the position sits after
+    ``__enter__``) raises Permission denied on Windows, because that
+    range was never locked.
+    """
+    file.seek(0)
     if fcntl is not None:
         fcntl.flock(file.fileno(), fcntl.LOCK_UN)
     else:

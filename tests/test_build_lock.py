@@ -4,6 +4,7 @@ Next.js reference: ``build/index.ts`` — ``isWriteable``,
 ``Lockfile.acquireWithRetriesOrExit``, per-stage separation, and the
 build id recorded last so a failed build never looks complete.
 """
+import errno
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+import pynext.build as build_module
 from pynext import cli
 from pynext.build import (
     BuildError,
@@ -293,3 +295,109 @@ def test_cli_rejects_negative_lock_timeout(monkeypatch, capsys):
         cli.main()
     assert error.value.code == 2
     assert "--lock-timeout" in capsys.readouterr().err
+
+
+# --- Windows byte-range lock regression --------------------------------
+# ``msvcrt.locking`` locks a byte range starting at the CURRENT file
+# position, unlike POSIX ``flock`` which locks the whole file.
+# BuildLock used to take the lock at the "a+" open position (EOF) but
+# release it at the end of the pid it wrote, so on Windows the release
+# raised Permission denied and a second build could take a different,
+# free byte instead of being blocked. The fake below reproduces real
+# Windows semantics on any platform, so these tests fail on the old
+# code and pass on the fixed code everywhere.
+
+
+class _FakeWindowsLocking:
+    """Fake ``msvcrt`` with real Windows byte-range lock semantics.
+
+    ``locking(fd, mode, nbytes)`` locks or unlocks ``nbytes`` starting
+    at the file's current position. Locking an already locked byte and
+    unlocking a byte that was never locked both fail with EACCES
+    (Permission denied), like the CRT's ``_locking``.
+    """
+
+    LK_NBLCK = 0
+    LK_UNLCK = 1
+
+    def __init__(self):
+        self._locked = {}
+        self.lock_positions = []
+        self.unlock_positions = []
+
+    @staticmethod
+    def _key(fd):
+        stat = os.fstat(fd)
+        return (stat.st_dev, stat.st_ino)
+
+    def locking(self, fd, mode, nbytes):
+        position = os.lseek(fd, 0, os.SEEK_CUR)
+        locked = self._locked.setdefault(self._key(fd), set())
+        wanted = set(range(position, position + nbytes))
+        if mode == self.LK_NBLCK:
+            self.lock_positions.append(position)
+            if wanted & locked:
+                raise OSError(errno.EACCES, "Permission denied")
+            locked |= wanted
+        elif mode == self.LK_UNLCK:
+            self.unlock_positions.append(position)
+            if not wanted <= locked:
+                raise OSError(errno.EACCES, "Permission denied")
+            locked -= wanted
+        else:  # pragma: no cover - invalid mode
+            raise ValueError(mode)
+
+
+@pytest.fixture
+def windows_locking(monkeypatch):
+    fake = _FakeWindowsLocking()
+    monkeypatch.setattr(build_module, "fcntl", None)
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    return fake
+
+
+def test_windows_build_lock_releases_without_permission_denied(tmp_path, windows_locking):
+    """Acquiring and releasing the lock on a fresh file must not raise.
+
+    Regression: the lock used to be taken at the "a+" open position
+    (EOF, byte 0 for a fresh file) but released at the end of the
+    written pid, so Windows raised Permission denied in ``__exit__``.
+    """
+    with BuildLock(tmp_path):
+        pass
+    # Re-acquiring right after release works: the lock is really gone.
+    with BuildLock(tmp_path, timeout=0):
+        pass
+    assert windows_locking.lock_positions == [0, 0]
+    assert windows_locking.unlock_positions == [0, 0]
+
+
+def test_windows_second_build_is_blocked(tmp_path, windows_locking):
+    """A second build must see the lock, not take a different byte.
+
+    Regression: the second build used to lock at its own "a+" open
+    position (EOF, past the first build's pid), a byte nobody held,
+    so mutual exclusion silently broke on Windows.
+    """
+    with BuildLock(tmp_path):
+        with pytest.raises(BuildLockError):
+            with BuildLock(tmp_path, timeout=0):
+                pass
+
+
+def test_windows_build_lock_with_stale_pid_of_other_length(tmp_path, windows_locking):
+    """Release must work when the lock file held a pid of another length.
+
+    The stale pid is deliberately longer than this process's pid, so
+    the acquire and release positions only coincide when both are
+    pinned to byte 0.
+    """
+    lock_path = tmp_path / ".pynext" / ".build.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("9" * (len(str(os.getpid())) + 3), encoding="utf-8")
+    with BuildLock(tmp_path):
+        assert lock_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+    with BuildLock(tmp_path, timeout=0):
+        pass
+    assert windows_locking.lock_positions == [0, 0]
+    assert windows_locking.unlock_positions == [0, 0]
