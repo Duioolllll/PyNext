@@ -35,6 +35,20 @@ DEFAULT_HEADER_READ_TIMEOUT_MS = DEFAULT_CONFIG.header_read_timeout_ms
 # 2-second grace window (see read_limited_body in the native crate). 0
 # disables the rate check; the whole-body timeout still applies.
 DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC = DEFAULT_CONFIG.body_min_rate_bytes_per_sec
+# S-P1-14: a streaming response is cut off after this many seconds in
+# total, even if every chunk arrives inside the 30s per-chunk timeout
+# (see streaming_body in the native crate). 0 disables the cap.
+DEFAULT_STREAMING_MAX_LIFETIME_SECS = DEFAULT_CONFIG.streaming_max_lifetime_secs
+# S-P1-15: at most this many concurrent body slots per client IP, inside
+# the global body_capacity (16 by default).
+DEFAULT_BODY_CAPACITY_PER_IP = DEFAULT_CONFIG.body_capacity_per_ip
+# S-P1-16: an idle WebSocket session is closed after this long, a session
+# never lives longer than ws_max_lifetime_secs, and the server pings an
+# idle session every ws_ping_interval_secs (unanswered for 10s: close).
+# 0 disables each timeout/ping.
+DEFAULT_WS_IDLE_TIMEOUT_SECS = DEFAULT_CONFIG.ws_idle_timeout_secs
+DEFAULT_WS_MAX_LIFETIME_SECS = DEFAULT_CONFIG.ws_max_lifetime_secs
+DEFAULT_WS_PING_INTERVAL_SECS = DEFAULT_CONFIG.ws_ping_interval_secs
 # Upper bounds for the server limits (review #4 #5). The CLI enforces
 # these at parse time; start_native enforces them again so a direct
 # Python caller cannot smuggle a value past the CLI that overflows the
@@ -47,6 +61,9 @@ MAX_CONNECTIONS = 1_000_000
 MAX_CONNECTIONS_PER_IP = 1_000_000
 MAX_TIMEOUT_MS = 86_400_000  # 24 hours in milliseconds
 MAX_BODY_MIN_RATE_BYTES_PER_SEC = 1_000_000_000  # 1 GiB/s
+MAX_STREAMING_LIFETIME_SECS = 86400  # 24 hours in seconds
+MAX_BODY_CAPACITY_PER_IP = 1_000_000
+MAX_WS_TIMEOUT_SECS = 86400  # 24 hours in seconds
 MAX_SHUTDOWN_TIMEOUT = 3600  # seconds
 _CANCEL_POLL_SECONDS = 0.05
 _WS_QUEUE_SIZE = 32
@@ -314,7 +331,10 @@ class _NativeStream:
 def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
                             body_capacity, body_timeout_ms, max_connections,
                             max_connections_per_ip, header_read_timeout_ms,
-                            body_min_rate_bytes_per_sec, shutdown_timeout):
+                            body_min_rate_bytes_per_sec, shutdown_timeout,
+                            streaming_max_lifetime_secs=300, body_capacity_per_ip=4,
+                            ws_idle_timeout_secs=300, ws_max_lifetime_secs=3600,
+                            ws_ping_interval_secs=60):
     """Reject server limits that cannot reach the native server safely.
 
     Counts and timeouts cross into Rust as usize/u64/f64: a value past
@@ -334,6 +354,13 @@ def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
         ("header_read_timeout_ms", header_read_timeout_ms, 0, MAX_TIMEOUT_MS),
         ("body_min_rate_bytes_per_sec", body_min_rate_bytes_per_sec, 0,
          MAX_BODY_MIN_RATE_BYTES_PER_SEC),
+        ("streaming_max_lifetime_secs", streaming_max_lifetime_secs, 0,
+         MAX_STREAMING_LIFETIME_SECS),
+        ("body_capacity_per_ip", body_capacity_per_ip, 1,
+         MAX_BODY_CAPACITY_PER_IP),
+        ("ws_idle_timeout_secs", ws_idle_timeout_secs, 0, MAX_WS_TIMEOUT_SECS),
+        ("ws_max_lifetime_secs", ws_max_lifetime_secs, 0, MAX_WS_TIMEOUT_SECS),
+        ("ws_ping_interval_secs", ws_ping_interval_secs, 0, MAX_WS_TIMEOUT_SECS),
     )
     for name, value, minimum, maximum in counts:
         if value is None:
@@ -352,7 +379,12 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                  max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                  header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                  body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
-                 shutdown_timeout=30.0, max_waiting=None):
+                 shutdown_timeout=30.0, max_waiting=None,
+                 streaming_max_lifetime_secs=DEFAULT_STREAMING_MAX_LIFETIME_SECS,
+                 body_capacity_per_ip=DEFAULT_BODY_CAPACITY_PER_IP,
+                 ws_idle_timeout_secs=DEFAULT_WS_IDLE_TIMEOUT_SECS,
+                 ws_max_lifetime_secs=DEFAULT_WS_MAX_LIFETIME_SECS,
+                 ws_ping_interval_secs=DEFAULT_WS_PING_INTERVAL_SECS):
     """Start the native server and return its handle.
 
     Overload policy (roadmap C7): bounded wait, then reject. At most
@@ -367,11 +399,22 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
     A 503 after the full wait carries ``Retry-After`` of
     ``ceil(acquire_timeout_ms / 1000)`` seconds (at least 1); a 503 for
     a full wait queue carries ``Retry-After: 1``.
+
+    DoS defences (S-P1-14/15/16): ``streaming_max_lifetime_secs`` caps
+    the total lifetime of one streaming response (0 disables);
+    ``body_capacity_per_ip`` caps concurrent body slots per client IP
+    inside the global ``body_capacity``; ``ws_idle_timeout_secs`` closes
+    an idle WebSocket session, ``ws_max_lifetime_secs`` caps a session's
+    total lifetime, and ``ws_ping_interval_secs`` pings idle sessions
+    (unanswered for 10s: close) — 0 disables each.
     """
     _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
                             body_capacity, body_timeout_ms, max_connections,
                             max_connections_per_ip, header_read_timeout_ms,
-                            body_min_rate_bytes_per_sec, shutdown_timeout)
+                            body_min_rate_bytes_per_sec, shutdown_timeout,
+                            streaming_max_lifetime_secs, body_capacity_per_ip,
+                            ws_idle_timeout_secs, ws_max_lifetime_secs,
+                            ws_ping_interval_secs)
     if observability is not None:
         app.configure_observability(observability)
     app.metrics.observe_worker_start()
@@ -559,6 +602,11 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                                 max_connections_per_ip=max_connections_per_ip,
                                 header_read_timeout_ms=header_read_timeout_ms,
                                 body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
+                                streaming_max_lifetime_secs=streaming_max_lifetime_secs,
+                                body_capacity_per_ip=body_capacity_per_ip,
+                                ws_idle_timeout_secs=ws_idle_timeout_secs,
+                                ws_max_lifetime_secs=ws_max_lifetime_secs,
+                                ws_ping_interval_secs=ws_ping_interval_secs,
                                 websocket_paths=sorted(app.websocket_routes),
                                 websocket_callback=ws_callback,
                                 websocket_origin_callback=ws_origin_callback,
@@ -587,7 +635,12 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                 max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                 header_read_timeout_ms=DEFAULT_HEADER_READ_TIMEOUT_MS,
                 body_min_rate_bytes_per_sec=DEFAULT_BODY_MIN_RATE_BYTES_PER_SEC,
-                shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None):
+                shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout, max_waiting=None,
+                streaming_max_lifetime_secs=DEFAULT_CONFIG.streaming_max_lifetime_secs,
+                body_capacity_per_ip=DEFAULT_CONFIG.body_capacity_per_ip,
+                ws_idle_timeout_secs=DEFAULT_CONFIG.ws_idle_timeout_secs,
+                ws_max_lifetime_secs=DEFAULT_CONFIG.ws_max_lifetime_secs,
+                ws_ping_interval_secs=DEFAULT_CONFIG.ws_ping_interval_secs):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
@@ -605,6 +658,12 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
     slower than that average after a 2-second grace window with a 408.
     These limits apply to the native (Axum) server only; the ASGI adapter
     relies on the ASGI server's own limits.
+
+    DoS defences (S-P1-14/15/16): ``streaming_max_lifetime_secs`` caps
+    the total lifetime of one streaming response; ``body_capacity_per_ip``
+    caps concurrent body slots per client IP; ``ws_idle_timeout_secs``,
+    ``ws_max_lifetime_secs`` and ``ws_ping_interval_secs`` bound idle
+    WebSocket sessions (see :func:`start_native`).
 
     Graceful shutdown (B6), in order: the app stops advertising
     readiness (``/readyz`` starts returning 503), live WebSocket
@@ -637,6 +696,11 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               max_connections_per_ip=max_connections_per_ip,
                               header_read_timeout_ms=header_read_timeout_ms,
                               body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
+                              streaming_max_lifetime_secs=streaming_max_lifetime_secs,
+                              body_capacity_per_ip=body_capacity_per_ip,
+                              ws_idle_timeout_secs=ws_idle_timeout_secs,
+                              ws_max_lifetime_secs=ws_max_lifetime_secs,
+                              ws_ping_interval_secs=ws_ping_interval_secs,
                               shutdown_timeout=shutdown_timeout, max_waiting=max_waiting)
         print(f"PyNext listening on http://{server.address}", flush=True)
         # A standalone bundle records its provenance in
