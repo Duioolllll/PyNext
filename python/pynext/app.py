@@ -526,6 +526,21 @@ def _is_dynamic_pattern(path):
     return any(segment.startswith("[") for segment in path.split("/"))
 
 
+def _posix_path(path):
+    """A project-relative path with forward slashes.
+
+    The build manifest records paths with the OS separator, so on
+    Windows a layout arrives as ``app\\blog\\layout.py`` while the
+    URL-derived lookups build ``app/blog/layout.py``. Normalise to
+    forward slashes so comparisons, ``source`` fields and log lines
+    are identical on every platform. (``Path.as_posix()`` alone would
+    not do this for a Windows-style string on POSIX, where a
+    backslash is a legal filename character, so the separator is
+    replaced directly.)
+    """
+    return str(path).replace("\\", "/")
+
+
 def _layout_url_dir(module):
     """The URL directory a layout module applies to.
 
@@ -533,7 +548,7 @@ def _layout_url_dir(module):
     group (``app/(marketing)/layout.py``) applies to ``/`` because groups
     do not appear in URLs.
     """
-    parts = module.split("/")[1:-1]
+    parts = _posix_path(module).split("/")[1:-1]
     url_parts = [part for part in parts if not (part.startswith("(") and part.endswith(")"))]
     return "/" + "/".join(url_parts)
 
@@ -812,9 +827,16 @@ class App:
                 if mode in {"ssg", "isr"} and getattr(fn, "__pynext_auth__", False):
                     raise ValueError(f"{mode.upper()} page {spec['entry']} cannot require authentication")
                 self.render_modes[pattern] = mode
+                # The manifest records paths with the OS separator, so on
+                # Windows ``spec["layouts"]`` holds ``app\\blog\\layout.py``.
+                # Normalise once here: layout lookups, ``layout_policies``
+                # sources and the override warning all compare against
+                # slash-built paths (see _posix_path).
+                entry = _posix_path(spec["entry"])
+                layout_relatives = [_posix_path(relative) for relative in spec["layouts"]]
                 layouts = []
                 layout_policies = []
-                for relative in spec["layouts"]:
+                for relative in layout_relatives:
                     layout_fn = getattr(self._module(relative), "Layout", None)
                     if not callable(layout_fn) or not getattr(layout_fn, "__pynext_layout__", False):
                         raise ValueError(f"{relative} must export a @layout Layout function")
@@ -864,7 +886,7 @@ class App:
                     # when the page explicitly asked for a value it does not
                     # get, naming both files so the override is never silent.
                     effective, winners = reduce_segment_config(
-                        [*layout_policies, (spec["entry"], page_policy)])
+                        [*layout_policies, (entry, page_policy)])
                     for key in ("revalidate", "stale", "expire"):
                         page_value = page_policy[key]
                         if (page_value is not None and page_value is not False and
@@ -873,7 +895,7 @@ class App:
                             log.warning(
                                 "ISR %s=%s in %s is overridden by %s=%s from %s for route %s; "
                                 "a child segment only wins with a shorter %s",
-                                key, page_value, spec["entry"], key, winner_value,
+                                key, page_value, entry, key, winner_value,
                                 winner_source, pattern, key)
                     if effective["revalidate"] is None:
                         raise ValueError(
@@ -924,7 +946,7 @@ class App:
                     # so invalidating a layout tag evicts the whole
                     # subtree (webhook type="layout" via _layout_tag).
                     self.isr_tags[pattern] = sorted(set(self.isr_tags[pattern]) |
-                        {_layout_tag(_layout_scope(relative)) for relative in spec["layouts"]})
+                        {_layout_tag(_layout_scope(relative)) for relative in layout_relatives})
                 else:
                     query_keys = []
                 if "query" in inspect.signature(fn).parameters and not query_keys:
@@ -945,7 +967,7 @@ class App:
                     getattr(layout_fn, "__pynext_layout_dynamic__", False) for layout_fn in layouts
                 )
                 self.entries[pattern] = (fn, layouts)
-                self.entry_layouts[pattern] = tuple(spec["layouts"])
+                self.entry_layouts[pattern] = tuple(layout_relatives)
             else:
                 handlers = {}
                 ws_handler = None
@@ -1470,7 +1492,7 @@ class App:
         also found by its URL directory. Raises ValueError when no layout
         is defined there, or when several group layouts share the URL.
         """
-        known = {module for layouts in self.entry_layouts.values() for module in layouts}
+        known = {_posix_path(module) for layouts in self.entry_layouts.values() for module in layouts}
         direct = "app/layout.py" if path == "/" else f"app{path}/layout.py"
         if direct in known:
             return direct
