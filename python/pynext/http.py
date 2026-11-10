@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import threading
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote_to_bytes
@@ -263,6 +264,11 @@ class SecurityConfig:
     csrf_form_field: str = "csrf_token"
     csrf_cookie_secure: bool = True
     csrf_cookie_samesite: str = "Lax"
+    # Double-submit cookie lifetime (S-P1-21): the cookie carries
+    # ``Max-Age`` and the signature embeds its issue time, so a stolen
+    # cookie value stops validating after this long even when replayed
+    # programmatically (default 12 hours, at most 30 days).
+    csrf_cookie_max_age: int = 43200
     cors_allowed_origins: tuple = ()
     cors_allowed_methods: tuple = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
     cors_allowed_headers: tuple = ("Content-Type", "Authorization", "X-CSRF-Token")
@@ -297,6 +303,9 @@ class SecurityConfig:
             raise ValueError("csrf_cookie_samesite must be Lax, Strict or None")
         if not isinstance(self.csrf_cookie_secure, bool):
             raise TypeError("csrf_cookie_secure must be a bool")
+        if isinstance(self.csrf_cookie_max_age, bool) or not isinstance(self.csrf_cookie_max_age, int) \
+                or not 0 < self.csrf_cookie_max_age <= 2_592_000:
+            raise ValueError("csrf_cookie_max_age must be an integer from 1 to 2592000")
         if not isinstance(self.csrf_origin_check, bool):
             raise TypeError("csrf_origin_check must be a bool")
         if isinstance(self.csrf_trusted_origins, (str, bytes)):
@@ -481,18 +490,29 @@ def _submitted_csrf_secret(submitted):
     return submitted
 
 
-def sign_csrf_token(token, *, config=DEFAULT_SECURITY):
+def sign_csrf_token(token, *, config=DEFAULT_SECURITY, issued_at=None):
     """Return the signed double-submit cookie value for ``token``.
 
-    The value is ``"<token>.<HMAC-SHA256 hex>"`` signed with the config's
-    ``csrf_signing_key``. Clients send the raw ``token`` back in the
-    header (or form field) and the signed value back as the cookie, so a
-    subdomain that can plant an unsigned cookie cannot pass validation
-    even if it knows the token.
+    The value is ``"<token>.<issued_at>.<HMAC-SHA256 hex>"`` where the
+    HMAC covers ``"<token>.<issued_at>"`` with the config's
+    ``csrf_signing_key``. ``issued_at`` is epoch seconds (default now;
+    pass it explicitly in tests for a deterministic value).
+    :func:`_signed_csrf_token` rejects values older than
+    ``config.csrf_cookie_max_age``, so a stolen cookie value stops
+    validating even when replayed programmatically. Clients send the
+    raw ``token`` back in the header (or form field) and the signed
+    value back as the cookie, so a subdomain that can plant an unsigned
+    cookie cannot pass validation even if it knows the token. Values
+    signed in the previous ``"<token>.<HMAC>"`` format carry no issue
+    time and are rejected — re-issue the cookie after upgrading.
     """
-    signature = hmac.new(config.csrf_signing_key, token.encode("ascii"),
+    if issued_at is None:
+        issued_at = time.time()
+    issued_at = int(issued_at)
+    payload = f"{token}.{issued_at}"
+    signature = hmac.new(config.csrf_signing_key, payload.encode("ascii"),
                          hashlib.sha256).hexdigest()
-    return f"{token}.{signature}"
+    return f"{payload}.{signature}"
 
 
 def _signed_csrf_token(cookie_value, *, config=DEFAULT_SECURITY):
@@ -501,13 +521,25 @@ def _signed_csrf_token(cookie_value, *, config=DEFAULT_SECURITY):
     Unsigned values (a bare token, a missing signature, a signature made
     with another key) are rejected: this is what stops subdomain cookie
     injection, where the attacker controls the cookie but not the key.
+    The signature also carries its issue time: values older than
+    ``config.csrf_cookie_max_age`` — or issued more than 60 seconds in
+    the future (clock skew) — are rejected, so a stolen cookie value
+    has a bounded replay window (S-P1-21). The previous
+    ``"<token>.<HMAC>"`` format has no issue time and is rejected.
     """
-    token, separator, signature = cookie_value.rpartition(".")
-    if not separator or not token:
+    parts = cookie_value.rsplit(".", 2)
+    if len(parts) != 3:
         return None
-    expected = hmac.new(config.csrf_signing_key, token.encode("ascii"),
+    token, issued, signature = parts
+    if not token or not issued.isdigit():
+        return None
+    expected = hmac.new(config.csrf_signing_key, f"{token}.{issued}".encode("ascii"),
                         hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, signature):
+        return None
+    now = time.time()
+    issued_at = int(issued)
+    if issued_at > now + 60 or now - issued_at > config.csrf_cookie_max_age:
         return None
     return token
 
@@ -523,10 +555,13 @@ def set_csrf_cookie(response, token, *, config=DEFAULT_SECURITY):
     development. The cookie value is the HMAC-signed token (see
     :func:`sign_csrf_token`): send the cookie back exactly as issued and
     the raw token in the header — reconstructing the cookie from the
-    token alone will not validate.
+    token alone will not validate. The cookie carries
+    ``Max-Age=config.csrf_cookie_max_age`` (default 12 hours) and the
+    signature embeds its issue time, so a stolen cookie value stops
+    validating after that long.
     """
     parts = [f"{config.csrf_cookie_name}={sign_csrf_token(token, config=config)}", "Path=/",
-             f"SameSite={config.csrf_cookie_samesite}"]
+             f"Max-Age={config.csrf_cookie_max_age}", f"SameSite={config.csrf_cookie_samesite}"]
     if config.csrf_cookie_secure:
         parts.append("Secure")
     response.headers.append((b"set-cookie", "; ".join(parts).encode("ascii")))
@@ -667,7 +702,8 @@ def validate_csrf(request, *, config=DEFAULT_SECURITY):
     double-submit value whose token matches the submitted header or form
     field. The submitted token may be masked (see :func:`mask_csrf_token`)
     or raw; either way it is unmasked first and then compared with the
-    secret in constant time (``hmac.compare_digest``).
+    secret in constant time (``hmac.compare_digest``), and the signed
+    value must be unexpired (see ``SecurityConfig.csrf_cookie_max_age``).
 
     The safe-method exemption is a contract: it only holds because GET,
     HEAD and OPTIONS handlers must not change server state (S-P1-23).

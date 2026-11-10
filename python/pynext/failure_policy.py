@@ -31,7 +31,11 @@ Defaults are chosen per component for the safer side of its own risk:
   proceeds with a fresh ephemeral session and nothing is persisted:
   reads keep working, but a login cannot complete during the outage
   (the CSRF token issued for it is never stored, so the login
-  request fails CSRF with 403).
+  request fails CSRF with 403). A delete or rotation that fails
+  under ``fail_open`` is not dropped: the old token hash is queued
+  in ``pending_revocations`` and revoked as soon as Redis is
+  reachable again (S-P1-20), so the window in which a logged-out or
+  rotated token stays usable is the outage itself, not the token's TTL.
 
 Best-effort cache writes stay best-effort in both modes: a shared-cache
 insert that fails after
@@ -44,14 +48,17 @@ reporting success, so callers never mistake an unapplied invalidation
 for a completed one. Redis sessions apply the policy to load, save and
 delete: ``fail_closed`` propagates storage failures; a ``fail_open`` save
 reports success without persisting anything (the session is ephemeral),
-and a rotation during the outage may leave the old session id usable
-until it expires. A ``fail_open`` delete is also best-effort: logout
-can clear the browser cookie while the server-side session remains
-usable with the old token until its TTL expires or it is explicitly
-deleted after recovery. Do not treat such a logout as confirmed
-server-side revocation. A ``fail_open`` session outage also breaks
-session-bound CSRF: the token issued for a login is never stored, so
-the login request fails CSRF (403) even though reads keep working.
+and a rotation during the outage queues the old session id for
+revocation on recovery (``pending_revocations``) instead of leaving it
+usable until it expires. A ``fail_open`` delete is also best-effort:
+logout can clear the browser cookie while the server-side session remains
+usable with the old token until it is revoked after recovery (the
+revocation is queued, not dropped, and ``delete()`` reports ``False``
+so the caller can tell a confirmed logout from a deferred one). Do not
+treat such a logout as confirmed server-side revocation. A ``fail_open``
+session outage also breaks session-bound CSRF: the token issued for a
+login is never stored, so the login request fails CSRF (403) even though
+reads keep working.
 """
 
 FAIL_OPEN = "fail_open"

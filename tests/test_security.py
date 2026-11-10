@@ -56,9 +56,10 @@ def test_set_csrf_cookie_defaults():
     response = set_csrf_cookie(Response("ok"), "token-value")
     cookie = [v for k, v in response.headers if k == b"set-cookie"]
     assert len(cookie) == 1
-    # The cookie is Secure by default and carries the HMAC-signed value.
+    # The cookie is Secure by default and carries the HMAC-signed value,
+    # with a Max-Age bounding the signed value's replay window (S-P1-21).
     assert cookie[0] == (f"pynext_csrf={sign_csrf_token('token-value')}; "
-                         "Path=/; SameSite=Lax; Secure").encode("ascii")
+                         "Path=/; Max-Age=43200; SameSite=Lax; Secure").encode("ascii")
 
 
 def test_set_csrf_cookie_insecure_for_local_dev():
@@ -66,7 +67,7 @@ def test_set_csrf_cookie_insecure_for_local_dev():
     response = set_csrf_cookie(Response("ok"), "token-value", config=config)
     cookie = [v for k, v in response.headers if k == b"set-cookie"][0]
     assert cookie == (f"pynext_csrf={sign_csrf_token('token-value', config=config)}; "
-                      "Path=/; SameSite=Lax").encode("ascii")
+                      "Path=/; Max-Age=43200; SameSite=Lax").encode("ascii")
 
 
 def test_set_csrf_cookie_secure_flag():
@@ -74,7 +75,7 @@ def test_set_csrf_cookie_secure_flag():
     response = set_csrf_cookie(Response("ok"), "token-value", config=config)
     cookie = [v for k, v in response.headers if k == b"set-cookie"][0]
     assert cookie == (f"pynext_csrf={sign_csrf_token('token-value', config=config)}; "
-                      "Path=/; SameSite=Strict; Secure").encode("ascii")
+                      "Path=/; Max-Age=43200; SameSite=Strict; Secure").encode("ascii")
 
 
 def test_security_config_rejects_bad_values():
@@ -82,6 +83,10 @@ def test_security_config_rejects_bad_values():
         SecurityConfig(csrf_cookie_name="bad name")
     with pytest.raises(ValueError, match="cors_max_age"):
         SecurityConfig(cors_max_age=-1)
+    with pytest.raises(ValueError, match="csrf_cookie_max_age"):
+        SecurityConfig(csrf_cookie_max_age=0)
+    with pytest.raises(ValueError, match="csrf_cookie_max_age"):
+        SecurityConfig(csrf_cookie_max_age=2_592_001)
 
 
 @pytest.mark.parametrize("method", ["GET", "HEAD", "OPTIONS"])

@@ -20,6 +20,6 @@ from .pubsub import PubSubOverflow as PubSubOverflow, WebSocketPubSub as WebSock
 from .ratelimit import RateLimiter as RateLimiter
 from .redis_rate import RedisRateLimiter as RedisRateLimiter
 from .routing import route as route, state_changing_get as state_changing_get, websocket as websocket
-from .sessions import RedisSessionStore as RedisSessionStore, Session as Session, SessionMiddleware as SessionMiddleware, SessionPayloadCipher as SessionPayloadCipher, SQLiteSessionStore as SQLiteSessionStore
+from .sessions import RedisSessionStore as RedisSessionStore, Session as Session, SessionMiddleware as SessionMiddleware, SessionPayloadCipher as SessionPayloadCipher, SessionRecord as SessionRecord, SQLiteSessionStore as SQLiteSessionStore
 from .static import StaticPathError as StaticPathError, resolve_static_path as resolve_static_path, validate_static_request_path as validate_static_request_path
 from .validation import Field as Field, Schema as Schema, ValidationError as ValidationError, bind_csrf_token as bind_csrf_token, validate_handler as validate_handler, validate_handler_input as validate_handler_input, validate_input as validate_input, validate_request as validate_request, validation_error_response as validation_error_response
