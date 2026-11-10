@@ -535,14 +535,14 @@ def discover(root):
             except ValueError as exc:
                 raise ValueError(_config_error(
                     str(exc),
-                    [("file", str(path.relative_to(root))), ("segment", part)],
+                    [("file", path.relative_to(root).as_posix()), ("segment", part)],
                     ["Rename the directory to a valid route group like (name)",
                      "Remove the parentheses to make it a literal URL segment"])) from exc
             if group is None:
                 parts.append(part)
         pattern = "/" + "/".join(parts)
         if pattern in routes:
-            entry = str(path.relative_to(root))
+            entry = path.relative_to(root).as_posix()
             existing = routes[pattern]
             if existing["kind"] != path.stem:
                 page_entry = entry if path.stem == "page" else existing["entry"]
@@ -925,7 +925,7 @@ def _nearest_boundary(dirs, filename, root):
     for directory in reversed(dirs):
         candidate = directory / filename
         if candidate.is_file():
-            return str(candidate.relative_to(root))
+            return candidate.relative_to(root).as_posix()
     return None
 
 

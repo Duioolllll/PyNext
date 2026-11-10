@@ -65,7 +65,7 @@ def make_app(root, *, island=False, render="ssg", api=False, public=False):
     if public:
         public_dir = root / "public"
         public_dir.mkdir(exist_ok=True)
-        (public_dir / "hello.txt").write_text("hello public\n", encoding="utf-8")
+        (public_dir / "hello.txt").write_bytes(b"hello public\n")
     return root
 
 
@@ -174,7 +174,7 @@ def test_static_only_exports_servable_files(tmp_path, esbuild):
     page = output / "index.html"
     assert page.read_bytes() == (tmp_path / ".pynext" / "static" /
                                  f"{manifest['static_pages']['/']['sha256']}.html").read_bytes()
-    assert (output / "hello.txt").read_text(encoding="utf-8") == "hello public\n"
+    assert (output / "hello.txt").read_bytes() == b"hello public\n"
     for digest in {manifest["client"]["runtime"], *manifest["client"]["bundles"].values()}:
         assert (output / "_pynext" / "static" / f"{digest}.js").is_file()
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(output))
@@ -189,7 +189,7 @@ def test_static_only_exports_servable_files(tmp_path, esbuild):
             bundle = manifest["client"]["bundles"]["counter"]
             bundle_response = client.get(f"/_pynext/static/{bundle}.js")
             assert bundle_response.status_code == 200 and "Count: " in bundle_response.text
-            assert client.get("/hello.txt").text == "hello public\n"
+            assert client.get("/hello.txt").content == b"hello public\n"
             assert client.get("/missing").status_code == 404
     finally:
         server.shutdown()

@@ -305,26 +305,26 @@ def test_constructor_rejects_a_file_path(tmp_path):
         FileSystemCacheBackend(tmp_path, max_bytes=0)
 
 
-def _child_hold_lease(cache_dir, queue):
+def _child_hold_lease(cache_dir, ready, release):
     from pynext.cache import FileSystemCacheBackend
 
     backend = FileSystemCacheBackend(cache_dir)
     assert backend.acquire_lease("/shared", "child", ttl=30.0) == 0
     assert backend.insert_fenced("/shared", b"from-child", 30.0, 60.0, 0, owner="child") is True
-    queue.put("held")
-    # Hold the lease while the parent probes; the queue blocks until the
-    # parent closes it.
-    queue.get()
-    backend.release_lease("/shared", "child")
+    try:
+        ready.set()
+        assert release.wait(timeout=10), "parent did not release the lease holder"
+    finally:
+        backend.release_lease("/shared", "child")
 
 
 def test_cross_process_lease_and_visibility(tmp_path):
-    ctx = mp.get_context("fork")
-    queue = ctx.Queue()
-    proc = ctx.Process(target=_child_hold_lease, args=(str(tmp_path), queue))
+    ctx = mp.get_context("spawn")
+    ready, release = ctx.Event(), ctx.Event()
+    proc = ctx.Process(target=_child_hold_lease, args=(str(tmp_path), ready, release))
     proc.start()
     try:
-        assert queue.get(timeout=10) == "held"
+        assert ready.wait(timeout=10), "child did not acquire its lease"
         backend = FileSystemCacheBackend(tmp_path)
         # The child's lease blocks this process, and the child's entry
         # is already visible here.
@@ -338,9 +338,11 @@ def test_cross_process_lease_and_visibility(tmp_path):
         # A different key is unaffected by the child's lease.
         assert backend.insert("/other", b"ok", 30.0, 60.0) is True
     finally:
-        queue.put("release")
-        queue.close()
+        release.set()
         proc.join(timeout=10)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=10)
         assert proc.exitcode == 0
 
 
