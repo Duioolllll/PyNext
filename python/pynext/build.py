@@ -38,6 +38,18 @@ MIN_FREE_DISK_BYTES = 64 * 1024 * 1024
 # immediately). Next.js retries its lockfile acquisition, then exits.
 LOCK_TIMEOUT_SECONDS = 30.0
 LOCK_POLL_SECONDS = 0.1
+# Byte offset of the Windows byte-range lock inside the lock file.
+# The lock must NOT cover any byte a read of the file can touch: on
+# Windows ``msvcrt.locking`` blocks reads of the locked range from any
+# other handle, and the tests (and the lock-timeout path) read the
+# holder's PID out of this file while the lock is held — locking byte 0
+# made ``read_text()`` raise Permission denied on Windows. The PID is
+# a few bytes, but reads happen in 8 KiB chunks, so the lock byte sits
+# 1 MiB in: far beyond the PID text and beyond any single read chunk,
+# so no read can overlap it under either lock-check reading. The
+# offset is fixed: a PID-dependent offset would let two processes lock
+# different bytes and break mutual exclusion.
+_LOCK_BYTE_OFFSET = 1 << 20
 
 try:
     import fcntl
@@ -70,13 +82,15 @@ class BuildLockError(BuildError):
 def _flock_nonblocking(file):
     """Take an exclusive, non-blocking lock on an open file. True when taken.
 
-    The lock always covers byte 0: on Windows ``msvcrt.locking`` locks
-    the range starting at the current file position (unlike POSIX
-    ``flock``, which locks the whole file), so the position is pinned
-    first — otherwise the lock and the later unlock would target
-    different bytes and the unlock would fail.
+    The lock covers the single byte at :data:`_LOCK_BYTE_OFFSET`: on
+    Windows ``msvcrt.locking`` locks the range starting at the current
+    file position (unlike POSIX ``flock``, which locks the whole file),
+    so the position is pinned first — otherwise the lock and the later
+    unlock would target different bytes and the unlock would fail.
+    The offset sits past the PID text written by :class:`BuildLock`,
+    so the PID stays readable while the lock is held.
     """
-    file.seek(0)
+    file.seek(_LOCK_BYTE_OFFSET)
     if fcntl is not None:
         try:
             fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -94,13 +108,13 @@ def _flock_nonblocking(file):
 def _funlock(file):
     """Release the lock taken by :func:`_flock_nonblocking`.
 
-    Seeks to byte 0 first, for the same reason as the lock: the unlock
-    must target the byte the lock was taken on. Unlocking the range at
-    the end of the written pid (where the position sits after
-    ``__enter__``) raises Permission denied on Windows, because that
-    range was never locked.
+    Seeks to :data:`_LOCK_BYTE_OFFSET` first, for the same reason as
+    the lock: the unlock must target the byte the lock was taken on.
+    Unlocking the range at the end of the written pid (where the
+    position sits after ``__enter__``) raises Permission denied on
+    Windows, because that range was never locked.
     """
-    file.seek(0)
+    file.seek(_LOCK_BYTE_OFFSET)
     if fcntl is not None:
         fcntl.flock(file.fileno(), fcntl.LOCK_UN)
     else:
@@ -466,7 +480,8 @@ def validate_routes(routes):
             _validate_route_pattern(pattern)
         except ValueError as exc:
             raise ValueError(
-                f"Invalid route {pattern} (from {spec['entry']}): {exc}") from exc
+                f"Invalid route {pattern} (from {Path(spec['entry']).as_posix()}): {exc}"
+            ) from exc
     try:
         return _native.Router(list(routes))
     except ValueError as exc:
@@ -477,7 +492,7 @@ def validate_routes(routes):
             try:
                 _native.Router([*built, pattern])
             except ValueError as inner:
-                entry = routes[pattern]["entry"]
+                entry = Path(routes[pattern]["entry"]).as_posix()
                 raise ValueError(
                     f"Invalid route {pattern} (from {entry}): {inner}. "
                     f"Fix: {_fix_hint(str(inner))}") from inner
