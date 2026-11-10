@@ -47,8 +47,10 @@ local t = redis.call('TIME')
 local now = t[1] * 1000 + math.floor(t[2] / 1000)
 local fresh = tonumber(ARGV[2])
 local stale = tonumber(ARGV[3])
+local generated = tonumber(ARGV[9])
+if not generated or generated <= 0 then generated = now end
 redis.call('HSET', KEYS[1], 'body', ARGV[1], 'fresh_until', now+fresh,
-           'tags', ARGV[7], 'generated_at', now, 'path', ARGV[8])
+           'tags', ARGV[7], 'generated_at', generated, 'path', ARGV[8])
 redis.call('PEXPIRE', KEYS[1], fresh+stale+tonumber(ARGV[6]))
 return 1
 """
@@ -190,7 +192,21 @@ class RedisCacheBackend:
             raise SharedCacheUnavailable("Redis cache lease release failed") from exc
 
     def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
-                      tags=()):
+                      tags=(), generated_at=None):
+        """Store ``body`` under a version + lease fence.
+
+        ``generated_at`` (seconds, wall clock) stamps the entry with
+        the render *start* time instead of the insert time, so a
+        generation that started before a tag invalidation but stored
+        after it is judged by when its content was produced. The
+        freshness windows (``fresh_until`` / ``stale_until``) still
+        run from the insert time. The render-start time comes from
+        the worker's clock while tag records use the Redis server
+        clock (``TIME``), so on multi-host deployments a worker whose
+        clock runs ahead of the server can still look fresh after an
+        invalidation — keep worker and server clocks synchronised
+        (NTP) and see the manual's clock-skew note.
+        """
         if len(body) > MAX_CACHE_BODY_BYTES or not _valid_durations(fresh_seconds, stale_seconds):
             return False
         try:
@@ -198,13 +214,16 @@ class RedisCacheBackend:
         except ValueError:
             return False
         fresh_seconds, stale_seconds = float(fresh_seconds), float(stale_seconds)
+        generated_ms = 0
+        if generated_at is not None:
+            generated_ms = max(1, math.ceil(float(generated_at) * 1000))
         try:
             return bool(self.client.eval(_INSERT, 2, *self._keys(key), bytes(body),
                                          max(1, math.ceil(fresh_seconds * 1000)),
                                          max(0, math.ceil(stale_seconds * 1000)),
                                          -1 if expected_version is None else expected_version,
                                          owner or "", math.ceil(LEASE_TTL * 1000),
-                                         ",".join(tags), key))
+                                         ",".join(tags), key, generated_ms))
         except Exception as exc:
             raise SharedCacheUnavailable("Redis cache write failed") from exc
 

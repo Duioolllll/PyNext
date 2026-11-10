@@ -38,13 +38,6 @@ request object can never reach page code during a prerender. The
 signature ban is the enforcement; the hooks above cover what page code
 can actually reach.
 
-Why ``request`` reads need no hook: SSG/ISR pages cannot accept a
-``request`` parameter at all (``App`` raises ``ValueError`` at startup,
-"cannot accept request"), and layouts only receive ``children`` — so a
-request object can never reach page code during a prerender. The
-signature ban is the enforcement; the hooks above cover what page code
-can actually reach.
-
 Two honest limits of the automatic hooks, by design:
 
 * A call is only recorded when its *direct* caller is user code (not the
@@ -255,19 +248,25 @@ class DynamicTrackingState:
 
         In ``dynamic="error"`` mode the first recorded access raises
         :class:`StaticGenBailoutError` instead of returning.
+
+        The cap is checked before the stack is extracted: once 32
+        accesses are stored, further calls (for example a page calling
+        ``random.random()`` in a loop) skip the expensive
+        ``traceback.extract_stack()`` entirely.
         """
-        stack = _user_stack()
-        location = stack[-1] if stack else "<unknown>"
         with self._lock:
             if self.closed:
                 return None
             if len(self.accesses) >= MAX_DYNAMIC_ACCESSES:
                 self.dropped += 1
+                snapshot = list(self.accesses)
                 access = None
             else:
+                stack = _user_stack()
+                location = stack[-1] if stack else "<unknown>"
                 access = DynamicAccess(expression, kind, location, stack)
                 self.accesses.append(access)
-            snapshot = list(self.accesses)
+                snapshot = list(self.accesses)
         if self.should_error:
             raise StaticGenBailoutError(self.pattern, expression, snapshot)
         return access
@@ -390,7 +389,32 @@ _ORIGINAL_DATETIME = _datetime.datetime
 _ORIGINAL_DATE = _datetime.date
 
 
-class _TrackedDatetime(_ORIGINAL_DATETIME):
+class _TrackedDatetimeMeta(type):
+    """Metaclass making ``isinstance`` accept the original class too.
+
+    The prerender swap replaces ``datetime.datetime`` with a subclass
+    for tracking. Without this, ``isinstance(plain_dt,
+    datetime.datetime)`` is False during a prerender for plain
+    datetimes created elsewhere (for example in another thread's
+    request), because a plain instance is not an instance of the
+    subclass — breaking concurrent requests (notably ``json.dumps``
+    with a ``default`` that dispatches on ``isinstance``). Accepting
+    any instance of the original class covers both plain and tracked
+    datetimes, since a tracked instance is also an original instance.
+    """
+
+    def __instancecheck__(cls, instance):
+        return isinstance(instance, _ORIGINAL_DATETIME)
+
+
+class _TrackedDateMeta(type):
+    """Metaclass making ``isinstance`` accept the original class too."""
+
+    def __instancecheck__(cls, instance):
+        return isinstance(instance, _ORIGINAL_DATE)
+
+
+class _TrackedDatetime(_ORIGINAL_DATETIME, metaclass=_TrackedDatetimeMeta):
     """``datetime.datetime`` that records ``now``/``utcnow``/``today`` reads."""
 
     @classmethod
@@ -409,7 +433,7 @@ class _TrackedDatetime(_ORIGINAL_DATETIME):
         return super().today()
 
 
-class _TrackedDate(_ORIGINAL_DATE):
+class _TrackedDate(_ORIGINAL_DATE, metaclass=_TrackedDateMeta):
     """``datetime.date`` that records ``today()`` reads."""
 
     @classmethod

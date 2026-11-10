@@ -566,11 +566,22 @@ class SQLiteCacheBackend(CacheBackend):
         return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None, tags=tags)
 
     def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
-                      tags=()):
+                      tags=(), generated_at=None, generated_mono=None):
         """Store ``body`` only if the entry version still equals
         ``expected_version`` (``0`` when no entry existed, ``None`` for an
         unfenced write). When an owner is given, its lease must still be live
-        in the same transaction. Returns False when either fence has moved."""
+        in the same transaction. Returns False when either fence has moved.
+
+        ``generated_at`` / ``generated_mono`` stamp the entry with the
+        render *start* time instead of the insert time. A generation
+        that started before a tag invalidation but stored after it
+        must be judged by when its content was produced, not when it
+        landed — otherwise the tag check (which compares
+        ``generated_at`` against the invalidation time) classifies
+        pre-invalidation content as fresh. When omitted they default
+        to the insert time. The lease liveness check always uses the
+        current time, never the render-start time.
+        """
         if len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES or len(body) > MAX_CACHE_BODY_BYTES:
             return False
         if not _valid_durations(fresh_seconds, stale_seconds):
@@ -585,6 +596,8 @@ class SQLiteCacheBackend(CacheBackend):
                 try:
                     now = time.time()
                     now_mono = time.monotonic()
+                    gen_at = generated_at if generated_at is not None else now
+                    gen_mono = generated_mono if generated_mono is not None else now_mono
                     if owner is not None:
                         lease = self._conn.execute(
                             "SELECT owner, expires_at, expires_mono FROM leases WHERE key = ?", (key,)
@@ -616,7 +629,7 @@ class SQLiteCacheBackend(CacheBackend):
                         " generated_at=excluded.generated_at, generated_mono=excluded.generated_mono,"
                         " fresh_for=excluded.fresh_for,"
                         " stale_for=excluded.stale_for, version=excluded.version, tags=excluded.tags",
-                        (key, bytes(body), now, now_mono, float(fresh_seconds), float(stale_seconds), version,
+                        (key, bytes(body), gen_at, gen_mono, float(fresh_seconds), float(stale_seconds), version,
                          json.dumps(list(tags))),
                     )
                     self._conn.execute("COMMIT")
@@ -958,15 +971,21 @@ class ISRCache:
             log.warning("Shared cache lookup failed for %s", key, exc_info=True)
             return _SHARED_UNAVAILABLE
 
-    async def _shared_store(self, key, body, policy, expected_version, owner, tags=()):
+    async def _shared_store(self, key, body, policy, expected_version, owner, tags=(),
+                            generated_at=None, generated_mono=None):
         # Best-effort in both policies: the page was already rendered
         # correctly, so a failed write only loses caching, never the
         # response. See failure_policy.
+        #
+        # ``generated_at`` / ``generated_mono`` stamp the entry with the
+        # render *start* time (see :meth:`_generate`): a generation that
+        # started before a tag invalidation but stored after it must be
+        # judged by when its content was produced, not when it landed.
         try:
             return await asyncio.to_thread(
                 self.shared.insert_fenced, self.namespace + key, body,
                 policy["revalidate"], policy["stale"], expected_version, owner,
-                tags,
+                tags, generated_at, generated_mono,
             )
         except Exception:
             log.warning("Shared cache insert failed for %s", key, exc_info=True)
@@ -1054,6 +1073,17 @@ class ISRCache:
         self._check_loop()
         now = time.time()
         self._tag_manifest[tag] = (now, now if expire is None else now + expire)
+        # The process-local manifest is the memory backend's copy of the
+        # tag manifest; without pruning it grows with every distinct tag
+        # (for example per-user tags) and is never cleaned. Mirror the
+        # SQLite backend's opportunistic prune: a record can only affect
+        # entries generated before its expired_at, and no entry lives
+        # longer than fresh+stale (2 * MAX_CACHE_SECONDS), so older rows
+        # are dead weight.
+        cutoff = now - 2 * MAX_CACHE_SECONDS
+        for old_tag in [t for t, (_, expired_at) in self._tag_manifest.items()
+                        if expired_at < cutoff]:
+            del self._tag_manifest[old_tag]
         for key, tags in list(self._key_tags.items()):
             if tag in tags:
                 self._inflight.pop(key, None)
@@ -1211,8 +1241,12 @@ class ISRCache:
                 return ("lease", (version, owner))
             await asyncio.sleep(LEASE_WAIT_INTERVAL)
 
-    def _remember_key_generated(self, key):
-        self._key_generated_at[key] = time.time()
+    def _remember_key_generated(self, key, generated_at=None):
+        # ``generated_at`` is the render *start* time when the caller
+        # knows it (see :meth:`_generate`): the local tag check compares
+        # this against invalidation times, so a generation that started
+        # before a ``revalidate_tag`` must not look fresh afterwards.
+        self._key_generated_at[key] = time.time() if generated_at is None else generated_at
         self._key_generated_at.move_to_end(key)
         while len(self._key_generated_at) > _MAX_LOCAL_VARIANT_PATHS:
             self._key_generated_at.popitem(last=False)
@@ -1268,6 +1302,15 @@ class ISRCache:
         """
         owner = lease[1] if lease is not None else None
         expected_version = lease[0] if lease is not None else None
+        # Stamp the render start time now: the entry's ``generated_at``
+        # must reflect when its content was produced, not when the
+        # (possibly slow) render finished and stored it. Otherwise a
+        # generation that started before a ``revalidate_tag`` but stored
+        # after it looks "fresh" to the tag check even though its content
+        # predates the invalidation. The same start time is recorded for
+        # the process-local tag check (``_remember_key_generated``).
+        started_at = time.time()
+        started_mono = time.monotonic()
         try:
             async with asyncio.timeout(GENERATION_TIMEOUT):
                 if lease is not None:
@@ -1288,7 +1331,9 @@ class ISRCache:
                     if _is_storable(response):
                         shared_stored = True
                         if self.shared is not None and owner is not None:
-                            shared_stored = await self._shared_store(key, response.body, policy, expected_version, owner, tags)
+                            shared_stored = await self._shared_store(
+                                key, response.body, policy, expected_version, owner, tags,
+                                generated_at=started_at, generated_mono=started_mono)
                             if not shared_stored:
                                 log.warning("Shared ISR insert for %s failed or was fenced out;"
                                             " page was served but not cached", key)
@@ -1296,7 +1341,7 @@ class ISRCache:
                         # or after this app invalidated the running task.
                         if shared_stored and self._inflight.get(key) is asyncio.current_task():
                             if self.store.insert(key, response.body, policy["revalidate"], policy["stale"]):
-                                self._remember_key_generated(key)
+                                self._remember_key_generated(key, started_at)
                             else:
                                 log.warning("ISR cache insert failed for %s; page was served but not cached", key)
                     else:

@@ -312,3 +312,46 @@ def test_tracking_primitives():
             mark_dynamic_access("external fetch")
     assert is_prerender_bailout(excinfo.value)
     assert "external fetch" in str(excinfo.value)
+
+
+def test_prerender_datetime_swap_does_not_break_other_threads():
+    """Regression: the datetime swap must not break ``isinstance`` in
+    concurrent requests. During a prerender, a plain datetime created
+    elsewhere (for example in another thread's request) must still
+    pass ``isinstance(plain_dt, datetime.datetime)``, and ``json.dumps``
+    with an ``isinstance``-dispatching ``default`` must keep working.
+    The bug broke the *other* request's values, not the tracked ones."""
+    import json
+    import threading
+
+    plain_dt = datetime.datetime(2026, 1, 2, 3, 4, 5)
+    plain_date = datetime.date(2026, 1, 2)
+    results = {}
+
+    def check_in_other_thread():
+        results["isinstance_dt"] = isinstance(plain_dt, datetime.datetime)
+        results["isinstance_date"] = isinstance(plain_date, datetime.date)
+
+        def enc(obj):
+            if isinstance(obj, datetime.datetime):
+                return obj.isoformat()
+            if isinstance(obj, datetime.date):
+                return obj.isoformat()
+            raise TypeError(f"not serializable: {obj!r}")
+
+        results["json"] = json.dumps(
+            {"at": plain_dt, "on": plain_date}, default=enc)
+
+    with track_prerender("/unit", "auto"):
+        # The swap is active here: datetime.datetime is the tracked subclass.
+        thread = threading.Thread(target=check_in_other_thread)
+        thread.start()
+        thread.join()
+        # The same must hold in this thread while the swap is active.
+        assert isinstance(plain_dt, datetime.datetime)
+        assert isinstance(plain_date, datetime.date)
+
+    assert results["isinstance_dt"] is True
+    assert results["isinstance_date"] is True
+    assert json.loads(results["json"]) == {
+        "at": "2026-01-02T03:04:05", "on": "2026-01-02"}

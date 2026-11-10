@@ -51,8 +51,9 @@ differently:
 * **Header order is normalised**: headers are lower-cased and sorted by
   name before serialisation. Next.js serialises in ``Headers`` iteration
   order; sorting makes the same logical request produce the same key
-  regardless of how the caller ordered its headers. Duplicate names keep
-  the last value.
+  regardless of how the caller ordered its headers. Duplicate names are
+  combined (``", "``-joined, ``"; "`` for ``cookie``) so different
+  values cannot collapse to one key.
 
 Body tagging (Next.js body handling, same order of cases):
 
@@ -150,7 +151,9 @@ FETCH_CACHE_MODES = frozenset({
 
 #: Methods auto-no-cache treats as cacheable (``patch-fetch.ts``:
 #: ``!['get', 'head'].includes(method.toLowerCase() || 'get')``).
-_CACHEABLE_METHODS = frozenset({"GET", "HEAD"})
+#: Lower-case, because :func:`decide_fetch_cache` compares
+#: ``method.lower()`` against this set.
+_CACHEABLE_METHODS = frozenset({"get", "head"})
 
 _UNSET = object()
 
@@ -160,8 +163,12 @@ def _header_pairs(headers):
     sorted ``{lower-name: value}`` dict with the excluded set removed.
 
     Names and values may be ``str`` or ``bytes`` (bytes decode as
-    latin-1, the HTTP header byte encoding). Duplicate names keep the
-    last value. Anything else raises :class:`TypeError`.
+    latin-1, the HTTP header byte encoding). Duplicate names are
+    combined, not overwritten: values are joined with ``", "`` (RFC
+    7230 §3.2.2), except ``cookie`` which is joined with ``"; "``
+    (RFC 6265 §5.4) — otherwise two ``cookie`` headers carrying
+    different sessions would collapse to the same cache key.
+    Anything else raises :class:`TypeError`.
     """
     if headers is None:
         return {}
@@ -188,7 +195,11 @@ def _header_pairs(headers):
         key = name.lower()
         if key in FETCH_CACHE_KEY_EXCLUDED_HEADERS:
             continue
-        result[key] = value
+        if key in result:
+            separator = "; " if key == "cookie" else ", "
+            result[key] = result[key] + separator + value
+        else:
+            result[key] = value
     return dict(sorted(result.items()))
 
 
