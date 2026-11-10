@@ -26,7 +26,7 @@ from . import _native
 from .admission import DecisionGate
 from .assets import read_public_artifacts, read_public_sources
 from .auth import check_authorization
-from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
+from .cache import CacheBusy, ISRCache, SharedCacheUnavailable, dev_retention_policy
 from .client import compile_client, read_client_artifacts
 from .components import (_isr_policy, _isr_query_keys, _node, _partial_isr_policy, _validate_tags,
                         bind_islands, reduce_segment_config)
@@ -1350,7 +1350,7 @@ class App:
             raise BadRequest("ISR query values are too large")
         return selected
 
-    async def _render_isr_cached(self, pattern, params, query, key):
+    async def _render_isr_cached(self, pattern, params, query, key, policy=None):
         feed = _ISRStreamFeed()
 
         async def render():
@@ -1373,8 +1373,10 @@ class App:
             finally:
                 await response.aclose()
 
+        if policy is None:
+            policy = self.isr_policies[pattern]
         task = asyncio.create_task(self.isr.get_or_render(
-            key, self.isr_policies[pattern], render, tags=self.isr_tags.get(pattern, ())))
+            key, policy, render, tags=self.isr_tags.get(pattern, ())))
 
         def observe(done):
             # A streamed request stops awaiting this task before generation
@@ -1779,7 +1781,7 @@ class App:
                 response = asset_response(request, self.static_pages[path], "text/html; charset=utf-8",
                                           self.asset_etags[path], cache_control=b"public, max-age=0, must-revalidate",
                                           extra_headers=[(b"vary", b"Cookie, Authorization")])
-            elif self.production and self.render_modes[pattern] == "isr":
+            elif self.render_modes[pattern] == "isr" and (self.production or self.debug):
                 query = self._page_query(pattern, request)
                 private = any(name.lower() in {b"authorization", b"cookie"} for name, _ in request.headers)
                 if private:
@@ -1805,8 +1807,15 @@ class App:
                                      generation + ":" + hashlib.sha256(encoded).hexdigest())
                     cache_before = self.isr.store.lookup(cache_key)[0]
                     self.metrics.observe_cache(cache_before)
+                    policy = self.isr_policies[pattern]
+                    if self.debug:
+                        # Dev relaxation: serve stale entries until expire
+                        # and retain them for at least the floor, so a
+                        # reload hits the cache. Production keeps the
+                        # declared policy.
+                        policy = dev_retention_policy(policy)
                     try:
-                        body = await self._render_isr_cached(pattern, params, query, cache_key)
+                        body = await self._render_isr_cached(pattern, params, query, cache_key, policy)
                     except CacheBusy:
                         self.metrics.observe_cache("busy")
                         self.metrics.observe_regeneration("failure")
