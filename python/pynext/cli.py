@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .app import create_app
 from .build import write_manifest
+from .check import DeploySettings, run_deploy_checks
 from .client import compile_client, discover_client
 from .env import load_env
 from .config import DEFAULT_CONFIG, ConfigError, load_config
@@ -459,12 +460,36 @@ def _observability_from_config(resolved):
     return config
 
 
+def _add_audit_args(command):
+    """Options shared by ``check`` and ``doctor`` (the deploy audit)."""
+    command.add_argument("--format", choices=("text", "json"), default="text",
+                         help="report format (default text)")
+    command.add_argument("--fail-on-warning", action="store_true",
+                         help="exit 1 when warnings are found, not just on errors")
+    command.add_argument("--debug", action="store_true",
+                         help="audit as if debug mode were on (also honoured "
+                              "via the PYNEXT_DEBUG environment variable)")
+
+
 def _build_parser():
     """Build the ``pynext`` argument parser (defaults from DEFAULT_CONFIG)."""
     parser = argparse.ArgumentParser(prog="pynext")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a minimal application")
     init.add_argument("--dir", default=".", help="application project directory")
+    check = sub.add_parser(
+        "check",
+        help="audit the deployment configuration for security mistakes "
+             "(Django 'check --deploy' pattern)")
+    check.add_argument("--dir", default=".", help="application project directory")
+    check.add_argument("--deploy", action="store_true",
+                       help="run the deployment security audit (required for 'check')")
+    _add_audit_args(check)
+    doctor = sub.add_parser(
+        "doctor",
+        help="audit the deployment configuration (alias for 'check --deploy')")
+    doctor.add_argument("--dir", default=".", help="application project directory")
+    _add_audit_args(doctor)
     for name in ("build", "dev", "start"):
         command = sub.add_parser(name)
         command.add_argument("--dir", default=".", help="application project directory")
@@ -620,16 +645,19 @@ def main():
     # already present (process-environment precedence), so the built
     # HTML would bake in the DEV values instead of the production ones.
     try:
-        load_env(root, mode="production" if command in ("build", "start") else "development")
+        load_env(root, mode="production" if command in ("build", "start", "check", "doctor") else "development")
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     resolved = None
     cli_overrides = {}
-    if command in ("dev", "build", "start"):
+    if command in ("dev", "build", "start", "check", "doctor"):
         cli_overrides = {key: explicit[dest] for dest, key in _CLI_CONFIG_MAP.items()
                          if dest in explicit}
         try:
-            resolved = load_config(root, command, cli_overrides=cli_overrides)
+            # A deploy audit reads the production posture ("start" phase):
+            # the checks ask what ``pynext start`` would actually run with.
+            resolved = load_config(root, "start" if command in ("check", "doctor") else command,
+                                   cli_overrides=cli_overrides)
         except ConfigError as exc:
             parser.error(str(exc))
         _apply_config_defaults(parser, resolved)
@@ -677,6 +705,21 @@ def main():
                 parser.error(str(exc))
             print(f"Created standalone directory in {output}")
         return
+    if args.command in ("check", "doctor"):
+        # Audit only: the checks read the resolved config, never start a
+        # server and never change settings. ``check`` mirrors Django and
+        # requires --deploy; ``doctor`` is the same audit without the flag.
+        if args.command == "check" and not args.deploy:
+            parser.error("pynext check requires --deploy (or run 'pynext doctor')")
+        settings = DeploySettings.from_resolved(resolved, debug=args.debug or None)
+        report = run_deploy_checks(settings)
+        if args.format == "json":
+            print(report.format_json())
+        else:
+            print(report.format_text())
+        if not report.ok or (args.fail_on_warning and report.warnings):
+            return 1
+        return 0
     if args.ws_max_message_bytes > 16 * 1024 * 1024:
         parser.error("--ws-max-message-bytes must be at most 16777216")
     # .env was already loaded in the prologue (before config resolution).
