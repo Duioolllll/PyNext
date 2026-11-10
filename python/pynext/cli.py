@@ -614,8 +614,13 @@ def main():
     # from the environment, so .env values must already be present.
     # (create_app() loads it again on every (re)start, which also
     # refreshes edited files in dev.)
+    # A build is a production build: it must load the production env
+    # files. Loading development first would poison os.environ, and
+    # write_manifest's own production load cannot override a variable
+    # already present (process-environment precedence), so the built
+    # HTML would bake in the DEV values instead of the production ones.
     try:
-        load_env(root, mode="production" if command == "start" else "development")
+        load_env(root, mode="production" if command in ("build", "start") else "development")
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     resolved = None
