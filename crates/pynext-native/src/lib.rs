@@ -1189,14 +1189,9 @@ fn bridge_response_header(key: &[u8], value: &[u8]) -> Option<(HeaderName, Heade
 ///
 /// This check is a backstop, not the deciding layer in the cases the tests
 /// cover: for an ordinary request hyper's parser turns conflicting
-/// `Content-Length` values into an automatic 400 before dispatch ever runs,
-/// and when `Transfer-Encoding: chunked` is present hyper drops
-/// `Content-Length` entirely (it removes earlier CL headers and skips later
-/// ones), so the request is framed as chunked and the conflicting values
-/// never reach dispatch — see
-/// `test_transfer_encoding_wins_over_conflicting_content_length`. Keep the
-/// check anyway: it is the layer that catches conflicting values if hyper's
-/// parsing ever lets them through.
+/// `Content-Length` values into an automatic 400 before dispatch ever runs.
+/// Keep the check anyway: it is the layer that catches conflicting values
+/// if hyper's parsing ever lets them through.
 fn conflicting_content_length(headers: &HeaderMap) -> bool {
     let mut values = std::collections::HashSet::new();
     for value in headers.get_all(header::CONTENT_LENGTH).iter() {
@@ -1400,6 +1395,65 @@ fn host_header_allowed(
     };
     patterns.iter().any(|pattern| host_matches(&host, pattern))
 }
+/// Marker header the first-request sniff (`SmugglingGuardIo`) inserts when
+/// a request carries both `Content-Length` and `Transfer-Encoding`
+/// (S-P1-31, Sanic CVE-2026-85078). hyper strips `Content-Length` from the
+/// header map as soon as `Transfer-Encoding` is present (it removes earlier
+/// CL headers and skips later ones), so by the time dispatch runs the
+/// combination is invisible — the marker is the only trace of it. The
+/// name is in Python's `INTERNAL_HEADERS`, so a client-sent copy is
+/// stripped at both entry points before any handler sees it; on the native
+/// path the sniff is the only producer, and a client that sends the marker
+/// itself only gets its own request rejected.
+const SMUGGLING_MARKER_NAME: &str = "x-pynext-smuggling";
+/// Value the sniff inserts for a `Content-Length` + `Transfer-Encoding`
+/// combination.
+const SMUGGLING_MARKER_CL_TE: &str = "cl-te";
+
+fn has_smuggling_marker(headers: &HeaderMap) -> bool {
+    headers
+        .get(SMUGGLING_MARKER_NAME)
+        .is_some_and(|v| v.as_bytes() == SMUGGLING_MARKER_CL_TE.as_bytes())
+}
+
+/// A `Transfer-Encoding` whose final coding is not `chunked` is a 400
+/// (RFC 9112 section 6.1: the message body length cannot be determined
+/// reliably otherwise). hyper already rejects this at parse time, so this
+/// is a backstop mirroring hyper's own rule — only the last header line's
+/// last comma-separated coding decides — in case hyper's parsing ever lets
+/// one through. `Transfer-Encoding` on HTTP/1.0 is likewise invalid.
+fn invalid_transfer_encoding(headers: &HeaderMap, version: Version) -> bool {
+    if !headers.contains_key(header::TRANSFER_ENCODING) {
+        return false;
+    }
+    if version == Version::HTTP_10 {
+        return true;
+    }
+    let Some(last) = headers
+        .get_all(header::TRANSFER_ENCODING)
+        .iter()
+        .next_back()
+    else {
+        return false;
+    };
+    let Ok(text) = last.to_str() else {
+        return true;
+    };
+    !text
+        .rsplit(',')
+        .next()
+        .is_some_and(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+}
+
+/// Request-smuggling framing (S-P1-31): ambiguous framing is a 400 with
+/// `Connection: close`, never a request the handler runs. Covers the
+/// sniff marker (`Content-Length` + `Transfer-Encoding`), conflicting
+/// `Content-Length` values, and a non-`chunked` `Transfer-Encoding`.
+fn smuggling_framing(headers: &HeaderMap, version: Version) -> bool {
+    has_smuggling_marker(headers)
+        || conflicting_content_length(headers)
+        || invalid_transfer_encoding(headers, version)
+}
 
 enum BodyReadError {
     TooLarge,
@@ -1447,6 +1501,18 @@ async fn read_limited_body(
         };
         let Some(frame) = frame else { break };
         let frame = frame.map_err(|_| BodyReadError::BadRequest)?;
+        // Chunk trailers (S-P1-31, Sanic CVE-2026-85078): hyper delivers
+        // any trailer fields after the final 0-chunk as a trailers frame.
+        // A trailer must never be silently accepted — in the CVE the
+        // trailer bytes were left in the keep-alive buffer and re-parsed
+        // as a smuggled request — so any trailer frame is a 400. The
+        // caller closes the connection (`close_with_unread_body`), so the
+        // bytes can never be reused as another request. A plain
+        // `0\r\n\r\n` terminator carries no trailer frame, so ordinary
+        // chunked requests are unaffected.
+        if frame.is_trailers() {
+            return Err(BodyReadError::BadRequest);
+        }
         if let Ok(data) = frame.into_data() {
             if buf.len() + data.len() > limit {
                 return Err(BodyReadError::TooLarge);
@@ -1954,6 +2020,25 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             parts.version,
         );
     }
+    // Request-smuggling framing (S-P1-31) runs before anything else,
+    // including the WebSocket upgrade below: an ambiguously framed
+    // request is a 400 with `Connection: close`, never an upgrade or a
+    // handler run. The body has not been read yet, so the connection
+    // must not be reused.
+    if smuggling_framing(&parts.headers, parts.version) {
+        return close_with_unread_body(
+            apply_path_headers_for_raw_path(
+                plain_response(
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request",
+                    &state.security_headers,
+                ),
+                parts.uri.path(),
+                &state.path_headers,
+            ),
+            parts.version,
+        );
+    }
     // A WebSocket upgrade is decided here, before any body handling: the
     // upgrade handshake must not compete for a Python execution slot, and a
     // request that is not a WebSocket route must not reach the HTTP bridge
@@ -2162,20 +2247,6 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         return upgrade.on_upgrade(move |socket| async move {
             run_ws_session(state, path, query, headers, protocol, socket).await;
         });
-    }
-    if conflicting_content_length(&parts.headers) {
-        return close_with_unread_body(
-            apply_path_headers_for_raw_path(
-                plain_response(
-                    StatusCode::BAD_REQUEST,
-                    "Bad Request",
-                    &state.security_headers,
-                ),
-                parts.uri.path(),
-                &state.path_headers,
-            ),
-            parts.version,
-        );
     }
     // Decide admission from headers before polling the body. In particular,
     // an over-limit Expect: 100-continue request must never be told to upload.
@@ -2902,6 +2973,176 @@ struct PeerAddr(SocketAddr);
 /// Bridge from hyper's connection service to the axum router: the router is a
 /// tower service, so each connection polls it ready and then calls it with the
 /// request body converted to axum's `Body`.
+/// Bytes of the first request's header block the smuggling sniff holds
+/// back for inspection. A header block larger than this is passed through
+/// uninspected and left to hyper's own limits; a `Content-Length` +
+/// `Transfer-Encoding` combination hiding past 128 KiB of headers is not
+/// inspected, but hyper still closes the connection after such a request
+/// (`keep_alive = false` when both are present), so it cannot poison a
+/// reused connection.
+const SMUGGLING_SNIFF_LIMIT: usize = 128 * 1024;
+
+/// Find the end of the first request's header block: returns
+/// `(end, insert_at)` where `end` is the index just past the blank-line
+/// terminator and `insert_at` is where a marker header line goes (just
+/// before the final blank line). `None` while the block is incomplete.
+fn first_header_block_end(buf: &[u8]) -> Option<(usize, usize)> {
+    // Search CRLF CRLF first: it cannot contain a bare LF LF.
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((pos + 4, pos + 2));
+    }
+    if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+        return Some((pos + 2, pos + 1));
+    }
+    None
+}
+
+/// Scan the first request's header block for a `Content-Length` +
+/// `Transfer-Encoding` combination and, when found, insert the smuggling
+/// marker header just before the final blank line. Returns true when the
+/// marker was inserted. The request line (first line) is skipped, header
+/// names compare case-insensitively, and an h2c prior-knowledge preface
+/// (`PRI * HTTP/2.0`) is left untouched — it has no headers to scan and
+/// hyper-util's auto builder still needs the exact preface bytes.
+fn mark_smuggling_request(buf: &mut Vec<u8>, end: usize, insert_at: usize) -> bool {
+    let head = &buf[..end];
+    if head.starts_with(b"PRI * HTTP/2.0") {
+        return false;
+    }
+    let mut saw_cl = false;
+    let mut saw_te = false;
+    for (index, line) in head.split(|&b| b == b'\n').enumerate() {
+        if index == 0 {
+            continue; // request line
+        }
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let name = &line[..colon];
+        if name.eq_ignore_ascii_case(b"content-length") {
+            saw_cl = true;
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            saw_te = true;
+        }
+        if saw_cl && saw_te {
+            break;
+        }
+    }
+    if !(saw_cl && saw_te) {
+        return false;
+    }
+    let marker = format!("{SMUGGLING_MARKER_NAME}: {SMUGGLING_MARKER_CL_TE}\r\n");
+    buf.splice(insert_at..insert_at, marker.into_bytes());
+    true
+}
+
+/// Byte-stream wrapper that sniffs the first request on a connection for
+/// request-smuggling framing (S-P1-31) before hyper parses it.
+///
+/// hyper decides framing while parsing and strips `Content-Length` as
+/// soon as `Transfer-Encoding` is present, so dispatch can never see a
+/// `Content-Length` + `Transfer-Encoding` combination — the only place to
+/// catch it is the raw bytes. This wrapper holds back the first request's
+/// header block until its blank-line terminator arrives, scans it, and
+/// inserts the `x-pynext-smuggling` marker when both headers are present;
+/// dispatch then rejects with 400 and closes the connection. Everything
+/// else passes through byte-for-byte, including the h2c preface and any
+/// bytes after the header block.
+///
+/// Only the first request per connection is inspected: finding later
+/// requests would require re-implementing body framing (lengths and
+/// chunked boundaries) on this layer. That is the documented residual —
+/// hyper already closes the connection after any request that carries
+/// both headers, so a smuggled request cannot poison a reused
+/// connection; the first-request sniff additionally turns the
+/// still-executed handler run into a 400.
+struct SmugglingGuardIo<S> {
+    inner: S,
+    /// Bytes read from `inner` but not yet delivered to hyper.
+    pending: Vec<u8>,
+    /// The first header block has been inspected (or inspection was
+    /// abandoned at EOF / over the size cap).
+    inspected: bool,
+}
+
+impl<S> SmugglingGuardIo<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            inspected: false,
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SmugglingGuardIo<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if !this.inspected {
+            // Hold back bytes until the first header block is complete
+            // enough to scan; a partial header block must never leak to
+            // hyper uninspected.
+            loop {
+                if this.pending.len() >= SMUGGLING_SNIFF_LIMIT {
+                    this.inspected = true;
+                    break;
+                }
+                if let Some((end, insert_at)) = first_header_block_end(&this.pending) {
+                    mark_smuggling_request(&mut this.pending, end, insert_at);
+                    this.inspected = true;
+                    break;
+                }
+                let mut chunk = [0u8; 8192];
+                let mut chunk_buf = ReadBuf::new(&mut chunk);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut chunk_buf) {
+                    Poll::Ready(Ok(())) => {
+                        let filled = chunk_buf.filled();
+                        if filled.is_empty() {
+                            // EOF before a complete header block: deliver
+                            // what we have; there is nothing to smuggle.
+                            this.inspected = true;
+                            break;
+                        }
+                        this.pending.extend_from_slice(filled);
+                    }
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+        if !this.pending.is_empty() {
+            let n = buf.remaining().min(this.pending.len());
+            buf.put_slice(&this.pending[..n]);
+            this.pending.drain(..n);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SmugglingGuardIo<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 struct HyperService {
     router: AxumRouter,
     peer_addr: Option<SocketAddr>,
@@ -3433,6 +3674,14 @@ impl NativeServer {
                                 router: app.clone(),
                                 peer_addr: Some(peer_addr),
                             };
+                            // Request-smuggling sniff (S-P1-31): wrap the
+                            // stream so the first request's header block is
+                            // scanned for a `Content-Length` +
+                            // `Transfer-Encoding` combination before hyper
+                            // parses it. The wrap happens here, outside the
+                            // h2c/auto-builder setup below, and only changes
+                            // the byte stream's first header block.
+                            let stream = SmugglingGuardIo::new(stream);
                             let mut stop_connection = connection_shutdown.subscribe();
                             // Auto-detect the protocol per connection: a
                             // client that opens with the HTTP/2
@@ -3462,7 +3711,15 @@ impl NativeServer {
                                     let mut preface = [0u8; 24];
                                     match tokio::time::timeout(
                                         Duration::from_millis(100),
-                                        stream.peek(&mut preface),
+                                        // The stream is already wrapped in
+                                        // SmugglingGuardIo (S-P1-31), which
+                                        // has no peek of its own: peek the
+                                        // inner TcpStream directly. The guard
+                                        // has not read anything yet (hyper
+                                        // reads first), so its pending buffer
+                                        // is empty and the peek sees the same
+                                        // bytes hyper will.
+                                        stream.inner.peek(&mut preface),
                                     )
                                     .await
                                     {
@@ -3898,5 +4155,94 @@ mod tests {
         assert!(bridge_response_header(b"x-evil", b"a\x7fb").is_none());
         assert!(bridge_response_header(b"x-\x01vil", b"a").is_none());
         assert!(bridge_response_header(b"bad name", b"a").is_none());
+    }
+    // Request-smuggling sniff (S-P1-31): pure-function coverage for the
+    // first-request header scan. The live behaviour (400 + connection
+    // close) is covered from Python by tests/test_request_smuggling.py.
+    fn sniffed(raw: &str) -> (Vec<u8>, bool) {
+        let mut buf = raw.as_bytes().to_vec();
+        let marked = match first_header_block_end(&buf) {
+            Some((end, insert_at)) => mark_smuggling_request(&mut buf, end, insert_at),
+            None => false,
+        };
+        (buf, marked)
+    }
+
+    #[test]
+    fn sniff_marks_content_length_with_transfer_encoding() {
+        let (buf, marked) = sniffed(
+            "POST /api/input HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
+        );
+        assert!(marked);
+        assert!(String::from_utf8_lossy(&buf).contains("x-pynext-smuggling: cl-te"));
+        assert!(buf.ends_with(b"\r\n\r\nhello"));
+    }
+
+    #[test]
+    fn sniff_marks_transfer_encoding_before_content_length() {
+        let (buf, marked) = sniffed(
+            "POST /api/input HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+        );
+        assert!(marked);
+        assert!(String::from_utf8_lossy(&buf).contains("x-pynext-smuggling: cl-te"));
+    }
+
+    #[test]
+    fn sniff_leaves_clean_requests_untouched() {
+        for raw in [
+            "POST /api/input HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "POST /api/input HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello",
+            "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ] {
+            let (buf, marked) = sniffed(raw);
+            assert!(!marked, "{raw}");
+            assert_eq!(buf, raw.as_bytes(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn sniff_leaves_h2c_preface_untouched() {
+        let (buf, marked) = sniffed("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        assert!(!marked);
+        assert_eq!(buf, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    }
+
+    #[test]
+    fn sniff_handles_lf_only_header_block() {
+        let (buf, marked) = sniffed(
+            "POST /api/input HTTP/1.1\nHost: localhost\nContent-Length: 5\nTransfer-Encoding: chunked\n\nhello",
+        );
+        assert!(marked);
+        assert!(String::from_utf8_lossy(&buf).contains("x-pynext-smuggling: cl-te"));
+    }
+
+    #[test]
+    fn sniff_incomplete_header_block_is_not_marked() {
+        let mut buf =
+            b"POST /api/input HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n".to_vec();
+        assert_eq!(first_header_block_end(&buf), None);
+        assert!(!mark_smuggling_request(&mut buf, 0, 0));
+    }
+
+    #[test]
+    fn smuggling_framing_rejects_marker_and_bad_transfer_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-pynext-smuggling", HeaderValue::from_static("cl-te"));
+        assert!(smuggling_framing(&headers, Version::HTTP_11));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::TRANSFER_ENCODING, HeaderValue::from_static("gzip"));
+        assert!(smuggling_framing(&headers, Version::HTTP_11));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("gzip, chunked"),
+        );
+        assert!(!smuggling_framing(&headers, Version::HTTP_11));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        assert!(smuggling_framing(&headers, Version::HTTP_10));
     }
 }

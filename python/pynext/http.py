@@ -577,15 +577,13 @@ def _header_values(request, name):
 # by a client. Next.js `INTERNAL_HEADERS`
 # (packages/next/src/server/lib/server-ipc/utils.ts:42-65) plus
 # `x-middleware-refresh`, the framework-set middleware signal read back in
-# `resolve-routes.ts:739-845` — 13 names in total. A client that sends one
-# of these must not be able to steer routing, middleware, or any security
-# decision that reads it, so both entry points
-# (`App.__call__` for ASGI, `create_server` for the native transport)
-# strip them before anything else sees the request. PyNext middleware
-# communicates through ``Request``/``Response`` objects, so there is no
-# `x-middleware-*` protocol to preserve — stripping is purely defensive,
-# and a future internal signal belongs in this list first.
-#
+# `resolve-routes.ts:739-845` — 13 names in total — plus `x-pynext-smuggling`,
+# the marker the native transport's first-request sniff inserts when a
+# request carries both `Content-Length` and `Transfer-Encoding` (S-P1-31).
+# A client-sent copy of the marker is stripped here so it can never steer
+# the Rust dispatch check's marker branch or leak into handler-visible
+# headers; the sniff is the only producer that matters, and it inserts the
+# marker before hyper parses the request, i.e. before this filter runs.
 # Deliberately NOT stripped: `x-request-id` (echoed by design,
 # `observability.begin_request_context`), `traceparent` (W3C tracing),
 # and `x-forwarded-*` (only honored from trusted proxies,
@@ -604,6 +602,7 @@ INTERNAL_HEADERS = frozenset((
     b"x-next-internal-go-token",
     b"x-next-resume-state-length",
     b"next-resume",
+    b"x-pynext-smuggling",
 ))
 
 
@@ -623,6 +622,72 @@ def filter_internal_headers(headers):
             else name.lower().encode("ascii", "ignore") if isinstance(name, str)
             else None) not in INTERNAL_HEADERS
     )
+
+
+def validate_request_framing(headers, http_version="1.1"):
+    """Return a reason when the request framing is ambiguous, else ``None``.
+
+    Request-smuggling defence (S-P1-31, Sanic CVE-2026-85078). The ASGI
+    entry point calls this before reading the body; it mirrors the native
+    transport's Rust checks (``smuggling_framing`` in ``lib.rs`` plus the
+    first-request sniff) so both transports interpret framing identically —
+    either side alone would leave the other transport re-interpreting the
+    same bytes (B-1 principle).
+
+    Rejected as 400, never interpreted leniently:
+
+    * ``Content-Length`` together with ``Transfer-Encoding`` — the two
+      framings can disagree about where the body ends, which is exactly
+      the smuggling primitive. (RFC 7230's "TE wins" leniency is what the
+      old behaviour did; S-P1-31 replaces it with rejection.)
+    * duplicate ``Content-Length`` headers whose values differ, or any
+      value that is not a plain decimal length (``"5, 5"`` — identical
+      comma-separated values — is accepted, per RFC 9112 section 8.6).
+    * ``Transfer-Encoding`` whose final coding is not ``chunked`` (or any
+      ``Transfer-Encoding`` on HTTP/1.0, where it has no meaning).
+      ``gzip, chunked`` is fine; ``chunked, gzip`` is not, because the
+      length is then not determinable from the chunked framing.
+
+    Chunk extensions and trailers are not visible here: by the time the
+    ASGI app sees the request the server has already de-chunked the body,
+    so malformed chunk framing is the server's parse error, not the app's
+    — on the native transport the same cases are rejected by hyper's
+    chunk parser and by the trailer-frame rejection in
+    ``read_limited_body``.
+    """
+    content_lengths = []
+    transfer_codings = []
+    for name, value in headers:
+        lowered = name.lower() if isinstance(name, bytes) else None
+        if lowered is None:
+            continue
+        text = (value.decode("ascii", "replace")
+                if isinstance(value, bytes)
+                else str(value))
+        if lowered == b"content-length":
+            content_lengths.append(text)
+        elif lowered == b"transfer-encoding":
+            transfer_codings.extend(
+                coding.strip() for coding in text.split(","))
+    if content_lengths and transfer_codings:
+        return "Content-Length and Transfer-Encoding both present"
+    if transfer_codings:
+        if http_version == "1.0":
+            return "Transfer-Encoding on HTTP/1.0"
+        final = transfer_codings[-1].split(";", 1)[0].strip().lower()
+        if final != "chunked":
+            return "Transfer-Encoding is not chunked"
+    if content_lengths:
+        lengths = set()
+        for raw in content_lengths:
+            for token in raw.split(","):
+                token = token.strip()
+                if not token.isascii() or not token.isdigit():
+                    return "Content-Length is not a decimal length"
+                lengths.add(token.lstrip("0") or "0")
+        if len(lengths) > 1:
+            return "Conflicting Content-Length values"
+    return None
 
 
 def _cookie_value(request, name):

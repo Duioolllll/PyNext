@@ -329,8 +329,9 @@ def test_static_pages_carry_cache_control(tmp_path):
 # hyper's behaviour, not the dispatch check. The dispatch check
 # (conflicting_content_length) is a backstop for the case where conflicting
 # values ever reach dispatch; when Transfer-Encoding is present hyper drops
-# Content-Length entirely (see the next test), so the check never sees them
-# there either.
+# Content-Length entirely, so the check never sees them there either — the
+# CL+TE combination is instead caught by the first-request sniff (S-P1-31,
+# see the next test).
 def test_conflicting_content_length_is_bad_request(tmp_path):
     route = tmp_path / "app" / "api" / "input"
     route.mkdir(parents=True)
@@ -364,14 +365,17 @@ def test_conflicting_content_length_is_bad_request(tmp_path):
     asyncio.run(run())
 
 
-def test_transfer_encoding_wins_over_conflicting_content_length(tmp_path):
-    # RFC 7230 section 3.3.3: Transfer-Encoding overrides Content-Length.
-    # hyper implements that by dropping Content-Length entirely when
-    # Transfer-Encoding is present (it removes earlier CL headers and skips
-    # later ones), so the conflicting values never reach dispatch and the
-    # request is framed as chunked. The handler therefore runs normally —
-    # there is no request-smuggling ambiguity to reject, and a 400 here
-    # would be wrong.
+def test_transfer_encoding_and_content_length_is_bad_request(tmp_path):
+    # S-P1-31 (a): Content-Length + Transfer-Encoding together is
+    # ambiguous framing and is rejected with 400, even though RFC 7230
+    # section 3.3.3 says Transfer-Encoding overrides Content-Length and
+    # hyper implements that by dropping Content-Length and framing the
+    # request as chunked. The lenient override is exactly the smuggling
+    # primitive (a proxy framing by Content-Length disagrees with the
+    # backend framing by Transfer-Encoding), so PyNext rejects the
+    # combination at the first-request sniff instead of running the
+    # handler. This replaces the old expectation that the handler runs
+    # with 200 here.
     route = tmp_path / "app" / "api" / "input"
     route.mkdir(parents=True)
     (route / "route.py").write_text(
@@ -395,21 +399,11 @@ def test_transfer_encoding_wins_over_conflicting_content_length(tmp_path):
                 )
                 await writer.drain()
                 first_line = await asyncio.wait_for(reader.readline(), timeout=5)
-                assert first_line.startswith(b"HTTP/1.1 200 "), first_line
+                assert first_line.startswith(b"HTTP/1.1 400 "), first_line
                 headers = await asyncio.wait_for(
                     reader.readuntil(b"\r\n\r\n"), timeout=5
                 )
-                length = int(
-                    next(
-                        line.split(b":", 1)[1].strip()
-                        for line in headers.split(b"\r\n")
-                        if line.lower().startswith(b"content-length:")
-                    )
-                )
-                body = await asyncio.wait_for(
-                    reader.readexactly(length), timeout=5
-                )
-                assert b'"ok":true' in body, body
+                assert b"connection: close" in headers.lower(), headers
             finally:
                 writer.close()
                 await writer.wait_closed()
