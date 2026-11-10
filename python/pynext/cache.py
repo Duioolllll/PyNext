@@ -2744,6 +2744,85 @@ class FileSystemCacheBackend(CacheBackend):
             except OSError as exc:
                 raise SharedCacheUnavailable("Filesystem cache generation failed") from exc
 
+    # -- tags (shared tag manifest, one JSON file per tag) --------------
+    # These mirror the tag-manifest contract the other shared stores
+    # provide (SQLite/Redis handlers implement the same three methods):
+    # ``_read_entry`` re-judges tagged entries by the manifest, and
+    # ``ISRCache.revalidate_tag`` records invalidations here so other
+    # workers observe them on their next lookup.
+
+    def _tag_times(self, tags):
+        """Return ``{tag: (stale_at, expired_at)}`` in wall-clock seconds.
+
+        A missing tag maps to ``(None, None)``. A tag file naming a
+        different tag is a file-name collision, not this tag's record.
+        """
+        times = {}
+        for tag in tags:
+            try:
+                with open(self._tag_path(_fs_entry_name(tag)), "rb") as handle:
+                    row = json.loads(handle.read().decode("utf-8"))
+                if not isinstance(row, dict) or row.get("tag") != tag:
+                    times[tag] = (None, None)
+                else:
+                    times[tag] = (float(row["stale_at"]), float(row["expired_at"]))
+            except (FileNotFoundError, OSError, ValueError, UnicodeDecodeError,
+                    KeyError, TypeError):
+                times[tag] = (None, None)
+        return times
+
+    def get_tag_times(self, tags):
+        """Return ``{tag: (stale_at, expired_at)}`` in wall-clock seconds.
+
+        A missing tag maps to ``(None, None)``.
+        """
+        return self._tag_times(tags)
+
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation in the shared manifest.
+
+        ``expire=None`` marks entries carrying the tag expired
+        immediately; ``expire`` seconds keeps them merely stale until
+        that delay passes. Entries generated after this call are
+        unaffected. Returns True when the record was stored.
+        """
+        tag = _validate_tag(tag)
+        expire = _validate_tag_expire(expire)
+        name = _fs_entry_name(tag)
+        with self._locked():
+            try:
+                now = time.time()
+                stale_at = now
+                expired_at = now if expire is None else now + expire
+                self._atomic_write(
+                    self._tag_path(name),
+                    json.dumps({"tag": tag, "stale_at": stale_at, "expired_at": expired_at},
+                               sort_keys=True).encode("utf-8"),
+                )
+                # A manifest row can only affect entries generated before
+                # its expired_at, and no entry lives longer than
+                # fresh+stale (2 * MAX_CACHE_SECONDS), so older rows are
+                # dead weight. Prune them opportunistically.
+                cutoff = now - 2 * MAX_CACHE_SECONDS
+                try:
+                    filenames = os.listdir(self._tags_dir)
+                except OSError:
+                    filenames = []
+                for filename in filenames:
+                    if not filename.endswith(".tag"):
+                        continue
+                    try:
+                        with open(os.path.join(self._tags_dir, filename), "rb") as handle:
+                            row = json.loads(handle.read().decode("utf-8"))
+                        if float(row["expired_at"]) < cutoff:
+                            self._remove_quietly(os.path.join(self._tags_dir, filename))
+                    except (OSError, ValueError, UnicodeDecodeError, KeyError, TypeError):
+                        continue
+                return True
+            except OSError:
+                log.warning("Filesystem cache tag invalidation failed for %s", tag, exc_info=True)
+                return False
+
     def close(self):
         # No connection to close; files are opened per operation.
         pass
@@ -2821,6 +2900,25 @@ class _PlainHandlerSharedAdapter(SharedCacheHandler):
         # entries by their render-start time (see _entry_meta).
         self._tags.update(tags, durations)
         return result
+
+    def _tag_times(self, tags):
+        """Tag invalidation instants from the local mirror (see :meth:`update_tags`).
+
+        The wrapped handler keeps its own tag store, but the adapter
+        judges entries by the render-start time, so the mirror — not
+        the handler — is the authority here. Satisfies the abstract
+        ``SharedCacheHandler._tag_times`` the adapter must implement.
+        """
+        return self._tags.times(tags)
+
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation through the wrapped handler and the local mirror."""
+        tag = _validate_tag(tag)
+        expire = _validate_tag_expire(expire)
+        durations = {"expire": expire} if expire is not None else None
+        self.handler.update_tags([tag], durations)
+        self._tags.update([tag], durations)
+        return True
 
     def refresh_tags(self):
         return self.handler.refresh_tags()
@@ -3030,6 +3128,12 @@ class ISRCache:
             self._cache_path = cache_path
             self._cache_url = cache_url
             self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_OPEN)
+            # Same reporting hooks as the cache_backend path below: the
+            # shared store is touched here too, so _report_backend and
+            # _report_degraded (and the warmup CacheSignal) must exist.
+            self._health = health
+            self._metrics = metrics
+            self.signal = CacheSignal()
             # The process-local store stays the native fast path in both modes:
             # the Axum server reads it directly for fresh hits.
             self.store = _native.PageCache()
