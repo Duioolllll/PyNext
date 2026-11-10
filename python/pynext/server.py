@@ -639,6 +639,12 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               body_min_rate_bytes_per_sec=body_min_rate_bytes_per_sec,
                               shutdown_timeout=shutdown_timeout, max_waiting=max_waiting)
         print(f"PyNext listening on http://{server.address}", flush=True)
+        # S-P1-28 (M-19): a debug server bound to a non-loopback address
+        # exposes detailed dev error pages to the network; warn at startup
+        # and let the app suppress those pages while externally bound.
+        note_bind = getattr(app, "note_dev_bind_host", None)
+        if note_bind is not None:
+            note_bind(host)
         # A standalone bundle records its provenance in
         # bundle-manifest.json next to the app dir; log it (and warn on
         # a Python/PyNext version mismatch) after the listening line so
