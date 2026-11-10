@@ -22,8 +22,9 @@ from .errors import (ForbiddenError, NotFoundError, RedirectError, SignalError, 
 from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, PathHeaderRule, PathHeaders, Request,
                    RequestCancelled, Response, SecurityConfig, StreamingResponse, WebSocket,
                    WebSocketDisconnect, apply_path_headers, apply_security_headers,
-                   compile_path_headers, content_security_policy, csrf_protect, new_csrf_token,
-                   new_csp_nonce, security_headers, set_csrf_cookie, sign_csrf_token, validate_csrf)
+                   compile_path_headers, content_security_policy, csrf_protect, mask_csrf_token,
+                   new_csrf_token, new_csp_nonce, security_headers, set_csrf_cookie, sign_csrf_token,
+                   unmask_csrf_token, validate_csrf)
 from .middleware import MiddlewareScope, RouteHas, ScopedMiddleware, scoped
 from .observability import MetricsCollector, ObservabilityConfig
 from .proxy import ProxyTrust, ResolvedProxy, parse_trusted_proxies
@@ -41,7 +42,7 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "is_signal_error", "get_digest_for_well_known_error", "compute_digest", "digest_for_error",
            "error_count", "lookup_error",
            "csrf_protect", "new_csrf_token", "new_csp_nonce", "set_csrf_cookie", "sign_csrf_token",
-           "validate_csrf",
+           "validate_csrf", "mask_csrf_token", "unmask_csrf_token",
            "content_security_policy", "security_headers", "apply_security_headers",
            "PathHeaderRule", "PathHeaders", "apply_path_headers", "compile_path_headers",
            "ObservabilityConfig", "MetricsCollector", "WebSocket", "WebSocketDisconnect", "MAX_WS_MESSAGE",

@@ -7,14 +7,16 @@ import math
 import signal
 import threading
 import time
+from dataclasses import replace
 
 from . import _native
 from .app import _decode_path, _invoke, _split_request_path, _typed_params
 from .config import DEFAULT_CONFIG
 from .errors import SignalError, digest_for_error
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
-                   WebSocketDisconnect, _RequestCancellation, apply_path_headers,
-                   apply_security_headers, filter_internal_headers, security_headers)
+                   WebSocketDisconnect, _FALLBACK_CSRF_SIGNING_KEY, _RequestCancellation,
+                   apply_path_headers, apply_security_headers, ensure_shared_csrf_signing_key,
+                   filter_internal_headers, security_headers)
 from .observability import begin_request_context, get_request_id, queue_wait_var
 from .ratelimit import _is_exempt_path
 from .standalone import log_bundle_info
@@ -346,6 +348,31 @@ def _validate_server_limits(max_concurrent, acquire_timeout_ms, max_waiting,
         raise ValueError(f"shutdown_timeout must be a number between 0 and {MAX_SHUTDOWN_TIMEOUT} seconds")
 
 
+def _ensure_shared_csrf_key(app):
+    """Share one CSRF signing key for this server process (M-10).
+
+    ``start_native``/``serve`` are the non-supervisor entry points: a
+    process started here without an explicit key (and without
+    ``PYNEXT_CSRF_SIGNING_KEY``) used to sign with the per-process
+    fallback key, so a cookie issued by one such process failed HMAC
+    verification on the next (finding #23, intermittent 403). Resolve
+    the shared key exactly like the supervisor does — an explicitly
+    configured key wins, then the environment, otherwise a fresh key
+    that is published back into the environment so processes spawned
+    afterwards (``multiprocessing`` ``"spawn"``, a forked worker, or a
+    dev-server restart) inherit it — and point the app's own config at
+    it, so this process validates with the same key its children will.
+    The key itself is never logged.
+    """
+    config = app.security
+    explicit = (None if config.csrf_signing_key is _FALLBACK_CSRF_SIGNING_KEY
+                else config.csrf_signing_key)
+    shared_key = ensure_shared_csrf_signing_key(explicit)
+    if shared_key != config.csrf_signing_key:
+        app.security = replace(config, csrf_signing_key=shared_key)
+    return shared_key
+
+
 def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acquire_timeout_ms=1000,
                  body_capacity=16, body_timeout_ms=10000, observability=None, *, reuse_port=False, listener=None,
                  max_connections=DEFAULT_MAX_CONNECTIONS,
@@ -372,6 +399,10 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=64, acqu
                             body_capacity, body_timeout_ms, max_connections,
                             max_connections_per_ip, header_read_timeout_ms,
                             body_min_rate_bytes_per_sec, shutdown_timeout)
+    # M-10: non-supervisor servers share one CSRF signing key too, so a
+    # cookie issued by this process validates on any process spawned
+    # from it (and survives a dev-server restart).
+    _ensure_shared_csrf_key(app)
     if observability is not None:
         app.configure_observability(observability)
     app.metrics.observe_worker_start()

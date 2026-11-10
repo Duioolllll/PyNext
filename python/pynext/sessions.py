@@ -13,7 +13,7 @@ from collections.abc import MutableMapping
 from pathlib import Path
 
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
-from .http import Response, StreamingResponse, _add_vary, _header_values
+from .http import Response, StreamingResponse, _add_vary, _header_values, mask_csrf_token
 
 log = logging.getLogger("pynext")
 
@@ -359,7 +359,13 @@ class Session(MutableMapping):
     session. The rotation preserves the session data and issues a fresh
     CSRF token; the old id stops working as soon as the response is
     sent. Call :meth:`invalidate` on logout to delete the server-side
-    session and clear the cookie.
+    session and clear the cookie. As a backstop, the middleware rotates
+    the id automatically whenever a request authenticates a previously
+    anonymous session (see :meth:`SessionMiddleware.__call__`, H-6), so
+    a login handler that forgets to rotate cannot leave a fixed id
+    authenticated — but call it explicitly anyway: the automatic
+    rotation runs after the handler, so a token issued before it no
+    longer validates.
     """
 
     def __init__(self, data=None, csrf=None, token=None, version=None):
@@ -395,11 +401,24 @@ class Session(MutableMapping):
         return len(self._data)
 
     def csrf_token(self):
+        """Return a CSRF token for this session (masked, Django-style).
+
+        Every call returns a different value — a fresh random one-time
+        mask over the stored secret — so the token embedded in a page
+        or JSON response changes per request and cannot be recovered by
+        BREACH-style compression analysis. Submit the masked value (or
+        the raw secret) in the ``X-CSRF-Token`` header or the
+        ``csrf_token`` form field; validation unmasks it and compares
+        the secret in constant time. The stored secret itself is only
+        replaced by :meth:`rotate` (login, privilege change). Fetch the
+        token after any rotation: a token issued before rotation no
+        longer validates.
+        """
         if self._invalidated:
             raise RuntimeError("session has been invalidated")
         if self._csrf is None:
             self._csrf = secrets.token_urlsafe(32)
-        return self._csrf
+        return mask_csrf_token(self._csrf)
 
     def rotate(self):
         """Mark this session for id rotation when the response is sent.
@@ -433,10 +452,30 @@ class Session(MutableMapping):
         """
         self.rotate()
 
+    def cycle_key(self):
+        """Rotate the session id, keeping the data (Django ``cycle_key``).
+
+        Alias for :meth:`rotate`: call it on login and whenever
+        privilege changes, so a session id fixed before authentication
+        cannot become an authenticated session. The old id is deleted
+        server-side when the response is sent; the CSRF secret rotates
+        with it.
+        """
+        self.rotate()
+
     def invalidate(self):
         self._data.clear()
         self._csrf = None
         self._invalidated = True
+
+    def flush(self):
+        """Delete the session entirely — data and id (Django ``flush``).
+
+        Alias for :meth:`invalidate`: call it on logout. The server-side
+        entry is deleted and the cookie cleared when the response is
+        sent; the next request starts a fresh anonymous session.
+        """
+        self.invalidate()
 
     def _changed(self):
         try:
@@ -451,6 +490,30 @@ class Session(MutableMapping):
             raise
 
 
+def _auto_rotate_on_login(session, previous_user_id):
+    """Rotate the session id when this request authenticated it (H-6).
+
+    ``previous_user_id`` is who (if anyone) the session authenticated
+    before the handler ran; the current ``session["user_id"]`` is who
+    it authenticates now. When the session was anonymous — or another
+    user's — and is authenticated afterwards, force a rotation, so an
+    id an attacker fixed before login cannot survive as the
+    authenticated session. An app that already called
+    :meth:`Session.rotate_on_login` is unaffected (``_rotate`` is
+    already set); a session that stays anonymous, or keeps the same
+    identity, is left alone. The rotation preserves the data and
+    issues a fresh CSRF secret, exactly like an explicit
+    :meth:`Session.rotate`.
+    """
+    current_user_id = session.get("user_id")
+    if not isinstance(current_user_id, str) or not current_user_id:
+        return
+    was_authenticated = isinstance(previous_user_id, str) and bool(previous_user_id)
+    if (not was_authenticated or current_user_id != previous_user_id) and not session._rotate:
+        log.debug("Rotating session id on authentication transition")
+        session.rotate()
+
+
 class SessionMiddleware:
     """Attach ``request.state['session']`` and persist changes before sending headers.
 
@@ -461,6 +524,16 @@ class SessionMiddleware:
     attacker cannot smuggle a chosen session id past the single-value
     check by sending two values. Login handlers must rotate the session
     id after authentication; see :meth:`Session.rotate_on_login`.
+
+    Session fixation (H-6): ``check_authorization`` runs before the
+    handler, so it cannot see the login transition — this middleware,
+    which wraps the whole request, is the only place that can guarantee
+    rotation. When the handler authenticates a session that was
+    anonymous (or another user's) before the request, the id is rotated
+    automatically even when the login handler forgot
+    :meth:`Session.rotate_on_login`: the pre-login id stops working as
+    soon as the response is sent. A session that stays anonymous, or
+    keeps the same identity, is left alone.
 
     When ``purge_interval`` is set (seconds, default 3600), the middleware
     runs the store's ``purge_expired`` in a background task while requests
@@ -555,7 +628,13 @@ class SessionMiddleware:
                             headers=[(b"retry-after", b"1"), (b"cache-control", b"no-store")])
         session = Session(*(loaded[:2]), token=token, version=loaded[2]) if loaded else Session()
         request.state["session"] = session
+        # H-6: remember who (if anyone) this session authenticated
+        # before the handler ran, so a login transition can be rotated
+        # even when the handler forgets rotate_on_login().
+        previous_user_id = session.get("user_id")
         response = await call_next(request)
+        if not session._invalidated:
+            _auto_rotate_on_login(session, previous_user_id)
         changed = session._changed() if not session._invalidated else False
         if session._invalidated:
             if session._token:
