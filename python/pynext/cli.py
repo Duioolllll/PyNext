@@ -20,7 +20,7 @@ from .scaffold import TEMPLATES, init_project
 from .server import (MAX_BODY_CAPACITY, MAX_BODY_MIN_RATE_BYTES_PER_SEC,
                      MAX_CONCURRENT, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP,
                      MAX_SHUTDOWN_TIMEOUT, MAX_TIMEOUT_MS, MAX_WAITING, serve)
-from .supervisor import MAX_WORKERS, WorkerConfig, run_supervisor
+from .supervisor import MAX_WORKERS, WorkerConfig, decide_auto_workers, run_supervisor
 from .standalone import build_standalone
 from .watch import Watcher
 
@@ -77,6 +77,30 @@ def _bounded(minimum, maximum, label):
             raise argparse.ArgumentTypeError(f"{label} must be an integer <= {maximum}")
         return number
     return convert
+
+
+def _workers(value):
+    """argparse type for --workers: an integer in [1, MAX_WORKERS] or "auto".
+
+    "auto" resolves later, in main(), via decide_auto_workers() — the
+    machine's CPU/memory count is only read once the rest of the flags
+    have parsed, so a bad --workers value still fails fast at parse
+    time. Error wording keeps the existing "[1, 64]" / ">= 1" / "<= 64"
+    messages (test_cli asserts on them) with 'auto' added to the
+    not-an-integer case.
+    """
+    if value == "auto":
+        return value
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--workers must be an integer in [1, 64] or 'auto'") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("--workers must be an integer >= 1")
+    if number > MAX_WORKERS:
+        raise argparse.ArgumentTypeError("--workers must be an integer <= 64")
+    return number
 
 
 async def _wait_for_change(watcher, server_task):
@@ -543,9 +567,10 @@ def _build_parser():
             command.add_argument("--tracing", dest="tracing",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="emit OpenTelemetry spans when the opentelemetry packages are installed (default: off)")
-            command.add_argument("--workers", type=_bounded(1, MAX_WORKERS, "--workers"),
+            command.add_argument("--workers", type=_workers,
                                  default=DEFAULT_CONFIG.workers,
-                                 help="worker processes sharing the port (default 1: single process; max 64); "
+                                 help="worker processes sharing the port (default 1: single process; max 64; "
+                                      "'auto' picks from CPU cores and available memory, max 8); "
                                       "a supervisor restarts crashed workers")
             command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"),
                                  default=DEFAULT_CONFIG.rate_limit,
@@ -734,7 +759,17 @@ def main():
         value = getattr(args, key)
         if value is not None and value != getattr(DEFAULT_CONFIG, key):
             conn_kwargs[key] = value
-    if args.workers > 1:
+    if args.workers == "auto":
+        decision = decide_auto_workers()
+        workers = decision.count
+        # The track (E P2-10) asks for the decision basis on one startup
+        # line: the resolved count and what capped it. Printed here, not
+        # in run_supervisor, so an auto decision of 1 — the
+        # single-process path, no supervisor — is reported too.
+        print(f"PyNext workers: {decision.describe()}", flush=True)
+    else:
+        workers = args.workers
+    if workers > 1:
         config = WorkerConfig(root=str(root), host=args.host, port=args.port,
                               production=args.command == "start",
                               max_concurrent=args.max_concurrent,
@@ -755,7 +790,7 @@ def main():
                               observability=obs_config, security=security,
                               websocket_max_message=args.ws_max_message_bytes,
                               shutdown_timeout=args.shutdown_timeout, strict_ssg=args.strict_ssg)
-        return run_supervisor(config, workers=args.workers)
+        return run_supervisor(config, workers=workers)
     if args.command == "dev":
         try:
             asyncio.run(run_dev(root, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,

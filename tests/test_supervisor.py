@@ -275,3 +275,77 @@ def test_cli_routes_multiple_workers_to_supervisor(tmp_path, monkeypatch):
     assert config.root == str(root)
     assert (config.host, config.port, config.production) == ("127.0.0.1", 3101, True)
     assert config.rate_limit == 50
+
+
+def test_cli_workers_auto_routes_to_supervisor(tmp_path, monkeypatch, capsys):
+    from pynext import cli
+    from pynext.supervisor import AutoWorkers
+
+    root = tmp_path.resolve()
+    seen = []
+    monkeypatch.setattr(cli, "run_supervisor",
+                        lambda config, workers: seen.append(workers) or 0)
+    monkeypatch.setattr(cli, "decide_auto_workers",
+                        lambda: AutoWorkers(count=3, cpus=4,
+                                            available_memory_bytes=4 * 1024 ** 3,
+                                            limited_by="memory"))
+    monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: pytest.fail("unexpected startup"))
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--workers", "auto"])
+    assert cli.main() == 0
+    assert seen == [3]
+    # The decision basis is logged on one startup line.
+    assert "PyNext workers: auto -> 3 worker(s)" in capsys.readouterr().out
+
+
+def test_cli_workers_auto_to_one_stays_single_process(tmp_path, monkeypatch, capsys):
+    from pynext import cli
+    from pynext.supervisor import AutoWorkers
+
+    root = tmp_path.resolve()
+    app = object()
+    served = []
+    monkeypatch.setattr(cli, "run_supervisor",
+                        lambda config, workers: pytest.fail("unexpected supervisor"))
+    monkeypatch.setattr(cli, "decide_auto_workers",
+                        lambda: AutoWorkers(count=1, cpus=1,
+                                            available_memory_bytes=512 * 1024 ** 2,
+                                            limited_by="memory"))
+    monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: app)
+
+    async def serve(received_app, *args, **kwargs):
+        served.append(received_app)
+
+    monkeypatch.setattr(cli, "serve", serve)
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--workers", "auto"])
+    cli.main()
+    assert served == [app]
+    assert "PyNext workers: auto -> 1 worker(s)" in capsys.readouterr().out
+
+
+def test_cli_workers_auto_under_dev_goes_to_supervisor(tmp_path, monkeypatch):
+    from pynext import cli
+    from pynext.supervisor import AutoWorkers
+
+    root = tmp_path.resolve()
+    seen = []
+    monkeypatch.setattr(cli, "run_supervisor",
+                        lambda config, workers: seen.append((config, workers)) or 0)
+    monkeypatch.setattr(cli, "decide_auto_workers",
+                        lambda: AutoWorkers(count=2, cpus=2,
+                                            available_memory_bytes=8 * 1024 ** 3,
+                                            limited_by="cpus"))
+    monkeypatch.setattr(sys, "argv", ["pynext", "dev", "--dir", str(root), "--workers", "auto"])
+    assert cli.main() == 0
+    config, workers = seen[0]
+    assert workers == 2
+    assert config.production is False
+
+
+def test_cli_workers_auto_is_case_sensitive(monkeypatch, capsys):
+    from pynext import cli
+
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--workers", "AUTO"])
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert "--workers must be an integer in [1, 64] or 'auto'" in capsys.readouterr().err
