@@ -297,7 +297,9 @@ def test_cli_only_static_passes_stage(monkeypatch, tmp_path, capsys):
 def test_cli_static_only_calls_export(monkeypatch, tmp_path, capsys):
     seen = {}
 
-    def fake_manifest(path, stages=None):
+    def fake_manifest(path, stages=None, **kwargs):
+        # --static-only runs a full build, so the CLI passes
+        # deployment_id/lock_timeout like the plain build path does.
         return {"routes": {"/": {}}}
 
     def fake_export(root, manifest, output=None):

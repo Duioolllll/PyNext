@@ -2239,6 +2239,11 @@ class ISRCache:
             self._inflight = {}
             self._task_leases = {}
             self._tasks = set()
+            # In-flight shared writes, keyed by cache key (Next.js ``pendingSets``):
+            # a second write for the same key waits on the event instead of
+            # issuing a duplicate write, and a read waits (bounded) and re-reads
+            # the shared entry once the write lands.
+            self._pending_sets = {}
             self._variant_paths = OrderedDict()
             # Tag invalidation state (same as the cache_backend path below):
             # ``_key_tags`` / ``_key_generated_at`` record which tags each
