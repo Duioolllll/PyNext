@@ -57,6 +57,9 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `set_csrf_cookie` | `pynext.http` |
 | `sign_csrf_token` | `pynext.http` |
 | `validate_csrf` | `pynext.http` |
+| `get_csrf_token` | `pynext.http` |
+| `csrf_token_response` | `pynext.http` |
+| `csrf_input` | `pynext.http` |
 | `content_security_policy` | `pynext.http` |
 | `security_headers` | `pynext.http` |
 | `apply_security_headers` | `pynext.http` |
@@ -79,6 +82,10 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `RedisSessionStore` | `pynext.sessions` |
 | `require_auth` | `pynext.auth` |
 | `require_permission` | `pynext.auth` |
+| `require_scope` | `pynext.auth` |
+| `AuthorizationPolicy` | `pynext.auth` |
+| `authorization_policy` | `pynext.auth` |
+| `state_changing_get` | `pynext.routing` |
 | `RedisRateLimiter` | `pynext.redis_rate` |
 | `WebSocketPubSub` | `pynext.pubsub` |
 | `PubSubOverflow` | `pynext.pubsub` |

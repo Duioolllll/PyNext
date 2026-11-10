@@ -2,6 +2,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import html
 import json
 import os
 import re
@@ -37,6 +38,10 @@ class _RequestCancellation(threading.Event):
 
 
 #: Methods that never change server state and are exempt from CSRF checks.
+#: The exemption is a contract, not a loophole: a GET/HEAD/OPTIONS handler
+#: must be side-effect free (see :func:`validate_csrf` and S-P1-23). A
+#: handler that changes state on GET receives no CSRF check at all, so
+#: state-changing work belongs on POST/PUT/PATCH/DELETE, never on GET.
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 #: One process-wide fallback signing key for double-submit CSRF cookies.
@@ -196,6 +201,25 @@ class SecurityConfig:
     same stored secret (BREACH mitigation) — and validation unmasks it
     and compares the secret in constant time; a raw (unmasked) token
     still validates, so clients holding one issued earlier keep working.
+
+    Issuing a token is a framework job, not per-app boilerplate
+    (S-P1-22): :func:`get_csrf_token` returns the token for the current
+    request (the session-bound token when a session is present, a fresh
+    double-submit token otherwise), :func:`csrf_token_response` answers
+    ``GET /_pynext/csrf-token`` with ``{"csrf_token": ...}`` and sets
+    the double-submit cookie for session-less apps, and
+    :func:`csrf_input` renders the hidden form field. An app whose
+    POSTs all fail with 403 because no token was ever issued should
+    call one of these — not turn CSRF off.
+
+    GET, HEAD and OPTIONS are exempt from CSRF checks (see
+    :func:`validate_csrf`), so a handler that changes state on GET is
+    unprotected by construction (S-P1-23): GET handlers must be
+    side-effect free. Development apps warn at startup when a GET
+    handler looks state-changing (see :func:`pynext.app.check_get_idempotency`);
+    a handler that knowingly mutates state on GET must be marked with
+    :func:`pynext.routing.state_changing_get` — the marker only silences
+    the warning, it does not add any CSRF protection, so prefer POST.
 
     The A1 default security headers (HSTS, ``X-Content-Type-Options``,
     ``X-Frame-Options``, ``Referrer-Policy``, ``Permissions-Policy`` and the
@@ -644,6 +668,12 @@ def validate_csrf(request, *, config=DEFAULT_SECURITY):
     field. The submitted token may be masked (see :func:`mask_csrf_token`)
     or raw; either way it is unmasked first and then compared with the
     secret in constant time (``hmac.compare_digest``).
+
+    The safe-method exemption is a contract: it only holds because GET,
+    HEAD and OPTIONS handlers must not change server state (S-P1-23).
+    A handler that mutates state on GET is never checked here, so it is
+    unprotected against cross-site requests by construction — move the
+    mutation to POST/PUT/PATCH/DELETE instead.
     """
     if request.method.upper() in SAFE_METHODS:
         return True
@@ -686,6 +716,79 @@ def csrf_protect(fn):
     """
     fn.__pynext_csrf__ = True
     return fn
+
+
+def get_csrf_token(request, *, config=DEFAULT_SECURITY):
+    """Return the CSRF token the client must submit with state-changing requests.
+
+    This is the standard issuance helper (S-P1-22): an app never needs to
+    mint its own token. With a session in ``request.state`` the token is
+    the session-bound one (``session.csrf_token()`` creates it on first
+    use, and the session middleware persists it); without a session it is
+    a fresh double-submit token from :func:`new_csrf_token`.
+
+    A session-less token is only valid when the matching HMAC-signed
+    cookie reaches the client on the same response — pair it with
+    :func:`set_csrf_cookie` on that response, or use
+    :func:`csrf_token_response` / :func:`csrf_input`, which do that for
+    you. A token issued here and never delivered is useless, and a POST
+    that then fails with 403 is the framework telling the app it forgot
+    to issue a token — not a reason to turn CSRF off.
+    """
+    from .sessions import Session
+    session = request.state.get("session")
+    if isinstance(session, Session):
+        return session.csrf_token()
+    return new_csrf_token()
+
+
+def csrf_token_response(request, *, config=DEFAULT_SECURITY):
+    """Answer a token-issuance request with ``{"csrf_token": ...}`` (S-P1-22).
+
+    This is what the built-in ``GET /_pynext/csrf-token`` endpoint
+    returns. With a session the token is session-bound and the session
+    middleware persists it (and sets the session cookie for a new
+    session); without one the double-submit cookie is set on this
+    response, so the token and the cookie always travel together. The
+    token is never read from the query string: a token in a URL would
+    leak into logs, history and Referer headers.
+    """
+    from .sessions import Session
+    session = request.state.get("session")
+    token = session.csrf_token() if isinstance(session, Session) else new_csrf_token()
+    response = JSONResponse({"csrf_token": token},
+                            headers=[(b"cache-control", b"private, no-store")])
+    if not isinstance(session, Session):
+        set_csrf_cookie(response, token, config=config)
+    return response
+
+
+def csrf_input(request, response=None, *, config=DEFAULT_SECURITY):
+    """Render the hidden ``<input>`` carrying the CSRF token for a form (S-P1-22).
+
+    Returns ``<input type="hidden" name="<csrf_form_field>" value="...">``
+    with the token HTML-escaped. With a session the token is
+    session-bound and the session middleware persists it, so ``response``
+    is not needed; without one the signed double-submit cookie must be
+    set on the very response that carries this form, so pass that
+    response in — otherwise a :class:`ValueError` is raised instead of
+    rendering a form whose POST could never validate.
+    """
+    from .sessions import Session
+    session = request.state.get("session")
+    if isinstance(session, Session):
+        token = session.csrf_token()
+    else:
+        if response is None:
+            raise ValueError(
+                "csrf_input() without a session needs the response carrying the form, "
+                "so the double-submit cookie can be set on it; pass response=... "
+                "or use csrf_token_response() instead")
+        token = new_csrf_token()
+        set_csrf_cookie(response, token, config=config)
+    field = html.escape(config.csrf_form_field, quote=True)
+    value = html.escape(token, quote=True)
+    return f'<input type="hidden" name="{field}" value="{value}">'
 
 
 def new_csp_nonce():

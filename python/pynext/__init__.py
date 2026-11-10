@@ -5,7 +5,7 @@ from importlib.metadata import version as _distribution_version
 __version__ = _distribution_version("pynext-framework")
 
 from .app import App, create_app
-from .auth import require_auth, require_permission
+from .auth import AuthorizationPolicy, authorization_policy, require_auth, require_permission, require_scope
 from .client_dsl import ClientDSLCompileError, compile_client_dsl
 from .components import CACHE_LIFE_PROFILES, h, fragment, island, layout, model_prop, page
 from .database import Database
@@ -22,8 +22,9 @@ from .errors import (ForbiddenError, NotFoundError, RedirectError, SignalError, 
 from .http import (MAX_WS_MESSAGE, BadRequest, JSONResponse, PathHeaderRule, PathHeaders, Request,
                    RequestCancelled, Response, SecurityConfig, StreamingResponse, WebSocket,
                    WebSocketDisconnect, apply_path_headers, apply_security_headers,
-                   compile_path_headers, content_security_policy, csrf_protect, mask_csrf_token,
-                   new_csrf_token, new_csp_nonce, security_headers, set_csrf_cookie, sign_csrf_token,
+                   compile_path_headers, content_security_policy, csrf_input, csrf_protect,
+                   csrf_token_response, get_csrf_token, mask_csrf_token, new_csrf_token,
+                   new_csp_nonce, security_headers, set_csrf_cookie, sign_csrf_token,
                    unmask_csrf_token, validate_csrf)
 from .middleware import MiddlewareScope, RouteHas, ScopedMiddleware, scoped
 from .observability import MetricsCollector, ObservabilityConfig
@@ -31,7 +32,7 @@ from .proxy import ProxyTrust, ResolvedProxy, parse_trusted_proxies
 from .pubsub import PubSubOverflow, WebSocketPubSub
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
-from .routing import route, websocket
+from .routing import route, state_changing_get, websocket
 from .sessions import RedisSessionStore, Session, SessionMiddleware, SQLiteSessionStore
 from .static import StaticPathError, resolve_static_path, validate_static_request_path
 
@@ -44,11 +45,13 @@ __all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layou
            "error_count", "lookup_error",
            "csrf_protect", "new_csrf_token", "new_csp_nonce", "set_csrf_cookie", "sign_csrf_token",
            "validate_csrf", "mask_csrf_token", "unmask_csrf_token",
+           "get_csrf_token", "csrf_token_response", "csrf_input",
            "content_security_policy", "security_headers", "apply_security_headers",
            "PathHeaderRule", "PathHeaders", "apply_path_headers", "compile_path_headers",
            "ObservabilityConfig", "MetricsCollector", "WebSocket", "WebSocketDisconnect", "MAX_WS_MESSAGE",
            "compile_client_dsl", "ClientDSLCompileError", "RateLimiter", "UploadFile",
            "Session", "SessionMiddleware", "SQLiteSessionStore", "RedisSessionStore", "require_auth", "require_permission",
+           "require_scope", "AuthorizationPolicy", "authorization_policy", "state_changing_get",
            "RedisRateLimiter", "WebSocketPubSub", "PubSubOverflow",
            "ProxyTrust", "ResolvedProxy", "parse_trusted_proxies", "FAIL_OPEN", "FAIL_CLOSED",
            "LoadedEnv", "env_file_names", "load_env", "public_env_defines", "public_env_vars",
