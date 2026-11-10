@@ -120,11 +120,14 @@ def test_sqlite_backend_ttl_transitions_and_fencing(tmp_path):
     backend = SQLiteCacheBackend(tmp_path / "cache.sqlite3")
     try:
         assert backend.lookup("k") == ("miss", None)
-        assert backend.insert("k", b"one", 0.2, 0.3)
+        # Generous TTLs: the old 0.2s/0.3s values were flaky on slow CI
+        # runners (macOS), where scheduling jitter could push the lookup
+        # past the stale window and report "expired" instead of "stale".
+        assert backend.insert("k", b"one", 1.0, 2.0)
         assert backend.lookup("k") == ("fresh", b"one")
         entry = backend.lookup_entry("k")
         assert entry.status == "fresh" and entry.version == 1
-        time.sleep(0.25)
+        time.sleep(1.5)
         assert backend.lookup("k") == ("stale", b"one")
         # A fenced write with the wrong version must not overwrite.
         assert not backend.insert_fenced("k", b"stale-writer", 30, 30, expected_version=99)
@@ -137,8 +140,8 @@ def test_sqlite_backend_ttl_transitions_and_fencing(tmp_path):
         assert backend.insert_fenced("new", b"n", 30, 30, expected_version=0)
         assert not backend.insert_fenced("new", b"n2", 30, 30, expected_version=0)
         assert backend.lookup("new") == ("fresh", b"n")
-        assert backend.insert("expiring", b"e", 0.2, 0.3)
-        time.sleep(0.6)
+        assert backend.insert("expiring", b"e", 1.0, 2.0)
+        time.sleep(3.5)
         assert backend.lookup("expiring")[0] == "expired"
         assert backend.lookup("expiring") == ("miss", None)
         assert backend.remove("new")
