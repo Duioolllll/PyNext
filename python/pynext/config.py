@@ -150,7 +150,9 @@ class PyNextConfig:
     max_waiting: int | None = None
     body_capacity: int = 16
     body_timeout_ms: int = 10000
-    # Connection limits (serve()).
+    # Connection limits (serve()). header_read_timeout_ms also bounds
+    # idle keep-alive connections: hyper applies it to every header read,
+    # so a connection that stays idle past it is closed (see serve()).
     max_connections: int = 1024
     max_connections_per_ip: int = 128
     # Per-IP execution quota (serve()): at most this many requests from

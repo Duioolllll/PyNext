@@ -936,6 +936,22 @@ class App:
                 executor.shutdown(wait=False, cancel_futures=True)
 
     async def _invoke_sync(self, fn, kwargs, request=None):
+        """Run a sync handler/layout on a worker thread (C-P1-8).
+
+        Client disconnect cancels the awaiter promptly: the native
+        transport notices the closed connection (Axum drops the
+        in-flight handler future, the bridge cancels the Python task)
+        and the ASGI transport notices ``http.disconnect`` (see
+        ``_run_while_connected``). Either way the request's
+        cancellation signal is set, so cooperative work can stop
+        before committing a side effect (see
+        :meth:`Request.check_cancelled`). A thread that is already
+        running cannot be interrupted, so its result is discarded and
+        its slot stays occupied until the thread actually finishes
+        (ADR-0002); the slot is then released and the worker is
+        reusable. Work that has not started yet never starts: the
+        pre-start check in ``run`` raises instead of calling ``fn``.
+        """
         # Keep capacity occupied until the actual thread finishes, even if
         # the awaiter timed out. Cancellation cannot stop a Python thread.
         # Bounded wait (C-P1-2): when every sync worker is busy the
@@ -1512,6 +1528,26 @@ class App:
                     log.exception("Resource shutdown failed")
         self._resources_started.clear()
         self._started = False
+        # Background work owned by middleware (C-P2-5): a session
+        # middleware runs an expiry purge loop while requests are served;
+        # stop it here so it does not outlive the app (and its store)
+        # across a reload in the same event loop. Only middleware that
+        # offers a close() is touched.
+        for item in self.middleware:
+            target = item.middleware if isinstance(item, ScopedMiddleware) else item
+            close = getattr(target, "close", None)
+            if close is None:
+                continue
+            try:
+                if inspect.iscoroutinefunction(close):
+                    await close()
+                else:
+                    close()
+            except Exception as exc:
+                if error is None:
+                    error = exc
+                else:
+                    log.exception("Middleware shutdown failed")
         try:
             # Cache teardown runs on the exit lane (C-P1-3c): closing the
             # shared cache must not wait behind in-flight sync handlers.
