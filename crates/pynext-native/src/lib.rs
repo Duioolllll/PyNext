@@ -985,7 +985,11 @@ fn invalid_transfer_encoding(headers: &HeaderMap, version: Version) -> bool {
     if version == Version::HTTP_10 {
         return true;
     }
-    let Some(last) = headers.get_all(header::TRANSFER_ENCODING).iter().last() else {
+    let Some(last) = headers
+        .get_all(header::TRANSFER_ENCODING)
+        .iter()
+        .next_back()
+    else {
         return false;
     };
     let Ok(text) = last.to_str() else {

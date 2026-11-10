@@ -54,12 +54,12 @@ def test_content_length_and_transfer_encoding_is_bad_request(tmp_path):
         host, port = server.address.rsplit(":", 1)
         try:
             for payload in (
-                b"POST /api/input HTTP/1.1\r\nHost: localhost\r\n"
-                b"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
-                b"0\r\n\r\n",
-                b"POST /api/input HTTP/1.1\r\nHost: localhost\r\n"
-                b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
-                b"0\r\n\r\n",
+                (b"POST /api/input HTTP/1.1\r\nHost: localhost\r\n"
+                 b"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
+                 b"0\r\n\r\n"),
+                (b"POST /api/input HTTP/1.1\r\nHost: localhost\r\n"
+                 b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
+                 b"0\r\n\r\n"),
             ):
                 head = await raw_head(host, port, payload)
                 assert status_of(head).startswith(b"HTTP/1.1 400 "), head
