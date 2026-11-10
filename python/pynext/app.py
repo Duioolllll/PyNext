@@ -1586,7 +1586,12 @@ class App:
                             stale = expire - revalidate
                         else:
                             stale = 60.0 if effective["stale"] is None else effective["stale"]
-                            expire = revalidate + stale
+                            # Pass expire=None so _isr_policy derives
+                            # expire = revalidate + stale itself: a zero
+                            # stale window (stale=0) legitimately yields
+                            # expire == revalidate, which _isr_policy only
+                            # rejects for an explicitly given expire.
+                            expire = None
                         try:
                             policy = _isr_policy(revalidate, stale, expire)
                         except ValueError as exc:
