@@ -2547,7 +2547,8 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                         Some(fast_permit),
                     ),
                     &path,
-                    &state.path_headers,                );
+                    &state.path_headers,
+                );
             }
             if !state.shared_cache_enabled
                 && !parts.headers.contains_key("authorization")
