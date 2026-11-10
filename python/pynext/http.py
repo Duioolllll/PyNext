@@ -857,6 +857,13 @@ class Request:
             raise RuntimeError("This request is not attached to an app")
         return await self._app.revalidate(path)
 
+    async def revalidate_tag(self, tag, expire=None):
+        """Invalidate every ISR entry carrying ``tag`` (see :meth:`App.revalidate_tag`)."""
+        self.check_cancelled()
+        if self._app is None:
+            raise RuntimeError("This request is not attached to an app")
+        return await self._app.revalidate_tag(tag, expire)
+
     @property
     def query(self):
         try:

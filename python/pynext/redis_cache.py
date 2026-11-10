@@ -3,28 +3,31 @@ import hashlib
 import math
 import uuid
 
-from .cache import (LEASE_TTL, MAX_CACHE_BODY_BYTES, MAX_CACHE_KEY_BYTES, _VARIANT_GENERATION_TTL,
-                    SharedCacheUnavailable, SharedEntry, _valid_durations)
+from .cache import (LEASE_TTL, MAX_CACHE_BODY_BYTES, MAX_CACHE_KEY_BYTES, MAX_CACHE_SECONDS,
+                    _VARIANT_GENERATION_TTL, SharedCacheUnavailable, SharedEntry, _valid_durations)
+from .components import _validate_tag, _validate_tag_expire, _validate_tags
 
 
 _LOOKUP = """
-local row = redis.call('HMGET', KEYS[1], 'body', 'fresh_until', 'stale_until', 'version')
+local row = redis.call('HMGET', KEYS[1], 'body', 'fresh_until', 'stale_until', 'version', 'tags', 'generated_at')
 if not row[1] then return nil end
 local t = redis.call('TIME')
 local now = t[1] * 1000 + math.floor(t[2] / 1000)
 local fresh = tonumber(row[2])
 local stale = tonumber(row[3])
+local tags = row[5] or ''
+local generated = tonumber(row[6]) or fresh
 if now >= stale then
   if redis.call('EXISTS', KEYS[2]) == 0 then
     redis.call('DEL', KEYS[1])
     return nil
   end
-  return {'', row[4], 'expired', '0', '0'}
+  return {'', row[4], 'expired', '0', '0', tags, tostring(generated), tostring(now)}
 end
 if now < fresh then
-  return {row[1], row[4], 'fresh', tostring(fresh-now), tostring(stale-fresh)}
+  return {row[1], row[4], 'fresh', tostring(fresh-now), tostring(stale-fresh), tags, tostring(generated), tostring(now)}
 end
-return {row[1], row[4], 'stale', '0', tostring(stale-now)}
+return {row[1], row[4], 'stale', '0', tostring(stale-now), tags, tostring(generated), tostring(now)}
 """
 
 _ACQUIRE = """
@@ -42,7 +45,8 @@ local now = t[1] * 1000 + math.floor(t[2] / 1000)
 local fresh = tonumber(ARGV[2])
 local stale = tonumber(ARGV[3])
 redis.call('HSET', KEYS[1], 'body', ARGV[1], 'fresh_until', now+fresh,
-           'stale_until', now+fresh+stale, 'version', version+1)
+           'stale_until', now+fresh+stale, 'version', version+1,
+           'tags', ARGV[7], 'generated_at', now)
 redis.call('PEXPIRE', KEYS[1], fresh+stale+tonumber(ARGV[6]))
 return 1
 """
@@ -83,17 +87,82 @@ class RedisCacheBackend:
         base = f"pynext:isr:{{{digest}}}"
         return base + ":entry", base + ":lease"
 
+    @staticmethod
+    def _tag_key(tag):
+        digest = hashlib.sha256(tag.encode("utf-8")).hexdigest()
+        return f"pynext:isr:tag:{digest}"
+
+    def _tag_status(self, tags, generated_at, now):
+        """Classify an entry by its tags against the tag manifest.
+
+        Returns ``"expired"`` when any tag was invalidated after the
+        entry was generated and that invalidation has fully expired,
+        ``"stale"`` when any tag was invalidated after generation but
+        the entry is still inside the stale window, and ``"fresh"``
+        otherwise. Tag records are fetched after the entry read, so a
+        revalidation landing between the two reads is picked up by the
+        next lookup.
+        """
+        if not tags:
+            return "fresh"
+        values = self.client.mget([self._tag_key(tag) for tag in tags])
+        stale = False
+        for value in values:
+            if not value:
+                continue
+            try:
+                stale_at, expired_at = (int(part) for part in value.decode("ascii").split(",", 1))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if generated_at < expired_at <= now:
+                return "expired"
+            if stale_at > generated_at:
+                stale = True
+        return "stale" if stale else "fresh"
+
     def lookup_entry(self, key):
         try:
             row = self.client.eval(_LOOKUP, 2, *self._keys(key))
             if row is None:
                 return None
-            body, version, status, fresh, stale = row
+            body, version, status, fresh, stale, tags, generated, now = row
             status = status.decode("ascii")
+            if status != "expired" and tags:
+                tag_status = self._tag_status(tags.decode("ascii").split(","), int(generated), int(now))
+                if tag_status == "expired":
+                    entry_key, lease_key = self._keys(key)
+                    if not self.client.exists(lease_key):
+                        self.client.delete(entry_key)
+                    return SharedEntry("expired", None, int(version), 0.0, 0.0)
+                if tag_status == "stale":
+                    status, fresh = "stale", 0
             return SharedEntry(status, None if status == "expired" else body, int(version),
                                int(fresh) / 1000, int(stale) / 1000)
         except Exception as exc:
             raise SharedCacheUnavailable("Redis cache lookup failed") from exc
+
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation in Redis.
+
+        ``expire=None`` marks entries carrying the tag expired
+        immediately; ``expire`` seconds keeps them merely stale until
+        that delay passes. The record outlives any entry it could
+        affect (``expire`` + the maximum entry lifetime + a lease),
+        then Redis expires it. Returns True when the record was stored.
+        """
+        tag = _validate_tag(tag)
+        expire = _validate_tag_expire(expire)
+        try:
+            seconds, microseconds = self.client.time()
+            now = seconds * 1000 + microseconds // 1000
+            stale_at = now
+            expired_at = now if expire is None else now + int(expire * 1000)
+            ttl_ms = (int(expire * 1000) if expire is not None else 0) \
+                + int(MAX_CACHE_SECONDS * 1000) + int(LEASE_TTL * 1000)
+            return bool(self.client.set(
+                self._tag_key(tag), f"{stale_at},{expired_at}".encode("ascii"), px=ttl_ms))
+        except Exception as exc:
+            raise SharedCacheUnavailable("Redis cache tag invalidation failed") from exc
 
     def lookup(self, key):
         entry = self.lookup_entry(key)
@@ -118,8 +187,13 @@ class RedisCacheBackend:
         except Exception as exc:
             raise SharedCacheUnavailable("Redis cache lease release failed") from exc
 
-    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None):
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=()):
         if len(body) > MAX_CACHE_BODY_BYTES or not _valid_durations(fresh_seconds, stale_seconds):
+            return False
+        try:
+            tags = _validate_tags(tags)
+        except ValueError:
             return False
         fresh_seconds, stale_seconds = float(fresh_seconds), float(stale_seconds)
         try:
@@ -127,12 +201,13 @@ class RedisCacheBackend:
                                          max(1, math.ceil(fresh_seconds * 1000)),
                                          max(0, math.ceil(stale_seconds * 1000)),
                                          -1 if expected_version is None else expected_version,
-                                         owner or "", math.ceil(LEASE_TTL * 1000)))
+                                         owner or "", math.ceil(LEASE_TTL * 1000),
+                                         ",".join(tags)))
         except Exception as exc:
             raise SharedCacheUnavailable("Redis cache write failed") from exc
 
-    def insert(self, key, body, fresh_seconds, stale_seconds):
-        return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None)
+    def insert(self, key, body, fresh_seconds, stale_seconds, tags=()):
+        return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None, tags=tags)
 
     def remove(self, key):
         try:

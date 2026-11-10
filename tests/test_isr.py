@@ -106,13 +106,13 @@ def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
                 module.started, module.gate = asyncio.Event(), asyncio.Event()
                 original_get = app.isr.get_or_render
                 both_arrived, count = asyncio.Event(), 0
-                async def record_arrival(key, policy, render):
+                async def record_arrival(key, policy, render, tags=()):
                     nonlocal count
                     if key == "/blog/cancel":
                         count += 1
                         if count == 2:
                             both_arrived.set()
-                    return await original_get(key, policy, render)
+                    return await original_get(key, policy, render, tags=tags)
                 app.isr.get_or_render = record_arrival
                 first = asyncio.create_task(client.get("/blog/cancel"))
                 await asyncio.wait_for(module.started.wait(), 3)

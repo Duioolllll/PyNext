@@ -235,6 +235,7 @@ def write_manifest(root):
     # later at runtime are not part of the build manifest.
     manifest["dynamic_accesses"] = {pattern: accesses for pattern, accesses in app.dynamic_accesses.items()
                                     if accesses}
+    manifest["isr_tags"] = app.isr_tags
     manifest["client"] = app.client_manifest
     # Only the file names and the public-variable keys are recorded, never
     # values: secrets stay out of the manifest, and the public keys show

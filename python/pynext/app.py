@@ -25,13 +25,14 @@ from .assets import read_public_artifacts, read_public_sources
 from .auth import check_authorization
 from .cache import CacheBusy, ISRCache, SharedCacheUnavailable
 from .client import compile_client, read_client_artifacts
-from .components import _isr_policy, _isr_query_keys, _node, _partial_isr_policy, bind_islands, reduce_segment_config
+from .components import (_isr_policy, _isr_query_keys, _node, _partial_isr_policy, _validate_tags,
+                        bind_islands, reduce_segment_config)
 from .env import load_env
 from .build import _materialize, discover, load_manifest
 from .config import DEFAULT_CONFIG
-from .errors import SignalError, digest_for_error, error_count
 from .dynamic import (DYNAMIC_MODES, MAX_DYNAMIC_ACCESSES, format_dynamic_accesses,
                       suppress_dynamic_tracking, track_prerender)
+from .errors import SignalError, digest_for_error, error_count
 from .http import (MAX_WS_MESSAGE, SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_security_headers, cors_preflight_response, new_csp_nonce, validate_csrf)
@@ -312,7 +313,6 @@ async def _run_while_connected(work, receive):
         await asyncio.gather(task, disconnect, return_exceptions=True)
 
 
-<<<<<<< HEAD
 def _typed_params(raw_params, kinds):
     """Collapse matched parameter values to the handler's types.
 
@@ -329,12 +329,6 @@ def _typed_params(raw_params, kinds):
             for k, v in raw_params.items()}
 
 
-def _decode_path(path, raw_path=None):
-    if raw_path is not None:
-        if re.search(br"%(?![0-9a-fA-F]{2})|%(?:2[fF]|5[cC]|00)", raw_path):
-            raise ValueError("Invalid or encoded path separator")
-        path = unquote_to_bytes(raw_path).decode("utf-8", errors="strict")
-=======
 # Matches Next.js `escapePathDelimiters(segment, true)`: re-encode any path
 # delimiter a decoded value produced, plus encoded delimiters that were
 # already present, so a decoded value can never be mistaken for a
@@ -349,7 +343,6 @@ def _escape_path_delimiters(segment):
 
 def _validate_path(path):
     """Reject a path that is not a normalized absolute path."""
->>>>>>> feat/nextjs-p1-paramdec
     if (not path.startswith("/") or "//" in path or "\\" in path or
             any(ord(c) < 32 or ord(c) == 127 for c in path) or
             any(part in (".", "..") for part in path.split("/"))):
@@ -622,6 +615,7 @@ class App:
         self.isr_policies = {}
         self.layout_policies = {}
         self.isr_queries = {}
+        self.isr_tags = {}
         if cache_backend == "sqlite" and cache_path is None:
             cache_path = self.root / ".pynext" / "isr-cache.sqlite3"
         build_id = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"),
@@ -742,6 +736,13 @@ class App:
                     except ValueError as exc:
                         raise ValueError(f"Invalid ISR query keys in {spec['entry']}: {exc}") from exc
                     self.isr_queries[pattern] = query_keys
+                    try:
+                        # Lists, not tuples: the manifest round-trips
+                        # through JSON, like isr_queries.
+                        self.isr_tags[pattern] = list(_validate_tags(
+                            getattr(fn, "__pynext_cache_tags__", ())))
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid ISR tags in {spec['entry']}: {exc}") from exc
                 else:
                     query_keys = []
                 if "query" in inspect.signature(fn).parameters and not query_keys:
@@ -791,6 +792,8 @@ class App:
                 raise ValueError("ISR query keys changed since build; run `pynext build` again")
             if manifest.get("dynamic_modes") != self.dynamic_modes:
                 raise ValueError("Dynamic modes changed since build; run `pynext build` again")
+            if manifest.get("isr_tags") != self.isr_tags:
+                raise ValueError("ISR tags changed since build; run `pynext build` again")
             self.client_manifest, self.client_assets = read_client_artifacts(self.root, manifest)
             self.static_pages = read_static_pages(self.root, manifest, self.router)
             self.public_assets = read_public_artifacts(self.root, manifest)
@@ -1019,6 +1022,17 @@ class App:
             return existed
         return await self.isr.invalidate(path)
 
+    async def revalidate_tag(self, tag, expire=None):
+        """Invalidate every ISR entry carrying ``tag`` for this app instance.
+
+        ``expire=None`` expires matching entries immediately; ``expire``
+        seconds keeps them merely stale until that delay passes. With a
+        shared cache backend the invalidation is visible to other
+        workers; with the memory backend it is process-local. Returns
+        True when the invalidation was recorded.
+        """
+        return await self.isr.revalidate_tag(tag, expire)
+
     def _merge_dynamic_accesses(self, pattern, state):
         """Fold one prerender's recorded accesses into the app report.
 
@@ -1162,7 +1176,8 @@ class App:
             finally:
                 await response.aclose()
 
-        task = asyncio.create_task(self.isr.get_or_render(key, self.isr_policies[pattern], render))
+        task = asyncio.create_task(self.isr.get_or_render(
+            key, self.isr_policies[pattern], render, tags=self.isr_tags.get(pattern, ())))
 
         def observe(done):
             # A streamed request stops awaiting this task before generation
@@ -1519,13 +1534,10 @@ class App:
             return Response("Not Found", status=404)
         pattern, raw_params, kinds = match
         route_var.set(pattern)
-<<<<<<< HEAD
-        params = _typed_params(raw_params, kinds)
-=======
         # The matched values are already decoded and delimiter-safe
-        # (see _normalize_path_for_matching), so they are used as-is.
-        params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
->>>>>>> feat/nextjs-p1-paramdec
+        # (see _normalize_path_for_matching); collapse them by the
+        # router-reported kinds, never by a substring test on the pattern.
+        params = _typed_params(raw_params, kinds)
         request = Request(request.method, request.path, request.query_string, request.headers, request.body,
                           params, self, request.state, request._cancel_event, raw_path=request.raw_path)
         spec = self.manifest["routes"][pattern]
@@ -1746,12 +1758,8 @@ class App:
         handler = self.websocket_entries.get(pattern)
         if handler is None:
             return Response("Not Found", status=404)
-<<<<<<< HEAD
-        params = _typed_params(raw_params, kinds)
-=======
         # The matched values are already decoded and delimiter-safe.
-        params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
->>>>>>> feat/nextjs-p1-paramdec
+        params = _typed_params(raw_params, kinds)
         request = Request("GET", path, bytes(query_string),
                           tuple((bytes(name), bytes(value)) for name, value in headers),
                           b"", params, self, {}, raw_path=raw_path or "")
@@ -1797,12 +1805,8 @@ class App:
             pattern, raw_params, kinds = match
             handler = self.websocket_entries.get(pattern)
             if handler is not None:
-<<<<<<< HEAD
-                params = _typed_params(raw_params, kinds)
-=======
                 # The matched values are already decoded and delimiter-safe.
-                params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in raw_params.items()}
->>>>>>> feat/nextjs-p1-paramdec
+                params = _typed_params(raw_params, kinds)
         if handler is None:
             # No route, or a route with no WebSocket handler: refuse the
             # handshake with a policy-violation close instead of hanging.
