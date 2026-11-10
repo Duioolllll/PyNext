@@ -37,7 +37,7 @@ redis = [
     "redis>=5,<8",
 ]
 encryption = [
-    "cryptography>=42,<46",
+    "cryptography>=50,<51",
 ]
 images = [
     "pillow>=13,<14",
