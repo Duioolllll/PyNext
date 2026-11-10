@@ -7,8 +7,9 @@ __version__ = _distribution_version("pynext-framework")
 from .app import App, create_app
 from .auth import require_auth, require_permission
 from .client_dsl import ClientDSLCompileError, compile_client_dsl
-from .components import CACHE_LIFE_PROFILES, h, fragment, island, layout, model_prop, page
+from .components import CACHE_LIFE_PROFILES, SafeString, h, fragment, island, layout, mark_safe, model_prop, page
 from .database import Database
+from .sql import RawSQL, quote_identifier, raw_sql, validate_ddl_definition
 from .django import DjangoBusyError, DjangoResource
 from .env import LoadedEnv, env_file_names, load_env, public_env_defines, public_env_vars
 from .dynamic import StaticGenBailoutError, is_prerender_bailout, mark_dynamic_access, no_store
@@ -33,7 +34,8 @@ from .redis_rate import RedisRateLimiter
 from .routing import route, websocket
 from .sessions import RedisSessionStore, Session, SessionMiddleware, SQLiteSessionStore
 
-__all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layout", "model_prop", "page", "route", "websocket", "Database",
+__all__ = ["__version__", "App", "create_app", "h", "fragment", "island", "layout", "mark_safe", "SafeString", "model_prop", "page", "route", "websocket", "Database",
+           "raw_sql", "RawSQL", "quote_identifier", "validate_ddl_definition",
            "DjangoBusyError", "DjangoResource", "CACHE_LIFE_PROFILES",
            "BadRequest", "Request", "RequestCancelled", "Response", "JSONResponse", "StreamingResponse", "SecurityConfig",
            "SignalError", "NotFoundError", "ForbiddenError", "UnauthorizedError", "RedirectError",

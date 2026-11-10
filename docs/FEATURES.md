@@ -21,11 +21,17 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `fragment` | `pynext.components` |
 | `island` | `pynext.components` |
 | `layout` | `pynext.components` |
+| `mark_safe` | `pynext.components` |
+| `SafeString` | `pynext.components` |
 | `model_prop` | `pynext.components` |
 | `page` | `pynext.components` |
 | `route` | `pynext.routing` |
 | `websocket` | `pynext.routing` |
 | `Database` | `pynext.database` |
+| `raw_sql` | `pynext.sql` |
+| `RawSQL` | `pynext.sql` |
+| `quote_identifier` | `pynext.sql` |
+| `validate_ddl_definition` | `pynext.sql` |
 | `DjangoBusyError` | `pynext.django` |
 | `DjangoResource` | `pynext.django` |
 | `CACHE_LIFE_PROFILES` | `pynext.components` |
