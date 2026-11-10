@@ -703,6 +703,7 @@ class App:
         self._dev_static_paths = {}
         self.isr_policies = {}
         self.layout_policies = {}
+        self.isr_policy_overrides = {}
         self.isr_queries = {}
         self.isr_tags = {}
         self.entry_layouts = {}
@@ -1284,6 +1285,80 @@ class App:
                 removed = await self._revalidate_one(pattern) or removed
         return removed
 
+
+    def get_isr_policy(self, pattern):
+        """Return the effective ISR policy for a route pattern.
+
+        Lookup order is "runtime override, then the build manifest"
+        (copy-on-write, mirroring Next.js ``SharedCacheControls``):
+        an override set with :meth:`set_isr_policy` wins, otherwise the
+        policy the page declared at build time is returned. The result
+        is a copy, so mutating it cannot change the stored policy.
+        Raises :class:`ValueError` when ``pattern`` is not an ISR route.
+        """
+        if not isinstance(pattern, str):
+            raise TypeError("ISR pattern must be a string")
+        override = self.isr_policy_overrides.get(pattern)
+        if override is not None:
+            return dict(override)
+        policy = self.isr_policies.get(pattern)
+        if policy is None:
+            raise ValueError(f"No ISR policy for route pattern {pattern!r}")
+        return dict(policy)
+
+    def set_isr_policy(self, pattern, *, revalidate=None, stale=None):
+        """Override an ISR policy at runtime, without rewriting the manifest.
+
+        ``pattern`` is a route pattern such as ``"/blog/[slug]"``. At
+        least one of ``revalidate``/``stale`` must be given; an omitted
+        value inherits the currently effective policy. Both values are
+        validated exactly like :func:`pynext.components.page` enforces
+        them (``revalidate`` positive, ``stale`` non-negative, both at
+        most 604800 seconds). Raises :class:`ValueError` for a
+        non-ISR pattern or an invalid value.
+
+        The override is process-local copy-on-write state: the build
+        manifest file and the base :attr:`isr_policies` are untouched,
+        so no rebuild is needed and production startup still passes
+        its manifest check. Each worker process needs its own call.
+        The override applies to generations started after the call;
+        entries already cached keep the lifetimes they were stored
+        with, and in-flight generations keep the policy snapshot they
+        started with. Pair with :meth:`revalidate` when an already
+        cached entry must pick the new policy up immediately. Returns
+        a copy of the new effective policy.
+        """
+        if not isinstance(pattern, str):
+            raise TypeError("ISR pattern must be a string")
+        if revalidate is None and stale is None:
+            raise ValueError("set_isr_policy requires revalidate or stale")
+        current = self.get_isr_policy(pattern)
+        policy = _isr_policy(
+            current["revalidate"] if revalidate is None else revalidate,
+            current["stale"] if stale is None else stale,
+        )
+        self.isr_policy_overrides[pattern] = policy
+        return dict(policy)
+
+    def clear_isr_policy(self, pattern):
+        """Drop the runtime override for one ISR route pattern.
+
+        Returns True when an override existed, False otherwise. The
+        route then falls back to its build-time policy. Raises
+        :class:`ValueError` for a non-ISR pattern.
+        """
+        if not isinstance(pattern, str):
+            raise TypeError("ISR pattern must be a string")
+        if pattern not in self.isr_policies:
+            raise ValueError(f"No ISR policy for route pattern {pattern!r}")
+        return self.isr_policy_overrides.pop(pattern, None) is not None
+
+    def clear_isr_policies(self):
+        """Drop every runtime ISR policy override. Returns how many were removed."""
+        count = len(self.isr_policy_overrides)
+        self.isr_policy_overrides.clear()
+        return count
+
     async def _render_stream_chunk(self, node):
         """Serialize one streamed UI node to HTML on a worker thread."""
         bound = bind_islands(_node(node), self.client_manifest, include_runtime=False)
@@ -1383,7 +1458,7 @@ class App:
                 await response.aclose()
 
         if policy is None:
-            policy = self.isr_policies[pattern]
+            policy = self.get_isr_policy(pattern)
         task = asyncio.create_task(self.isr.get_or_render(
             key, policy, render, tags=self.isr_tags.get(pattern, ())))
 
@@ -1824,7 +1899,7 @@ class App:
                                      generation + ":" + hashlib.sha256(encoded).hexdigest())
                     cache_before = self.isr.store.lookup(cache_key)[0]
                     self.metrics.observe_cache(cache_before)
-                    policy = self.isr_policies[pattern]
+                    policy = self.get_isr_policy(pattern)
                     if self.debug:
                         # Dev relaxation: serve stale entries until expire
                         # and retain them for at least the floor, so a
