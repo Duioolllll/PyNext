@@ -626,7 +626,12 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from .cache import MAX_CACHE_BODY_BYTES, MAX_CACHE_SECONDS, ISRCache, SharedCacheUnavailable
+from .cache import (
+    MAX_CACHE_BODY_BYTES,
+    ISRCache,
+    SharedCacheUnavailable,
+    _MAX_L1_SECONDS,
+)
 from .failure_policy import FAIL_CLOSED
 from .request_memo import ensure_request_memo
 
@@ -692,7 +697,13 @@ async def fetch_cached(url, fetcher, **kwargs):
     return await cache.get_or_fetch(url, fetcher, **kwargs)
 
 _FETCH_PREFIX = "\0fetch:"
-_EXCLUDED_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization", "set-cookie"})
+# Headers excluded from the storage-layer fetch key. Only distributed
+# tracing headers: they must not affect caching or deduplication
+# (Next.js ``FETCH_CACHE_KEY_EXCLUDED_HEADERS``). Credential headers
+# (``Authorization`` / ``Cookie`` / ``Proxy-Authorization``) are
+# intentionally NOT here — two fetches with different credentials
+# must not share one entry (P1-1).
+_EXCLUDED_HEADERS = frozenset({"traceparent", "tracestate"})
 _METHOD_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 
 
@@ -718,10 +729,17 @@ class FetchPolicy:
 
     @property
     def fresh_seconds(self):
-        """``revalidate`` mapped onto what the backends can store."""
+        """``revalidate`` mapped onto what the backends can store.
+
+        The native L1 PageCache rejects any window over
+        ``_MAX_L1_SECONDS`` (7 days) with ``ValueError: Invalid cache
+        durations``, so an infinite policy — and any finite revalidate
+        longer than the cap — is clamped to the cap instead of
+        rejected (same rule as ``ISRCache`` in :mod:`pynext.cache`).
+        """
         if self.revalidate is False:
-            return MAX_CACHE_SECONDS
-        return float(self.revalidate)
+            return _MAX_L1_SECONDS
+        return min(float(self.revalidate), _MAX_L1_SECONDS)
 
 
 def _is_zero(value):
@@ -779,10 +797,14 @@ def fetch_cache_key(url, *, method="GET", headers=(), body=None):
     """Return the hex cache key for one fetch.
 
     The key hashes ``[url (fragment stripped), method, headers, body]``.
-    ``Authorization``, ``Cookie``, ``Proxy-Authorization`` and
-    ``Set-Cookie`` headers are excluded: a cached response must never
-    be served to a different credential. Header order does not matter;
-    the body is type-tagged (see :func:`_encode_body`).
+    Credential headers (``Authorization``, ``Cookie``,
+    ``Proxy-Authorization``) are part of the key: a cached response
+    must never be served to a different credential, so two fetches
+    with different credentials get different keys. Only distributed
+    tracing headers (``traceparent`` / ``tracestate``) are excluded,
+    matching Next.js ``FETCH_CACHE_KEY_EXCLUDED_HEADERS``. Header
+    order does not matter; the body is type-tagged (see
+    :func:`_encode_body`).
     """
     if not isinstance(url, str) or not url:
         raise ValueError("fetch URL must be a non-empty string")

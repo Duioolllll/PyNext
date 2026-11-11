@@ -528,20 +528,39 @@ def test_fetch_cache_key_is_stable_and_method_sensitive():
     assert len(key) == 64
 
 
-def test_fetch_cache_key_ignores_sensitive_headers_and_header_order():
+def test_fetch_cache_key_distinguishes_credentials_and_ignores_tracing_headers():
+    """P1-1 regression: credential headers are part of the key, so two
+    fetches with different credentials never share one entry. Only
+    distributed tracing headers are excluded (Next.js
+    ``FETCH_CACHE_KEY_EXCLUDED_HEADERS``)."""
     base = fetch_cache_key(FETCH_URL, headers=[("Accept", "application/json")])
-    assert base == fetch_cache_key(
+    # Different credentials -> different keys (no cross-user serving).
+    assert base != fetch_cache_key(
         FETCH_URL, headers=[("Accept", "application/json"),
-                      ("Authorization", "Bearer x"), ("Cookie", "s=1")])
-    assert base == fetch_cache_key(
+                      ("Authorization", "Bearer x")])
+    assert base != fetch_cache_key(
         FETCH_URL, headers=[("Accept", "application/json"),
-                      ("authorization", "Bearer <redacted>")])
-    assert fetch_cache_key(FETCH_URL) == fetch_cache_key(
-        FETCH_URL, headers=[("Authorization", "Bearer <redacted>")])
+                      ("Cookie", "s=1")])
     assert fetch_cache_key(
-        FETCH_URL, headers=[("X-B", "2"), ("Accept", "application/json"), ("X-A", "1")]) == fetch_cache_key(
-        FETCH_URL, headers=[("X-A", "1"), ("X-B", "2"), ("Accept", "application/json")])
-    # ...but a different non-sensitive header value does change the key.
+        FETCH_URL, headers=[("Authorization", "Bearer alice")]) != fetch_cache_key(
+        FETCH_URL, headers=[("Authorization", "Bearer bob")])
+    assert fetch_cache_key(
+        FETCH_URL, headers=[("Cookie", "s=alice")]) != fetch_cache_key(
+        FETCH_URL, headers=[("Cookie", "s=bob")])
+    # Same credential -> same key (header order and case do not matter).
+    assert fetch_cache_key(
+        FETCH_URL, headers=[("X-B", "2"), ("Accept", "application/json"), ("X-A", "1"),
+                      ("Authorization", "Bearer x")]) == fetch_cache_key(
+        FETCH_URL, headers=[("authorization", "Bearer x"), ("X-A", "1"),
+                      ("X-B", "2"), ("Accept", "application/json")])
+    # Tracing headers still do not change the key.
+    assert base == fetch_cache_key(
+        FETCH_URL, headers=[("Accept", "application/json"),
+                      ("traceparent", "00-abc-def-01")])
+    assert base == fetch_cache_key(
+        FETCH_URL, headers=[("Accept", "application/json"),
+                      ("TraceState", "vendor=1")])
+    # ...but a different non-credential header value does change the key.
     assert base != fetch_cache_key(
         FETCH_URL, headers=[("Accept", "text/html")])
 
@@ -574,6 +593,22 @@ def test_policy_explicit_revalidate_wins():
 def test_policy_force_cache_without_revalidate_is_infinite():
     policy = resolve_fetch_policy(cache="force-cache")
     assert policy.revalidate is False and policy.cached is True
+
+
+def test_policy_infinite_fresh_seconds_is_clamped_to_the_native_l1_cap():
+    """P1-3 regression: an infinite policy resolves to a fresh window
+    the native L1 PageCache accepts (7 days), not the 1-year
+    ``MAX_CACHE_SECONDS`` the native ``insert`` rejects with
+    ``ValueError: Invalid cache durations``. A finite revalidate
+    longer than the cap is clamped the same way."""
+    for policy in (resolve_fetch_policy(),
+                   resolve_fetch_policy(cache="force-cache"),
+                   resolve_fetch_policy(revalidate=False)):
+        assert policy.revalidate is False
+        assert policy.fresh_seconds == 604_800.0
+    assert resolve_fetch_policy(revalidate=2_592_000).fresh_seconds == 604_800.0
+    # Shorter windows are untouched.
+    assert resolve_fetch_policy(revalidate=60).fresh_seconds == 60.0
 
 
 def test_policy_no_store_is_zero():
@@ -737,6 +772,69 @@ def test_fetch_cache_stores_and_serves_without_refetching():
             assert fetcher.calls == 1
         finally:
             await cache.close()
+
+    _run(run())
+
+
+def test_fetch_cache_does_not_serve_one_users_authorised_response_to_another():
+    """P1-1 regression: with an explicit ``revalidate``, Alice's cached
+    response must not be served to Bob. Different credentials get
+    different keys, so Bob's request misses and fetches upstream."""
+
+    class _TokenFetcher:
+        def __init__(self):
+            self.calls = 0
+
+        async def __call__(self, url, *, method="GET", headers=(), body=None, **_kwargs):
+            self.calls += 1
+            pairs = headers.items() if hasattr(headers, "items") else headers
+            token = dict((k.lower(), v) for k, v in pairs).get("authorization", "?")
+            return FetchResult(200, (), f"data-for-{token}".encode())
+
+    async def run():
+        cache = ISRCache()
+        try:
+            fetch = FetchCache(cache)
+            fetcher = _TokenFetcher()
+            with request_memo_scope():
+                alice = await fetch.get_or_fetch(
+                    FETCH_URL, fetcher, revalidate=60,
+                    headers={"Authorization": "Bearer alice"})
+            assert alice.body == b"data-for-Bearer alice"
+            assert fetcher.calls == 1
+            with request_memo_scope():
+                bob = await fetch.get_or_fetch(
+                    FETCH_URL, fetcher, revalidate=60,
+                    headers={"Authorization": "Bearer bob"})
+            assert bob.body == b"data-for-Bearer bob"
+            assert fetcher.calls == 2
+        finally:
+            await cache.close()
+
+    _run(run())
+
+
+def test_fetch_cache_infinite_policy_stores_without_value_error():
+    """P1-3 regression: the default, force-cache and revalidate=False
+    policies (all infinite) store through the native L1 without
+    ``ValueError: Invalid cache durations`` and serve the second
+    request from the cache."""
+    async def run():
+        for kwargs in ({}, {"cache": "force-cache"}, {"revalidate": False}):
+            cache = ISRCache()
+            try:
+                fetch = FetchCache(cache)
+                fetcher = _CountingFetcher()
+                with request_memo_scope():
+                    first = await fetch.get_or_fetch(FETCH_URL, fetcher, **kwargs)
+                assert first.status == 200
+                assert fetcher.calls == 1
+                with request_memo_scope():
+                    second = await fetch.get_or_fetch(FETCH_URL, fetcher, **kwargs)
+                assert second == first
+                assert fetcher.calls == 1
+            finally:
+                await cache.close()
 
     _run(run())
 
