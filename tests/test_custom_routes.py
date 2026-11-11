@@ -153,6 +153,47 @@ def test_headers_for_returns_matching_rule():
     assert routes.headers_for("/about") == []
 
 
+def test_headers_for_merges_overlapping_rules():
+    # P2-4: a global catch-all rule and a specific rule both apply.
+    # Previously only the router's single best match was returned, so
+    # the global header was dropped for /blog/hello.
+    routes = compile_custom_routes(
+        {"headers": [{"source": "/[[...path]]",
+                      "headers": [{"key": "X-Global", "value": "all"}]},
+                     {"source": "/blog/[slug]",
+                      "headers": [{"key": "X-Blog", "value": "blog"}]}]})
+    assert routes.headers_for("/blog/hello") == [("X-Global", "all"), ("X-Blog", "blog")]
+    assert routes.headers_for("/other") == [("X-Global", "all")]
+    assert routes.headers_for("/") == [("X-Global", "all")]
+
+
+def test_headers_for_later_rule_wins_duplicate_key():
+    # Next.js: "If two headers match the same path and set the same
+    # header key, the last header key will override the first", so a
+    # specific rule listed after a catch-all wins the shared key while
+    # the catch-all's other headers still apply.
+    routes = compile_custom_routes(
+        {"headers": [{"source": "/[[...path]]",
+                      "headers": [{"key": "X-Shared", "value": "global"},
+                                  {"key": "X-Global", "value": "all"}]},
+                     {"source": "/blog/[slug]",
+                      "headers": [{"key": "X-Shared", "value": "blog"},
+                                  {"key": "X-Blog", "value": "blog"}]}]})
+    assert routes.headers_for("/blog/hello") == [
+        ("X-Shared", "blog"), ("X-Global", "all"), ("X-Blog", "blog")]
+
+
+def test_headers_for_catch_all_and_static_overlap():
+    routes = compile_custom_routes(
+        {"headers": [{"source": "/[...rest]",
+                      "headers": [{"key": "X-All", "value": "yes"}]},
+                     {"source": "/about",
+                      "headers": [{"key": "X-About", "value": "yes"}]}]})
+    assert routes.headers_for("/about") == [("X-All", "yes"), ("X-About", "yes")]
+    # A non-optional catch-all needs at least one segment.
+    assert routes.headers_for("/") == []
+
+
 def test_apply_to_response_replaces_existing_header():
     routes = compile_custom_routes(
         {"headers": [{"source": "/x", "headers": [{"key": "X-Test", "value": "new"}]}]})

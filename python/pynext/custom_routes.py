@@ -145,9 +145,18 @@ def _check_headers(headers, *, where):
 class _RuleSet:
     """One compiled source->rule list, matched through the Rust router."""
 
-    def __init__(self, rules):
+    def __init__(self, rules, *, match_all=False):
         self._router = _native.Router([rule["source"] for rule in rules]) if rules else None
         self._rules = {rule["source"]: rule for rule in rules}
+        # Header rules are the only list where *every* matching rule
+        # applies (Next.js merges them), while redirects/rewrites stop
+        # at the first match. Router.matches() returns only the single
+        # best match, so for headers keep one single-pattern router per
+        # rule: testing each rule on its own reuses the exact native
+        # matching semantics instead of a second Python pattern matcher
+        # that could disagree with the router on edge cases.
+        self._single = ([(rule, _native.Router([rule["source"]])) for rule in rules]
+                        if match_all else None)
 
     def match(self, path):
         if self._router is None:
@@ -161,6 +170,22 @@ class _RuleSet:
         pattern, raw_params, _kinds = matched
         return self._rules[pattern], raw_params
 
+    def match_all(self, path):
+        """Return [(rule, raw_params)] for every rule matching ``path``.
+
+        Rules come back in config order. Only available when the rule
+        set was built with ``match_all=True`` (headers).
+        """
+        if self._single is None:
+            raise ValueError("match_all() needs a rule set built with match_all=True")
+        found = []
+        for rule, router in self._single:
+            matched = router.matches(path)
+            if matched is not None:
+                _pattern, raw_params, _kinds = matched
+                found.append((rule, raw_params))
+        return found
+
 
 class CustomRoutes:
     """Compiled redirects / rewrites / headers. Empty when no rules."""
@@ -168,7 +193,7 @@ class CustomRoutes:
     def __init__(self, redirects, rewrites, headers):
         self._redirects = _RuleSet(redirects)
         self._rewrites = {phase: _RuleSet(rewrites.get(phase, ())) for phase in _REWRITE_PHASES}
-        self._headers = _RuleSet(headers)
+        self._headers = _RuleSet(headers, match_all=True)
 
     def __bool__(self):
         return bool(self._redirects._rules or self._headers._rules or
@@ -194,16 +219,15 @@ class CustomRoutes:
     def headers_for(self, path):
         """Merged (key, value) headers for every rule matching ``path``.
 
-        All matching rules apply in order; a later rule replaces an
-        earlier value for the same header name.
+        All matching rules apply, in config order; a later rule
+        replaces an earlier value for the same header name (Next.js:
+        "If two headers match the same path and set the same header
+        key, the last header key will override the first"). So list a
+        catch-all rule before the specific rules whose values should
+        win over it.
         """
-        # A source pattern only matches one rule, but the same path can
-        # match at most one rule per set, so this is a single lookup;
-        # the merge loop keeps the multi-rule behaviour explicit.
         merged = {}
-        found = self._headers.match(path)
-        if found is not None:
-            rule, _ = found
+        for rule, _raw_params in self._headers.match_all(path):
             for key, value in rule["headers"]:
                 merged[key.lower()] = (key, value)
         return list(merged.values())
