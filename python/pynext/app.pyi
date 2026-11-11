@@ -13,6 +13,10 @@ class App:
     debug: bool
     hot_reload: bool
     sync_workers: int
+    sync_wait_timeout: float
+    sync_queue_limit: int
+    render_workers: int
+    session_workers: int
     websocket_max_message: int
     security: SecurityConfig
     path_headers: PathHeaders
@@ -27,8 +31,11 @@ class App:
                  cache_failure_policy: Literal["fail_open", "fail_closed"] | None = ...,
                  websocket_max_message: int = ..., hot_reload: bool = ...,
                  trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...,
+                 sync_wait_timeout: float = ..., sync_queue_limit: int | None = ...,
+                 render_workers: int | None = ..., session_workers: int | None = ...,
                  strict_ssg: bool = ..., headers: Iterable[PathHeaderRuleInput] | None = ...,
-                 revalidate_secret: str | None = ...) -> None: ...
+                 revalidate_secret: str | None = ..., body_timeout_ms: int = ...,
+                 handler_timeout_ms: int = ..., response_timeout_ms: int = ...) -> None: ...
     def configure_observability(self, config: ObservabilityConfig) -> App: ...
     async def startup(self) -> None: ...
     async def shutdown(self) -> None: ...
@@ -43,6 +50,7 @@ class App:
     async def dispatch(self, request: Request) -> Response: ...
     def update_dev_client(self, manifest: dict[str, Any], assets: dict[str, bytes]) -> None: ...
     def error_response(self, exc: Exception, digest: str | None = ...) -> Response: ...
+    def note_dev_bind_host(self, host: str | None) -> None: ...
     async def render_page(self, pattern: str, request: Request, params: Params, *, csp_nonce: bool = ...,
                           query: dict[str, list[str]] | None = ...) -> Response: ...
     @property
@@ -60,5 +68,8 @@ def create_app(root: str | PathLike[str] = ..., *, production: bool = ...,
                cache_failure_policy: Literal["fail_open", "fail_closed"] | None = ...,
                websocket_max_message: int = ..., hot_reload: bool = ...,
                trusted_proxies: Iterable[ProxyEntry] | None = ..., sync_workers: int = ...,
+               sync_wait_timeout: float = ..., sync_queue_limit: int | None = ...,
+               render_workers: int | None = ..., session_workers: int | None = ...,
                strict_ssg: bool = ..., headers: Iterable[PathHeaderRuleInput] | None = ...,
-               revalidate_secret: str | None = ...) -> App: ...
+               revalidate_secret: str | None = ..., body_timeout_ms: int = ...,
+               handler_timeout_ms: int = ..., response_timeout_ms: int = ...) -> App: ...

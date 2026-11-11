@@ -35,11 +35,31 @@ from collections import OrderedDict
 
 from . import _native
 from .components import MAX_CACHE_SECONDS, _validate_tag, _validate_tag_expire, _validate_tags
+from .errors import ForbiddenError, NotFoundError, SignalError, UnauthorizedError
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
+from .sync_dispatch import run_sync_with_context
 
 log = logging.getLogger("pynext")
 MAX_INFLIGHT = 128
 GENERATION_TIMEOUT = 30.0
+# Regeneration retention (ROADMAP Part 2 Phase C, C-2 / Next.js
+# ``retainPreviousCacheEntry``): when an ISR regeneration fails, the
+# previous entry is kept and served instead of erroring, and the next
+# retry is delayed so a failing origin is not hammered on every
+# request. The retry delay grows exponentially from the 3s base and is
+# clamped to [3, 30] seconds (the revalidate 3~30s tightening); a stale
+# lookup during the delay resolves early from the retained entry and
+# does not start another regeneration (the SWR early-resolve +
+# ``isStale=-1`` blocking-regeneration behaviour).
+REGEN_RETRY_BASE_DELAY = 3.0
+REGEN_RETRY_MIN_DELAY = 3.0
+REGEN_RETRY_MAX_DELAY = 30.0
+#: Cap on last-known-good bodies retained per process (count and total
+#: bytes). Retention is best-effort: the oldest entries are evicted
+#: first, and a key whose body was never retained simply has no
+#: fallback when its regeneration fails.
+_MAX_RETAINED_ENTRIES = 1024
+_MAX_RETAINED_BYTES = 64 * 1024 * 1024
 # A lease outlives one generation attempt so a slow render is not
 # immediately duplicated by another worker; fencing still protects the
 # write if the lease expires mid-generation.
@@ -71,6 +91,21 @@ _MAX_LOCAL_VARIANT_PATHS = 1024
 # dropped here is still found through a shared backend's own key list,
 # and a stale path only costs one no-op invalidation.
 _MAX_CACHED_PATHS = 4096
+
+
+def regen_retry_delay(failures):
+    """Delay in seconds before retrying a failed ISR regeneration.
+
+    ``failures`` counts consecutive failures for one key (1 for the
+    first failure). The delay doubles per failure — 3s, 6s, 12s, 24s —
+    and is clamped to :data:`REGEN_RETRY_MIN_DELAY` ..
+    :data:`REGEN_RETRY_MAX_DELAY` (3~30s).
+    """
+    if failures <= 0:
+        return REGEN_RETRY_MIN_DELAY
+    return min(REGEN_RETRY_MAX_DELAY,
+               max(REGEN_RETRY_MIN_DELAY,
+                   REGEN_RETRY_BASE_DELAY * (2.0 ** (failures - 1))))
 
 
 def is_prerenderable_policy(policy):
@@ -185,6 +220,41 @@ class CacheBusy(Exception):
 
 class SharedCacheUnavailable(Exception):
     """A shared backend operation failed rather than observing a cache miss."""
+
+
+class ISRRenderStatusError(Exception):
+    """A render finished with a non-cacheable 4xx status.
+
+    Unlike a failed regeneration, a 4xx outcome is permanent for this
+    render: rendering the same request again cannot succeed, so it
+    must not arm the regeneration backoff or fall back to the retained
+    previous body. Callers re-raise it instead of serving retention
+    (see :meth:`ISRCache._generate`). The 401/403/404 cases surface
+    instead as the matching :class:`~pynext.errors.SignalError`, so
+    the dispatcher answers with that exact status; this exception
+    covers the remaining 4xx statuses, for which no signal exists.
+    """
+
+    def __init__(self, status, body=b""):
+        super().__init__(f"ISR render returned HTTP {status}")
+        self.status = status
+        self.body = body
+
+
+def _signal_for_status(status):
+    """Return the control-flow signal for a 4xx render status, or ``None``.
+
+    Only 401/403/404 have a signal whose dispatcher response carries
+    the exact status; every other 4xx is reported through
+    :class:`ISRRenderStatusError` instead.
+    """
+    if status == 404:
+        return NotFoundError()
+    if status == 403:
+        return ForbiddenError()
+    if status == 401:
+        return UnauthorizedError()
+    return None
 
 
 class CacheBackend:
@@ -499,9 +569,23 @@ class SQLiteCacheBackend(CacheBackend):
             raise ValueError(f"Cannot open SQLite cache at {path}: {exc}") from exc
 
     def _ensure_column(self, table, column, definition):
-        columns = [row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")]
+        # DDL cannot use bound parameters for identifiers, so this is
+        # the one place in the cache that interpolates SQL text — routed
+        # through the explicit raw_sql() escape hatch (S-P1-10) with the
+        # table/column strictly validated as identifiers and the
+        # definition restricted to a bare type + optional NOT NULL /
+        # DEFAULT literal. Call sites pass framework constants only.
+        from .sql import quote_identifier, raw_sql, validate_ddl_definition
+
+        table_q = quote_identifier(table)
+        column_q = quote_identifier(column)
+        definition = validate_ddl_definition(definition)
+        columns = [row[1] for row in raw_sql(
+            f"PRAGMA table_info({table_q})").execute(self._conn)]
         if column not in columns:
-            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            raw_sql(
+                f"ALTER TABLE {table_q} ADD COLUMN {column_q} {definition}"
+            ).execute(self._conn)
 
     @staticmethod
     def _age(generated_at, generated_mono, now_wall, now_mono):
@@ -1116,6 +1200,17 @@ class ISRCache:
         self._inflight = {}
         self._task_leases = {}
         self._tasks = set()
+        # C-2 retention: ``_retained`` maps a key to its last-known-good
+        # ``(body, retained_at)`` — the previous entry a failed
+        # regeneration falls back to, even after the backends have
+        # dropped the expired entry itself. ``_regen_failures`` maps a
+        # key to ``{"failures", "next_retry_at", "last_error"}`` for the
+        # retry backoff. Both are process-local: another worker keeps
+        # its own copies and learns of invalidations through the shared
+        # tag manifest (see :meth:`_retained_body`).
+        self._retained = OrderedDict()
+        self._retained_bytes = 0
+        self._regen_failures = {}
         self._variant_paths = OrderedDict()
         # Tag invalidation state. ``_tag_manifest`` is the process-local
         # copy of the tag manifest (authoritative for the memory backend;
@@ -1144,7 +1239,34 @@ class ISRCache:
             self.shared = RedisCacheBackend(self._cache_url)
         self._closed = False
 
-    async def close(self):
+    async def wait_for_background(self, timeout):
+        """Wait for background ISR regenerations to finish (C-P2-5).
+
+        Returns True when no background task is left, False on timeout.
+        Tasks still running after ``timeout`` are left alone here;
+        :meth:`close` cancels them, so shutdown stays bounded. A
+        regeneration that finishes in time publishes its result
+        normally, instead of being cancelled mid-render for no reason.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            tasks = [task for task in list(self._tasks) if not task.done()]
+            if not tasks:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.wait(tasks, timeout=remaining,
+                               return_when=asyncio.FIRST_COMPLETED)
+
+    async def close(self, executor=None):
+        """Cancel in-flight generations and close the shared backend.
+
+        ``executor`` is the thread pool the blocking ``shared.close()``
+        runs on. Callers pass the app's exit executor (C-P1-3c) so cache
+        teardown never waits behind the sync entry limiter; ``None`` keeps
+        the loop's default executor, as before.
+        """
         self._closed = True
         tasks = list(self._tasks)
         for task in tasks:
@@ -1154,13 +1276,19 @@ class ISRCache:
         self._inflight.clear()
         self._task_leases.clear()
         self._tasks.clear()
+        self._retained.clear()
+        self._retained_bytes = 0
+        self._regen_failures.clear()
         self._variant_paths.clear()
         self._key_tags.clear()
         self._key_generated_at.clear()
         self._cached_paths.clear()
         self._loop = None
         if self.shared is not None:
-            await asyncio.to_thread(self.shared.close)
+            if executor is None:
+                await asyncio.to_thread(self.shared.close)
+            else:
+                await run_sync_with_context(self.shared.close, executor=executor)
             self.shared = None
 
     def _check_loop(self):
@@ -1249,7 +1377,10 @@ class ISRCache:
         ValueError beyond it, while ISR policies run to
         ``MAX_CACHE_SECONDS``; clamp so a long-lived entry still caches
         locally for a week instead of failing the request. Returns False
-        when the entry cannot be stored.
+        when the entry cannot be stored. A successful insert also
+        remembers the body as the key's last-known-good value (C-2
+        retention), so a later failed regeneration can still serve it
+        after the backends have dropped the expired entry itself.
         """
         try:
             fresh = min(float(fresh_seconds), _MAX_L1_SECONDS)
@@ -1257,9 +1388,117 @@ class ISRCache:
         except (TypeError, ValueError):
             return False
         try:
-            return self.store.insert(key, body, fresh, stale)
+            stored = self.store.insert(key, body, fresh, stale)
         except ValueError:
             return False
+        if stored:
+            self._retain(key, body)
+        return stored
+
+    def _retain(self, key, body, retained_at=None):
+        """Remember ``body`` as the last-known-good value for ``key``.
+
+        Best-effort and bounded: the oldest retained entries are
+        evicted once the count or byte cap is reached. Only bodies
+        stored through the render path are retained — entries seeded
+        directly into the backend (tests, the native fast path) have no
+        retained copy, so a failed regeneration for them still errors
+        instead of serving a value this layer never saw.
+        """
+        if not isinstance(body, (bytes, bytearray)):
+            return
+        body = bytes(body)
+        previous = self._retained.get(key)
+        if previous is not None:
+            self._retained_bytes -= len(previous[0])
+        self._retained[key] = (body, time.time() if retained_at is None else retained_at)
+        self._retained.move_to_end(key)
+        self._retained_bytes += len(body)
+        while ((len(self._retained) > _MAX_RETAINED_ENTRIES
+                or self._retained_bytes > _MAX_RETAINED_BYTES)
+               and self._retained):
+            old_key, old_body = self._retained.popitem(last=False)
+            self._retained_bytes -= len(old_body[0])
+
+    def _drop_retained(self, key):
+        """Forget the retained previous value for ``key``, if any."""
+        record = self._retained.pop(key, None)
+        if record is not None:
+            self._retained_bytes -= len(record[0])
+
+    async def _retained_body(self, key, tags=()):
+        """Return the retained previous body for ``key``, or ``None``.
+
+        The copy is void when an explicit invalidation landed after it
+        was retained: a same-worker invalidation already drops it (see
+        :meth:`_apply_tag_invalidation` and :meth:`invalidate`), and a
+        cross-worker tag invalidation is caught here through the shared
+        tag manifest — a tag whose ``expired_at`` passed after the copy
+        was retained means the content was invalidated, so retention
+        must not resurrect it. Time-based expiry never voids a copy:
+        that is exactly what retention is for.
+        """
+        record = self._retained.get(key)
+        if record is None:
+            return None
+        body, retained_at = record
+        if self.shared is not None:
+            check_tags = tuple(tags) or tuple(self._key_tags.get(key, ()))
+            if check_tags:
+                try:
+                    times = await asyncio.to_thread(
+                        self.shared.get_tag_times,
+                        [self.namespace + tag for tag in check_tags])
+                except Exception:
+                    times = {}
+                now = time.time()
+                for tag in check_tags:
+                    _, expired_at = times.get(self.namespace + tag, (None, None))
+                    if expired_at is not None and retained_at < expired_at <= now:
+                        self._drop_retained(key)
+                        return None
+        return body
+
+    async def retained_body(self, key, tags=()):
+        """Return the retained last-known-good body for ``key``, or ``None``.
+
+        Public wrapper for :meth:`_retained_body` for callers outside the
+        cache (the app's ISR handler serves it when regeneration cannot
+        even start, e.g. :class:`CacheBusy`). ``tags`` defaults to the
+        tags remembered for the key when omitted.
+        """
+        return await self._retained_body(key, tags)
+
+    def _record_regen_failure(self, key, exc):
+        """Record a failed regeneration and arm the retry backoff.
+
+        Consecutive failures for ``key`` count up; the next retry is
+        due after :func:`regen_retry_delay` seconds. The previous entry
+        is deliberately left in place — a failed regeneration never
+        evicts it (Next.js ``retainPreviousCacheEntry``).
+        """
+        record = self._regen_failures.get(key)
+        failures = (record["failures"] + 1) if record is not None else 1
+        delay = regen_retry_delay(failures)
+        self._regen_failures[key] = {
+            "failures": failures,
+            "next_retry_at": time.monotonic() + delay,
+            "last_error": f"{type(exc).__name__}: {exc}",
+        }
+        log.warning("ISR regeneration failed for %s (consecutive failure %d);"
+                    " retaining previous entry, next retry in %.1fs",
+                    key, failures, delay)
+
+    def _clear_regen_failure(self, key):
+        """Clear the failure/backoff record after a successful regeneration."""
+        self._regen_failures.pop(key, None)
+
+    def _regen_backoff_remaining(self, key):
+        """Seconds until a failed regeneration for ``key`` may be retried (0 if none)."""
+        record = self._regen_failures.get(key)
+        if record is None:
+            return 0.0
+        return max(0.0, record["next_retry_at"] - time.monotonic())
 
     def _remember_key_tags(self, key, tags):
         self._key_tags[key] = tuple(tags)
@@ -1331,6 +1570,13 @@ class ISRCache:
                     evicted += 1
                 if (expire is None or expire == 0) and self.store.remove(key):
                     evicted += 1
+                # An explicit invalidation voids the retained previous
+                # value too — even a deferred one: the stale body is
+                # still served from the store while the window runs,
+                # but once it lapses the invalidated content must not
+                # come back through the retention fallback (C-2 covers
+                # time-based expiry only, never explicit invalidation).
+                self._drop_retained(key)
         return evicted
 
     async def revalidate_tag(self, tag, expire=None):
@@ -1417,6 +1663,12 @@ class ISRCache:
         removed = self.store.remove(key)
         self._key_tags.pop(key, None)
         self._key_generated_at.pop(key, None)
+        # An explicit invalidation voids the retained previous value
+        # and any retry backoff: the next request regenerates from
+        # scratch instead of serving invalidated content (C-2 retention
+        # covers time-based expiry only).
+        self._drop_retained(key)
+        self._regen_failures.pop(key, None)
         if self.shared is not None:
             removed = await self._shared_remove(key) or removed
         return removed or retired is not None
@@ -1506,7 +1758,10 @@ class ISRCache:
                 self._inflight.pop(key, None)
             if not finished.cancelled():
                 error = finished.exception()
-                if error is not None:
+                if error is not None and not isinstance(error, (SignalError, ISRRenderStatusError)):
+                    # A permanent 4xx render is a deterministic outcome,
+                    # not a failure: like the dispatcher, do not log a
+                    # signal as an error.
                     log.error("ISR regeneration failed for %s", key,
                               exc_info=(type(error), error, error.__traceback__))
         task.add_done_callback(completed)
@@ -1626,9 +1881,30 @@ class ISRCache:
                     if entry is not _SHARED_UNAVAILABLE and entry is not None and entry.status == "fresh":
                         if self._inflight.get(key) is asyncio.current_task():
                             self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                        self._clear_regen_failure(key)
                         return entry.body
                 response = await render()
                 if response.status != 200:
+                    if 400 <= response.status < 500:
+                        # C-2: a 4xx render is a permanent outcome for
+                        # this key, not a failed regeneration. A deleted
+                        # page (404) must reach the client instead of
+                        # being masked by the retained previous body
+                        # forever: no backoff is armed, the retained copy
+                        # is dropped so no fallback path can resurrect
+                        # it, and the outcome is re-raised as the
+                        # matching signal (401/403/404) or as
+                        # ISRRenderStatusError (other 4xx) so the
+                        # callers below do not serve retention for it.
+                        # A 5xx render keeps the old path: it may be
+                        # transient, so it stays a regeneration failure
+                        # with backoff + retained fallback.
+                        self._drop_retained(key)
+                        self._clear_regen_failure(key)
+                        signal = _signal_for_status(response.status)
+                        if signal is not None:
+                            raise signal
+                        raise ISRRenderStatusError(response.status, response.body)
                     raise ValueError("ISR can cache only successful page responses")
                 # An invalidated generation may finish for existing callers,
                 # but must never repopulate the cache after invalidation.
@@ -1651,22 +1927,68 @@ class ISRCache:
                                 log.warning("ISR cache insert failed for %s; page was served but not cached", key)
                     else:
                         log.info("ISR response for %s is private; served but not cached", key)
+                self._clear_regen_failure(key)
                 return response.body
+        except asyncio.CancelledError:
+            raise
+        except (SignalError, ISRRenderStatusError):
+            # A permanent 4xx outcome is not a regeneration failure:
+            # no backoff is recorded and the retained previous body is
+            # never served for it (see the raise site above).
+            raise
+        except Exception as exc:
+            # C-2: a failed regeneration never evicts the previous
+            # entry; record it so the next retry backs off instead of
+            # hammering the origin on every request.
+            self._record_regen_failure(key, exc)
+            raise
         finally:
             if owner is not None and self.shared is not None:
                 await self._shared_release(key, owner)
 
     async def _get_or_render_local(self, key, policy, render, status, body, tags=()):
+        # C-2 (retainPreviousCacheEntry): a stale entry is served while
+        # one background regeneration runs — but while a failed
+        # regeneration is backing off, serve it without starting
+        # another one (SWR early-resolve; the retry gets its breathing
+        # room instead of hammering the origin on every request).
+        if status == "stale":
+            if self._regen_backoff_remaining(key) <= 0:
+                task = self._inflight.get(key)
+                if task is None and len(self._tasks) < MAX_INFLIGHT:
+                    task = self._register(key, asyncio.create_task(
+                        self._generate(key, policy, render, tags=tags), context=contextvars.Context()))
+            return body
+        # Expired or miss: the backends have already dropped the entry,
+        # so the retained previous value (if any) is the fallback. While
+        # its retry backs off, serve it outright; otherwise regenerate
+        # inline, and if that fails serve it instead of erroring.
+        previous = body
+        if previous is None:
+            previous = await self._retained_body(key, tags)
+        if previous is not None and self._regen_backoff_remaining(key) > 0:
+            return previous
         task = self._inflight.get(key)
         if task is None and len(self._tasks) < MAX_INFLIGHT:
             task = self._register(key, asyncio.create_task(
                 self._generate(key, policy, render, tags=tags), context=contextvars.Context()))
-        if status == "stale":
-            return body
         if task is None:
+            if previous is not None:
+                return previous
             raise CacheBusy("Too many ISR generations")
         # A cancelled request must not cancel the shared render for other callers.
-        return await asyncio.shield(task)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except (SignalError, ISRRenderStatusError):
+            # A permanent 4xx render must reach the caller, never the
+            # retained previous body (C-2).
+            raise
+        except Exception:
+            if previous is not None:
+                return previous
+            raise
 
     async def _get_or_render_shared(self, key, policy, render, status, body, tags=()):
         entry = await self._shared_entry(key)
@@ -1695,8 +2017,21 @@ class ISRCache:
                 if self._inflight.get(key) is task:
                     self._inflight.pop(key, None)
                 task = None
+        # C-2: while a failed regeneration backs off, a stale entry is
+        # served without taking another lease or starting another
+        # regeneration.
+        if (entry is not None and entry.status == "stale"
+                and self._regen_backoff_remaining(key) > 0):
+            return entry.body
         if entry is None or entry.status == "expired":
             self.store.remove(key)
+        if ((entry is None or entry.status == "expired")
+                and self._regen_backoff_remaining(key) > 0):
+            # Expired and backing off: serve the retained previous
+            # value instead of regenerating (or erroring) right away.
+            previous = await self._retained_body(key, tags)
+            if previous is not None:
+                return previous
         if task is None and len(self._tasks) < MAX_INFLIGHT:
             if entry is not None and entry.status == "stale":
                 # Serve stale now; regenerate in the background, but only
@@ -1744,6 +2079,26 @@ class ISRCache:
         if entry is not None and entry.status == "stale":
             return entry.body
         if task is None:
+            # C-2: too busy to regenerate is still a regeneration
+            # failure — serve the retained previous value instead of
+            # erroring, when one exists (mirrors the local path).
+            previous = await self._retained_body(key, tags)
+            if previous is not None:
+                return previous
             raise CacheBusy("Too many ISR generations")
         # A cancelled request must not cancel the shared render for other callers.
-        return await asyncio.shield(task)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except (SignalError, ISRRenderStatusError):
+            # A permanent 4xx render must reach the caller, never the
+            # retained previous body (C-2).
+            raise
+        except Exception:
+            # C-2: a failed (re)generation serves the retained previous
+            # value instead of erroring, when one exists.
+            previous = await self._retained_body(key, tags)
+            if previous is not None:
+                return previous
+            raise

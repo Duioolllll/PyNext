@@ -10,6 +10,41 @@ from contextlib import asynccontextmanager
 from .dynamic import mark_dynamic_access
 
 
+def raw_sql(sql, params=None):
+    """Explicit escape hatch for raw SQL with a :class:`Database` (S-P1-10).
+
+    Returns a SQLAlchemy ``text()`` clause with ``params`` bound by
+    name — the SQLAlchemy spelling of the same rule as
+    :func:`pynext.sql.raw_sql`: values are passed separately, never
+    interpolated into ``sql``. ``params`` must be a mapping of
+    ``:name`` placeholders (or ``None`` for a parameter-less
+    statement); positional sequences are rejected so a call site
+    cannot silently fall back to string formatting.
+
+    Use only when the ORM / Core expression language cannot express
+    the statement. Every use belongs on the "escape-hatch usages"
+    review checklist (see ``docs/SECURITY.md``).
+
+    Example::
+
+        await session.execute(
+            raw_sql("SELECT * FROM posts WHERE author = :author",
+                    {"author": name}))
+    """
+    if not isinstance(sql, str):
+        raise TypeError("raw SQL statement must be a string")
+    if params is not None and not isinstance(params, dict):
+        raise TypeError("raw_sql() parameters must be a dict of named parameters, or None")
+    try:
+        from sqlalchemy import text
+    except ImportError as exc:
+        raise RuntimeError("install pynext-framework[database] to use raw_sql") from exc
+    clause = text(sql)
+    if params:
+        clause = clause.bindparams(**params)
+    return clause
+
+
 class _MemorySessions:
     def __init__(self):
         self.lock = asyncio.Lock()

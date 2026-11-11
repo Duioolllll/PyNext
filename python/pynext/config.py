@@ -21,7 +21,9 @@ schema validation, in ``server/config.ts``):
 Validation follows the Next.js warning/fatal split (``config-schema.ts``
 + ``normalizeNextConfigZodErrors``): an unknown key is a warning and
 loading continues, while a wrong type, an out-of-range value or a bad
-security value (for example an invalid CSRF signing key) is a fatal
+security value (for example an invalid CSRF signing key, or
+``cors_allow_credentials=True`` together with a wildcard origin — see
+:func:`_check_cors_credentials_wildcard`) is a fatal
 :class:`ConfigError` and startup fails. All schema errors are collected
 and reported together, with the setting name and the source that set it.
 
@@ -33,8 +35,10 @@ from __future__ import annotations
 
 import difflib
 import importlib.util
+import ipaddress
 import math
 import os
+import re
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -46,13 +50,16 @@ from .http import _ORIGIN, canonical_origin, parse_csrf_signing_key
 __all__ = [
     "CONFIG_FILENAME",
     "CONFIG_VARIABLE",
+    "DEFAULT_ALLOWED_HOSTS",
     "DEFAULT_CONFIG",
     "ConfigError",
     "PyNextConfig",
     "ResolvedConfig",
+    "effective_allowed_hosts",
     "find_config_file",
     "load_config",
     "load_config_file",
+    "resolve_workers",
 ]
 
 CONFIG_FILENAME = "pynext.config.py"
@@ -74,6 +81,22 @@ class ConfigError(ValueError):
     """A fatal configuration problem: startup must fail, not continue."""
 
 
+def resolve_workers(value):
+    """Resolve a ``workers`` setting to a process count (C-P1-5).
+
+    ``"auto"`` (any case, surrounding whitespace ignored) means one
+    worker per CPU, clamped to the 1..64 range the CLI enforces — the
+    Sanic ``fast=True`` rule. An int passes through unchanged (bounds
+    are checked by the caller). Anything else raises
+    :class:`ConfigError`.
+    """
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return min(64, max(1, os.cpu_count() or 1))
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"'workers' must be an integer or 'auto' (got {value!r})")
+    return value
+
+
 @dataclass(frozen=True)
 class PyNextConfig:
     """All server settings, with their defaults, in one place.
@@ -91,30 +114,101 @@ class PyNextConfig:
     host: str = "127.0.0.1"
     port: int = 3000
     # Request admission and body limits (serve()).
-    max_concurrent: int = 64
-    acquire_timeout_ms: int = 1000
+    # C-P0-2: raised together with the multi-worker default (C-P0-1) —
+    # the workers share one accept queue, so the per-process admission
+    # budget and the wait for a slot are sized for all workers at once.
+    #
+    # ``acquire_timeout_ms`` (C-P1-5): how long a request waits in the
+    # Rust admission queue for an execution slot before it is refused
+    # with 503 + ``Retry-After``. The default (3000 ms) absorbs bursts
+    # when handlers are fast (a few ms: a waiter clears in one slot
+    # turnover) and already covers handlers up to ~500 ms; at the old
+    # 1000 ms default the root-cause reproduction (``concurrency-analysis/
+    # pynext-root-cause.md`` §5) measured 90.4% 503 for 500 ms
+    # ``time.sleep`` handlers and 74.2% for ~130 ms CPU handlers,
+    # because a waiter behind a full 64-slot queue waits roughly one
+    # mean slot-hold time per queue position ahead of it.
+    # Rule of thumb: set this to at least ~2x the p95 handler latency
+    # (3000-5000 ms for handlers that typically take ~500 ms), or set
+    # ``acquire_timeout_max_ms`` and let the effective timeout adapt to
+    # the observed slot-hold time instead of guessing one number.
+    max_concurrent: int = 128
+    acquire_timeout_ms: int = 3000
+    # Adaptive admission ceiling (C-P1-5): when set, the effective slot
+    # wait is ``clamp(2 * EWMA(slot hold time), acquire_timeout_ms,
+    # acquire_timeout_max_ms)`` — a slow-handler deployment waits longer
+    # instead of converting latency into 503s, while the ceiling keeps
+    # the wait bounded (each waiter can hold a fully buffered body).
+    # ``None`` (default) keeps the fixed ``acquire_timeout_ms``.
+    acquire_timeout_max_ms: int | None = None
+    # Per-stage request timeouts (C-P1-7): handler execution and
+    # response sending are separate stages with separate budgets.
+    # A handler that runs past ``handler_timeout_ms`` answers 504
+    # ("the server could not finish the work"); running out of
+    # admission capacity answers 503 + ``Retry-After`` ("cannot accept
+    # right now") — the two are never mixed. ``body_timeout_ms`` below
+    # is the body-read stage (a slow body answers 408). 0 disables the
+    # stage timeout on the ASGI path; on the native path 0 disables the
+    # bridge deadline (use with care: a hung handler then holds its
+    # slot until the client disconnects).
+    handler_timeout_ms: int = 30000
+    response_timeout_ms: int = 30000
     max_waiting: int | None = None
     body_capacity: int = 16
     body_timeout_ms: int = 10000
-    # Connection limits (serve()).
+    # Connection limits (serve()). header_read_timeout_ms also bounds
+    # idle keep-alive connections: hyper applies it to every header read,
+    # so a connection that stays idle past it is closed (see serve()).
     max_connections: int = 1024
     max_connections_per_ip: int = 128
+    # Per-IP execution quota (serve()): at most this many requests from
+    # one client IP may hold an execution slot at once (H-5). The global
+    # pool is ``max_concurrent`` (128), so the default 16 is one eighth
+    # of the pool: a single IP can no longer take all 128 slots with slow
+    # requests and 503 every other user.
+    max_concurrent_per_ip: int = 16
     header_read_timeout_ms: int = 10000
     body_min_rate_bytes_per_sec: int = 1024
+    # S-P1-14/15/16 DoS defences (serve()): total streaming-response
+    # lifetime, per-IP body-slot cap, WebSocket idle timeout, maximum
+    # WebSocket lifetime, and WebSocket ping interval. 0 disables the
+    # streaming lifetime and the WebSocket timeouts/pings.
+    streaming_max_lifetime_secs: int = 300
+    body_capacity_per_ip: int = 4
+    ws_idle_timeout_secs: int = 300
+    ws_max_lifetime_secs: int = 3600
+    ws_ping_interval_secs: int = 60
     # Lifecycle.
     shutdown_timeout: float = 30.0
-    workers: int = 1
+    # C-P0-1: two worker processes by default, so one worker crashing (or
+    # a rolling restart) does not take the server down. It also accepts
+    # ``"auto"`` (config file or ``--workers auto``): the number of CPUs,
+    # clamped to 1..64 — the same rule Sanic's ``fast=True`` uses
+    # (workers = CPU affinity count). The memory ISR cache is per-process
+    # and is NOT shared between workers — use a shared cache backend
+    # ('sqlite' or 'redis') to share ISR entries across workers (see
+    # supervisor.py and the ``_cross_check`` warning, which only fires
+    # when ``workers`` was set explicitly). Only the count changes here;
+    # the supervisor still spawns `workers` processes on one listener.
+    workers: int = 2
     # ISR cache.
     cache_backend: str = "memory"
     cache_path: str | None = None
     cache_failure_policy: str = "fail_open"
-    # Rate limiting.
-    rate_limit: int = 0
+    # Rate limiting (H-1): on by default — 300 requests per client IP
+    # per 60-second window. A default deployment used to expose no
+    # framework-level throttle at all (``rate_limit=0``), so the only
+    # defence was the 64 execution slots, which reject attackers and
+    # legitimate users alike with 503. Set ``rate_limit=0`` to opt out
+    # (``pynext start`` then warns that throttling is disabled).
+    # Health probes are exempt by default so a load balancer can always
+    # reach /healthz and /readyz.
+    rate_limit: int = 300
     rate_limit_window: float = 60.0
     rate_limit_backend: str = "memory"
     rate_limit_ipv6_prefix_len: int = 64
     rate_limit_failure_policy: str = "fail_closed"
-    rate_limit_exempt_paths: tuple = ()
+    rate_limit_exempt_paths: tuple = ("/healthz", "/readyz")
     trusted_proxies: tuple = ()
     # Security.
     csrf_enabled: bool | None = None
@@ -126,6 +220,9 @@ class PyNextConfig:
     websocket_max_message: int = 65_536
     websocket_allowed_origins: tuple = ()
     websocket_allow_missing_origin: bool = False
+    # Host header validation (S-P1-19, Django ALLOWED_HOSTS): an empty
+    # list means the loopback default (see effective_allowed_hosts).
+    allowed_hosts: tuple = ()
     # Observability (None = from the environment, as before).
     structured_logs: bool | None = None
     metrics: bool | None = None
@@ -135,6 +232,30 @@ class PyNextConfig:
 
 #: The single default source. Frozen: callers must not mutate it.
 DEFAULT_CONFIG = PyNextConfig()
+
+#: Hosts allowed when ``allowed_hosts`` is empty: loopback only. The
+#: native server enforces the same default for a direct caller that
+#: passes no allowlist (see ``effective_allowed_hosts``).
+DEFAULT_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def effective_allowed_hosts(allowed_hosts=(), bind_host=None):
+    """The Host allowlist actually enforced by the native server.
+
+    An explicitly configured list wins as-is. Otherwise the loopback
+    default applies, plus the bind host when it names a host (for
+    example ``--host example.com``); a wildcard bind (``0.0.0.0``,
+    ``::``) is not a hostname and adds nothing — a public deployment
+    must set ``allowed_hosts`` explicitly (Django ``ALLOWED_HOSTS``).
+    """
+    if allowed_hosts:
+        return tuple(allowed_hosts)
+    hosts = list(DEFAULT_ALLOWED_HOSTS)
+    if bind_host:
+        candidate = bind_host.lower()
+        if candidate not in hosts and candidate not in ("0.0.0.0", "::"):
+            hosts.append(candidate)
+    return tuple(hosts)
 
 
 @dataclass(frozen=True)
@@ -170,15 +291,24 @@ _SPECS = {
     "port": _Spec("int", 0, 65535),
     "max_concurrent": _Spec("int", 1, 1000000),
     "acquire_timeout_ms": _Spec("int", 0, 86400000),
+    "acquire_timeout_max_ms": _Spec("int_or_none", 0, 86400000),
+    "handler_timeout_ms": _Spec("int", 0, 86400000),
+    "response_timeout_ms": _Spec("int", 0, 86400000),
     "max_waiting": _Spec("int_or_none", 0, 1000000),
     "body_capacity": _Spec("int", 1, 1000000),
     "body_timeout_ms": _Spec("int", 0, 86400000),
     "max_connections": _Spec("int", 1, 1000000),
     "max_connections_per_ip": _Spec("int", 1, 1000000),
+    "max_concurrent_per_ip": _Spec("int", 1, 1000000),
     "header_read_timeout_ms": _Spec("int", 0, 86400000),
     "body_min_rate_bytes_per_sec": _Spec("int", 0, 1000000000),
+    "streaming_max_lifetime_secs": _Spec("int", 0, 86400),
+    "body_capacity_per_ip": _Spec("int", 1, 1000000),
+    "ws_idle_timeout_secs": _Spec("int", 0, 86400),
+    "ws_max_lifetime_secs": _Spec("int", 0, 86400),
+    "ws_ping_interval_secs": _Spec("int", 0, 86400),
     "shutdown_timeout": _Spec("float", 0, 3600),
-    "workers": _Spec("int", 1, 64),
+    "workers": _Spec("workers", 1, 64),
     "cache_backend": _Spec("str", choices=("memory", "sqlite", "redis")),
     "cache_path": _Spec("str_or_none"),
     "cache_failure_policy": _Spec("str", choices=("fail_open", "fail_closed")),
@@ -198,11 +328,70 @@ _SPECS = {
     "websocket_max_message": _Spec("int", 1, _MAX_WS_MESSAGE_BYTES),
     "websocket_allowed_origins": _Spec("ws_origins"),
     "websocket_allow_missing_origin": _Spec("bool"),
+    "allowed_hosts": _Spec("allowed_hosts"),
     "structured_logs": _Spec("bool_or_none"),
     "metrics": _Spec("bool_or_none"),
     "tracing": _Spec("bool_or_none"),
     "log_level": _Spec("log_level"),
 }
+
+#: One DNS label: alphanumerics, hyphens (not at either end) and
+#: underscores (intranet names such as ``my_host``). The native matcher
+#: enforces the same alphabet on request Host values.
+_HOST_LABEL = re.compile(r"^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$")
+
+
+def _validate_allowed_host(entry, *, source, key):
+    """Validate one ``allowed_hosts`` entry; return it lowercased.
+
+    Django ``ALLOWED_HOSTS`` forms: ``*`` (any host), ``.example.com``
+    (the domain and all its subdomains), ``*.example.com`` (subdomains
+    only), or an exact hostname / IP literal. Entries are bare hosts:
+    no scheme, no port (the request Host's port is stripped at match
+    time), no path or query.
+    """
+    if not isinstance(entry, str) or not entry:
+        _fail(source, key, "must be a list or tuple of non-empty host patterns", entry)
+    lowered = entry.lower()
+    if lowered == "*":
+        return "*"
+    if "://" in lowered or any(ch in lowered for ch in " /?#@"):
+        _fail(source, key, f"has an invalid allowed host {entry!r}", entry)
+    body = lowered
+    suffix = body.startswith("*.") or body.startswith(".")
+    if body.startswith("*."):
+        body = body[2:]
+    elif body.startswith("."):
+        body = body[1:]
+    if "*" in body:
+        _fail(source, key, f"has an invalid allowed host {entry!r}", entry)
+    if body.startswith("[") and body.endswith("]"):
+        try:
+            ipaddress.ip_address(body[1:-1])
+        except ValueError:
+            _fail(source, key, f"has an invalid allowed host {entry!r}", entry)
+        if suffix:
+            _fail(source, key,
+                  f"subdomain pattern {entry!r} must name a domain, not an IP literal", entry)
+        return body[1:-1]
+    try:
+        ipaddress.ip_address(body)
+    except ValueError:
+        pass
+    else:
+        if suffix:
+            _fail(source, key,
+                  f"subdomain pattern {entry!r} must name a domain, not an IP literal", entry)
+        return body
+    if ":" in body:
+        _fail(source, key, f"allowed host {entry!r} must not include a port", entry)
+    if not body or len(body) > 253:
+        _fail(source, key, f"has an invalid allowed host {entry!r}", entry)
+    for label in body.split("."):
+        if not _HOST_LABEL.fullmatch(label):
+            _fail(source, key, f"has an invalid allowed host {entry!r}", entry)
+    return lowered
+
 
 def _env_bool_value(value):
     """Parse an env-var bool the way :func:`observability._env_bool` does."""
@@ -257,6 +446,15 @@ def _validate_value(key, value, *, source):
             _fail(source, key, "must be an integer", value)
         _check_bounds(source, key, value, spec)
         return value
+    if kind == "workers":
+        if isinstance(value, str):
+            if value.strip().lower() != "auto":
+                _fail(source, key, "must be an integer or 'auto'", value)
+            return resolve_workers(value)
+        if type(value) is not int:
+            _fail(source, key, "must be an integer or 'auto'", value)
+        _check_bounds(source, key, value, spec)
+        return value
     if kind == "int_or_none":
         if value is None:
             return None
@@ -295,6 +493,10 @@ def _validate_value(key, value, *, source):
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"{source}: {exc}") from exc
         return value
+    if kind == "allowed_hosts":
+        if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+            _fail(source, key, "must be a list or tuple of host patterns", value)
+        return tuple(_validate_allowed_host(item, source=source, key=key) for item in value)
     if kind in ("str_tuple", "cors_origins", "ws_origins"):
         if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
             _fail(source, key, "must be a list or tuple of strings", value)
@@ -334,19 +536,86 @@ def _validate_config_dict(raw, *, source):
     return cleaned, warnings
 
 
-def _cross_check(values, *, source):
-    """Warn about option combinations that are legal but surprising."""
+def _cross_check(values, *, source, workers_source="default"):
+    """Warn about option combinations that are legal but surprising.
+
+    The multi-worker memory-cache warning only fires when ``workers``
+    was set explicitly (file/env/cli): with the multi-worker default
+    (C-P0-1) it would otherwise warn on every startup even though the
+    user changed nothing.
+
+    One combination is fatal, not just surprising (H-4):
+    ``cors_allowed_origins=["*"]`` with ``cors_allow_credentials=True``
+    would echo any request Origin back with credentials allowed, so an
+    arbitrary site could make credentialed (cookie-bearing) cross-origin
+    requests. Refuse it at startup; list the origins explicitly instead.
+    """
+    if "*" in values.cors_allowed_origins and values.cors_allow_credentials:
+        raise ConfigError(
+            f"{source}: 'cors_allowed_origins' contains '*' together with "
+            "'cors_allow_credentials=True'; that would allow any origin to "
+            "make credentialed cross-origin requests. List the allowed "
+            "origins explicitly instead of '*'.")
     warnings = []
+    if (values.acquire_timeout_max_ms is not None
+            and values.acquire_timeout_max_ms < values.acquire_timeout_ms):
+        warnings.append(
+            f"{source}: 'acquire_timeout_max_ms' ({values.acquire_timeout_max_ms}) is below "
+            f"'acquire_timeout_ms' ({values.acquire_timeout_ms}); the adaptive ceiling never "
+            "applies — raise the ceiling or lower the base timeout")
     if values.cache_path is not None and values.cache_backend != "sqlite":
         warnings.append(
             f"{source}: 'cache_path' is only used with cache_backend 'sqlite'; "
             f"it will be ignored with backend {values.cache_backend!r}")
-    if values.workers > 1 and values.cache_backend == "memory":
+    if (values.workers > 1 and values.cache_backend == "memory"
+            and workers_source != "default"):
         warnings.append(
             f"{source}: with workers={values.workers} and the memory ISR cache "
             "backend, each worker keeps its own ISR cache; use "
             "cache_backend 'sqlite' or 'redis' to share it")
+    if "*" in values.allowed_hosts:
+        warnings.append(
+            f"{source}: 'allowed_hosts' contains '*', which allows any Host header; "
+            "set explicit hosts before deploying publicly")
     return warnings
+
+
+def _check_cors_credentials_wildcard(values, *, source):
+    """Reject the credentialed-wildcard CORS combination (S-P1-5).
+
+    ``cors_allow_credentials=True`` with ``"*"`` in
+    ``cors_allowed_origins`` lets *any* website read credentialed
+    (cookie / ``Authorization``) responses: the CORS middleware echoes
+    the request Origin back with ``Access-Control-Allow-Credentials:
+    true`` for both preflight and actual requests (``http.py:
+    _allow_origin_value``), so the browser accepts the response from
+    every origin. This is the Litestar trap (``litestar-security.md``
+    §2.7 item 1): Litestar performs no such check, and there a simple
+    request is echoed past a preflight that keeps the literal ``*``;
+    in PyNext the preflight echoes too, so the bypass is complete.
+
+    Rejected (a fatal :class:`ConfigError`, so startup fails) rather
+    than warned about, for three reasons:
+
+    1. The combination has no legitimate use: "allow every origin with
+       credentials" cannot be expressed safely. The intent is always
+       either a wildcard *without* credentials, or explicit origins
+       *with* credentials — both keep working.
+    2. A warning is too easy to miss in server logs while the app keeps
+       serving the vulnerable configuration.
+    3. It fits this loader's existing fatal/warning split: like an
+       invalid CSRF signing key, a bad security value fails startup.
+
+    The check runs on the merged config (file → env → CLI) because the
+    two halves of the combination can arrive from different layers —
+    per-value validation cannot see it.
+    """
+    if values.cors_allow_credentials and "*" in values.cors_allowed_origins:
+        raise ConfigError(
+            f"{source}: 'cors_allow_credentials' is True with wildcard origin "
+            f"'*' in 'cors_allowed_origins': any website could read "
+            f"credentialed responses. List explicit origins in "
+            f"'cors_allowed_origins', or set 'cors_allow_credentials' to False.")
 
 
 def find_config_file(root):
@@ -433,7 +702,10 @@ def load_config(root, phase, *, cli_overrides=None, env=None):
         sources[key] = "cli"
 
     values = PyNextConfig(**merged)
-    warnings.extend(_cross_check(values, source=str(config_file) if config_file else "config"))
+    _check_cors_credentials_wildcard(
+        values, source=str(config_file) if config_file else "config")
+    warnings.extend(_cross_check(values, source=str(config_file) if config_file else "config",
+                                 workers_source=sources["workers"]))
     return ResolvedConfig(values=values, warnings=tuple(warnings),
                           config_file=config_file, phase=phase,
                           sources=MappingProxyType(sources))

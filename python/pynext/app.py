@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import copy
 import dataclasses
 import hashlib
@@ -20,15 +21,16 @@ import traceback
 import uuid
 import warnings
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from urllib.parse import quote, unquote, unquote_to_bytes
 
 from . import _native
-from .admission import DecisionGate
+from .admission import DecisionGate, DecisionUnavailable
 from .assets import read_public_artifacts, read_public_sources
-from .auth import check_authorization
+from .auth import authorization_policy, check_authorization
 from .cache import (MAX_CACHE_SECONDS, CacheBusy, ISRCache, SharedCacheUnavailable,
                     dev_retention_policy, validate_cache_tag)
 from .client import compile_client, read_client_artifacts
@@ -43,7 +45,8 @@ from .errors import SignalError, digest_for_error, error_count
 from .http import (SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
                    StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
                    apply_path_headers, apply_security_headers, compile_path_headers,
-                   cors_preflight_response, filter_internal_headers, new_csp_nonce, validate_csrf)
+                   cors_preflight_response, csrf_token_response, filter_internal_headers, new_csp_nonce, sanitize_response_headers,
+                   validate_csrf, validate_request_framing)
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .middleware import ScopedMiddleware
 from .observability import (
@@ -59,14 +62,33 @@ from .observability import (
 )
 from .proxy import ProxyTrust
 from .ratelimit import _is_exempt_path, rate_limited_response
-from .sessions import SessionMiddleware
-from .static import asset_response
+from .sessions import SessionMiddleware, SQLiteSessionStore, WS_PREFLIGHT_STATE_KEY
+from .sync_dispatch import (
+    CALL_ASYNC,
+    CALL_ASYNC_GEN,
+    cache_call_kind,
+    cached_call_kind,
+    run_sync_with_context,
+)
+from .static import StaticPathError, asset_response, validate_static_request_path
+from .validation import validate_handler_input
 from .ws_origin import websocket_origin_allowed
 
 log = logging.getLogger("pynext")
 MAX_BODY = 1_048_576
 ASGI_DECISION_CAPACITY = 64
 ASGI_DECISION_TIMEOUT = 2.0
+# ASGI body limits (S-P1-12 / M-2): native parity — the whole body must
+# arrive within the body timeout, and after the grace window it must
+# average at least the minimum receive rate (native: 10 s, 1024 B/s,
+# 2 s grace, re-checked every 250 ms while stalled). The values come
+# from the same DEFAULT_CONFIG the native server defaults to; uvicorn
+# itself applies no such bound, so without this a slow body can hold an
+# ASGI connection (Slowloris) indefinitely.
+ASGI_BODY_TIMEOUT_SECS = DEFAULT_CONFIG.body_timeout_ms / 1000.0
+ASGI_BODY_MIN_RATE_BYTES_PER_SEC = DEFAULT_CONFIG.body_min_rate_bytes_per_sec
+ASGI_BODY_MIN_RATE_GRACE_SECS = 2.0
+ASGI_BODY_MIN_RATE_CHECK_INTERVAL_SECS = 0.25
 
 # Development error page (P1-3): how much of a traceback the dev page keeps.
 # The tail is kept so the frames nearest the failure survive; anything cut
@@ -123,6 +145,30 @@ def _render_dev_traceback(text):
             f"{html.escape(match.group('path'))}</a>&quot;, line {match.group('line')}, "
             f"in {html.escape(match.group('func'))}")
     return "\n".join(rendered)
+
+
+def _is_external_bind_host(host):
+    """True when ``host`` is a bind address reachable from other machines.
+
+    S-P1-28 (M-19): a development server bound to a non-loopback address
+    exposes the detailed dev error page (traceback, file paths, exception
+    messages) to the network. Loopback addresses (``127.0.0.1``, ``::1``,
+    ``localhost``) are local; the wildcard addresses (``0.0.0.0``, ``::``)
+    and any other concrete address are external. An unparseable hostname
+    fails closed (treated as external); ``None``/empty means no bind
+    address was recorded, so there is nothing to warn about.
+    """
+    if host is None:
+        return False
+    host = str(host).strip().lower()
+    if not host or host == "localhost" or host.endswith(".localhost"):
+        return False
+    import ipaddress
+
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True
 
 
 class _SyncHandlerBusy(Exception):
@@ -249,16 +295,29 @@ def _check_signature(fn, allowed, label):
             raise ValueError(f"Unsupported required parameter {p.name!r} in {label}")
 
 
-async def _invoke(fn, **values):
+async def _invoke(fn, _app=None, **values):
+    """Invoke a page/layout/handler/generator callable.
+
+    The sync/async verdict is the one cached on the callable at
+    registration time (see :func:`pynext.sync_dispatch.cached_call_kind`),
+    not a fresh ``inspect`` per request. Sync callables always run through
+    the app's :meth:`App._invoke_sync` — the single sync entry point —
+    when an app is known, either from ``request._app`` or from the explicit
+    ``_app`` argument (build-time generators and prerenders have no
+    request). Only an app-less direct use falls back to a worker thread
+    with the caller's context copied, and that fallback never touches the
+    entry limiter because there is no app to account the work to.
+    """
     names = inspect.signature(fn).parameters
     kwargs = {key: value for key, value in values.items() if key in names}
-    if inspect.iscoroutinefunction(fn):
+    if cached_call_kind(fn) == CALL_ASYNC:
         return await fn(**kwargs)
     request = values.get("request")
-    if request is not None and request._app is not None:
-        result = await request._app._invoke_sync(fn, kwargs, request)
+    app = request._app if request is not None and request._app is not None else _app
+    if app is not None:
+        result = await app._invoke_sync(fn, kwargs, request)
     else:
-        result = await asyncio.to_thread(fn, **kwargs)
+        result = await run_sync_with_context(fn, **kwargs)
     return await result if inspect.isawaitable(result) else result
 
 
@@ -356,7 +415,45 @@ def _substitute_shell_marker(node, marker, page_tree):
     return node, 0
 
 
-async def _send_response(response, send, *, config=None, production=True):
+def _header_pair_has_ctl(name, value):
+    """True when a response header name/value pair carries a CTL byte (S-P1-7).
+
+    Same rule as the Rust parser/writer (``lib.rs``) and aiohttp's
+    ``_safe_header`` (RFC 9110 §5.5, RFC 9112 §4): a value may not
+    contain ``0x00-0x08``, ``0x0A-0x1F`` or ``0x7F`` (HTAB ``0x09`` is a
+    legal field-value byte); a name may not contain any byte below
+    ``0x20`` or ``0x7F`` at all.
+    """
+    name_bytes = bytes(name) if isinstance(name, (bytes, bytearray, memoryview)) else str(name).encode("utf-8", "ignore")
+    value_bytes = bytes(value) if isinstance(value, (bytes, bytearray, memoryview)) else str(value).encode("utf-8", "ignore")
+    return (any(b < 0x20 or b == 0x7F for b in name_bytes)
+            or any((b < 0x20 and b != 0x09) or b == 0x7F for b in value_bytes))
+
+
+def _strip_ctl_response_headers(response):
+    """Drop response headers carrying a control character (S-P1-7, writer side).
+
+    The ASGI ``send`` below is the last serialization point on the Python
+    path: a handler can append to ``response.headers`` after the
+    :class:`Response` constructor validated them, so re-check here. A bad
+    header is dropped — not raised — so one bad app header cannot fail
+    the whole response; only the offending header's name is logged, never
+    its value. The native bridge instead rejects the whole response with
+    500 (see ``lib.rs`` ``bridge_response_header``); both paths agree
+    that no CTL byte ever reaches the wire. Returns the response for
+    call-site chaining.
+    """
+    if not any(_header_pair_has_ctl(key, value) for key, value in response.headers):
+        return response
+    dropped = [bytes(key) for key, value in response.headers
+               if _header_pair_has_ctl(key, value)]
+    response.headers = [(key, value) for key, value in response.headers
+                        if not _header_pair_has_ctl(key, value)]
+    log.warning("Dropped response header(s) containing control characters: %r", dropped)
+    return response
+
+
+async def _send_response(response, send, *, config=None, production=True, response_timeout=None):
     """Send ``response`` over ASGI, adding the A1 security headers first.
 
     ``config`` is the app's :class:`SecurityConfig`; when it is ``None`` the
@@ -364,19 +461,57 @@ async def _send_response(response, send, *, config=None, production=True):
     :meth:`App.dispatch` applied the headers there). Applying here as well
     covers the responses that bypass dispatch: rate-limit 429/503, bad
     request 400, oversized 413 and the 500 error page.
+
+    ``response_timeout`` (seconds, C-P1-7) bounds the response-send
+    stage: a plain response must finish both sends within it, and each
+    streaming chunk pull and send gets its own budget of it. ``None``
+    (the default for callers that do not pass it) keeps the old
+    unbounded behaviour. A timeout raises :class:`TimeoutError` to the
+    caller — by then the status line may already be out, so no second
+    status can be sent; the caller records stage ``"response"`` and
+    stops. A long-lived stream is not killed for its total duration,
+    only for a single stalled chunk.
+
+    Headers are sanitized exactly once here, immediately before the
+    ``http.response.start`` message (see
+    :func:`pynext.http.sanitize_response_headers`, S-P1-30): a handler or
+    middleware may have appended a header after :class:`Response`
+    construction, so the constructor check alone cannot guarantee the
+    bytes on the wire carry no CR/LF.
     """
     if config is not None:
         apply_security_headers(response, config=config, production=production)
+    _strip_ctl_response_headers(response)
+    headers = sanitize_response_headers(response.headers)
     if not isinstance(response, StreamingResponse):
-        await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
-        await send({"type": "http.response.body", "body": response.body})
+        if response_timeout is None:
+            await send({"type": "http.response.start", "status": response.status, "headers": headers})
+            await send({"type": "http.response.body", "body": response.body})
+            return
+        async with asyncio.timeout(response_timeout):
+            await send({"type": "http.response.start", "status": response.status, "headers": headers})
+            await send({"type": "http.response.body", "body": response.body})
         return
     try:
-        await send({"type": "http.response.start", "status": response.status, "headers": response.headers})
-        if not response._head_only:
-            while (chunk := await response._next_chunk()) is not None:
-                await send({"type": "http.response.body", "body": chunk, "more_body": True})
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        if response_timeout is None:
+            await send({"type": "http.response.start", "status": response.status, "headers": headers})
+            if not response._head_only:
+                while (chunk := await response._next_chunk()) is not None:
+                    await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        else:
+            async with asyncio.timeout(response_timeout):
+                await send({"type": "http.response.start", "status": response.status, "headers": headers})
+            if not response._head_only:
+                while True:
+                    async with asyncio.timeout(response_timeout):
+                        chunk = await response._next_chunk()
+                    if chunk is None:
+                        break
+                    async with asyncio.timeout(response_timeout):
+                        await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            async with asyncio.timeout(response_timeout):
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
     finally:
         await response.aclose()
 
@@ -572,6 +707,30 @@ def _layout_tag(scope):
     return "_pynext_layout_" + scope
 
 
+# Characters a cache tag may contain after the "_pynext_path_" prefix
+# (see cache.validate_cache_tag). Used by _implicit_path_tag (M-21).
+_IMPLICIT_PATH_TAG_SAFE = re.compile(r"[A-Za-z0-9_./:-]*\Z")
+
+
+def _implicit_path_tag(path):
+    """The implicit ISR tag for one concrete path.
+
+    Readable ``_pynext_path_<path>`` when the path only uses tag-safe
+    characters (letters, digits, ``_``, ``.``, ``/``, ``:``, ``-``) and
+    stays within the 256-character tag limit; a
+    ``_pynext_path_h_<sha256>`` hash otherwise. A decoded path can
+    contain anything else — ``%3F`` decodes to ``?``, ``%23`` to ``#``
+    — and the old code built the tag verbatim, so tag validation
+    rejected it and every ISR request for such a path 500'd (M-21).
+    ``revalidate(path)`` builds its tags through this same function,
+    so invalidation still matches the stored entry.
+    """
+    tag = "_pynext_path_" + path
+    if len(tag) <= 256 and _IMPLICIT_PATH_TAG_SAFE.fullmatch(path):
+        return tag
+    return "_pynext_path_h_" + hashlib.sha256(path.encode("utf-8")).hexdigest()
+
+
 def _implicit_path_tags(path):
     """The implicit tag(s) an ISR entry for a concrete path carries.
 
@@ -579,11 +738,11 @@ def _implicit_path_tags(path):
     ``/index`` are aliases of each other (Next.js ``revalidatePath``),
     so invalidating either invalidates both.
     """
-    tags = ["_pynext_path_" + path]
+    tags = [_implicit_path_tag(path)]
     if path == "/":
-        tags.append("_pynext_path_/index")
+        tags.append(_implicit_path_tag("/index"))
     elif path == "/index":
-        tags.append("_pynext_path_/")
+        tags.append(_implicit_path_tag("/"))
     return tags
 
 
@@ -594,17 +753,130 @@ def _module_key(root, relative):
     return str((root / relative).resolve()).casefold()
 
 
+#: Source patterns that mark a GET handler as (probably) state-changing
+#: (S-P1-23 lint). A GET handler is exempt from CSRF checks, so any of
+#: these in its source means the route is likely unprotected against
+#: cross-site requests. The list is deliberately short and high-signal —
+#: session writes, cache invalidation and transaction commits — so a
+#: lint hit is worth reading; it is a heuristic, not a proof, and a
+#: handler can always acknowledge the pattern with
+#: :func:`pynext.routing.state_changing_get`.
+_STATE_CHANGING_GET_PATTERNS = (
+    # `session["key"] = ...` (local alias) or
+    # `request.state["session"]["key"] = ...` (inline access).
+    (re.compile(r"(\bsession\s*\[[^\]]*\]\s*=|\[['\"]session['\"]\]\s*\[[^\]]*\]\s*=)"),
+     "writes to the session"),
+    (re.compile(r"\brevalidate_tag\s*\("), "calls revalidate_tag()"),
+    (re.compile(r"\brevalidate\s*\("), "calls revalidate()"),
+    (re.compile(r"\.commit\s*\("), "commits a database transaction"),
+)
+
+
+def check_get_idempotency(app):
+    """Warn about GET handlers that look state-changing (S-P1-23).
+
+    GET, HEAD and OPTIONS are exempt from CSRF checks, so a GET handler
+    that mutates state is unprotected by construction. This lint reads
+    each registered GET handler's source (pages and API routes alike)
+    for the patterns in :data:`_STATE_CHANGING_GET_PATTERNS` and logs
+    one warning per hit, naming the route pattern and the reason.
+    Handlers marked with :func:`pynext.routing.state_changing_get` are
+    skipped — the marker is an explicit acknowledgement, not a fix.
+    Handlers whose source cannot be read (built-ins, C extensions) are
+    skipped silently. Returns the list of ``(pattern, reason)`` findings
+    so callers (and tests) can inspect them without parsing logs.
+    Development apps run this at startup; production apps do not, so a
+    warning never costs a request.
+    """
+    findings = []
+    for pattern, spec in app.manifest["routes"].items():
+        entry = app.entries.get(pattern)
+        if entry is None:
+            continue
+        handlers = {"GET": entry[0]} if spec["kind"] == "page" else entry
+        for method, fn in handlers.items():
+            if method != "GET" or getattr(fn, "__pynext_state_changing_get__", False):
+                continue
+            try:
+                source = inspect.getsource(fn)
+            except (OSError, TypeError):
+                continue
+            for regex, reason in _STATE_CHANGING_GET_PATTERNS:
+                if regex.search(source):
+                    findings.append((pattern, reason))
+                    log.warning("GET handler for %s %s; GET requests are exempt from CSRF checks, "
+                                "so move the mutation to POST (or mark the handler with "
+                                "state_changing_get to acknowledge the exposure)", pattern, reason)
+                    break
+    return findings
+
+
 class App:
     def __init__(self, root, manifest, *, production=False, security=None,
                  cache_backend=DEFAULT_CONFIG.cache_backend,
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
                  resources=None, cache_url=None, cache_failure_policy=None,
                  websocket_max_message=DEFAULT_CONFIG.websocket_max_message, hot_reload=False,
-                 trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None,
-                 revalidate_secret=None):
+                 trusted_proxies=None, sync_workers=32, sync_wait_timeout=ASGI_DECISION_TIMEOUT,
+                 sync_queue_limit=None, render_workers=None, session_workers=None,
+                 strict_ssg=False, headers=None,
+                 revalidate_secret=None,
+                 body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms,
+                 handler_timeout_ms=DEFAULT_CONFIG.handler_timeout_ms,
+                 response_timeout_ms=DEFAULT_CONFIG.response_timeout_ms):
         if isinstance(sync_workers, bool) or not isinstance(sync_workers, int) or not 1 <= sync_workers <= 1024:
             raise ValueError("sync_workers must be an integer from 1 to 1024")
         self.sync_workers = sync_workers
+        # Bounded wait for a sync-worker slot (C-P1-2): how long a sync
+        # handler may queue when every worker is busy. The default
+        # reuses the ASGI admission gate's 2.0s deadline
+        # (``admission.DecisionGate``). 0 disables waiting entirely and
+        # restores the old refuse-immediately behaviour.
+        if (isinstance(sync_wait_timeout, bool)
+                or not isinstance(sync_wait_timeout, (int, float))
+                or not 0 <= sync_wait_timeout <= 300):
+            raise ValueError("sync_wait_timeout must be a number from 0 to 300")
+        self.sync_wait_timeout = float(sync_wait_timeout)
+        # Cap on queued sync waiters. None means twice the worker count.
+        # A request that arrives when the queue is full is refused
+        # immediately with 503, so a burst cannot grow the queue without
+        # bound ("wait -> timeout -> refuse", three stages).
+        if sync_queue_limit is None:
+            sync_queue_limit = sync_workers * 2
+        if (isinstance(sync_queue_limit, bool) or not isinstance(sync_queue_limit, int)
+                or not 0 <= sync_queue_limit <= 65536):
+            raise ValueError("sync_queue_limit must be an integer from 0 to 65536")
+        self.sync_queue_limit = sync_queue_limit
+        # Dedicated worker pools (C-P1-1). The sync pool is sized by
+        # sync_workers so every admitted handler has a thread of its
+        # own; render and session I/O get their own pools so a burst in
+        # one kind of work cannot starve the others — before this, all
+        # three shared asyncio's default executor (min(32, CPU+4)
+        # threads, 8 on a 4-core machine).
+        if render_workers is None:
+            render_workers = max(2, min(8, os.cpu_count() or 4))
+        if (isinstance(render_workers, bool) or not isinstance(render_workers, int)
+                or not 1 <= render_workers <= 1024):
+            raise ValueError("render_workers must be an integer from 1 to 1024")
+        self.render_workers = render_workers
+        if session_workers is None:
+            session_workers = 4
+        if (isinstance(session_workers, bool) or not isinstance(session_workers, int)
+                or not 1 <= session_workers <= 1024):
+            raise ValueError("session_workers must be an integer from 1 to 1024")
+        self.session_workers = session_workers
+        # Per-stage ASGI timeouts (C-P1-7, milliseconds in, seconds kept):
+        # body read / handler execution / response send are separate
+        # budgets. 0 disables that stage's timeout; the defaults match
+        # the native server (10 s body, 30 s handler, 30 s per send).
+        for _name, _value in (("body_timeout_ms", body_timeout_ms),
+                              ("handler_timeout_ms", handler_timeout_ms),
+                              ("response_timeout_ms", response_timeout_ms)):
+            if isinstance(_value, bool) or not isinstance(_value, int) or not 0 <= _value <= 86_400_000:
+                raise ValueError(f"{_name} must be an integer from 0 to 86400000")
+        self._body_timeout_s = body_timeout_ms / 1000 or None
+        self._handler_timeout_s = handler_timeout_ms / 1000 or None
+        self._response_timeout_s = response_timeout_ms / 1000 or None
         # Secret for the POST /_pynext/revalidate webhook. None disables
         # the endpoint (it answers 404). create_app() also reads
         # PYNEXT_REVALIDATE_SECRET when no explicit secret is given.
@@ -733,42 +1005,329 @@ class App:
             self._inflight = 0
             self._inflight_streams = 0
             self._sync_active = 0
+            # FIFO waiters for a sync-worker slot (C-P1-2), oldest first.
+            # Guarded by _inflight_lock together with _sync_active; every
+            # touch happens on the event loop thread.
+            self._sync_waiters = collections.deque()
+            # Deepest the FIFO waiter queue (C-P1-2) has ever grown:
+            # the recorded queue-length metric. Updated on every
+            # enqueue, under the same lock as _sync_waiters.
+            self._sync_queue_max = 0
+            # App-owned pools (C-P1-1). Threads spawn lazily on first
+            # submit, so an app that never renders or runs sync work
+            # holds no threads at all.
+            self._sync_executor = ThreadPoolExecutor(
+                max_workers=sync_workers, thread_name_prefix="pynext-sync")
+            self._render_executor = ThreadPoolExecutor(
+                max_workers=render_workers, thread_name_prefix="pynext-render")
+            self._session_executor = ThreadPoolExecutor(
+                max_workers=session_workers, thread_name_prefix="pynext-session")
+            self._worker_executors_retired = False
+            self._bind_session_executor()
+            # Dedicated single-thread exit executor (C-P1-3c). Sync teardown
+            # work — cache close, shutdown cleanup — runs here through
+            # _run_exit_sync, never on the entry limiter: a shutdown must
+            # not wait behind saturated sync workers, and an in-flight
+            # request must not wait behind a teardown. FastAPI's
+            # dedicated 1-token exit_limiter (fastapi/concurrency.py)
+            # exists for the same deadlock avoidance; here the separation
+            # is a thread of its own, because the entry limiter counts
+            # threads, not tokens. Layout-shell release and the dynamic
+            # tracker __exit__ need no thread at all (loop-local dict /
+            # contextvar ops), so they never contend with either lane.
+            self._exit_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pynext-exit")
+            self._exit_executor_retired = False
             self._inflight_lock = threading.Lock()
-            self._asgi_admission = DecisionGate(ASGI_DECISION_CAPACITY, ASGI_DECISION_TIMEOUT)
+            # Named so a 503 from this gate reads as the rate-limit
+            # decision stage (C-P1-7), not the Rust slot-wait stage.
+            self._asgi_admission = DecisionGate(ASGI_DECISION_CAPACITY, ASGI_DECISION_TIMEOUT,
+                                                "rate-limit decision")
         except BaseException:
+            self._shutdown_executors()
+            self._shutdown_exit_executor()
             self._release_modules()
             raise
 
-    async def _invoke_sync(self, fn, kwargs, request):
+    def _bind_session_executor(self):
+        """Point SQLite session stores at the app's session pool.
+
+        Stores are built by user middleware code before the App sees
+        them, so the App wires the pool in after the middleware list is
+        assembled. A store with an explicit executor is left alone, and
+        a store shared by two apps keeps the first app's pool.
+        """
+        for item in self.middleware:
+            inner = item.middleware if isinstance(item, ScopedMiddleware) else item
+            if not isinstance(inner, SessionMiddleware):
+                continue
+            store = getattr(inner, "store", None)
+            if isinstance(store, SQLiteSessionStore) and store.executor is None:
+                store.executor = self._session_executor
+
+    def _shutdown_executors(self):
+        """Stop the app-owned worker pools without waiting for stuck work.
+
+        A running sync handler cannot be cancelled (Python threads), so
+        shutdown never blocks on one; queued-but-unstarted work is
+        dropped. Safe to call before the pools exist, and safe to call
+        twice.
+        """
+        for name in ("_sync_executor", "_render_executor", "_session_executor"):
+            executor = getattr(self, name, None)
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+        self._worker_executors_retired = True
+
+    def _ensure_worker_executors(self):
+        """Recreate the app-owned worker pools after a shutdown (C-P1-1).
+
+        A ``ThreadPoolExecutor`` raises ``RuntimeError`` after
+        shutdown, so a restart (startup → shutdown → startup, as the
+        resources tests exercise) must recreate the pools instead of
+        submitting to dead ones — the same treatment the exit pool
+        gets in :meth:`_ensure_exit_executor`. Before C-P1-1 sync
+        work ran on the loop's default executor, which shutdown
+        never retired, so a restart kept working; the app-owned
+        pools need the recreation to keep that contract. Session
+        stores bound to the retired session pool are rebound to the
+        new one, or SQLite session I/O would keep submitting to it.
+        """
+        if not getattr(self, "_worker_executors_retired", False):
+            return
+        old_session = getattr(self, "_session_executor", None)
+        self._sync_executor = ThreadPoolExecutor(
+            max_workers=self.sync_workers, thread_name_prefix="pynext-sync")
+        self._render_executor = ThreadPoolExecutor(
+            max_workers=self.render_workers, thread_name_prefix="pynext-render")
+        self._session_executor = ThreadPoolExecutor(
+            max_workers=self.session_workers, thread_name_prefix="pynext-session")
+        self._worker_executors_retired = False
+        if old_session is not None:
+            for item in getattr(self, "middleware", ()):
+                inner = item.middleware if isinstance(item, ScopedMiddleware) else item
+                if not isinstance(inner, SessionMiddleware):
+                    continue
+                store = getattr(inner, "store", None)
+                if isinstance(store, SQLiteSessionStore) and store.executor is old_session:
+                    store.executor = self._session_executor
+
+    def _hand_off_sync_slot_locked(self):
+        """Hand the owned sync slot to the oldest live waiter, or release it.
+
+        Callers must hold ``self._inflight_lock`` and own a sync slot
+        they will not run: either the worker thread just finished
+        (``finished``) or this waiter was cancelled/timed out after
+        ``finished`` had already transferred the slot to it (PR #61
+        review #1). Returns the waiter to wake, or ``None`` when the
+        slot was released instead (``_sync_active`` decremented). A
+        waiter that is already done cannot run the work, so it is
+        skipped and the slot keeps moving instead of leaking.
+        """
+        while self._sync_waiters:
+            candidate = self._sync_waiters.popleft()
+            if not candidate.done():
+                return candidate
+        self._sync_active -= 1
+        return None
+
+    async def _invoke_sync(self, fn, kwargs, request=None):
+        """Run a sync handler/layout on a worker thread (C-P1-8).
+
+        Client disconnect cancels the awaiter promptly: the native
+        transport notices the closed connection (Axum drops the
+        in-flight handler future, the bridge cancels the Python task)
+        and the ASGI transport notices ``http.disconnect`` (see
+        ``_run_while_connected``). Either way the request's
+        cancellation signal is set, so cooperative work can stop
+        before committing a side effect (see
+        :meth:`Request.check_cancelled`). A thread that is already
+        running cannot be interrupted, so its result is discarded and
+        its slot stays occupied until the thread actually finishes
+        (ADR-0002); the slot is then released and the worker is
+        reusable. Work that has not started yet never starts: the
+        pre-start check in ``run`` raises instead of calling ``fn``.
+        """
         # Keep capacity occupied until the actual thread finishes, even if
         # the awaiter timed out. Cancellation cannot stop a Python thread.
-        request.check_cancelled()
+        # Bounded wait (C-P1-2): when every sync worker is busy the
+        # caller joins a FIFO waiter queue instead of being refused at
+        # once. The wait is capped by sync_wait_timeout (default 2.0s,
+        # the DecisionGate deadline) and the queue itself is capped by
+        # sync_queue_limit: "wait -> timeout -> refuse", three stages.
+        # A freed slot goes to the oldest waiter (the slot is
+        # transferred, not released and re-contended), so waiters cannot
+        # be starved by new arrivals.
+        # ``request`` is None for request-less invocations (build-time
+        # generate_static_params, prerenders): the same limiter still
+        # accounts the work, only the cancellation checks are skipped.
+        if request is not None:
+            request.check_cancelled()
+        waiter = None
         with self._inflight_lock:
-            if self._sync_active >= self.sync_workers:
+            if self._sync_active < self.sync_workers:
+                self._sync_active += 1
+            elif self.sync_wait_timeout <= 0 or len(self._sync_waiters) >= self.sync_queue_limit:
+                # Sync-worker saturation 503, counted for C-P1-6
+                # observability (the dispatch-level conversion cannot
+                # tell this refusal apart from other 503s).
+                self.metrics.observe_worker_timeout("unavailable")
                 raise _SyncHandlerBusy()
-            self._sync_active += 1
+            else:
+                waiter = asyncio.get_running_loop().create_future()
+                self._sync_waiters.append(waiter)
+                self._sync_queue_max = max(self._sync_queue_max, len(self._sync_waiters))
+        if waiter is not None:
+            # Queue-length/wait-time metrics (C-P1-2): the wait is timed
+            # here and added to the request's queue-wait contextvar on
+            # every exit path (woken, deadline, cancelled), so dispatch's
+            # observe_request records it in snapshot queue.waits_ms
+            # (and the C-P1-6 slot-wait histogram once integrated). An
+            # admission wait set by server.py, if any, is kept: the two
+            # waits are sequential, so the total is their sum.
+            wait_started = time.monotonic()
+            try:
+                await asyncio.wait_for(asyncio.shield(waiter), self.sync_wait_timeout)
+            except TimeoutError:
+                with self._inflight_lock:
+                    if waiter.done():
+                        # Already dequeued by finished(): the slot was
+                        # transferred and the waiter was woken, but the
+                        # timeout fired in the same loop turn before the
+                        # coroutine resumed, so the wait still times out.
+                        # Hand the transferred slot on instead of leaking
+                        # it (PR #61 review #1).
+                        nxt = self._hand_off_sync_slot_locked()
+                    else:
+                        try:
+                            self._sync_waiters.remove(waiter)
+                        except ValueError:
+                            # Already dequeued by finished() without the
+                            # slot being transferred yet (defensive only:
+                            # pop and set_result run back-to-back in one
+                            # finished() call, no loop interleave).
+                            pass
+                        nxt = None
+                if nxt is not None:
+                    nxt.set_result(None)
+                queue_wait_var.set((queue_wait_var.get() or 0.0)
+                                   + (time.monotonic() - wait_started) * 1000)
+                # Waiter deadline expiry: a sync-worker saturation 503
+                # (C-P1-6 observability, same counter as the immediate
+                # refusal above — one refused request counts once).
+                self.metrics.observe_worker_timeout("unavailable")
+                raise _SyncHandlerBusy()
+            except asyncio.CancelledError:
+                with self._inflight_lock:
+                    if waiter.done():
+                        # Already dequeued by finished(): the slot was
+                        # transferred and the waiter was woken, but the
+                        # awaiter was cancelled before its coroutine
+                        # resumed. The cancelled waiter never runs the
+                        # work, so hand the transferred slot on instead
+                        # of leaking it (PR #61 review #1).
+                        nxt = self._hand_off_sync_slot_locked()
+                    else:
+                        try:
+                            self._sync_waiters.remove(waiter)
+                        except ValueError:
+                            pass
+                        nxt = None
+                if nxt is not None:
+                    nxt.set_result(None)
+                queue_wait_var.set((queue_wait_var.get() or 0.0)
+                                   + (time.monotonic() - wait_started) * 1000)
+                if request is not None:
+                    request._cancel_event.set()
+                raise
+            queue_wait_var.set((queue_wait_var.get() or 0.0)
+                               + (time.monotonic() - wait_started) * 1000)
 
         def run():
-            request.check_cancelled()  # a cancelled queued job never starts
+            if request is not None:
+                request.check_cancelled()  # a cancelled queued job never starts
             return fn(**kwargs)
 
-        task = asyncio.create_task(asyncio.to_thread(run))
+        # App-owned sync pool (C-P1-1), not the shared default executor.
+        # Context propagation (C-P1-4): run_sync_with_context is
+        # Litestar's sync_to_thread shape (litestar/concurrency.py:37-40)
+        # — contextvars.copy_context().run keeps the request context
+        # (request_id, tracing) visible in the worker, exactly as
+        # asyncio.to_thread did. The executor future is awaited inside
+        # a real task (not ensure_future on the concurrent future):
+        # with a wrapped future the done-callback below runs *after*
+        # the awaiting coroutine resumes, so _sync_active would still
+        # read busy when the next _invoke_sync acquires. A task runs
+        # its done-callbacks first, as create_task(to_thread(...)) did.
+        # C-P1-1 moves this onto the app-owned sync pool, same shape.
+        async def _run_on_pool():
+            return await run_sync_with_context(run, executor=self._sync_executor)
+
+        task = asyncio.create_task(_run_on_pool())
 
         def finished(done):
             with self._inflight_lock:
-                self._sync_active -= 1
+                # The freed slot transfers to the oldest live waiter
+                # and _sync_active stays put until that waiter's thread
+                # finishes; with no waiter left the slot is released.
+                waiter = self._hand_off_sync_slot_locked()
+            if waiter is not None:
+                waiter.set_result(None)
             # A timed-out awaiter cannot retrieve a late exception/result.
             if not done.cancelled():
                 error = done.exception()
-                if error is None and request.cancelled and inspect.iscoroutine(done.result()):
+                if error is None and request is not None and request.cancelled and inspect.iscoroutine(done.result()):
                     done.result().close()
 
         task.add_done_callback(finished)
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
-            request._cancel_event.set()
+            if request is not None:
+                request._cancel_event.set()
             raise
+
+    async def _run_exit_sync(self, fn, *args, **kwargs):
+        """Run sync teardown work on the dedicated exit executor (C-P1-3c).
+
+        The exit lane never touches ``_sync_active`` or the entry limiter,
+        so teardown (cache close, shutdown cleanup) cannot deadlock
+        behind saturated sync workers — and a sync handler can never be
+        starved by a teardown holding an entry slot. The caller's context
+        is copied into the worker, as in :meth:`_invoke_sync`.
+        """
+        return await run_sync_with_context(
+            fn, *args, executor=self._ensure_exit_executor(), **kwargs)
+
+    def _ensure_exit_executor(self):
+        """Return a live exit executor, creating (or recreating) it if needed.
+
+        The pool is retired by :meth:`_shutdown_exit_executor`, but an App
+        can be restarted (startup → shutdown → startup, as the resources
+        tests exercise), so the next startup or teardown recreates it
+        instead of submitting to a dead pool — ``ThreadPoolExecutor``
+        raises ``RuntimeError`` after shutdown.
+        """
+        if getattr(self, "_exit_executor", None) is None or getattr(
+                self, "_exit_executor_retired", False):
+            self._exit_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pynext-exit")
+            self._exit_executor_retired = False
+        return self._exit_executor
+
+    def _shutdown_exit_executor(self):
+        """Stop the exit pool without waiting for stuck teardown work.
+
+        A running sync teardown cannot be cancelled (Python threads), so
+        shutdown never blocks on one; queued-but-unstarted work is
+        dropped. Safe to call before the pool exists, and safe to call
+        twice. Marks the pool retired so :meth:`_ensure_exit_executor`
+        recreates it if the app is restarted.
+        """
+        executor = getattr(self, "_exit_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._exit_executor_retired = True
 
     def configure_observability(self, config):
         """Apply a new observability config to this app (logging + metrics)."""
@@ -784,6 +1343,13 @@ class App:
         self.production = production
         self.router = _native.Router(list(manifest["routes"]))
         self.entries = {}
+        # Authorization policies snapshotted at registration (S-P1-33):
+        # pattern -> {method: AuthorizationPolicy} for HTTP routes, and
+        # pattern -> AuthorizationPolicy for WebSocket handlers. Dispatch
+        # enforces from these snapshots, never from the handler's live
+        # attributes, so a lost decorator cannot silently drop the check.
+        self.route_auth = {}
+        self.websocket_auth = {}
         self._layout_shells = {}
         self._layout_shell_locks = {}
         self._layout_shell_dynamic = {}
@@ -967,6 +1533,19 @@ class App:
                     getattr(layout_fn, "__pynext_layout_dynamic__", False) for layout_fn in layouts
                 )
                 self.entries[pattern] = (fn, layouts)
+                self.route_auth[pattern] = {"GET": authorization_policy(fn)}
+                # Sync/async verdicts, cached once at registration (C-P1-3a):
+                # _invoke reads the stamp instead of inspecting the
+                # callable on every request. The stamp lives on the
+                # callable, like the __pynext_page__ / __pynext_layout__
+                # markers the decorators already set.
+                cache_call_kind(fn)
+                for layout_fn in layouts:
+                    cache_call_kind(layout_fn)
+                if mode == "ssg":
+                    generator = self.static_generators.get(pattern)
+                    if generator is not None:
+                        cache_call_kind(generator)
                 self.entry_layouts[pattern] = tuple(layout_relatives)
             else:
                 handlers = {}
@@ -987,7 +1566,15 @@ class App:
                     raise ValueError(f"{spec['entry']} has no @route handlers")
                 if ws_handler is not None:
                     self.websocket_entries[pattern] = ws_handler
+                    self.websocket_auth[pattern] = authorization_policy(ws_handler)
                 self.entries[pattern] = handlers
+                self.route_auth[pattern] = {method: authorization_policy(fn)
+                                            for method, fn in handlers.items()}
+                # Sync/async verdicts, cached once at registration (C-P1-3a).
+                for handler_fn in handlers.values():
+                    cache_call_kind(handler_fn)
+                if ws_handler is not None:
+                    cache_call_kind(ws_handler)
         if production:
             from .build import read_static_pages
             if manifest.get("render_modes") != self.render_modes:
@@ -1014,6 +1601,11 @@ class App:
                   **{path: body for path, (body, _) in self.public_assets.items()}}
         self.asset_etags = {path: f'"{hashlib.sha256(body).hexdigest()}"' for path, body in assets.items()}
         self._dev_client_history = [self.client_assets] if self.hot_reload else []
+        if not production:
+            # S-P1-23: a GET handler that mutates state is exempt from
+            # CSRF checks, so warn at startup (development only) instead
+            # of letting the exposure stay silent until review.
+            check_get_idempotency(self)
 
     def update_dev_client(self, manifest, assets):
         """Atomically replace development bundles, keeping two prior versions."""
@@ -1071,7 +1663,15 @@ class App:
         else:
             count = error_count(digest)
         request_id = get_request_id()
-        if not self.debug:
+        # S-P1-28 (M-19): the detailed dev page below (traceback, file
+        # paths, exception message) must never reach a non-local client.
+        # When the dev server is bound to an external address (recorded by
+        # note_dev_bind_host() at startup), serve the same generic body as
+        # production instead. A bind address that was never recorded keeps
+        # the historical behaviour (detailed page) so local-only tools and
+        # the ASGI adapter are unaffected.
+        externally_bound = bool(getattr(self, "_dev_bind_external", False))
+        if not self.debug or externally_bound:
             detail = "Internal Server Error"
             parts = []
             if request_id:
@@ -1080,6 +1680,13 @@ class App:
                 parts.append(f"digest: {digest}")
             if parts:
                 detail += " (" + ", ".join(parts) + ")"
+            if externally_bound and not getattr(self, "_dev_external_page_warned", False):
+                self._dev_external_page_warned = True
+                log.warning(
+                    "Detailed development error page suppressed: the dev server is "
+                    "externally bound (host=%s); returning a generic error page "
+                    "instead. Bind to 127.0.0.1 for local development.",
+                    getattr(self, "_dev_bind_host", None))
             return Response(detail, status=500)
         digest = _dev_error_digest(exc)
         if digest not in self._dev_error_counts and len(self._dev_error_counts) >= _DEV_ERROR_COUNT_LIMIT:
@@ -1115,6 +1722,33 @@ class App:
         return Response(body, status=500, media_type="text/html; charset=utf-8",
                         headers=[(b"cache-control", b"no-store")])
 
+    def note_dev_bind_host(self, host):
+        """Record the address the server is listening on (S-P1-28, M-19).
+
+        Called by :func:`pynext.server.serve` once the socket is bound.
+        With ``debug=True`` and a non-loopback ``host`` (``0.0.0.0``,
+        ``::``, a LAN address, ...), log a startup warning: anyone on the
+        network can reach this server, so :meth:`error_response` serves
+        the generic production-style page instead of the detailed dev
+        page while externally bound. The warning is logged once per
+        transition to externally bound; loopback binds stay silent.
+        The attributes are set here (rather than in ``__init__``) so the
+        bind address is only ever recorded by this method; an app that
+        never serves over a socket simply has no recorded bind address.
+        """
+        external = _is_external_bind_host(host)
+        was_external = bool(getattr(self, "_dev_bind_external", False))
+        self._dev_bind_host = host
+        self._dev_bind_external = external
+        if self.debug and external and not was_external:
+            log.warning(
+                "Development server (debug=True) is listening on %s, which is "
+                "reachable from other machines on the network. Detailed "
+                "development error pages (tracebacks, file paths, exception "
+                "messages) are disabled while externally bound; bind to "
+                "127.0.0.1 for local development only.",
+                host)
+
     async def startup(self):
         """Start the cache and registered resources in registration order."""
         async with self._lifecycle_lock:
@@ -1124,6 +1758,12 @@ class App:
         if self._started:
             return
         self._draining = False
+        # A restart after a shutdown recreates the retired exit pool
+        # before anything can submit teardown work to it, and the
+        # retired worker pools before anything can submit sync,
+        # render or session work to them.
+        self._ensure_exit_executor()
+        self._ensure_worker_executors()
         self.isr.open()
         try:
             for resource in self.resources.values():
@@ -1136,7 +1776,10 @@ class App:
                 except Exception:
                     log.exception("Resource cleanup after startup failure failed")
             self._resources_started.clear()
-            await self.isr.close()
+            # Cache teardown runs on the exit lane (C-P1-3c), not the
+            # entry limiter: startup may fail while sync workers are
+            # still busy, and the close must not wait behind them.
+            await self.isr.close(executor=self._ensure_exit_executor())
             raise
         self._started = True
 
@@ -1159,13 +1802,44 @@ class App:
                     log.exception("Resource shutdown failed")
         self._resources_started.clear()
         self._started = False
+        # Background work owned by middleware (C-P2-5): a session
+        # middleware runs an expiry purge loop while requests are served;
+        # stop it here so it does not outlive the app (and its store)
+        # across a reload in the same event loop. Only middleware that
+        # offers a close() is touched.
+        for item in self.middleware:
+            target = item.middleware if isinstance(item, ScopedMiddleware) else item
+            close = getattr(target, "close", None)
+            if close is None:
+                continue
+            try:
+                if inspect.iscoroutinefunction(close):
+                    await close()
+                else:
+                    close()
+            except Exception as exc:
+                if error is None:
+                    error = exc
+                else:
+                    log.exception("Middleware shutdown failed")
         try:
-            await self.isr.close()
+            # Cache teardown runs on the exit lane (C-P1-3c): closing the
+            # shared cache must not wait behind in-flight sync handlers.
+            # The pool is ensured live first, so a repeated shutdown (or a
+            # shutdown after a restart) never submits to a retired pool.
+            await self.isr.close(executor=self._ensure_exit_executor())
         except Exception as exc:
             if error is None:
                 error = exc
             else:
                 log.exception("Cache shutdown failed")
+        finally:
+            # The exit pool is retired only after the last teardown that
+            # uses it has finished (or failed).
+            self._shutdown_exit_executor()
+        # App-owned worker pools (C-P1-1): never block shutdown on a
+        # stuck sync thread; queued-but-unstarted work is dropped.
+        self._shutdown_executors()
         if error is not None:
             raise error
 
@@ -1464,7 +2138,7 @@ class App:
             paths = {pattern}
         else:
             try:
-                params_list = await _invoke(generator)
+                params_list = await _invoke(generator, _app=self)
                 paths = {_materialize(pattern, params) for params in params_list}
             except Exception:
                 log.warning("Cannot determine generated SSG paths for %s; "
@@ -1600,7 +2274,8 @@ class App:
         """Serialize one streamed UI node to HTML on a worker thread."""
         bound = bind_islands(_node(node), self.client_manifest, include_runtime=False)
         payload = json.dumps(bound, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        return await asyncio.to_thread(_native.render, payload)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._render_executor, _native.render, payload)
 
 
     async def _layout_shell(self, pattern, layouts, request=None):
@@ -1660,7 +2335,8 @@ class App:
         """
         bound = bind_islands(shell, self.client_manifest, dev_id=self._dev_id)
         payload = json.dumps(bound, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        html = await asyncio.to_thread(_native.render, payload)
+        html = await asyncio.get_running_loop().run_in_executor(
+            self._render_executor, _native.render, payload)
         parts = html.split(marker)
         if len(parts) != 2:
             raise ValueError(
@@ -1850,7 +2526,7 @@ class App:
 
     async def _render_page_inner(self, pattern, fn, layouts, request, params, query, csp_nonce,
                                  tracker=None):
-        if inspect.isasyncgenfunction(fn):
+        if cached_call_kind(fn) == CALL_ASYNC_GEN:
             # Calling an async generator function only creates the iterator;
             # its body runs when the stream is first pulled. Call it directly
             # instead of _invoke, which would run it on a worker thread.
@@ -1893,7 +2569,8 @@ class App:
         started = time.monotonic()
         with span("pynext.render", {"http.route": pattern},
                   enabled=self.observability_config.tracing):
-            html = await asyncio.to_thread(_native.render, payload, nonce)
+            html = await asyncio.get_running_loop().run_in_executor(
+                self._render_executor, _native.render, payload, nonce)
         render_ms = (time.monotonic() - started) * 1000
         render_ms_var.set((render_ms_var.get() or 0.0) + render_ms)
         if isinstance(tree, dict) and tree.get("tag", "").lower() == "html":
@@ -2128,6 +2805,15 @@ class App:
                     len(width) > 4 or len(quality) > 2 or not 1 <= int(width) <= MAX_IMAGE_WIDTH or
                     not 1 <= int(quality) <= MAX_IMAGE_QUALITY):
                 raise BadRequest("Invalid image dimensions or quality")
+            try:
+                # S-P0-6: the image source is a query parameter, so it never
+                # passed request-path validation — apply the static-path
+                # defense (normpath + absolute/UNC rejection) before the
+                # in-memory lookup. A traversal/UNC source is a 404, like
+                # a missing asset, never a disk access.
+                source = validate_static_request_path(source)
+            except StaticPathError:
+                return Response("Not Found", status=404)
             asset = self.public_assets.get(source)
             if asset is None:
                 return Response("Not Found", status=404)
@@ -2141,11 +2827,24 @@ class App:
             return asset_response(request, body, "image/webp", etag,
                                   cache_control=b"public, max-age=0, must-revalidate",
                                   extra_headers=[(b"x-content-type-options", b"nosniff")])
+        if path == "/_pynext/csrf-token":
+            route_var.set("__csrf_token__")
+            if request.method == "OPTIONS":
+                return Response(b"", status=204, headers=[(b"allow", b"GET, HEAD, OPTIONS")], media_type=None)
+            if request.method not in {"GET", "HEAD"}:
+                return Response("Method Not Allowed", status=405, headers=[(b"allow", b"GET, HEAD, OPTIONS")])
+            return csrf_token_response(request, config=self.security)
         if path == "/_pynext/revalidate":
             route_var.set("__revalidate__")
             return await self._revalidate_webhook(request)
         if path == "/_pynext" or path.startswith("/_pynext/"):
             route_var.set("__client__")
+            try:
+                # S-P0-6: defense in depth at the serving layer (the
+                # request path was already validated on ingress).
+                validate_static_request_path(path)
+            except StaticPathError:
+                return Response("Not Found", status=404)
             if path not in self.client_assets:
                 return Response("Not Found", status=404)
             allow = b"GET, HEAD, OPTIONS"
@@ -2156,6 +2855,13 @@ class App:
             return asset_response(request, self.client_assets[path], "text/javascript; charset=utf-8",
                                   self.asset_etags[path], cache_control=b"public, max-age=31536000, immutable",
                                   extra_headers=[(b"x-content-type-options", b"nosniff")])
+        # S-P0-6: validate the request path at the serving layer before
+        # the in-memory lookup (normpath + absolute/UNC rejection). The
+        # snapshot itself was built with the symlink checks in assets.py.
+        try:
+            validate_static_request_path(path)
+        except StaticPathError:
+            return Response("Not Found", status=404)
         if path in self.public_assets:
             route_var.set("__public__")
             allow = b"GET, HEAD, OPTIONS"
@@ -2212,7 +2918,14 @@ class App:
         handler = entry[0] if spec["kind"] == "page" else entry.get(
             "GET" if request.method == "HEAD" and "HEAD" not in entry else request.method)
         if handler is not None:
-            denied = check_authorization(request, handler)
+            # S-P1-33: enforce from the policy snapshotted at
+            # registration, keyed by the router-matched pattern (the
+            # normalized path routing already decided on) — never from
+            # the handler's live attributes.
+            method_key = "GET" if spec["kind"] == "page" else (
+                "GET" if request.method == "HEAD" and "HEAD" not in entry else request.method)
+            denied = check_authorization(request, handler,
+                                         policy=self.route_auth.get(pattern, {}).get(method_key))
             if denied is not None:
                 return denied
         if spec["kind"] == "page":
@@ -2251,7 +2964,7 @@ class App:
                         encoded = json.dumps(query, ensure_ascii=True, separators=(",", ":")).encode("ascii")
                         cache_key = ("\0isr:" + hashlib.sha256(match_path.encode("utf-8")).hexdigest() + ":" +
                                      generation + ":" + hashlib.sha256(encoded).hexdigest())
-                    cache_before = self.isr.store.lookup(cache_key)[0]
+                    cache_before, retained_body = self.isr.store.lookup(cache_key)
                     self.metrics.observe_cache(cache_before)
                     policy = self.get_isr_policy(pattern)
                     if self.debug:
@@ -2274,6 +2987,22 @@ class App:
                     except CacheBusy:
                         self.metrics.observe_cache("busy")
                         self.metrics.observe_regeneration("failure")
+                        if retained_body is None:
+                            # C-2 retention: the store lookup above has
+                            # no body for an expired entry (the native
+                            # cache drops it on lookup), so ask the ISR
+                            # cache for the retained previous value.
+                            retained_body = await self.isr.retained_body(cache_key)
+                        if retained_body is not None:
+                            # C-2 retention: the server is too busy to
+                            # regenerate, not the page broken — serve
+                            # the previous value instead of failing the
+                            # request (stale-while-revalidate).
+                            return Response(
+                                retained_body, media_type="text/html; charset=utf-8", headers=[
+                                    (b"cache-control", b"public, max-age=0, must-revalidate"),
+                                    (b"vary", b"Cookie, Authorization"),
+                                ])
                         return Response("Server Busy", status=503,
                                         headers=[(b"retry-after", b"1")])
                     except SharedCacheUnavailable:
@@ -2305,6 +3034,13 @@ class App:
                          or getattr(entry[method], "__pynext_csrf__", False))
                     and not validate_csrf(request, config=self.security)):
                 return Response("Forbidden", status=403)
+            # S-P1-2: input validation runs once, here at the handler
+            # entry point, before the handler is invoked. Handlers
+            # without a schema are untouched; a failure answers 400
+            # with field names and reason codes only (no value echo).
+            denied = await validate_handler_input(request, entry[method], params, config=self.security)
+            if denied is not None:
+                return denied
             response = await _invoke(entry[method], request=request, params=params)
             if not isinstance(response, Response):
                 raise TypeError("API handlers must return a Response")
@@ -2346,9 +3082,21 @@ class App:
 
         try:
             allowed, retry_after = await self._asgi_admission.check(decide)
+        except DecisionUnavailable:
+            # H-2: no decision could be produced — the decision gate was
+            # full or its deadline expired while the loop was saturated.
+            # A protection that cannot decide must not become a rejection
+            # device: fail open and count it, instead of 503ing requests
+            # the limiter would have allowed.
+            self.metrics.observe_rate_limit_fail_open()
+            return None
         except Exception:
-            # Match native admission: callback failures and overload fail
-            # closed regardless of a backend's own failure-policy choice.
+            # A decision was produced but was invalid, or the limiter's
+            # own backend failed (RateLimitUnavailable honours that
+            # limiter's failure_policy): fail closed, as before.
+            # Counted under the admission stage (C-P1-7), distinct from
+            # the Rust slot-wait 503s, which never reach this gate.
+            self.metrics.observe_stage_timeout("admission")
             return Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
         return None if allowed else rate_limited_response(max(1, retry_after or 1))
 
@@ -2397,11 +3145,17 @@ class App:
         the Rust upgrade — so handlers that need the identity must re-derive
         it from the socket (for example from a session cookie the
         middleware already validated, or from a token checked in
-        middleware). The check itself is identical on ASGI and native.
-        Middleware must not rotate or invalidate the session during this
-        pre-flight: the pre-flight response is discarded, so a rotated
-        token's ``set-cookie`` would never reach the client while the
-        old token is already gone from the store.
+        middleware). The check itself is identical on ASGI and native. The pre-flight
+        is read-only for the session (M-15): the synthetic request carries
+        ``sessions.WS_PREFLIGHT_STATE_KEY`` in its state, and
+        ``SessionMiddleware`` loads the session for the authorization check
+        but skips persisting it — no save, no rotation, no invalidation —
+        because the pre-flight response is discarded and a rotated token's
+        ``set-cookie`` would never reach the client while the old token is
+        already gone from the store. Middleware may read the session during
+        the pre-flight, but any mutation it makes is dropped with the
+        response; perform login and session changes through ordinary HTTP
+        endpoints before connecting.
         """
         # Match on the per-segment decoded form (Next.js
         # decodePathParams) so the pre-flight checks the same route the
@@ -2423,7 +3177,7 @@ class App:
         params = _typed_params(raw_params, kinds)
         request = Request("GET", path, bytes(query_string),
                           tuple((bytes(name), bytes(value)) for name, value in headers),
-                          b"", params, self, {}, raw_path=raw_path or "")
+                          b"", params, self, {WS_PREFLIGHT_STATE_KEY: True}, raw_path=raw_path or "")
         terminal_reached = False
         seen = {}
 
@@ -2443,7 +3197,10 @@ class App:
             # A middleware answered the upgrade itself: its response is
             # the denial (for example 403 from an auth middleware).
             return response
-        denied = check_authorization(seen.get("request", request), handler)
+        # S-P1-33: enforce from the policy snapshotted at registration
+        # for this pattern, as HTTP dispatch does.
+        denied = check_authorization(seen.get("request", request), handler,
+                                     policy=self.websocket_auth.get(pattern))
         if denied is not None:
             return denied
         return None
@@ -2495,7 +3252,26 @@ class App:
         peer_ip = client[0] if client else None
         if not websocket_origin_allowed(scope.get("headers", []), peer_ip, scope.get("scheme") or "ws",
                                         self.proxy_trust, self.security):
-            await send({"type": "websocket.close", "code": 1008})
+            # A denied handshake is observable, not silent: HTTP 403
+            # (the same answer the native upgrade branch gives) plus a
+            # log line, so a CSWSH attempt shows up in the logs instead
+            # of looking like a dropped connection. The handler never
+            # runs.
+            origin = None
+            for name, value in scope.get("headers", []) or []:
+                if (isinstance(name, (bytes, bytearray))
+                        and isinstance(value, (bytes, bytearray))
+                        and bytes(name).lower() == b"origin"):
+                    origin = bytes(value).decode("ascii", "replace")
+                    break
+            log.warning("WebSocket handshake denied by origin policy: path=%s origin=%r peer=%s",
+                        path, origin, peer_ip)
+            denied = Response("Forbidden", status=403)
+            apply_path_headers(denied, path, path_headers=self.path_headers)
+            apply_security_headers(denied, config=self.security, production=self.production)
+            await send({"type": "websocket.http.response.start", "status": denied.status,
+                        "headers": denied.headers})
+            await send({"type": "websocket.http.response.body", "body": denied.body})
             return
         offered = scope.get("subprotocols", [])
         if not isinstance(offered, (list, tuple)) or any(not isinstance(value, str) for value in offered):
@@ -2633,6 +3409,27 @@ class App:
         finally:
             _reset_request_context()
 
+    async def _dispatch_with_timeout(self, request):
+        """Run dispatch under the handler-stage budget (C-P1-7).
+
+        A handler that runs past ``handler_timeout_ms`` answers 504:
+        the server could not finish the work (the aiohttp rule —
+        handler ``TimeoutError`` → explicit 504, never a silent drop).
+        Admission overload is a different stage and answers 503 +
+        ``Retry-After``; the two are never mixed. A handler that raises
+        ``TimeoutError`` itself is answered the same way. Cancellation
+        (client disconnect, server shutdown) still propagates as
+        ``CancelledError``.
+        """
+        if self._handler_timeout_s is None:
+            return await self.dispatch(request)
+        try:
+            return await asyncio.wait_for(self.dispatch(request), self._handler_timeout_s)
+        except TimeoutError:
+            self.metrics.observe_stage_timeout("handler")
+            log.warning("Handler timeout: %s %s", request.method, request.path)
+            return Response("Gateway Timeout", status=504)
+
     async def _handle_http(self, scope, receive, send):
         # Normalize before admission, as the native adapter does: malformed
         # paths never consume a token, even when the client's bucket is empty.
@@ -2646,6 +3443,14 @@ class App:
             # with the handler routing actually serves, or an encoded
             # path escapes the limiter while reaching another handler.
             match_path = _normalize_path_for_matching(encoded_path)
+            # Request-smuggling framing (S-P1-31): ambiguous framing is a
+            # 400 before admission or any body read, same as the native
+            # transport's dispatch check (`http.validate_request_framing`
+            # is the shared rule; the native side mirrors it in Rust).
+            framing = validate_request_framing(
+                scope.get("headers", []), scope.get("http_version", "1.1"))
+            if framing is not None:
+                raise BadRequest(framing)
         except (ValueError, UnicodeError, BadRequest):
             response = Response("Bad Request", status=400)
         else:
@@ -2656,16 +3461,65 @@ class App:
                 if scope["method"].upper() == "HEAD":
                     denied.body = b""
                 apply_path_headers(denied, path, path_headers=self.path_headers)
-                await _send_response(denied, send, config=self.security, production=self.production)
+                await _send_response(denied, send, config=self.security, production=self.production,
+                                     response_timeout=self._response_timeout_s)
                 return
             chunks, total = [], 0
+            # Body-read stage (C-P1-7 + S-P1-12 / M-2): the whole body must
+            # arrive within the body timeout — the same whole-body budget
+            # the native server enforces in Rust, so a trickle sender
+            # cannot hold the request open one chunk at a time. After the
+            # grace window it must also average at least the minimum
+            # receive rate (Slowloris). Each receive waits at most one
+            # check interval, so a stall is re-checked every 250 ms
+            # instead of waiting out the whole timeout; a client that
+            # resumes sending within the budget is never cut off. The
+            # effective budget is the tighter of the app's configured
+            # body_timeout_ms and the module-level ASGI_BODY_TIMEOUT_SECS
+            # (kept as the operator/test override point); a configured 0
+            # falls back to the module constant, so the ASGI path never
+            # waits forever. A timeout answers 408 (Sanic REQUEST stage),
+            # never 503: the server is not out of capacity, the client
+            # is too slow.
+            body_started = asyncio.get_running_loop().time()
+            body_timeout_s = self._body_timeout_s
+            if body_timeout_s is None or ASGI_BODY_TIMEOUT_SECS < body_timeout_s:
+                body_timeout_s = ASGI_BODY_TIMEOUT_SECS
+            body_deadline = body_started + body_timeout_s
             try:
                 while True:
-                    message = await receive()
+                    remaining = body_deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        self.metrics.observe_stage_timeout("body")
+                        log.warning("Body read timeout: %s %s", scope["method"], path)
+                        response = Response("Request Timeout", status=408,
+                                            headers=[(b"retry-after", b"1")])
+                        break
+                    try:
+                        message = await asyncio.wait_for(
+                            receive(),
+                            timeout=min(remaining, ASGI_BODY_MIN_RATE_CHECK_INTERVAL_SECS))
+                    except TimeoutError:
+                        elapsed = asyncio.get_running_loop().time() - body_started
+                        if (ASGI_BODY_MIN_RATE_BYTES_PER_SEC > 0
+                                and elapsed >= ASGI_BODY_MIN_RATE_GRACE_SECS
+                                and total < ASGI_BODY_MIN_RATE_BYTES_PER_SEC * elapsed):
+                            self.metrics.observe_stage_timeout("body")
+                            log.warning("Body read timeout: %s %s", scope["method"], path)
+                            response = Response("Request Timeout", status=408,
+                                                headers=[(b"retry-after", b"1")])
+                            break
+                        continue
                     if message["type"] == "http.disconnect":
                         return
                     if message["type"] != "http.request":
                         raise RuntimeError("Unexpected ASGI message")
+                    # Chunk trailers (S-P1-31, Sanic CVE-2026-85078): a
+                    # trailer section must never be silently accepted —
+                    # trailer bytes re-parsed as a request are the
+                    # smuggling primitive — so any trailer part is a 400.
+                    if message.get("trailers"):
+                        raise BadRequest("Chunk trailers are not accepted")
                     chunk = message.get("body", b"")
                     total += len(chunk)
                     if total > MAX_BODY:
@@ -2706,7 +3560,7 @@ class App:
 
             async def dispatch_and_send():
                 try:
-                    result = await self.dispatch(request)
+                    result = await self._dispatch_with_timeout(request)
                 except SignalError as exc:
                     # A signal that escaped dispatch (defensive: the timed
                     # dispatcher converts these first) still answers without
@@ -2732,10 +3586,17 @@ class App:
                 if scope["method"].upper() == "HEAD":
                     result.body = b""
                 try:
-                    await _send_response(result, send, config=self.security, production=self.production)
+                    await _send_response(result, send, config=self.security, production=self.production,
+                                         response_timeout=self._response_timeout_s)
                 except asyncio.CancelledError:
                     request._cancel_event.set()
                     raise
+                except TimeoutError:
+                    # The status line may already be out, so no second
+                    # status can be sent; the stage is logged and
+                    # counted instead of dropping silently (C-P1-7).
+                    self.metrics.observe_stage_timeout("response")
+                    log.warning("Response send timeout: %s %s", request.method, request.path)
 
             await _run_while_connected(dispatch_and_send(), receive)
             return
@@ -2744,7 +3605,8 @@ class App:
         request_id = get_request_id()
         if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
             response.headers.append((b"x-request-id", request_id.encode("ascii")))
-        await _send_response(response, send, config=self.security, production=self.production)
+        await _send_response(response, send, config=self.security, production=self.production,
+                             response_timeout=self._response_timeout_s)
 
 
 def create_app(root=".", *, production=False, security=None, cache_backend=DEFAULT_CONFIG.cache_backend,
@@ -2752,8 +3614,13 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
                cache_failure_policy=None, websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
                hot_reload=False,
-               trusted_proxies=None, sync_workers=32, strict_ssg=False, headers=None,
-               revalidate_secret=None):
+               trusted_proxies=None, sync_workers=32, sync_wait_timeout=ASGI_DECISION_TIMEOUT,
+               sync_queue_limit=None, render_workers=None, session_workers=None,
+               strict_ssg=False, headers=None,
+               revalidate_secret=None,
+               body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms,
+               handler_timeout_ms=DEFAULT_CONFIG.handler_timeout_ms,
+               response_timeout_ms=DEFAULT_CONFIG.response_timeout_ms):
     root = Path(root).resolve()
     # .env files are loaded before the manifest is read or user code runs,
     # so server code, middleware and island bundling all see them.
@@ -2765,5 +3632,10 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                observability=observability, rate_limit=rate_limit, middleware=middleware, debug=debug,
                resources=resources, cache_url=cache_url, cache_failure_policy=cache_failure_policy,
                websocket_max_message=websocket_max_message, hot_reload=hot_reload,
-               trusted_proxies=trusted_proxies, sync_workers=sync_workers, strict_ssg=strict_ssg,
-               headers=headers, revalidate_secret=revalidate_secret)
+               trusted_proxies=trusted_proxies, sync_workers=sync_workers,
+               sync_wait_timeout=sync_wait_timeout, sync_queue_limit=sync_queue_limit,
+               render_workers=render_workers, session_workers=session_workers,
+               strict_ssg=strict_ssg,
+               headers=headers, revalidate_secret=revalidate_secret,
+               body_timeout_ms=body_timeout_ms, handler_timeout_ms=handler_timeout_ms,
+               response_timeout_ms=response_timeout_ms)

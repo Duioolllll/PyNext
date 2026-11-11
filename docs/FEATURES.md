@@ -21,11 +21,17 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `fragment` | `pynext.components` |
 | `island` | `pynext.components` |
 | `layout` | `pynext.components` |
+| `mark_safe` | `pynext.components` |
+| `SafeString` | `pynext.components` |
 | `model_prop` | `pynext.components` |
 | `page` | `pynext.components` |
 | `route` | `pynext.routing` |
 | `websocket` | `pynext.routing` |
 | `Database` | `pynext.database` |
+| `raw_sql` | `pynext.sql` |
+| `RawSQL` | `pynext.sql` |
+| `quote_identifier` | `pynext.sql` |
+| `validate_ddl_definition` | `pynext.sql` |
 | `DjangoBusyError` | `pynext.django` |
 | `DjangoResource` | `pynext.django` |
 | `CACHE_LIFE_PROFILES` | `pynext.components` |
@@ -57,6 +63,11 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `set_csrf_cookie` | `pynext.http` |
 | `sign_csrf_token` | `pynext.http` |
 | `validate_csrf` | `pynext.http` |
+| `mask_csrf_token` | `pynext.http` |
+| `unmask_csrf_token` | `pynext.http` |
+| `get_csrf_token` | `pynext.http` |
+| `csrf_token_response` | `pynext.http` |
+| `csrf_input` | `pynext.http` |
 | `content_security_policy` | `pynext.http` |
 | `security_headers` | `pynext.http` |
 | `apply_security_headers` | `pynext.http` |
@@ -77,8 +88,15 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `SessionMiddleware` | `pynext.sessions` |
 | `SQLiteSessionStore` | `pynext.sessions` |
 | `RedisSessionStore` | `pynext.sessions` |
+| `SessionPayloadCipher` | `pynext.sessions` |
+| `SessionRecord` | `pynext.sessions` |
 | `require_auth` | `pynext.auth` |
 | `require_permission` | `pynext.auth` |
+| `require_scope` | `pynext.auth` |
+| `AuthorizationPolicy` | `pynext.auth` |
+| `authorization_policy` | `pynext.auth` |
+| `state_changing_get` | `pynext.routing` |
+| `LoginRateLimiter` | `pynext.auth` |
 | `RedisRateLimiter` | `pynext.redis_rate` |
 | `WebSocketPubSub` | `pynext.pubsub` |
 | `PubSubOverflow` | `pynext.pubsub` |
@@ -106,6 +124,18 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `RouteHas` | `pynext.middleware` |
 | `ScopedMiddleware` | `pynext.middleware` |
 | `scoped` | `pynext.middleware` |
+| `StaticPathError` | `pynext.static` |
+| `resolve_static_path` | `pynext.static` |
+| `validate_static_request_path` | `pynext.static` |
+| `Field` | `pynext.validation` |
+| `Schema` | `pynext.validation` |
+| `ValidationError` | `pynext.validation` |
+| `validate_input` | `pynext.validation` |
+| `validate_request` | `pynext.validation` |
+| `validate_handler` | `pynext.validation` |
+| `validate_handler_input` | `pynext.validation` |
+| `validation_error_response` | `pynext.validation` |
+| `bind_csrf_token` | `pynext.validation` |
 
 ## Security defaults (`SecurityConfig`)
 
@@ -119,6 +149,7 @@ Fields of `pynext.http.SecurityConfig` with their defaults.
 | `csrf_form_field` | `'csrf_token'` |
 | `csrf_cookie_secure` | `True` |
 | `csrf_cookie_samesite` | `'Lax'` |
+| `csrf_cookie_max_age` | `43200` |
 | `cors_allowed_origins` | `()` |
 | `cors_allowed_methods` | `('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS')` |
 | `cors_allowed_headers` | `('Content-Type', 'Authorization', 'X-CSRF-Token')` |
@@ -127,12 +158,13 @@ Fields of `pynext.http.SecurityConfig` with their defaults.
 | `csp_nonce_enabled` | `False` |
 | `csrf_signing_key` | `field(default=None, repr=False)` |
 | `csrf_origin_check` | `True` |
+| `csrf_trusted_origins` | `()` |
 | `hsts_enabled` | `True` |
 | `hsts_max_age` | `31536000` |
 | `hsts_include_subdomains` | `True` |
 | `hsts_preload` | `False` |
 | `frame_options` | `'DENY'` |
-| `referrer_policy` | `'strict-origin-when-cross-origin'` |
+| `referrer_policy` | `'same-origin'` |
 | `permissions_policy` | `'camera=(), microphone=(), geolocation=()'` |
 | `csp_style_src` | `"'self'"` |
 | `csp_frame_ancestors` | `"'none'"` |
@@ -156,7 +188,9 @@ Backends accepted by `ISRCache` (`--cache-backend`, `create_app(..., cache_backe
 | Command | Help |
 | --- | --- |
 | `build` | Build the application (SSG, islands, manifest). |
+| `check` | audit the deployment configuration for security mistakes (Django 'check --deploy' pattern) |
 | `dev` | Start the development server with file watching. |
+| `doctor` | audit the deployment configuration (alias for 'check --deploy') |
 | `init` | create a minimal application |
 | `start` | Start the built application (production mode). |
 

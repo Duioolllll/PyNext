@@ -41,8 +41,11 @@ Scope and limits, stated plainly:
   must retry. Only the *server* survives, not the in-flight request.
 - The parent retains the listener, including a dynamically assigned port,
   so replacements accept on the same address after a restart.
-- The default is one worker, which is exactly the historical
-  single-process path: no supervisor process or shared listener.
+- The default is two workers for ``pynext start`` (a supervisor spawns
+  two processes on one listener); ``pynext dev`` defaults to the
+  single-process path instead — no supervisor process or shared
+  listener — unless workers are configured explicitly, and
+  ``--workers 1`` is exactly the historical single-process path.
 """
 import logging
 import multiprocessing
@@ -83,13 +86,20 @@ class WorkerConfig:
     # Connection limits (A4); defaults mirror server.DEFAULT_*.
     max_connections: int = DEFAULT_CONFIG.max_connections
     max_connections_per_ip: int = DEFAULT_CONFIG.max_connections_per_ip
+    # Per-IP execution quota (H-5); defaults mirror server.DEFAULT_*.
+    max_concurrent_per_ip: int = DEFAULT_CONFIG.max_concurrent_per_ip
     header_read_timeout_ms: int = DEFAULT_CONFIG.header_read_timeout_ms
     body_min_rate_bytes_per_sec: int = DEFAULT_CONFIG.body_min_rate_bytes_per_sec
     max_waiting: int | None = None  # None keeps the native default min(max_concurrent, 64)
+    # Adaptive admission ceiling (C-P1-5): None keeps the fixed
+    # acquire_timeout_ms; per-stage timeouts (C-P1-7) in ms.
+    acquire_timeout_max_ms: int | None = DEFAULT_CONFIG.acquire_timeout_max_ms
+    handler_timeout_ms: int = DEFAULT_CONFIG.handler_timeout_ms
+    response_timeout_ms: int = DEFAULT_CONFIG.response_timeout_ms
     rate_limit: int = DEFAULT_CONFIG.rate_limit  # 0 disables rate limiting
     rate_limit_window: float = DEFAULT_CONFIG.rate_limit_window
     rate_limit_backend: str = DEFAULT_CONFIG.rate_limit_backend
-    rate_limit_exempt_paths: tuple = ()
+    rate_limit_exempt_paths: tuple = DEFAULT_CONFIG.rate_limit_exempt_paths
     rate_limit_ipv6_prefix_len: int = DEFAULT_CONFIG.rate_limit_ipv6_prefix_len  # IPv6 bucket grouping (see ratelimit.py)
     trusted_proxies: tuple = ()
     # Shared-cache / observability settings, forwarded to each worker's
@@ -108,6 +118,10 @@ class WorkerConfig:
     # or a slow request can still be cut off mid-flight.
     shutdown_timeout: float = DEFAULT_CONFIG.shutdown_timeout
     shutdown_timeout: float = 30.0
+    # Host allowlist (S-P1-19, M-9): Django ALLOWED_HOSTS patterns from
+    # the config; empty means the loopback default (see
+    # config.effective_allowed_hosts).
+    allowed_hosts: tuple = ()
     # Dev-only: answer 404 (like production) for SSG paths that
     # generate_static_params would not produce, instead of merely warning.
     strict_ssg: bool = False
@@ -142,7 +156,10 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                      cache_failure_policy=config.cache_failure_policy,
                      observability=config.observability, debug=not config.production,
                      security=config.security, websocket_max_message=config.websocket_max_message,
-                     trusted_proxies=config.trusted_proxies, strict_ssg=config.strict_ssg)
+                     trusted_proxies=config.trusted_proxies, strict_ssg=config.strict_ssg,
+                     body_timeout_ms=config.body_timeout_ms,
+                     handler_timeout_ms=config.handler_timeout_ms,
+                     response_timeout_ms=config.response_timeout_ms)
 
     async def run():
         loop = asyncio.get_running_loop()
@@ -167,12 +184,17 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                         config.acquire_timeout_ms, config.body_capacity, config.body_timeout_ms,
                         listener=listener, stop_event=stop_event,
                         observability=config.observability,
+                        acquire_timeout_max_ms=config.acquire_timeout_max_ms,
+                        handler_timeout_ms=config.handler_timeout_ms,
+                        response_timeout_ms=config.response_timeout_ms,
                         max_connections=config.max_connections,
                         max_connections_per_ip=config.max_connections_per_ip,
+                        max_concurrent_per_ip=config.max_concurrent_per_ip,
                         header_read_timeout_ms=config.header_read_timeout_ms,
                         body_min_rate_bytes_per_sec=config.body_min_rate_bytes_per_sec,
                         shutdown_timeout=config.shutdown_timeout,
                         max_waiting=config.max_waiting,
+                        allowed_hosts=config.allowed_hosts,
                         on_ready=lambda _address: ready.set())
         finally:
             shutdown_task.cancel()

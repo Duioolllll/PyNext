@@ -109,6 +109,14 @@ class RedisRateLimiter(RateLimiter):
     entry, so its return within the window is treated as an existing
     key, never a brand-new one.
 
+    Atomicity (S-P1-4): ``allow`` is a single Lua ``EVAL`` — the whole
+    read-refill-decide-write step (including new-key-window admission
+    and table-pressure eviction) runs atomically on the Redis server,
+    so two workers or processes sharing a namespace can never
+    interleave a check and a consume. The limit is therefore enforced
+    globally across workers, unlike the per-process ``RateLimiter``.
+    See ``tests/test_ratelimit_atomicity.py`` for the multi-worker proof.
+
     Bucket scores are integer microseconds since the epoch, taken from
     Redis ``TIME`` and held in Lua doubles. Two scripts can read the
     same microsecond in principle (``TIME`` is gettimeofday-based), so

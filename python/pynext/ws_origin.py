@@ -1,4 +1,28 @@
-"""Strict WebSocket Origin validation shared by ASGI and Axum."""
+"""Strict WebSocket Origin validation shared by ASGI and Axum.
+
+Allowlist semantics (S-P0-7): the handshake is checked exactly once,
+before the 101 response, by :func:`websocket_origin_allowed`, which
+both transports call — the ASGI handler in :mod:`pynext.app` and the
+native upgrade branch in ``crates/pynext-native`` (via the
+``websocket_origin_callback`` in :mod:`pynext.server`). A denied
+handshake is answered HTTP 403 and logged on both transports, never
+silently closed.
+
+An origin is allowed when it either matches an entry of
+``SecurityConfig.websocket_allowed_origins`` exactly — scheme, host
+and port all take part, with the default port implied
+(``https://client.example`` matches ``:443`` and nothing else) — or
+equals the request's effective origin (the ``Host`` header, resolved
+through :class:`~pynext.proxy.ProxyTrust` for trusted proxies only).
+``*``, ``null``, userinfo, paths, queries and fragments are not valid
+allowlist values and are rejected at config time. A request with a
+duplicate or unparseable ``Origin`` header, or a duplicate ``Host``
+header, is denied. A missing ``Origin`` is denied unless
+``websocket_allow_missing_origin`` explicitly opts non-browser clients
+in. Origin checking is not authentication: the header is
+client-controlled and can be forged or omitted, so handlers must
+still establish identity (session / ``@require_auth``).
+"""
 
 import ipaddress
 import re

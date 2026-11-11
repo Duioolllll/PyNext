@@ -9,9 +9,10 @@ from pathlib import Path
 
 from .app import create_app
 from .build import write_manifest
+from .check import DeploySettings, run_deploy_checks
 from .client import compile_client, discover_client
 from .env import load_env
-from .config import DEFAULT_CONFIG, ConfigError, load_config
+from .config import DEFAULT_CONFIG, ConfigError, load_config, resolve_workers
 from .http import MAX_WS_MESSAGE, SecurityConfig
 from .observability import ObservabilityConfig
 from .ratelimit import RateLimiter
@@ -79,6 +80,20 @@ def _bounded(minimum, maximum, label):
     return convert
 
 
+def _workers_value(value):
+    """``--workers`` value: an integer 1..64, or ``"auto"`` (C-P1-5).
+
+    ``"auto"`` means one worker per CPU, clamped to 1..64 — the
+    Sanic ``fast=True`` rule. The probe parse in
+    :func:`_explicit_cli_values` runs this converter too, so an
+    explicit ``--workers auto`` is already an int by the time the
+    config is resolved.
+    """
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return resolve_workers(value)
+    return _bounded(1, MAX_WORKERS, "--workers")(value)
+
+
 async def _wait_for_change(watcher, server_task):
     """Wait for a watched file to change.
 
@@ -112,10 +127,13 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                  observability=None, rate_limit=None, security=None,
                  websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
                  max_connections=None, max_connections_per_ip=None,
+                 max_concurrent_per_ip=None,
                  header_read_timeout_ms=None, body_min_rate_bytes_per_sec=None,
                  trusted_proxies=(), cache_failure_policy=None,
                  shutdown_timeout=DEFAULT_CONFIG.shutdown_timeout,
-                 max_waiting=None, strict_ssg=False, config=None, cli_overrides=None):
+                max_waiting=None, strict_ssg=False, allowed_hosts=(),
+                config=None, cli_overrides=None,
+                acquire_timeout_max_ms=None, handler_timeout_ms=None, response_timeout_ms=None):
     """Serve the app in development mode, replacing changed island bundles.
 
     Other file changes restart the server on the same port and reload open
@@ -138,12 +156,20 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
         "websocket_max_message": websocket_max_message,
         "max_connections": max_connections,
         "max_connections_per_ip": max_connections_per_ip,
+        "max_concurrent_per_ip": max_concurrent_per_ip,
         "header_read_timeout_ms": header_read_timeout_ms,
         "body_min_rate_bytes_per_sec": body_min_rate_bytes_per_sec,
         "trusted_proxies": trusted_proxies,
         "cache_failure_policy": cache_failure_policy,
         "shutdown_timeout": shutdown_timeout, "max_waiting": max_waiting,
-        "strict_ssg": strict_ssg,
+        "strict_ssg": strict_ssg, "allowed_hosts": allowed_hosts,
+        # Stage/adaptive timeouts (C-P1-5/C-P1-7); None keeps serve()'s
+        # default, which is also DEFAULT_CONFIG's value.
+        "acquire_timeout_max_ms": acquire_timeout_max_ms,
+        "handler_timeout_ms": (DEFAULT_CONFIG.handler_timeout_ms
+                               if handler_timeout_ms is None else handler_timeout_ms),
+        "response_timeout_ms": (DEFAULT_CONFIG.response_timeout_ms
+                                if response_timeout_ms is None else response_timeout_ms),
     }
 
     def refresh_settings():
@@ -173,11 +199,16 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
             "security": sec, "websocket_max_message": values.websocket_max_message,
             "max_connections": values.max_connections,
             "max_connections_per_ip": values.max_connections_per_ip,
+            "max_concurrent_per_ip": values.max_concurrent_per_ip,
             "header_read_timeout_ms": values.header_read_timeout_ms,
             "body_min_rate_bytes_per_sec": values.body_min_rate_bytes_per_sec,
             "trusted_proxies": values.trusted_proxies,
             "cache_failure_policy": values.cache_failure_policy,
             "shutdown_timeout": values.shutdown_timeout, "max_waiting": values.max_waiting,
+            "acquire_timeout_max_ms": values.acquire_timeout_max_ms,
+            "handler_timeout_ms": values.handler_timeout_ms,
+            "response_timeout_ms": values.response_timeout_ms,
+            "allowed_hosts": values.allowed_hosts,
         })
         return True
 
@@ -191,6 +222,9 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
                           websocket_max_message=settings["websocket_max_message"],
                           hot_reload=True, trusted_proxies=settings["trusted_proxies"],
                           strict_ssg=settings["strict_ssg"],
+                          body_timeout_ms=settings["body_timeout_ms"],
+                          handler_timeout_ms=settings["handler_timeout_ms"],
+                          response_timeout_ms=settings["response_timeout_ms"],
                           **({"cache_failure_policy": settings["cache_failure_policy"]}
                              if settings["cache_failure_policy"] is not None else {}))
 
@@ -203,10 +237,21 @@ async def run_dev(root, host, port, max_concurrent, acquire_timeout_ms,
         # Only forward a connection limit that differs from serve()'s
         # default; an unset limit stays at the default.
         for key in ("max_connections", "max_connections_per_ip",
+                    "max_concurrent_per_ip",
                     "header_read_timeout_ms", "body_min_rate_bytes_per_sec"):
             if (settings[key] is not None
                     and settings[key] != getattr(DEFAULT_CONFIG, key)):
                 kwargs[key] = settings[key]
+        # Same rule for the stage/adaptive timeouts (C-P1-5/C-P1-7).
+        if settings["acquire_timeout_max_ms"] is not None:
+            kwargs["acquire_timeout_max_ms"] = settings["acquire_timeout_max_ms"]
+        for key in ("handler_timeout_ms", "response_timeout_ms"):
+            if settings[key] != getattr(DEFAULT_CONFIG, key):
+                kwargs[key] = settings[key]
+        # An empty allowlist is serve()'s loopback default, so only a
+        # configured list is forwarded (S-P1-19).
+        if settings["allowed_hosts"]:
+            kwargs["allowed_hosts"] = settings["allowed_hosts"]
         return kwargs
 
     watcher = Watcher(root)
@@ -312,11 +357,15 @@ _CLI_CONFIG_MAP = {
     "port": "port",
     "max_concurrent": "max_concurrent",
     "acquire_timeout_ms": "acquire_timeout_ms",
+    "acquire_timeout_max_ms": "acquire_timeout_max_ms",
+    "handler_timeout_ms": "handler_timeout_ms",
+    "response_timeout_ms": "response_timeout_ms",
     "max_waiting": "max_waiting",
     "body_capacity": "body_capacity",
     "body_timeout_ms": "body_timeout_ms",
     "max_connections": "max_connections",
     "max_connections_per_ip": "max_connections_per_ip",
+    "max_concurrent_per_ip": "max_concurrent_per_ip",
     "header_read_timeout_ms": "header_read_timeout_ms",
     "body_min_rate_bytes_per_sec": "body_min_rate_bytes_per_sec",
     "cache_backend": "cache_backend",
@@ -459,12 +508,36 @@ def _observability_from_config(resolved):
     return config
 
 
+def _add_audit_args(command):
+    """Options shared by ``check`` and ``doctor`` (the deploy audit)."""
+    command.add_argument("--format", choices=("text", "json"), default="text",
+                         help="report format (default text)")
+    command.add_argument("--fail-on-warning", action="store_true",
+                         help="exit 1 when warnings are found, not just on errors")
+    command.add_argument("--debug", action="store_true",
+                         help="audit as if debug mode were on (also honoured "
+                              "via the PYNEXT_DEBUG environment variable)")
+
+
 def _build_parser():
     """Build the ``pynext`` argument parser (defaults from DEFAULT_CONFIG)."""
     parser = argparse.ArgumentParser(prog="pynext")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a minimal application")
     init.add_argument("--dir", default=".", help="application project directory")
+    check = sub.add_parser(
+        "check",
+        help="audit the deployment configuration for security mistakes "
+             "(Django 'check --deploy' pattern)")
+    check.add_argument("--dir", default=".", help="application project directory")
+    check.add_argument("--deploy", action="store_true",
+                       help="run the deployment security audit (required for 'check')")
+    _add_audit_args(check)
+    doctor = sub.add_parser(
+        "doctor",
+        help="audit the deployment configuration (alias for 'check --deploy')")
+    doctor.add_argument("--dir", default=".", help="application project directory")
+    _add_audit_args(doctor)
     for name in ("build", "dev", "start"):
         command = sub.add_parser(name)
         command.add_argument("--dir", default=".", help="application project directory")
@@ -482,10 +555,27 @@ def _build_parser():
             command.add_argument("--port", type=_port, default=DEFAULT_CONFIG.port)
             command.add_argument("--max-concurrent", type=_bounded(1, MAX_CONCURRENT, "--max-concurrent"),
                                  default=DEFAULT_CONFIG.max_concurrent,
-                                 help="in-flight requests before new ones wait for a slot (1-1000000)")
+                                 help="in-flight requests before new ones wait for a slot "
+                                      "(default 128; 1-1000000)")
             command.add_argument("--acquire-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--acquire-timeout-ms"),
                                  default=DEFAULT_CONFIG.acquire_timeout_ms,
-                                 help="how long a request waits for a slot before getting a 503 (0-86400000)")
+                                 help="how long a request waits for a slot before getting a 503 "
+                                      "(default 3000; 0-86400000); raise it toward 5000 or set "
+                                      "--acquire-timeout-max-ms when handlers typically take "
+                                      "hundreds of ms, or most waits end in 503")
+            command.add_argument("--acquire-timeout-max-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--acquire-timeout-max-ms"),
+                                 default=DEFAULT_CONFIG.acquire_timeout_max_ms,
+                                 help="adaptive admission ceiling: when set, the slot wait becomes "
+                                      "clamp(2 x mean slot-hold time, --acquire-timeout-ms, this value) "
+                                      "instead of a fixed timeout (default: unset, fixed timeout)")
+            command.add_argument("--handler-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--handler-timeout-ms"),
+                                 default=DEFAULT_CONFIG.handler_timeout_ms,
+                                 help="how long a handler may run before the request answers 504 "
+                                      "(0 disables; default 30000)")
+            command.add_argument("--response-timeout-ms", type=_bounded(0, MAX_TIMEOUT_MS, "--response-timeout-ms"),
+                                 default=DEFAULT_CONFIG.response_timeout_ms,
+                                 help="per-chunk budget for sending a response, in ms "
+                                      "(0 disables; default 30000)")
             command.add_argument("--max-waiting", type=_bounded(0, MAX_WAITING, "--max-waiting"), default=None,
                                  help="requests waiting for an execution slot before new ones get a 503"
                                       " (default: min(--max-concurrent, 64); 0 waits for nobody; max 1000000)")
@@ -502,6 +592,12 @@ def _build_parser():
                                  type=_bounded(1, MAX_CONNECTIONS_PER_IP, "--max-connections-per-ip"),
                                  default=None,
                                  help="concurrent TCP connections allowed from one client IP (1-1000000)")
+            command.add_argument("--max-concurrent-per-ip",
+                                 type=_bounded(1, MAX_CONCURRENT, "--max-concurrent-per-ip"),
+                                 default=None,
+                                 help="execution slots one client IP may hold at once (1-1000000; "
+                                      "default 16, a quarter of the 64-slot pool, so one IP cannot "
+                                      "take every slot with slow requests)")
             command.add_argument("--header-read-timeout-ms",
                                  type=_bounded(0, MAX_TIMEOUT_MS, "--header-read-timeout-ms"),
                                  default=None,
@@ -515,7 +611,9 @@ def _build_parser():
             command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis"),
                                  default=DEFAULT_CONFIG.cache_backend,
                                  help="ISR page cache backend: process-local memory (default) or a"
-                                      " shared SQLite file or Redis via PYNEXT_REDIS_URL")
+                                      " shared SQLite file or Redis via PYNEXT_REDIS_URL"
+                                      " (recommended with --workers > 1: the memory cache"
+                                      " is per-process and not shared between workers)")
             command.add_argument("--cache-path", default=None,
                                  help="SQLite cache file for --cache-backend sqlite;"
                                       " defaults to <project>/.pynext/isr-cache.sqlite3")
@@ -533,13 +631,16 @@ def _build_parser():
             command.add_argument("--tracing", dest="tracing",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="emit OpenTelemetry spans when the opentelemetry packages are installed (default: off)")
-            command.add_argument("--workers", type=_bounded(1, MAX_WORKERS, "--workers"),
+            command.add_argument("--workers", type=_workers_value,
                                  default=DEFAULT_CONFIG.workers,
-                                 help="worker processes sharing the port (default 1: single process; max 64); "
+                                 help=f"worker processes sharing the port: an integer 1-64, or 'auto' "
+                                      f"for one per CPU (default {DEFAULT_CONFIG.workers} for start, "
+                                      "single process for dev; max 64); "
                                       "a supervisor restarts crashed workers")
             command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"),
                                  default=DEFAULT_CONFIG.rate_limit,
-                                 help="requests allowed per client per --rate-limit-window (0 disables)")
+                                 help="requests allowed per client per --rate-limit-window "
+                                      "(default 300 per 60s; 0 disables)")
             command.add_argument("--rate-limit-window", type=_positive_float,
                                  default=DEFAULT_CONFIG.rate_limit_window,
                                  help="rate limit window in seconds")
@@ -565,7 +666,7 @@ def _build_parser():
                                       "client identity (repeatable; default: none trusted)")
             command.add_argument("--rate-limit-exempt-path", action="append", default=[], metavar="PATH",
                                  help="path prefix that skips rate limiting, e.g. /healthz "
-                                      "(repeatable; default: nothing is exempt)")
+                                      "(repeatable; default: /healthz and /readyz are exempt)")
             command.add_argument("--csrf", action=argparse.BooleanOptionalAction, default=None,
                                  help="protect state-changing API requests (default: auto — on when a "
                                       "session middleware is installed; --no-csrf opts out)")
@@ -620,16 +721,19 @@ def main():
     # already present (process-environment precedence), so the built
     # HTML would bake in the DEV values instead of the production ones.
     try:
-        load_env(root, mode="production" if command in ("build", "start") else "development")
+        load_env(root, mode="production" if command in ("build", "start", "check", "doctor") else "development")
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     resolved = None
     cli_overrides = {}
-    if command in ("dev", "build", "start"):
+    if command in ("dev", "build", "start", "check", "doctor"):
         cli_overrides = {key: explicit[dest] for dest, key in _CLI_CONFIG_MAP.items()
                          if dest in explicit}
         try:
-            resolved = load_config(root, command, cli_overrides=cli_overrides)
+            # A deploy audit reads the production posture ("start" phase):
+            # the checks ask what ``pynext start`` would actually run with.
+            resolved = load_config(root, "start" if command in ("check", "doctor") else command,
+                                   cli_overrides=cli_overrides)
         except ConfigError as exc:
             parser.error(str(exc))
         _apply_config_defaults(parser, resolved)
@@ -642,6 +746,14 @@ def main():
     if resolved is not None:
         for warning in resolved.warnings:
             print(f"PyNext config warning: {warning}", file=sys.stderr)
+    if (command in ("dev", "start") and resolved is not None
+            and resolved.values.rate_limit < 1):
+        # H-1: opting out of the default throttle is a deliberate choice;
+        # say so at startup instead of silently serving unthrottled.
+        print("PyNext config warning: rate limiting is disabled (rate_limit=0); "
+              "the server has no framework-level throttle against brute force, "
+              "credential stuffing or scraping. Set rate_limit to a per-client "
+              "per-minute limit to enable it.", file=sys.stderr)
     root = Path(args.dir).resolve()
     if args.command == "init":
         try:
@@ -677,6 +789,21 @@ def main():
                 parser.error(str(exc))
             print(f"Created standalone directory in {output}")
         return
+    if args.command in ("check", "doctor"):
+        # Audit only: the checks read the resolved config, never start a
+        # server and never change settings. ``check`` mirrors Django and
+        # requires --deploy; ``doctor`` is the same audit without the flag.
+        if args.command == "check" and not args.deploy:
+            parser.error("pynext check requires --deploy (or run 'pynext doctor')")
+        settings = DeploySettings.from_resolved(resolved, debug=args.debug or None)
+        report = run_deploy_checks(settings)
+        if args.format == "json":
+            print(report.format_json())
+        else:
+            print(report.format_text())
+        if not report.ok or (args.fail_on_warning and report.warnings):
+            return 1
+        return 0
     if args.ws_max_message_bytes > 16 * 1024 * 1024:
         parser.error("--ws-max-message-bytes must be at most 16777216")
     # .env was already loaded in the prologue (before config resolution).
@@ -710,15 +837,33 @@ def main():
     # changes nothing, and an unset limit stays at serve()'s default.
     conn_kwargs = {}
     for key in ("max_connections", "max_connections_per_ip",
+                "max_concurrent_per_ip",
                 "header_read_timeout_ms", "body_min_rate_bytes_per_sec"):
         value = getattr(args, key)
         if value is not None and value != getattr(DEFAULT_CONFIG, key):
             conn_kwargs[key] = value
-    if args.workers > 1:
+    # `pynext dev` stays on the single-process run_dev path (file watching
+    # and reload) unless workers were configured explicitly — via --workers,
+    # a config file, or the environment. The multi-worker default
+    # (DEFAULT_CONFIG.workers) must not push dev onto the supervisor path:
+    # the supervisor serves but never reloads, so a default `pynext dev`
+    # would silently lose its watch/reload loop. `pynext start` takes the
+    # supervisor whenever the resolved worker count is above one, default
+    # included.
+    if args.command == "dev":
+        workers_explicit = (resolved is not None
+                            and resolved.source_of("workers") != "default")
+        use_supervisor = workers_explicit and args.workers > 1
+    else:
+        use_supervisor = args.workers > 1
+    if use_supervisor:
         config = WorkerConfig(root=str(root), host=args.host, port=args.port,
                               production=args.command == "start",
                               max_concurrent=args.max_concurrent,
                               acquire_timeout_ms=args.acquire_timeout_ms,
+                              acquire_timeout_max_ms=args.acquire_timeout_max_ms,
+                              handler_timeout_ms=args.handler_timeout_ms,
+                              response_timeout_ms=args.response_timeout_ms,
                               max_waiting=args.max_waiting,
                               body_capacity=args.body_capacity,
                               body_timeout_ms=args.body_timeout_ms,
@@ -734,8 +879,19 @@ def main():
                               cache_failure_policy=args.cache_failure_policy,
                               observability=obs_config, security=security,
                               websocket_max_message=args.ws_max_message_bytes,
-                              shutdown_timeout=args.shutdown_timeout, strict_ssg=args.strict_ssg)
+                              shutdown_timeout=args.shutdown_timeout, strict_ssg=args.strict_ssg,
+                              allowed_hosts=values.allowed_hosts)
         return run_supervisor(config, workers=args.workers)
+    # Only forward a stage/adaptive timeout that differs from serve()'s
+    # default: the historical call shape is preserved otherwise (see
+    # test_cli_without_observability_flags_keeps_old_call_shape, whose
+    # fake serve() has a fixed signature).
+    timeout_kwargs = {}
+    if args.acquire_timeout_max_ms is not None:
+        timeout_kwargs["acquire_timeout_max_ms"] = args.acquire_timeout_max_ms
+    for key in ("handler_timeout_ms", "response_timeout_ms"):
+        if getattr(args, key) != getattr(DEFAULT_CONFIG, key):
+            timeout_kwargs[key] = getattr(args, key)
     if args.command == "dev":
         try:
             asyncio.run(run_dev(root, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
@@ -748,7 +904,8 @@ def main():
                                 shutdown_timeout=args.shutdown_timeout, max_waiting=args.max_waiting,
                                 config=resolved, cli_overrides=cli_overrides,
                                 strict_ssg=args.strict_ssg,
-                                **extra, **conn_kwargs))
+                                allowed_hosts=values.allowed_hosts,
+                                **extra, **conn_kwargs, **timeout_kwargs))
         except KeyboardInterrupt:
             pass
         return
@@ -762,15 +919,22 @@ def main():
                             if args.cache_failure_policy != "fail_open" else {}),
                          **({"websocket_max_message": args.ws_max_message_bytes}
                             if args.ws_max_message_bytes != MAX_WS_MESSAGE else {}),
-                         **({"strict_ssg": True} if args.strict_ssg else {}), **extra)
+                         **({"strict_ssg": True} if args.strict_ssg else {}), **extra,
+                         **({"body_timeout_ms": args.body_timeout_ms}
+                            if args.body_timeout_ms != DEFAULT_CONFIG.body_timeout_ms else {}),
+                         **({"handler_timeout_ms": args.handler_timeout_ms}
+                            if args.handler_timeout_ms != DEFAULT_CONFIG.handler_timeout_ms else {}),
+                         **({"response_timeout_ms": args.response_timeout_ms}
+                            if args.response_timeout_ms != DEFAULT_CONFIG.response_timeout_ms else {}))
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     try:
         asyncio.run(serve(app, args.host, args.port, args.max_concurrent, args.acquire_timeout_ms,
                           args.body_capacity, args.body_timeout_ms,
                           shutdown_timeout=args.shutdown_timeout,
+                          **({"allowed_hosts": values.allowed_hosts} if values.allowed_hosts else {}),
                           **({"max_waiting": args.max_waiting} if args.max_waiting is not None else {}),
-                          **extra, **conn_kwargs))
+                          **extra, **conn_kwargs, **timeout_kwargs))
     except KeyboardInterrupt:
         pass
 

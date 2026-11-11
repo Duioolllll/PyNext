@@ -19,7 +19,8 @@ import pytest
 
 from pynext import cli
 from pynext.app import create_app
-from pynext.config import DEFAULT_CONFIG, ConfigError, find_config_file, load_config
+from pynext.config import (DEFAULT_ALLOWED_HOSTS, DEFAULT_CONFIG, ConfigError,
+                          effective_allowed_hosts, find_config_file, load_config)
 from pynext.server import serve
 from pynext.supervisor import WorkerConfig
 
@@ -74,6 +75,37 @@ def test_defaults_are_single_sourced():
                 "cache_failure_policy", "rate_limit_failure_policy",
                 "websocket_max_message", "shutdown_timeout"):
         assert getattr(worker, key) == getattr(DEFAULT_CONFIG, key), key
+
+
+def test_concurrency_p0_defaults():
+    """C-P0-1/C-P0-2: multi-worker default with a raised admission budget.
+
+    The defaults are sized to be used together: two workers share one
+    accept queue, so max_concurrent/acquire_timeout_ms cover both.
+    """
+    assert DEFAULT_CONFIG.workers == 2
+    assert DEFAULT_CONFIG.max_concurrent == 128
+    assert DEFAULT_CONFIG.acquire_timeout_ms == 3000
+
+
+def test_load_config_default_workers_do_not_warn(tmp_path):
+    """The multi-worker default alone must not warn on every load.
+
+    The per-process memory-cache warning only fires when workers > 1 was
+    set explicitly (file/env/cli), not when it comes from the default.
+    """
+    resolved = load_config(tmp_path, "dev", env={})
+    assert resolved.values.workers == 2
+    assert resolved.values.max_concurrent == 128
+    assert resolved.values.acquire_timeout_ms == 3000
+    assert resolved.warnings == ()
+
+
+def test_load_config_explicit_workers_warn_about_memory_cache(tmp_path):
+    """Explicit workers > 1 with the memory cache still warns."""
+    resolved = load_config(tmp_path, "dev", env={}, cli_overrides={"workers": 2})
+    assert any("each worker keeps its own ISR cache" in warning
+               for warning in resolved.warnings)
 
 
 # -- load_config --------------------------------------------------------------
@@ -138,6 +170,20 @@ def test_load_config_unknown_key_warns_with_suggestion(tmp_path):
     ("{'websocket_allowed_origins': ['*']}", "invalid WebSocket origin '*'"),
     ("{'websocket_allowed_origins': 'https://example.com'}",
      "'websocket_allowed_origins' must be a list or tuple of strings"),
+    ("{'allowed_hosts': 'example.com'}",
+     "'allowed_hosts' must be a list or tuple of host patterns"),
+    ("{'allowed_hosts': [42]}",
+     "'allowed_hosts' must be a list or tuple of non-empty host patterns"),
+    ("{'allowed_hosts': ['https://example.com']}",
+     "has an invalid allowed host 'https://example.com'"),
+    ("{'allowed_hosts': ['example.com:3000']}",
+     "allowed host 'example.com:3000' must not include a port"),
+    ("{'allowed_hosts': ['exa mple.com']}",
+     "has an invalid allowed host 'exa mple.com'"),
+    ("{'allowed_hosts': ['.127.0.0.1']}",
+     "subdomain pattern '.127.0.0.1' must name a domain, not an IP literal"),
+    ("{'allowed_hosts': ['foo.*.example.com']}",
+     "has an invalid allowed host 'foo.*.example.com'"),
     ("{'cors_allowed_origins': ['not-an-origin']}", "invalid CORS origin 'not-an-origin'"),
     ("{'cors_allow_credentials': 1}", "'cors_allow_credentials' must be a bool"),
     ("{'trusted_proxies': '10.0.0.1'}", "'trusted_proxies' must be a list or tuple of strings"),
@@ -177,6 +223,38 @@ def test_load_config_accepts_boundary_and_list_values(tmp_path):
     assert resolved.warnings == ()
 
 
+def test_load_config_accepts_allowed_hosts(tmp_path):
+    write_config(tmp_path,
+                 "config = {'allowed_hosts': ['Example.COM', '.example.org', '*.example.net',\n"
+                 "          '127.0.0.1', '[::1]', 'localhost']}\n")
+    resolved = load_config(tmp_path, "dev", env={})
+    assert resolved.values.allowed_hosts == ("example.com", ".example.org", "*.example.net",
+                                             "127.0.0.1", "::1", "localhost")
+    assert resolved.warnings == ()
+
+
+def test_load_config_wildcard_allowed_hosts_warns(tmp_path):
+    write_config(tmp_path, "config = {'allowed_hosts': ['*']}\n")
+    resolved = load_config(tmp_path, "dev", env={})
+    assert resolved.values.allowed_hosts == ("*",)
+    assert len(resolved.warnings) == 1
+    assert "'allowed_hosts' contains '*'" in resolved.warnings[0]
+
+
+def test_effective_allowed_hosts():
+    # No explicit list: loopback only.
+    assert effective_allowed_hosts(()) == DEFAULT_ALLOWED_HOSTS
+    assert effective_allowed_hosts() == DEFAULT_ALLOWED_HOSTS
+    # A bind host that names a host joins the default; a wildcard bind
+    # (0.0.0.0 / ::) and a loopback bind add nothing.
+    assert effective_allowed_hosts((), "example.com") == (*DEFAULT_ALLOWED_HOSTS, "example.com")
+    assert effective_allowed_hosts((), "0.0.0.0") == DEFAULT_ALLOWED_HOSTS
+    assert effective_allowed_hosts((), "::") == DEFAULT_ALLOWED_HOSTS
+    assert effective_allowed_hosts((), "127.0.0.1") == DEFAULT_ALLOWED_HOSTS
+    # An explicit list wins as-is.
+    assert effective_allowed_hosts(["example.com"]) == ("example.com",)
+
+
 @pytest.mark.parametrize("text, fragment", [
     ("config = {\n", "failed to load pynext.config.py"),
     ("config = None\n", "`config` must be a dict, got NoneType"),
@@ -196,6 +274,54 @@ def test_load_config_cross_check_warnings(tmp_path):
     assert len(resolved.warnings) == 2
     assert "'cache_path' is only used with cache_backend 'sqlite'" in resolved.warnings[0]
     assert "each worker keeps its own ISR cache" in resolved.warnings[1]
+
+
+# -- S-P1-5: CORS credentialed-wildcard combination ----------------------------
+
+def test_load_config_rejects_cors_credentials_with_wildcard_origin(tmp_path):
+    # credentials + "*" lets any website read credentialed responses
+    # (the middleware echoes the request Origin), so startup must fail.
+    write_config(tmp_path,
+                 "config = {'cors_allowed_origins': ['*'], 'cors_allow_credentials': True}\n")
+    with pytest.raises(ConfigError) as error:
+        load_config(tmp_path, "dev", env={})
+    message = str(error.value)
+    assert "'cors_allow_credentials' is True with wildcard origin '*'" in message
+    assert "List explicit origins" in message
+
+
+def test_load_config_rejects_cors_credentials_with_wildcard_among_origins(tmp_path):
+    # "*" anywhere in the list is a wildcard, even next to explicit origins.
+    write_config(tmp_path,
+                 "config = {'cors_allowed_origins': ['https://example.com', '*'], "
+                 "'cors_allow_credentials': True}\n")
+    with pytest.raises(ConfigError):
+        load_config(tmp_path, "dev", env={})
+
+
+def test_load_config_rejects_cors_dangerous_combo_across_layers(tmp_path):
+    # The two halves can arrive from different layers: the file sets the
+    # wildcard, the CLI turns credentials on. Only the merged config shows it.
+    write_config(tmp_path, "config = {'cors_allowed_origins': ['*']}\n")
+    with pytest.raises(ConfigError):
+        load_config(tmp_path, "dev", env={},
+                    cli_overrides={"cors_allow_credentials": True})
+
+
+@pytest.mark.parametrize("raw", [
+    # Wildcard without credentials: a public API, no credentialed reads.
+    "{'cors_allowed_origins': ['*']}",
+    # Credentials with explicit origins only: the safe spelling.
+    "{'cors_allowed_origins': ['https://example.com'], 'cors_allow_credentials': True}",
+    # Credentials with no origins at all: deny-all, nothing to echo.
+    "{'cors_allow_credentials': True}",
+    # Wildcard next to explicit origins, without credentials.
+    "{'cors_allowed_origins': ['*', 'https://example.com']}",
+])
+def test_load_config_accepts_safe_cors_combinations(tmp_path, raw):
+    write_config(tmp_path, f"config = {raw}\n")
+    resolved = load_config(tmp_path, "dev", env={})
+    assert not any("cors" in warning.lower() for warning in resolved.warnings)
 
 
 def test_load_config_rejects_unknown_phase(tmp_path):
@@ -232,9 +358,12 @@ def test_cli_config_file_values_reach_server(tmp_path, monkeypatch):
                          body_capacity, body_timeout_ms, shutdown_timeout, max_waiting)
 
     monkeypatch.setattr(cli, "serve", serve)
-    _run_cli(["start", "--dir", str(root)], monkeypatch)
+    # C-P0-1: pin single-process; the default now takes the supervisor path.
+    _run_cli(["start", "--dir", str(root), "--workers", "1"], monkeypatch)
     assert seen["app"] == (root, True, "sqlite")
-    assert seen["serve"] == ("0.0.0.0", 4001, 33, 1000, 16, 10000, 5, None)
+    # C-P0-2: acquire_timeout_ms comes from the new default (3000); the
+    # file only sets max_concurrent (33).
+    assert seen["serve"] == ("0.0.0.0", 4001, 33, 3000, 16, 10000, 5, None)
 
 
 def test_cli_flag_beats_config_file(tmp_path, monkeypatch):
@@ -248,7 +377,8 @@ def test_cli_flag_beats_config_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli, "serve", serve)
-    _run_cli(["start", "--dir", str(root), "--port", "5000"], monkeypatch)
+    # C-P0-1: pin single-process; the default now takes the supervisor path.
+    _run_cli(["start", "--dir", str(root), "--workers", "1", "--port", "5000"], monkeypatch)
     assert seen["serve"] == ("127.0.0.1", 5000, 33)
 
 
@@ -275,7 +405,8 @@ def test_cli_unknown_config_key_warns_but_starts(tmp_path, monkeypatch, capsys):
         pass
 
     monkeypatch.setattr(cli, "serve", serve)
-    _run_cli(["start", "--dir", str(root)], monkeypatch)
+    # C-P0-1: pin single-process; the default now takes the supervisor path.
+    _run_cli(["start", "--dir", str(root), "--workers", "1"], monkeypatch)
     err = capsys.readouterr().err
     assert "unknown config key 'bogus_key'" in err
 
@@ -295,10 +426,12 @@ def test_cli_repeatable_option_replaces_file_list(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "create_app", create_app)
     monkeypatch.setattr(cli, "serve", serve)
     # Without a CLI flag the file value reaches the app.
-    _run_cli(["start", "--dir", str(root)], monkeypatch)
+    # C-P0-1: pin single-process; the default now takes the supervisor path.
+    _run_cli(["start", "--dir", str(root), "--workers", "1"], monkeypatch)
     assert seen["security"].cors_allowed_origins == ("https://file.example.com",)
     # With a CLI flag the file list is replaced, not extended.
-    _run_cli(["start", "--dir", str(root), "--cors-origin", "https://cli.example.com"], monkeypatch)
+    _run_cli(["start", "--dir", str(root), "--workers", "1",
+              "--cors-origin", "https://cli.example.com"], monkeypatch)
     assert seen["security"].cors_allowed_origins == ("https://cli.example.com",)
 
 
@@ -330,7 +463,8 @@ def test_cli_config_observability_reaches_app(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "create_app", create_app)
     monkeypatch.setattr(cli, "serve", serve)
-    _run_cli(["start", "--dir", str(root)], monkeypatch)
+    # C-P0-1: pin single-process; the default now takes the supervisor path.
+    _run_cli(["start", "--dir", str(root), "--workers", "1"], monkeypatch)
     config = seen["create_app"]["observability"]
     assert config.metrics is False
     assert config.log_level == "WARNING"
@@ -382,8 +516,11 @@ def _wait_for_content(url, marker, timeout=15):
 
 
 def _start_dev(root):
+    # C-P0-1: pin single-process so the dev server keeps the run_dev path
+    # (file watching/reload); the multi-worker default takes the
+    # supervisor path, which prints a different listening line.
     proc = subprocess.Popen(
-        [sys.executable, "-m", "pynext.cli", "dev", "--dir", str(root), "--port", "0"],
+        [sys.executable, "-m", "pynext.cli", "dev", "--dir", str(root), "--workers", "1", "--port", "0"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     lines = queue.Queue()
 

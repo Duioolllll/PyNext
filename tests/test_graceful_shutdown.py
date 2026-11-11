@@ -8,6 +8,7 @@ restart under load must serve no 5xx.
 import asyncio
 import base64
 import hashlib
+import http.client
 import os
 import re
 import signal
@@ -23,7 +24,7 @@ import httpx
 import psutil
 import pytest
 
-from pynext import JSONResponse, Request, Response, create_app
+from pynext import JSONResponse, Request, Response, SessionMiddleware, create_app
 from pynext.build import write_manifest
 from pynext.ratelimit import RateLimiter
 from pynext.server import serve, start_native
@@ -83,6 +84,25 @@ def _write_api_app(tmp_path, *, slow=False, ws=False, health_route=False):
             '@route("GET")\ndef get(): return Response("user health page")\n',
             encoding="utf-8",
         )
+
+
+def _write_isr_app(tmp_path):
+    """One ISR page whose render delay/started event the test controls."""
+    directory = tmp_path / "app" / "blog" / "[slug]"
+    directory.mkdir(parents=True)
+    (directory / "page.py").write_text(
+        'from pynext import h, page\n'
+        'import asyncio\n'
+        'calls = 0\ndelay = 0.05\nstarted = None\n'
+        '@page(render="isr", revalidate=0.2, stale=60)\n'
+        'async def Page(params):\n'
+        '    global calls\n'
+        '    calls += 1\n'
+        '    if started is not None: started.set()\n'
+        '    await asyncio.sleep(delay)\n'
+        '    return h("p", {}, f"{params[\'slug\']}:{calls}")\n',
+        encoding="utf-8",
+    )
 
 
 def _free_port():
@@ -529,3 +549,261 @@ def test_supervisor_rolling_restart_serves_no_5xx(tmp_path):
         assert not errors, f"transport errors during rolling restart: {errors[:5]}"
     finally:
         sup.stop()
+
+
+# --- C-P2-5: drain stops accepting, keep-alive policy, background work --
+
+def test_serve_drain_still_serves_health_probes_on_new_connections(tmp_path):
+    """A fresh connection during drain still reaches health probes (C-P2-5).
+
+    The drain stops advertising readiness, but the listener stays open
+    until the server stops: a client with no idle keep-alive connection
+    (e.g. its only pooled connection is busy with the in-flight slow
+    request) must still get ``/readyz`` 503 instead of a refused
+    connection. Closing the listener at drain start broke exactly this
+    (``test_serve_drains_inflight_request_and_closes_websocket``), so
+    this pins the restored contract at the TCP level.
+    """
+    _write_api_app(tmp_path, slow=True)
+    entered_file = tmp_path / "app" / "api" / "slow" / "entered"
+
+    async def run():
+        app = create_app(tmp_path)
+        stop_event = asyncio.Event()
+        address = {}
+        task = asyncio.create_task(
+            serve(app, "127.0.0.1", 0, stop_event=stop_event, shutdown_timeout=10.0,
+                  on_ready=lambda value: address.__setitem__("value", value)))
+        try:
+            deadline = asyncio.get_running_loop().time() + 10
+            while "value" not in address:
+                assert asyncio.get_running_loop().time() < deadline, "server did not start"
+                await asyncio.sleep(0.05)
+            host, port = address["value"].rsplit(":", 1)
+            port = int(port)
+            async with httpx.AsyncClient(trust_env=False, base_url=f"http://{address['value']}", timeout=10) as client:
+                request = asyncio.create_task(client.get("/api/slow"))
+                deadline = asyncio.get_running_loop().time() + 5
+                while not entered_file.exists():
+                    assert asyncio.get_running_loop().time() < deadline, "slow handler did not start"
+                    await asyncio.sleep(0.05)
+                stop_event.set()
+
+                def fresh_readyz():
+                    conn = http.client.HTTPConnection(host, port, timeout=5)
+                    try:
+                        conn.request("GET", "/readyz")
+                        response = conn.getresponse()
+                        return response.status, response.read()
+                    finally:
+                        conn.close()
+
+                # The client's only pooled connection is busy with the
+                # slow request, so this must open a fresh one — and the
+                # drain must answer it (503, not a refusal).
+                status, body = await asyncio.to_thread(fresh_readyz)
+                assert status == 503
+                assert body == b"not ready"
+                assert (await asyncio.wait_for(request, 10)).json() == {"slow": True}
+            await asyncio.wait_for(task, 10)
+        finally:
+            if not task.done():
+                stop_event.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_idle_keepalive_connection_closed_after_timeout(tmp_path):
+    """An idle keep-alive connection is reaped (C-P2-5b).
+
+    ``header_read_timeout_ms`` bounds idle keep-alive as well as slow
+    request headers: the same connection serves a second request while
+    it is still fresh, then the server closes it once it has been idle
+    past the timeout.
+    """
+    _write_api_app(tmp_path)
+
+    async def run():
+        app = create_app(tmp_path)
+        await app.startup()
+        server = start_native(app, asyncio.get_running_loop(), port=0,
+                              header_read_timeout_ms=1000)
+        try:
+            host, port = server.address.rsplit(":", 1)
+
+            def check():
+                conn = http.client.HTTPConnection(host, int(port), timeout=5)
+                try:
+                    conn.request("GET", "/api/ok")
+                    response = conn.getresponse()
+                    assert response.status == 200
+                    response.read()
+                    # Reuse works while the connection is still fresh.
+                    conn.request("GET", "/api/ok")
+                    response = conn.getresponse()
+                    assert response.status == 200
+                    response.read()
+                    time.sleep(2.5)
+                    try:
+                        conn.request("GET", "/api/ok")
+                        conn.getresponse().read()
+                    except (http.client.RemoteDisconnected, ConnectionResetError,
+                            BrokenPipeError, OSError):
+                        return True
+                    return False
+                finally:
+                    conn.close()
+
+            assert await asyncio.to_thread(check), "server did not close the idle keep-alive connection"
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.shutdown()
+
+    asyncio.run(run())
+
+
+async def _until_stale(app, path, timeout=5):
+    async with asyncio.timeout(timeout):
+        while app.isr.store.lookup(path)[0] != "stale":
+            await asyncio.sleep(0.01)
+
+
+def test_serve_shutdown_waits_for_isr_background_regeneration(tmp_path):
+    """A background ISR regeneration finishes inside the drain (C-P2-5c).
+
+    The second request serves stale and starts a ~1s background
+    regeneration; shutdown with a 10s budget waits for it instead of
+    cancelling it, so the fresh generation is published.
+    """
+    _write_isr_app(tmp_path)
+    write_manifest(tmp_path)
+
+    async def run():
+        app = create_app(tmp_path, production=True)
+        module = app._module("app/blog/[slug]/page.py")
+        stop_event = asyncio.Event()
+        address = {}
+        task = asyncio.create_task(
+            serve(app, "127.0.0.1", 0, stop_event=stop_event, shutdown_timeout=10.0,
+                  on_ready=lambda value: address.__setitem__("value", value)))
+        try:
+            deadline = asyncio.get_running_loop().time() + 10
+            while "value" not in address:
+                assert asyncio.get_running_loop().time() < deadline, "server did not start"
+                await asyncio.sleep(0.05)
+            async with httpx.AsyncClient(trust_env=False, base_url=f"http://{address['value']}", timeout=10) as client:
+                assert (await client.get("/blog/policy")).status_code == 200
+                assert module.calls == 1
+                await _until_stale(app, "/blog/policy")
+                module.delay = 1.0
+                module.started = asyncio.Event()
+                response = await client.get("/blog/policy")
+                assert response.status_code == 200
+                assert b"policy:1" in response.content  # stale, served at once
+                await asyncio.wait_for(module.started.wait(), 3)  # regen running
+                stop_event.set()
+            await asyncio.wait_for(task, 15)
+            assert module.calls == 2
+            state, body = app.isr.store.lookup("/blog/policy")
+            assert state == "fresh"
+            assert b"policy:2" in body
+        finally:
+            if not task.done():
+                stop_event.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_serve_shutdown_cancels_long_isr_regeneration(tmp_path):
+    """A regeneration that outlives the budget is cancelled (C-P2-5c).
+
+    With a 30s regeneration and a 2s shutdown timeout, serve() still
+    returns promptly instead of hanging on the background task.
+    """
+    _write_isr_app(tmp_path)
+    write_manifest(tmp_path)
+
+    async def run():
+        app = create_app(tmp_path, production=True)
+        module = app._module("app/blog/[slug]/page.py")
+        stop_event = asyncio.Event()
+        address = {}
+        task = asyncio.create_task(
+            serve(app, "127.0.0.1", 0, stop_event=stop_event, shutdown_timeout=2.0,
+                  on_ready=lambda value: address.__setitem__("value", value)))
+        try:
+            deadline = asyncio.get_running_loop().time() + 10
+            while "value" not in address:
+                assert asyncio.get_running_loop().time() < deadline, "server did not start"
+                await asyncio.sleep(0.05)
+            async with httpx.AsyncClient(trust_env=False, base_url=f"http://{address['value']}", timeout=10) as client:
+                assert (await client.get("/blog/policy")).status_code == 200
+                await _until_stale(app, "/blog/policy")
+                module.delay = 30.0
+                module.started = asyncio.Event()
+                assert (await client.get("/blog/policy")).status_code == 200
+                await asyncio.wait_for(module.started.wait(), 3)  # regen running
+                started = time.monotonic()
+                stop_event.set()
+            await asyncio.wait_for(task, 15)
+            assert time.monotonic() - started < 10
+            assert not app.isr._tasks
+        finally:
+            if not task.done():
+                stop_event.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_serve_shutdown_stops_session_purge_task(tmp_path):
+    """The session expiry purge loop stops with the app (C-P2-5c)."""
+    _write_api_app(tmp_path)
+
+    class _Store:
+        def __init__(self):
+            self.purges = 0
+
+        async def load(self, token):
+            return None
+
+        async def save(self, token, data, max_age):
+            return token or "test-token"
+
+        async def delete(self, token):
+            return None
+
+        async def purge_expired(self):
+            self.purges += 1
+
+    store = _Store()
+    middleware = SessionMiddleware(store, purge_interval=0.05)
+
+    async def run():
+        app = create_app(tmp_path, middleware=[middleware])
+        stop_event = asyncio.Event()
+        address = {}
+        task = asyncio.create_task(
+            serve(app, "127.0.0.1", 0, stop_event=stop_event, shutdown_timeout=5.0,
+                  on_ready=lambda value: address.__setitem__("value", value)))
+        try:
+            deadline = asyncio.get_running_loop().time() + 10
+            while "value" not in address:
+                assert asyncio.get_running_loop().time() < deadline, "server did not start"
+                await asyncio.sleep(0.05)
+            async with httpx.AsyncClient(trust_env=False, base_url=f"http://{address['value']}", timeout=5) as client:
+                assert (await client.get("/api/ok")).status_code == 200
+            await asyncio.sleep(0.2)
+            assert store.purges >= 1
+            assert middleware._purge_task is not None and not middleware._purge_task.done()
+            stop_event.set()
+            await asyncio.wait_for(task, 10)
+            assert middleware._purge_task is None or middleware._purge_task.done()
+        finally:
+            if not task.done():
+                stop_event.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())

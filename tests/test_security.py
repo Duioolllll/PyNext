@@ -56,9 +56,10 @@ def test_set_csrf_cookie_defaults():
     response = set_csrf_cookie(Response("ok"), "token-value")
     cookie = [v for k, v in response.headers if k == b"set-cookie"]
     assert len(cookie) == 1
-    # The cookie is Secure by default and carries the HMAC-signed value.
+    # The cookie is Secure by default and carries the HMAC-signed value,
+    # with a Max-Age bounding the signed value's replay window (S-P1-21).
     assert cookie[0] == (f"pynext_csrf={sign_csrf_token('token-value')}; "
-                         "Path=/; SameSite=Lax; Secure").encode("ascii")
+                         "Path=/; Max-Age=43200; SameSite=Lax; Secure").encode("ascii")
 
 
 def test_set_csrf_cookie_insecure_for_local_dev():
@@ -66,7 +67,7 @@ def test_set_csrf_cookie_insecure_for_local_dev():
     response = set_csrf_cookie(Response("ok"), "token-value", config=config)
     cookie = [v for k, v in response.headers if k == b"set-cookie"][0]
     assert cookie == (f"pynext_csrf={sign_csrf_token('token-value', config=config)}; "
-                      "Path=/; SameSite=Lax").encode("ascii")
+                      "Path=/; Max-Age=43200; SameSite=Lax").encode("ascii")
 
 
 def test_set_csrf_cookie_secure_flag():
@@ -74,7 +75,7 @@ def test_set_csrf_cookie_secure_flag():
     response = set_csrf_cookie(Response("ok"), "token-value", config=config)
     cookie = [v for k, v in response.headers if k == b"set-cookie"][0]
     assert cookie == (f"pynext_csrf={sign_csrf_token('token-value', config=config)}; "
-                      "Path=/; SameSite=Strict; Secure").encode("ascii")
+                      "Path=/; Max-Age=43200; SameSite=Strict; Secure").encode("ascii")
 
 
 def test_security_config_rejects_bad_values():
@@ -82,6 +83,10 @@ def test_security_config_rejects_bad_values():
         SecurityConfig(csrf_cookie_name="bad name")
     with pytest.raises(ValueError, match="cors_max_age"):
         SecurityConfig(cors_max_age=-1)
+    with pytest.raises(ValueError, match="csrf_cookie_max_age"):
+        SecurityConfig(csrf_cookie_max_age=0)
+    with pytest.raises(ValueError, match="csrf_cookie_max_age"):
+        SecurityConfig(csrf_cookie_max_age=2_592_001)
 
 
 @pytest.mark.parametrize("method", ["GET", "HEAD", "OPTIONS"])
@@ -529,7 +534,12 @@ def test_cors_wildcard_and_credentials(tmp_path):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=credentialed),
                                      base_url="http://test") as client:
             response = await client.get("/api/echo", headers={"origin": "https://any.example"})
-            assert response.headers["access-control-allow-origin"] == "https://any.example"
+            # S-P1-5 defence in depth: a SecurityConfig built directly
+            # bypasses config-file validation, so the middleware never
+            # echoes an arbitrary Origin with credentials — browsers
+            # ignore a wildcard Allow-Origin on a credentialed request,
+            # so no cross-origin page can read the response.
+            assert response.headers["access-control-allow-origin"] == "*"
             assert response.headers["access-control-allow-credentials"] == "true"
     run(exercise())
 
@@ -630,7 +640,7 @@ DEFAULT_CSP = ("script-src 'self'; style-src 'self'; object-src 'none'; base-uri
 EXPECTED_HEADERS = {
     "x-content-type-options": "nosniff",
     "x-frame-options": "DENY",
-    "referrer-policy": "strict-origin-when-cross-origin",
+    "referrer-policy": "same-origin",
     "permissions-policy": "camera=(), microphone=(), geolocation=()",
     "content-security-policy": DEFAULT_CSP,
 }
@@ -676,7 +686,7 @@ def test_security_config_header_defaults():
     assert config.hsts_include_subdomains is True
     assert config.hsts_preload is False
     assert config.frame_options == "DENY"
-    assert config.referrer_policy == "strict-origin-when-cross-origin"
+    assert config.referrer_policy == "same-origin"
     assert config.permissions_policy == "camera=(), microphone=(), geolocation=()"
     assert config.csp_style_src == "'self'"
     assert config.csp_frame_ancestors == "'none'"
@@ -702,7 +712,7 @@ def test_security_headers_dev_omits_hsts_but_keeps_the_rest():
     assert "strict-transport-security" not in headers
     assert headers[b"x-content-type-options"] == b"nosniff"
     assert headers[b"x-frame-options"] == b"DENY"
-    assert headers[b"referrer-policy"] == b"strict-origin-when-cross-origin"
+    assert headers[b"referrer-policy"] == b"same-origin"
     assert headers[b"permissions-policy"] == b"camera=(), microphone=(), geolocation=()"
     assert headers[b"content-security-policy"] == DEFAULT_CSP.encode("ascii")
 
@@ -860,6 +870,34 @@ def test_a1_nonce_page_keeps_nonce_and_other_headers(tmp_path, esbuild):
             assert f'nonce="{nonce}"' in response.text
             assert response.headers["x-content-type-options"] == "nosniff"
             assert response.headers["x-frame-options"] == "DENY"
-            assert response.headers["referrer-policy"] == "strict-origin-when-cross-origin"
+            assert response.headers["referrer-policy"] == "same-origin"
             assert "strict-transport-security" not in response.headers
+    run(exercise())
+
+
+def test_a1_header_scan_health_responses(tmp_path):
+    """Health probes get the same security headers (S-P0-3).
+
+    ``_dispatch_response`` skips the header step for /healthz and
+    /readyz on purpose — the transport applies it instead (ASGI
+    ``_send_response``, native Python bridge) — so assert here, on
+    both transports, that the headers really arrive.
+    """
+    make_header_project(tmp_path)
+    write_manifest(tmp_path)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(tmp_path)),
+                                     base_url="http://test") as client:
+            assert_security_headers(await client.get("/healthz"), production=False)
+            assert_security_headers(await client.get("/readyz"), production=False)
+        app = create_app(tmp_path, production=True)
+        server = start_native(app, asyncio.get_running_loop(), port=0)
+        try:
+            async with httpx.AsyncClient(base_url=f"http://{server.address}", timeout=10) as client:
+                assert_security_headers(await client.get("/healthz"), production=True)
+                assert_security_headers(await client.get("/readyz"), production=True)
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
     run(exercise())

@@ -1,5 +1,7 @@
 import asyncio
 import sys
+import threading
+import time
 
 import httpx
 import pytest
@@ -246,6 +248,43 @@ def test_ipv6_flood_within_one_prefix_creates_one_bucket():
         key = limiter.key_for(f"2001:db8:0:1:{i >> 16:x}:{(i >> 8) & 0xFF:x}:{i & 0xFF:x}:1")
         limiter.allow(key, now=1000.0)
     assert limiter.stats()["buckets"] == 1
+
+
+def test_ipv6_48_flood_cannot_fill_new_key_window():
+    # S-P1-26 (M-17) mitigation: a /48 holder minting 10,000 distinct
+    # /64s inside one /48 collapses to a single bucket and a single
+    # new-key admission at ipv6_prefix_len=48, so a genuinely brand-new
+    # user is still admitted instead of getting 429.
+    # ``now`` is anchored at the real monotonic clock: stats() prunes
+    # new-key admissions against time.monotonic(), so a fixed fake
+    # timestamp would look expired to it.
+    now = time.monotonic()
+    limiter = RateLimiter(100, 60, ipv6_prefix_len=48)
+    for i in range(10_000):
+        key = limiter.key_for(f"2001:db8:0:{i:x}::1")
+        limiter.allow(key, now=now)
+    stats = limiter.stats()
+    assert stats["buckets"] == 1
+    assert stats["new_keys_in_window"] == 1
+    legit = limiter.key_for("2001:db8:1::1")
+    assert limiter.allow(legit, now=now) == (True, None)
+
+
+def test_ipv6_64_flood_fills_new_key_window_and_denies_new_key():
+    # Control for the test above: at the default /64 the same flood —
+    # 10,000 distinct /64s inside one /48 — fills the new-key window,
+    # so a genuinely brand-new key is denied with 429 until the window
+    # slides. This is the M-17 disruption the /48 grouping mitigates.
+    now = time.monotonic()
+    limiter = RateLimiter(100, 60)
+    for i in range(10_000):
+        key = limiter.key_for(f"2001:db8:0:{i:x}::1")
+        limiter.allow(key, now=now)
+    assert limiter.stats()["new_keys_in_window"] == 10_000
+    legit = limiter.key_for("2001:db8:1::1")
+    allowed, retry_after = limiter.allow(legit, now=now)
+    assert allowed is False
+    assert retry_after == 60
 
 
 def test_is_exempt_matches_exact_paths_and_subpaths():
@@ -521,6 +560,7 @@ def test_cli_passes_rate_limit_to_app(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "serve", serve)
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root),
+                                      "--workers", "1",
                                       "--rate-limit", "100", "--rate-limit-window", "30",
                                       "--rate-limit-exempt-path", "/healthz",
                                       "--rate-limit-ipv6-prefix-len", "48",
@@ -539,3 +579,72 @@ def test_cli_passes_rate_limit_to_app(tmp_path, monkeypatch):
     assert seen[1][0] == "serve"
     assert seen[1][-2] == 30  # B6 graceful-shutdown default
     assert seen[1][-1] is None  # C7 max_waiting default
+
+
+# --- S-P1-4: atomicity (a limit must never over-admit under contention) ---
+
+
+def test_memory_limiter_is_atomic_under_threads():
+    """One lock covers get+refill+set: concurrent threads never over-admit.
+
+    With a check-then-set race, two threads can both see the last token
+    and both consume it, admitting more than the limit. The barrier makes
+    all threads hit the bucket at once, so a race would show up here.
+    """
+    limiter = RateLimiter(10, 60)
+    barrier = threading.Barrier(8)
+    admitted = []
+
+    def hammer():
+        barrier.wait(timeout=10)
+        count = 0
+        for _ in range(25):
+            allowed, _ = limiter.allow("shared")
+            count += bool(allowed)
+        admitted.append(count)
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert all(not thread.is_alive() for thread in threads)
+    assert sum(admitted) == 10
+
+
+def test_memory_limiter_multi_key_thread_safety():
+    """Concurrent keys stay isolated and the table stays bounded."""
+    limiter = RateLimiter(5, 60, max_buckets=32)
+    barrier = threading.Barrier(16)
+    admitted = {}
+
+    def hammer(index):
+        key = f"key-{index}"
+        barrier.wait(timeout=10)
+        count = 0
+        for _ in range(20):
+            allowed, _ = limiter.allow(key)
+            count += bool(allowed)
+        admitted[key] = count
+
+    threads = [threading.Thread(target=hammer, args=(index,)) for index in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert all(not thread.is_alive() for thread in threads)
+    assert admitted == {f"key-{index}": 5 for index in range(16)}
+    assert limiter.stats()["buckets"] == 16
+
+
+def test_memory_limiter_buckets_are_per_process():
+    """Two limiter instances do not share buckets (two workers, two limits).
+
+    The memory backend is per-process by design (S-P1-4): each worker
+    enforces its own copy of the limit. A limit shared across workers
+    needs RedisRateLimiter — see tests/test_ratelimit_atomicity.py.
+    """
+    first = RateLimiter(3, 60)
+    second = RateLimiter(3, 60)
+    assert [first.allow("k")[0] for _ in range(4)] == [True, True, True, False]
+    assert [second.allow("k")[0] for _ in range(4)] == [True, True, True, False]

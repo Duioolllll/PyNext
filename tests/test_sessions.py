@@ -125,6 +125,7 @@ def test_authenticated_static_pages_are_rejected(tmp_path):
 
 def test_rotate_on_login_preserves_data_and_rotates_csrf():
     """The login hook rotates the id and the CSRF token, keeping the data."""
+    from pynext.http import unmask_csrf_token
     from pynext.sessions import Session
 
     session = Session({"user_id": "alice"}, csrf="old-csrf", token="old-token", version=1)
@@ -133,7 +134,13 @@ def test_rotate_on_login_preserves_data_and_rotates_csrf():
     assert session._rotate is True
     assert session["user_id"] == "alice"
     assert session._csrf != "old-csrf"
-    assert session.csrf_token() == session._csrf
+    # csrf_token() is masked (S-P0-2): every call returns a different
+    # value over the same stored secret.
+    first_issued = session.csrf_token()
+    assert first_issued != session._csrf
+    assert unmask_csrf_token(first_issued) == session._csrf
+    assert session.csrf_token() != first_issued
+    assert unmask_csrf_token(session.csrf_token()) == session._csrf
     # Rotating twice, or after invalidation, behaves like rotate().
     session.rotate_on_login()
     assert session._rotate is True
@@ -253,7 +260,12 @@ def test_session_size_cap_boundary_still_enforced(tmp_path):
 
     async def run():
         token = secrets.token_urlsafe(32)
-        overhead = len(json.dumps({"data": {"big": ""}, "csrf": None},
+        # The stored payload now also carries created_at/last_seen
+        # (S-P1-9); the boundary accounts for the longest timestamps,
+        # matching the store's own size check.
+        overhead = len(json.dumps({"data": {"big": ""}, "csrf": None,
+                                   "created_at": 9_999_999_999.999,
+                                   "last_seen": 9_999_999_999.999},
                                   ensure_ascii=False, separators=(",", ":")).encode())
         fits = "x" * (16_384 - overhead)
         assert await store.save(token, {"big": fits}, None, None, time.time() + 60) == 1
@@ -311,3 +323,70 @@ def test_session_changed_names_key_mutated_in_place():
     session["tags"].append(object())
     with pytest.raises(TypeError, match="'tags'"):
         session._changed()
+
+
+def _cookie_flags(set_cookie):
+    """Split a Set-Cookie value into its lower-cased flag parts."""
+    return {part.strip().lower() for part in set_cookie.split(";")}
+
+
+def test_session_cookie_secure_defaults(tmp_path):
+    """S-P0-4: the default session cookie is Secure + HttpOnly + SameSite=Lax.
+
+    The defaults live on ``SessionMiddleware`` itself (``secure=True``,
+    ``same_site="Lax"``, ``HttpOnly`` always set), so an app that
+    installs the middleware without arguments gets the safe cookie —
+    and the token is stored server-side under its SHA-256 hash.
+    """
+    from pynext.sessions import _key
+
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite3")
+    assert SessionMiddleware(store).secure is True
+    assert SessionMiddleware(store).same_site == "Lax"
+    assert len(_key("x" * 43)) == 64  # SHA-256 hex digest, not SHA-1
+    api = tmp_path / "app" / "api"
+    (api / "token").mkdir(parents=True)
+    (api / "token" / "route.py").write_text(
+        'from pynext import JSONResponse, route\n@route("GET")\n'
+        'def get(request): return JSONResponse({"token": request.state["session"].csrf_token()})\n'
+    )
+    app = create_app(tmp_path, middleware=[SessionMiddleware(store)])
+
+    async def run():
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://test") as client:
+                response = await client.get("/api/token")
+                flags = _cookie_flags(response.headers["set-cookie"])
+                assert "secure" in flags
+                assert "httponly" in flags
+                assert "samesite=lax" in flags
+        finally:
+            await app.isr.close()
+    asyncio.run(run())
+
+
+def test_session_cookie_secure_opt_out_is_explicit(tmp_path):
+    """S-P0-4: plain-http local dev opts out with an explicit ``secure=False``."""
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite3")
+    assert SessionMiddleware(store, secure=False).secure is False
+    api = tmp_path / "app" / "api"
+    (api / "token").mkdir(parents=True)
+    (api / "token" / "route.py").write_text(
+        'from pynext import JSONResponse, route\n@route("GET")\n'
+        'def get(request): return JSONResponse({"token": request.state["session"].csrf_token()})\n'
+    )
+    app = create_app(tmp_path, middleware=[SessionMiddleware(store, secure=False)])
+
+    async def run():
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://test") as client:
+                response = await client.get("/api/token")
+                flags = _cookie_flags(response.headers["set-cookie"])
+                assert "secure" not in flags
+                assert "httponly" in flags
+                assert "samesite=lax" in flags
+        finally:
+            await app.isr.close()
+    asyncio.run(run())

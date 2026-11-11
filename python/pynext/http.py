@@ -2,11 +2,13 @@ import base64
 import binascii
 import hashlib
 import hmac
+import html
 import json
 import os
 import re
 import secrets
 import threading
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote_to_bytes
@@ -37,6 +39,10 @@ class _RequestCancellation(threading.Event):
 
 
 #: Methods that never change server state and are exempt from CSRF checks.
+#: The exemption is a contract, not a loophole: a GET/HEAD/OPTIONS handler
+#: must be side-effect free (see :func:`validate_csrf` and S-P1-23). A
+#: handler that changes state on GET receives no CSRF check at all, so
+#: state-changing work belongs on POST/PUT/PATCH/DELETE, never on GET.
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 #: One process-wide fallback signing key for double-submit CSRF cookies.
@@ -46,9 +52,10 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 #: environment variable still override it per config. Workers are
 #: separate processes, so each has its own fallback key — a lone worker
 #: (or a single-process server) is unaffected, but a multi-worker
-#: supervisor must share one key explicitly: see
+#: deployment must share one key explicitly: see
 #: :func:`ensure_shared_csrf_signing_key`, which the supervisor calls
-#: before spawning workers so every worker signs with the same key.
+#: before spawning workers and ``server.start_native``/``serve`` call
+#: at startup, so every worker signs with the same key.
 _FALLBACK_CSRF_SIGNING_KEY = secrets.token_bytes(32)
 
 
@@ -110,9 +117,12 @@ def ensure_shared_csrf_signing_key(explicit_key=None):
     the app's config. The key itself is never logged; only the fact
     that one key is shared is observable to callers.
 
-    The supervisor calls this once before spawning workers; single-
-    process servers do not call it, so their per-process fallback
-    behaviour is unchanged.
+    The supervisor calls this once before spawning workers, and
+    ``server.start_native``/``serve`` call it at startup, so every
+    server entry point shares one key; a lone single-process server
+    generates its key here and publishes it, so processes spawned
+    afterwards inherit it instead of each minting a per-process
+    fallback.
     """
     if explicit_key is not None:
         key = parse_csrf_signing_key(explicit_key, source="csrf_signing_key")
@@ -123,6 +133,14 @@ def ensure_shared_csrf_signing_key(explicit_key=None):
         else:
             key = secrets.token_bytes(32)
     os.environ["PYNEXT_CSRF_SIGNING_KEY"] = f"hex:{key.hex()}"
+    # Keep the framework default in agreement: helpers that sign with
+    # the default config (``set_csrf_cookie`` without an explicit
+    # config) must verify against an app's own config, which resolves
+    # the same shared key. Without this, a server that resolved a
+    # shared key would issue cookies signed with the import-time
+    # fallback key and then reject them under its own config.
+    if DEFAULT_SECURITY.csrf_signing_key != key:
+        DEFAULT_SECURITY.csrf_signing_key = key
     return key
 
 _KNOWN_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
@@ -169,9 +187,40 @@ class SecurityConfig:
     app is started with ``--workers N`` the supervisor generates one
     key (or adopts ``--csrf-signing-key`` / ``PYNEXT_CSRF_SIGNING_KEY``)
     and shares it with every worker, including replacements started
-    after a crash or a rolling restart. With sessions the token is
-    bound to the server-side session instead and the signing key is
-    unused.
+    after a crash or a rolling restart. The same sharing happens for
+    non-supervisor servers: ``server.start_native``/``serve`` resolve
+    the shared key at startup (see :func:`ensure_shared_csrf_signing_key`).
+    With sessions the token is bound to the server-side session instead
+    and the signing key is unused.
+
+    State-changing requests from another origin are rejected by the
+    Origin check unless the origin is listed in ``csrf_trusted_origins``
+    (Django's ``CSRF_TRUSTED_ORIGINS``): same-origin requests and
+    listed origins pass, anything else fails closed before the token is
+    even looked at. The token a session hands out is masked — every
+    call to ``Session.csrf_token()`` returns a different value over the
+    same stored secret (BREACH mitigation) — and validation unmasks it
+    and compares the secret in constant time; a raw (unmasked) token
+    still validates, so clients holding one issued earlier keep working.
+
+    Issuing a token is a framework job, not per-app boilerplate
+    (S-P1-22): :func:`get_csrf_token` returns the token for the current
+    request (the session-bound token when a session is present, a fresh
+    double-submit token otherwise), :func:`csrf_token_response` answers
+    ``GET /_pynext/csrf-token`` with ``{"csrf_token": ...}`` and sets
+    the double-submit cookie for session-less apps, and
+    :func:`csrf_input` renders the hidden form field. An app whose
+    POSTs all fail with 403 because no token was ever issued should
+    call one of these — not turn CSRF off.
+
+    GET, HEAD and OPTIONS are exempt from CSRF checks (see
+    :func:`validate_csrf`), so a handler that changes state on GET is
+    unprotected by construction (S-P1-23): GET handlers must be
+    side-effect free. Development apps warn at startup when a GET
+    handler looks state-changing (see :func:`pynext.app.check_get_idempotency`);
+    a handler that knowingly mutates state on GET must be marked with
+    :func:`pynext.routing.state_changing_get` — the marker only silences
+    the warning, it does not add any CSRF protection, so prefer POST.
 
     The A1 default security headers (HSTS, ``X-Content-Type-Options``,
     ``X-Frame-Options``, ``Referrer-Policy``, ``Permissions-Policy`` and the
@@ -190,10 +239,23 @@ class SecurityConfig:
     pass ``csrf_cookie_secure=False`` to the app config and to
     :func:`set_csrf_cookie` (or use ``pynext dev``, which does that).
 
-    WebSocket handshakes require a same-origin ``Origin`` by default.
-    Additional origins can be listed in ``websocket_allowed_origins``;
-    ``websocket_allow_missing_origin`` opts non-browser clients without
-    the header in. Origin checking does not replace authentication.
+    WebSocket handshakes require a same-origin ``Origin`` by default,
+    on both the ASGI and the native (Axum) transports: the check runs
+    once, before the 101 response, in :func:`pynext.ws_origin.websocket_origin_allowed`,
+    and a denied handshake is answered HTTP 403 and logged (never a
+    silent close). Allowlist semantics: ``websocket_allowed_origins``
+    holds exact serialized HTTP(S) origins — scheme, host and port all
+    take part in the comparison, with the default port implied
+    (``https://client.example`` matches ``:443`` and nothing else);
+    ``*``, ``null``, userinfo, paths, queries and fragments are
+    rejected as values, and a request carrying a duplicate or
+    unparseable ``Origin`` (or duplicate ``Host``) is denied. Without
+    an allowlist hit the origin must equal the request's effective
+    origin (``Host`` header, resolved through :class:`ProxyTrust` for
+    trusted proxies only). A missing ``Origin`` is denied unless
+    ``websocket_allow_missing_origin`` opts non-browser clients in
+    explicitly. Origin checking does not replace authentication: the
+    header is client-controlled and can be forged or omitted.
     """
 
     csrf_enabled: bool | None = None
@@ -202,6 +264,11 @@ class SecurityConfig:
     csrf_form_field: str = "csrf_token"
     csrf_cookie_secure: bool = True
     csrf_cookie_samesite: str = "Lax"
+    # Double-submit cookie lifetime (S-P1-21): the cookie carries
+    # ``Max-Age`` and the signature embeds its issue time, so a stolen
+    # cookie value stops validating after this long even when replayed
+    # programmatically (default 12 hours, at most 30 days).
+    csrf_cookie_max_age: int = 43200
     cors_allowed_origins: tuple = ()
     cors_allowed_methods: tuple = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
     cors_allowed_headers: tuple = ("Content-Type", "Authorization", "X-CSRF-Token")
@@ -210,12 +277,13 @@ class SecurityConfig:
     csp_nonce_enabled: bool = False
     csrf_signing_key: str | bytes | None = field(default=None, repr=False)
     csrf_origin_check: bool = True
+    csrf_trusted_origins: tuple = ()
     hsts_enabled: bool = True
     hsts_max_age: int = 31_536_000
     hsts_include_subdomains: bool = True
     hsts_preload: bool = False
     frame_options: str | None = "DENY"
-    referrer_policy: str | None = "strict-origin-when-cross-origin"
+    referrer_policy: str | None = "same-origin"
     permissions_policy: str | None = "camera=(), microphone=(), geolocation=()"
     csp_style_src: str = "'self'"
     csp_frame_ancestors: str = "'none'"
@@ -235,8 +303,17 @@ class SecurityConfig:
             raise ValueError("csrf_cookie_samesite must be Lax, Strict or None")
         if not isinstance(self.csrf_cookie_secure, bool):
             raise TypeError("csrf_cookie_secure must be a bool")
+        if isinstance(self.csrf_cookie_max_age, bool) or not isinstance(self.csrf_cookie_max_age, int) \
+                or not 0 < self.csrf_cookie_max_age <= 2_592_000:
+            raise ValueError("csrf_cookie_max_age must be an integer from 1 to 2592000")
         if not isinstance(self.csrf_origin_check, bool):
             raise TypeError("csrf_origin_check must be a bool")
+        if isinstance(self.csrf_trusted_origins, (str, bytes)):
+            raise TypeError("csrf_trusted_origins must be a sequence of origins")
+        self.csrf_trusted_origins = tuple(self.csrf_trusted_origins)
+        trusted_keys = [canonical_origin(origin) for origin in self.csrf_trusted_origins]
+        if any(origin is None for origin in trusted_keys):
+            raise ValueError("csrf_trusted_origins must contain valid HTTP(S) origins")
         if not isinstance(self.websocket_allow_missing_origin, bool):
             raise TypeError("websocket_allow_missing_origin must be a bool")
         if isinstance(self.websocket_allowed_origins, (str, bytes)):
@@ -320,18 +397,122 @@ def new_csrf_token():
     return secrets.token_urlsafe(32)
 
 
-def sign_csrf_token(token, *, config=DEFAULT_SECURITY):
+#: Characters a raw CSRF secret may contain (the
+#: ``secrets.token_urlsafe`` alphabet). A masked token unmasks to a
+#: value in this alphabet; anything else is malformed.
+_CSRF_TOKEN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+
+#: Unpadded base64url alphabet (one or more characters).
+_B64URL = re.compile(r"[A-Za-z0-9_-]+\Z")
+
+
+def _b64url_nopad(data):
+    """Base64url-encode ``data`` without padding (token-safe)."""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode_nopad(text):
+    """Decode unpadded base64url, raising on invalid input."""
+    if not _B64URL.fullmatch(text):
+        raise ValueError("not base64url")
+    return base64.urlsafe_b64decode(text.encode("ascii") + b"=" * (-len(text) % 4))
+
+
+def mask_csrf_token(token):
+    """Return a masked CSRF token that unmasks to ``token`` (Django-style).
+
+    The mask is a fresh random one-time pad XORed over the secret, so
+    every call returns a different value even for the same secret: the
+    token embedded in a page or JSON response changes per request and
+    cannot be recovered by BREACH-style compression analysis of the
+    response body. The secret itself is never sent unmasked by
+    :meth:`pynext.sessions.Session.csrf_token` — submit the masked
+    value in the header or form field and validation unmasks it first.
+    A double-submit app can mask the token it embeds the same way
+    (the signed cookie still carries the raw secret). ``token`` must be
+    a nonempty ASCII string (every framework-issued secret is).
+    """
+    if not isinstance(token, str):
+        raise TypeError("CSRF token must be str")
+    try:
+        raw = token.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("CSRF token must be ASCII") from exc
+    if not raw:
+        raise ValueError("CSRF token must not be empty")
+    pad = secrets.token_bytes(len(raw))
+    masked = bytes(byte ^ pad_byte for byte, pad_byte in zip(raw, pad))
+    return f"{_b64url_nopad(pad)}.{_b64url_nopad(masked)}"
+
+
+def unmask_csrf_token(masked):
+    """Return the raw secret inside a masked CSRF token, or ``None``.
+
+    ``None`` means ``masked`` is not a masked token at all: not a
+    string, missing the ``"."`` separator, undecodable base64url, pad
+    and payload of different lengths, or an unmasked value outside the
+    token alphabet. Callers treat ``None`` as a failed token, never as
+    a value to compare.
+    """
+    if not isinstance(masked, str):
+        return None
+    pad_text, separator, masked_text = masked.partition(".")
+    if not separator or not pad_text or not masked_text:
+        return None
+    try:
+        pad = _b64url_decode_nopad(pad_text)
+        masked_bytes = _b64url_decode_nopad(masked_text)
+    except (binascii.Error, ValueError):
+        return None
+    if not pad or len(pad) != len(masked_bytes):
+        return None
+    try:
+        token = bytes(byte ^ pad_byte for byte, pad_byte in zip(masked_bytes, pad)).decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if not token or any(char not in _CSRF_TOKEN_CHARS for char in token):
+        return None
+    return token
+
+
+def _submitted_csrf_secret(submitted):
+    """Return the raw secret a submitted token carries, or ``None``.
+
+    A masked token (``Session.csrf_token()`` output, or
+    :func:`mask_csrf_token`) is unmasked first — it is the form every
+    current client sends. A raw token (no ``"."``) is used as-is, so a
+    client holding a token issued before masking still validates. A
+    malformed masked value is rejected outright.
+    """
+    if "." in submitted:
+        return unmask_csrf_token(submitted)
+    return submitted
+
+
+def sign_csrf_token(token, *, config=DEFAULT_SECURITY, issued_at=None):
     """Return the signed double-submit cookie value for ``token``.
 
-    The value is ``"<token>.<HMAC-SHA256 hex>"`` signed with the config's
-    ``csrf_signing_key``. Clients send the raw ``token`` back in the
-    header (or form field) and the signed value back as the cookie, so a
-    subdomain that can plant an unsigned cookie cannot pass validation
-    even if it knows the token.
+    The value is ``"<token>.<issued_at>.<HMAC-SHA256 hex>"`` where the
+    HMAC covers ``"<token>.<issued_at>"`` with the config's
+    ``csrf_signing_key``. ``issued_at`` is epoch seconds (default now;
+    pass it explicitly in tests for a deterministic value).
+    :func:`_signed_csrf_token` rejects values older than
+    ``config.csrf_cookie_max_age``, so a stolen cookie value stops
+    validating even when replayed programmatically. Clients send the
+    raw ``token`` back in the header (or form field) and the signed
+    value back as the cookie, so a subdomain that can plant an unsigned
+    cookie cannot pass validation even if it knows the token. Values
+    signed in the previous ``"<token>.<HMAC>"`` format carry no issue
+    time and are rejected — re-issue the cookie after upgrading.
     """
-    signature = hmac.new(config.csrf_signing_key, token.encode("ascii"),
+    if issued_at is None:
+        issued_at = time.time()
+    issued_at = int(issued_at)
+    payload = f"{token}.{issued_at}"
+    signature = hmac.new(config.csrf_signing_key, payload.encode("ascii"),
                          hashlib.sha256).hexdigest()
-    return f"{token}.{signature}"
+    return f"{payload}.{signature}"
 
 
 def _signed_csrf_token(cookie_value, *, config=DEFAULT_SECURITY):
@@ -340,13 +521,25 @@ def _signed_csrf_token(cookie_value, *, config=DEFAULT_SECURITY):
     Unsigned values (a bare token, a missing signature, a signature made
     with another key) are rejected: this is what stops subdomain cookie
     injection, where the attacker controls the cookie but not the key.
+    The signature also carries its issue time: values older than
+    ``config.csrf_cookie_max_age`` — or issued more than 60 seconds in
+    the future (clock skew) — are rejected, so a stolen cookie value
+    has a bounded replay window (S-P1-21). The previous
+    ``"<token>.<HMAC>"`` format has no issue time and is rejected.
     """
-    token, separator, signature = cookie_value.rpartition(".")
-    if not separator or not token:
+    parts = cookie_value.rsplit(".", 2)
+    if len(parts) != 3:
         return None
-    expected = hmac.new(config.csrf_signing_key, token.encode("ascii"),
+    token, issued, signature = parts
+    if not token or not issued.isdigit():
+        return None
+    expected = hmac.new(config.csrf_signing_key, f"{token}.{issued}".encode("ascii"),
                         hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, signature):
+        return None
+    now = time.time()
+    issued_at = int(issued)
+    if issued_at > now + 60 or now - issued_at > config.csrf_cookie_max_age:
         return None
     return token
 
@@ -362,10 +555,13 @@ def set_csrf_cookie(response, token, *, config=DEFAULT_SECURITY):
     development. The cookie value is the HMAC-signed token (see
     :func:`sign_csrf_token`): send the cookie back exactly as issued and
     the raw token in the header — reconstructing the cookie from the
-    token alone will not validate.
+    token alone will not validate. The cookie carries
+    ``Max-Age=config.csrf_cookie_max_age`` (default 12 hours) and the
+    signature embeds its issue time, so a stolen cookie value stops
+    validating after that long.
     """
     parts = [f"{config.csrf_cookie_name}={sign_csrf_token(token, config=config)}", "Path=/",
-             f"SameSite={config.csrf_cookie_samesite}"]
+             f"Max-Age={config.csrf_cookie_max_age}", f"SameSite={config.csrf_cookie_samesite}"]
     if config.csrf_cookie_secure:
         parts.append("Secure")
     response.headers.append((b"set-cookie", "; ".join(parts).encode("ascii")))
@@ -381,15 +577,13 @@ def _header_values(request, name):
 # by a client. Next.js `INTERNAL_HEADERS`
 # (packages/next/src/server/lib/server-ipc/utils.ts:42-65) plus
 # `x-middleware-refresh`, the framework-set middleware signal read back in
-# `resolve-routes.ts:739-845` — 13 names in total. A client that sends one
-# of these must not be able to steer routing, middleware, or any security
-# decision that reads it, so both entry points
-# (`App.__call__` for ASGI, `create_server` for the native transport)
-# strip them before anything else sees the request. PyNext middleware
-# communicates through ``Request``/``Response`` objects, so there is no
-# `x-middleware-*` protocol to preserve — stripping is purely defensive,
-# and a future internal signal belongs in this list first.
-#
+# `resolve-routes.ts:739-845` — 13 names in total — plus `x-pynext-smuggling`,
+# the marker the native transport's first-request sniff inserts when a
+# request carries both `Content-Length` and `Transfer-Encoding` (S-P1-31).
+# A client-sent copy of the marker is stripped here so it can never steer
+# the Rust dispatch check's marker branch or leak into handler-visible
+# headers; the sniff is the only producer that matters, and it inserts the
+# marker before hyper parses the request, i.e. before this filter runs.
 # Deliberately NOT stripped: `x-request-id` (echoed by design,
 # `observability.begin_request_context`), `traceparent` (W3C tracing),
 # and `x-forwarded-*` (only honored from trusted proxies,
@@ -408,6 +602,7 @@ INTERNAL_HEADERS = frozenset((
     b"x-next-internal-go-token",
     b"x-next-resume-state-length",
     b"next-resume",
+    b"x-pynext-smuggling",
 ))
 
 
@@ -427,6 +622,72 @@ def filter_internal_headers(headers):
             else name.lower().encode("ascii", "ignore") if isinstance(name, str)
             else None) not in INTERNAL_HEADERS
     )
+
+
+def validate_request_framing(headers, http_version="1.1"):
+    """Return a reason when the request framing is ambiguous, else ``None``.
+
+    Request-smuggling defence (S-P1-31, Sanic CVE-2026-85078). The ASGI
+    entry point calls this before reading the body; it mirrors the native
+    transport's Rust checks (``smuggling_framing`` in ``lib.rs`` plus the
+    first-request sniff) so both transports interpret framing identically —
+    either side alone would leave the other transport re-interpreting the
+    same bytes (B-1 principle).
+
+    Rejected as 400, never interpreted leniently:
+
+    * ``Content-Length`` together with ``Transfer-Encoding`` — the two
+      framings can disagree about where the body ends, which is exactly
+      the smuggling primitive. (RFC 7230's "TE wins" leniency is what the
+      old behaviour did; S-P1-31 replaces it with rejection.)
+    * duplicate ``Content-Length`` headers whose values differ, or any
+      value that is not a plain decimal length (``"5, 5"`` — identical
+      comma-separated values — is accepted, per RFC 9112 section 8.6).
+    * ``Transfer-Encoding`` whose final coding is not ``chunked`` (or any
+      ``Transfer-Encoding`` on HTTP/1.0, where it has no meaning).
+      ``gzip, chunked`` is fine; ``chunked, gzip`` is not, because the
+      length is then not determinable from the chunked framing.
+
+    Chunk extensions and trailers are not visible here: by the time the
+    ASGI app sees the request the server has already de-chunked the body,
+    so malformed chunk framing is the server's parse error, not the app's
+    — on the native transport the same cases are rejected by hyper's
+    chunk parser and by the trailer-frame rejection in
+    ``read_limited_body``.
+    """
+    content_lengths = []
+    transfer_codings = []
+    for name, value in headers:
+        lowered = name.lower() if isinstance(name, bytes) else None
+        if lowered is None:
+            continue
+        text = (value.decode("ascii", "replace")
+                if isinstance(value, bytes)
+                else str(value))
+        if lowered == b"content-length":
+            content_lengths.append(text)
+        elif lowered == b"transfer-encoding":
+            transfer_codings.extend(
+                coding.strip() for coding in text.split(","))
+    if content_lengths and transfer_codings:
+        return "Content-Length and Transfer-Encoding both present"
+    if transfer_codings:
+        if http_version == "1.0":
+            return "Transfer-Encoding on HTTP/1.0"
+        final = transfer_codings[-1].split(";", 1)[0].strip().lower()
+        if final != "chunked":
+            return "Transfer-Encoding is not chunked"
+    if content_lengths:
+        lengths = set()
+        for raw in content_lengths:
+            for token in raw.split(","):
+                token = token.strip()
+                if not token.isascii() or not token.isdigit():
+                    return "Content-Length is not a decimal length"
+                lengths.add(token.lstrip("0") or "0")
+        if len(lengths) > 1:
+            return "Conflicting Content-Length values"
+    return None
 
 
 def _cookie_value(request, name):
@@ -459,11 +720,16 @@ def csrf_token_from_request(request, *, config=DEFAULT_SECURITY):
     return None
 
 
-def _csrf_origin_allowed(request):
+def _csrf_origin_allowed(request, *, config=DEFAULT_SECURITY):
     """True when the request's origin signals do not show a cross-site call.
 
     A present ``Origin`` must match the ``Host`` header exactly (a
-    malformed Origin, ``Origin: null`` or a missing Host all fail closed).
+    malformed Origin, ``Origin: null`` or a missing Host all fail closed),
+    or be listed in ``config.csrf_trusted_origins`` (Django's
+    ``CSRF_TRUSTED_ORIGINS``: origins allowed to drive state-changing
+    requests from another origin, for example an app whose API lives on
+    a different subdomain). The Origin check runs before the token
+    check, so a cross-site request with a stolen token still fails.
     Without an Origin, ``Sec-Fetch-Site`` must be ``same-origin`` or
     ``none`` (a non-browser client sends neither header and is allowed
     through to the token check). ``same-site`` is rejected too: a
@@ -479,7 +745,12 @@ def _csrf_origin_allowed(request):
             origin = origins[0].decode("ascii")
         except UnicodeDecodeError:
             return False
-        return _is_same_origin(request, origin)
+        if _is_same_origin(request, origin):
+            return True
+        parsed = canonical_origin(origin)
+        return parsed is not None and any(
+            parsed == canonical_origin(trusted)
+            for trusted in config.csrf_trusted_origins)
     fetch_site = _header_values(request, "sec-fetch-site")
     if fetch_site:
         return fetch_site[0].decode("ascii", "ignore").strip().lower() in {"same-origin", "none"}
@@ -494,11 +765,20 @@ def validate_csrf(request, *, config=DEFAULT_SECURITY):
     then the token: with a session the token must match the session-bound
     token, and without one the cookie must be a valid HMAC-signed
     double-submit value whose token matches the submitted header or form
-    field. Tokens are compared in constant time.
+    field. The submitted token may be masked (see :func:`mask_csrf_token`)
+    or raw; either way it is unmasked first and then compared with the
+    secret in constant time (``hmac.compare_digest``), and the signed
+    value must be unexpired (see ``SecurityConfig.csrf_cookie_max_age``).
+
+    The safe-method exemption is a contract: it only holds because GET,
+    HEAD and OPTIONS handlers must not change server state (S-P1-23).
+    A handler that mutates state on GET is never checked here, so it is
+    unprotected against cross-site requests by construction — move the
+    mutation to POST/PUT/PATCH/DELETE instead.
     """
     if request.method.upper() in SAFE_METHODS:
         return True
-    if config.csrf_origin_check and not _csrf_origin_allowed(request):
+    if config.csrf_origin_check and not _csrf_origin_allowed(request, config=config):
         return False
     submitted = csrf_token_from_request(request, config=config)
     from .sessions import Session
@@ -507,6 +787,9 @@ def validate_csrf(request, *, config=DEFAULT_SECURITY):
         expected = session._csrf
         if not expected or not submitted:
             return False
+        submitted = _submitted_csrf_secret(submitted)
+        if submitted is None:
+            return False
         try:
             return hmac.compare_digest(expected, submitted)
         except TypeError:
@@ -514,6 +797,9 @@ def validate_csrf(request, *, config=DEFAULT_SECURITY):
     cookie = _cookie_value(request, config.csrf_cookie_name)
     token = _signed_csrf_token(cookie, config=config) if cookie else None
     if not token or not submitted:
+        return False
+    submitted = _submitted_csrf_secret(submitted)
+    if submitted is None:
         return False
     try:
         return hmac.compare_digest(token, submitted)
@@ -531,6 +817,79 @@ def csrf_protect(fn):
     """
     fn.__pynext_csrf__ = True
     return fn
+
+
+def get_csrf_token(request, *, config=DEFAULT_SECURITY):
+    """Return the CSRF token the client must submit with state-changing requests.
+
+    This is the standard issuance helper (S-P1-22): an app never needs to
+    mint its own token. With a session in ``request.state`` the token is
+    the session-bound one (``session.csrf_token()`` creates it on first
+    use, and the session middleware persists it); without a session it is
+    a fresh double-submit token from :func:`new_csrf_token`.
+
+    A session-less token is only valid when the matching HMAC-signed
+    cookie reaches the client on the same response — pair it with
+    :func:`set_csrf_cookie` on that response, or use
+    :func:`csrf_token_response` / :func:`csrf_input`, which do that for
+    you. A token issued here and never delivered is useless, and a POST
+    that then fails with 403 is the framework telling the app it forgot
+    to issue a token — not a reason to turn CSRF off.
+    """
+    from .sessions import Session
+    session = request.state.get("session")
+    if isinstance(session, Session):
+        return session.csrf_token()
+    return new_csrf_token()
+
+
+def csrf_token_response(request, *, config=DEFAULT_SECURITY):
+    """Answer a token-issuance request with ``{"csrf_token": ...}`` (S-P1-22).
+
+    This is what the built-in ``GET /_pynext/csrf-token`` endpoint
+    returns. With a session the token is session-bound and the session
+    middleware persists it (and sets the session cookie for a new
+    session); without one the double-submit cookie is set on this
+    response, so the token and the cookie always travel together. The
+    token is never read from the query string: a token in a URL would
+    leak into logs, history and Referer headers.
+    """
+    from .sessions import Session
+    session = request.state.get("session")
+    token = session.csrf_token() if isinstance(session, Session) else new_csrf_token()
+    response = JSONResponse({"csrf_token": token},
+                            headers=[(b"cache-control", b"private, no-store")])
+    if not isinstance(session, Session):
+        set_csrf_cookie(response, token, config=config)
+    return response
+
+
+def csrf_input(request, response=None, *, config=DEFAULT_SECURITY):
+    """Render the hidden ``<input>`` carrying the CSRF token for a form (S-P1-22).
+
+    Returns ``<input type="hidden" name="<csrf_form_field>" value="...">``
+    with the token HTML-escaped. With a session the token is
+    session-bound and the session middleware persists it, so ``response``
+    is not needed; without one the signed double-submit cookie must be
+    set on the very response that carries this form, so pass that
+    response in — otherwise a :class:`ValueError` is raised instead of
+    rendering a form whose POST could never validate.
+    """
+    from .sessions import Session
+    session = request.state.get("session")
+    if isinstance(session, Session):
+        token = session.csrf_token()
+    else:
+        if response is None:
+            raise ValueError(
+                "csrf_input() without a session needs the response carrying the form, "
+                "so the double-submit cookie can be set on it; pass response=... "
+                "or use csrf_token_response() instead")
+        token = new_csrf_token()
+        set_csrf_cookie(response, token, config=config)
+    field = html.escape(config.csrf_form_field, quote=True)
+    value = html.escape(token, quote=True)
+    return f'<input type="hidden" name="{field}" value="{value}">'
 
 
 def new_csp_nonce():
@@ -617,6 +976,44 @@ def apply_security_headers(response, *, config=DEFAULT_SECURITY, nonce=None, pro
         if key not in present:
             response.headers.append((key, value))
     return response
+
+
+#: Bytes stripped from response header names and values at the
+#: serialization point (S-P1-30): CR and LF split a response, NUL is never
+#: valid in a header field. Same set Sanic strips in its CVE-2026-85077
+#: fix (``response/types.py`` ``HEADER_TRANSLATION_TABLE``).
+_CRLF_STRIP_BYTES = b"\r\n\x00"
+
+
+def sanitize_response_headers(headers):
+    """Return ``headers`` with response-splitting bytes removed (S-P1-30).
+
+    This is the single serialization-point invariant for the ASGI path,
+    mirroring Sanic's CVE-2026-85077 fix: :class:`Response` already rejects
+    CR/LF in headers at construction, but headers are a mutable list, so
+    a handler, middleware, or a ``set-cookie``/CORS/path-header helper can
+    append an attacker-controlled value afterwards (e.g. a ``Location`` or
+    ``Content-Disposition`` filename carrying ``\\r\\n``). Checking here —
+    once, immediately before the ``http.response.start`` message is sent —
+    covers every response that crosses this point instead of trusting each
+    call site to remember.
+
+    CR, LF and NUL are stripped from both names and values. A pair whose
+    sanitized name is not a valid header token, or whose value still holds
+    another control byte, is dropped rather than sent, so no byte the
+    server emits here can ever terminate a header line early. Valid
+    headers pass through unchanged. The input list is never mutated.
+    """
+    clean = []
+    for name, value in headers:
+        name = bytes(name).translate(None, _CRLF_STRIP_BYTES)
+        value = bytes(value).translate(None, _CRLF_STRIP_BYTES)
+        if not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9a-zA-Z-]+", name):
+            continue
+        if any(byte < 32 or byte == 127 for byte in value):
+            continue
+        clean.append((name, value))
+    return clean
 
 
 #: Response headers a path rule must never set. Framing headers are owned
@@ -937,6 +1334,14 @@ def _allow_origin_value(origin, config):
     # A wildcard is only safe without credentials; with credentials the
     # exact origin must be echoed back.
     if "*" in config.cors_allowed_origins and not config.cors_allow_credentials:
+        return "*"
+    if "*" in config.cors_allowed_origins and config.cors_allow_credentials:
+        # Defence in depth for the H-4 combination (config validation
+        # rejects it at startup, but a SecurityConfig built directly
+        # bypasses that): never echo an arbitrary request Origin when
+        # credentials are allowed. Returning "*" is safe here because
+        # browsers ignore a wildcard Allow-Origin on a credentialed
+        # request, so no cross-origin page can read the response.
         return "*"
     return origin
 

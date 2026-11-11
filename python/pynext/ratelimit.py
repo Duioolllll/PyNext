@@ -33,6 +33,35 @@ global default. Lowering ``max_new_keys_per_window`` instead only
 slows the attacker down while also admitting fewer legitimate new
 users per window, so it does not fix the exhaustion either.
 
+How to narrow the grouping (operator setting, S-P1-26 / M-17):
+
+- CLI: ``pynext start --rate-limit 100 --rate-limit-ipv6-prefix-len 48``
+- Config file: ``rate_limit_ipv6_prefix_len = 48`` (``pynext.toml``;
+  the same key is ``rate_limit_ipv6_prefix_len`` in ``PyNextConfig``)
+- Programmatic: ``RateLimiter(100, 60, ipv6_prefix_len=48)``
+- The Redis backend groups the same way: ``RedisRateLimiter`` inherits
+  :meth:`RateLimiter.key_for`, so the same prefix applies to the
+  shared buckets; the transports call ``key_for`` before ``allow`` on
+  either backend.
+
+What 48 buys, quantitatively: one /48 minting distinct /64s collapses
+from 65,536 candidate buckets to exactly one bucket and one new-key
+admission. Filling the 10,000-per-window new-key window then needs
+10,000 distinct /48s instead of a single /48, so the flood that used
+to deny brand-new users with 429 can no longer do so from one /48.
+Narrow to 48 when new-key-window 429s spike under an IPv6 flood —
+``stats()["new_keys_in_window"]`` climbing towards
+``max_new_keys_per_window`` while the distinct /64s share few /48s is
+the signal — and revert to 64 once the flood subsides, because a /48
+shared by many legitimate hosts (carrier-grade NAT, a campus, a cloud
+region) throttles those hosts together under one bucket. Narrowing
+does not stop an attacker who holds many /48s: each /48 still mints
+its own bucket, so a distributed holder can still fill the window;
+pair the setting with monitoring of ``new_keys_in_window`` and, if
+the abuse persists, with an upstream (WAF / edge) block of the
+offending prefixes rather than a still narrower prefix, which only
+widens the collateral damage.
+
 Bucket table pressure never blocks an existing key. The table is a
 bounded leaderboard of the most recently active keys (at most
 ``_MAX_BUCKETS``): when it is full, a new key evicts the stalest bucket
@@ -44,6 +73,16 @@ global sliding window (at most ``max_new_keys_per_window`` new keys per
 429 until the window slides, which bounds how fast an attacker can churn
 the table to reset buckets. Existing keys are never denied by table
 pressure.
+
+Atomicity (S-P1-4): ``RateLimiter.allow`` holds a single
+``threading.Lock`` across the whole read-refill-decide-write step, so
+two threads can never interleave a check and a consume on the same
+bucket. That guarantee is per-process: the bucket table lives in this
+process's memory, so with ``--workers N`` each worker enforces its own
+copy of the limit and the effective limit is N times the configured
+one. A limit shared across workers needs ``RedisRateLimiter``
+(``redis_rate.py``), whose single Lua ``EVAL`` is the atomic unit —
+see ``tests/test_ratelimit_atomicity.py`` for the multi-worker proof.
 
 When a limiter is configured, static files and fresh ISR pages are also
 charged. Axum calls the Python decision callback from the Rust header
@@ -146,6 +185,11 @@ class RateLimiter:
     ``limit`` is the burst size and the refill rate is ``limit`` tokens
     per ``window_seconds``. A key that has been idle long enough to refill
     completely is treated as fresh.
+
+    ``allow`` is atomic within this process: one lock covers the whole
+    get-refill-decide-set step (S-P1-4), so concurrent threads can never
+    over-admit a bucket. The table itself is per-process — see the module
+    docstring: a limit shared across workers needs ``RedisRateLimiter``.
     """
 
     def __init__(self, limit, window_seconds, *, trusted_proxies=(), exempt_paths=(),

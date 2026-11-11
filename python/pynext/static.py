@@ -1,6 +1,139 @@
-"""Conditional and single-range responses for immutable in-memory assets."""
+"""Conditional and single-range responses for immutable in-memory assets.
+
+Static path safety (S-P0-6) lives here too: :func:`validate_static_request_path`
+and :func:`resolve_static_path` implement the aiohttp-style triple defense
+(``web_urldispatcher.py:607-653``, CVE-2024-23334) for any code that maps a
+client-supplied path onto the filesystem — the framework's own static
+serving and app-level media handlers such as ``/api/media`` (POST/GET):
+
+1. ``normpath`` + prefix check on the (already decoded) request path.
+2. Absolute-path rejection, including Windows UNC paths (``\\\\server\\share``)
+   and drive-letter paths (``C:\\...`` / ``C:/...``) — an UNC path can be
+   abused for NTLM credential theft on Windows, which PyNext supports.
+3. ``resolve()`` + ``relative_to`` check against the root, so a symlink
+   inside the root that points outside is caught. ``break_symlink_sandbox``
+   (aiohttp's ``_break_symlink_sandbox``) opts out of layer 3: when true,
+   only the ``normpath`` check runs and symlinks are followed. The default
+   (false) resolves first and blocks escapes.
+
+Werkzeug's ``safe_join`` is the anti-pattern here: it follows symlinks, so
+layer 3 must be explicit, not assumed.
+"""
+
+import os
+import posixpath
+import re
+from pathlib import Path, PureWindowsPath
 
 from .http import Response
+
+
+class StaticPathError(ValueError):
+    """A client-supplied static/media path failed the sandbox checks."""
+
+
+_DRIVE_LETTER = re.compile(r"^[A-Za-z]:")
+
+
+def _reject_control_chars(value):
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise StaticPathError(f"Invalid static path: {value!r}")
+
+
+def _reject_absolute_forms(value):
+    """Layer (2): reject absolute and UNC paths.
+
+    ``value`` is the path with at most one leading ``/`` stripped, so a
+    plain URL path such as ``/logo.txt`` is root-relative and fine, while
+    ``//server/share``, ``\\\\server\\share``, ``C:\\...`` and ``C:/...``
+    are rejected. Backslashes are rejected outright: they are path
+    separators on Windows, so ``..\\..\\secret`` must never survive as a
+    harmless filename on a POSIX host either.
+    """
+    if "\\" in value:
+        raise StaticPathError(f"Invalid static path: {value!r}")
+    if value.startswith("/") or value.startswith("\\"):
+        raise StaticPathError(f"Invalid static path: {value!r}")
+    if _DRIVE_LETTER.match(value):
+        raise StaticPathError(f"Invalid static path: {value!r}")
+    if PureWindowsPath(value).is_absolute():
+        raise StaticPathError(f"Invalid static path: {value!r}")
+
+
+def _check_normpath_prefix(relative):
+    """Layer (1): ``normpath`` the root-relative path and check the prefix.
+
+    ``.``/``..`` segments are rejected outright (stricter than aiohttp,
+    which normalizes them away) to match PyNext's request-path policy:
+    a request path never legitimately contains them. The normalized form
+    must stay inside the root, never be absolute, and never escape via
+    a leading ``..``.
+    """
+    parts = relative.split("/")
+    if any(part in (".", "..") for part in parts):
+        raise StaticPathError(f"Invalid static path: {relative!r}")
+    normalized = posixpath.normpath("/" + relative).lstrip("/")
+    if normalized == ".":
+        return ""
+    if normalized.startswith("../") or normalized == ".." or normalized.startswith("/"):
+        raise StaticPathError(f"Invalid static path: {relative!r}")
+    return normalized
+
+
+def validate_static_request_path(path):
+    """Validate an already-decoded URL path for static-asset lookup.
+
+    Applies layers (1) and (2) and returns the path unchanged when it
+    passes, so in-memory asset dictionaries (keyed by the exact URL path)
+    keep working. Raises :class:`StaticPathError` otherwise; callers that
+    serve from those dictionaries map that to 404. Layer (3) does not
+    apply here — no disk access happens for in-memory assets; it is
+    enforced when the snapshot is built (``assets._read_public``) and by
+    :func:`resolve_static_path` for disk-backed serving.
+    """
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise StaticPathError(f"Invalid static path: {path!r}")
+    _reject_control_chars(path)
+    _reject_absolute_forms(path[1:])
+    _check_normpath_prefix(path[1:])
+    return path
+
+
+def resolve_static_path(root, request_path, *, break_symlink_sandbox=False):
+    """Resolve a client-supplied path inside ``root`` (aiohttp 3-layer defense).
+
+    ``request_path`` is an already-decoded, root-relative path (``/a/b.png``
+    or ``a/b.png`` — the leading slash is optional). Returns the resolved
+    absolute :class:`pathlib.Path` inside ``root``. Raises
+    :class:`StaticPathError` when any layer fails: ``..`` escape, absolute
+    or UNC path, or — with the default ``break_symlink_sandbox=False`` — a
+    symlink (file or directory) whose resolved target leaves ``root``.
+    A symlink that stays inside ``root`` resolves fine.
+
+    With ``break_symlink_sandbox=True`` only layers (1) and (2) run and
+    symlinks are followed (aiohttp's fast-path option); the caller accepts
+    that a symlink inside the root may point outside it.
+
+    The file is not required to exist: resolution uses ``strict=False``,
+    so a missing id maps to a path the caller can answer 404 for instead
+    of raising here.
+    """
+    if not isinstance(request_path, str):
+        raise StaticPathError(f"Invalid static path: {request_path!r}")
+    _reject_control_chars(request_path)
+    relative = request_path[1:] if request_path.startswith("/") else request_path
+    _reject_absolute_forms(relative)
+    normalized = _check_normpath_prefix(relative)
+    root = Path(root).resolve()
+    candidate = root if not normalized else root / normalized
+    if break_symlink_sandbox:
+        return Path(os.path.normpath(candidate))
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise StaticPathError(f"Static path escapes its root: {request_path!r}") from exc
+    return resolved
 
 
 def _values(request, name):

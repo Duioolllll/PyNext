@@ -84,6 +84,9 @@ with tempfile.TemporaryDirectory(prefix="pynext-wheel-check-") as directory:
     # Serve the example from the installed wheel as well as building it. Reuse
     # the browser smoke runner's bounded port retry and HTTP checks without
     # installing or launching a browser in this packaging test.
+    # One worker keeps the native module in the Popen process, so waiting for
+    # that process releases the Windows .pyd before the venv is removed.
+    # Multi-worker lifecycle coverage lives in test_supervisor*.py.
     spec = importlib.util.spec_from_file_location("pynext_browser_smoke", ROOT / "tests/browser/run_smoke.py")
     smoke = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(smoke)
@@ -92,7 +95,7 @@ with tempfile.TemporaryDirectory(prefix="pynext-wheel-check-") as directory:
         try:
             server, port = smoke._start_server(
                 lambda port: [str(wheel_python), "-m", "pynext.cli", "start", "--dir", str(ROOT / "examples/basic"),
-                              "--host", "127.0.0.1", "--port", str(port)],
+                              "--host", "127.0.0.1", "--port", str(port), "--workers", "1"],
                 log, popen=lambda *args, **kwargs: subprocess.Popen(*args, env=env, **kwargs),
             )
             smoke.verify_http(f"http://127.0.0.1:{port}")

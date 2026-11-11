@@ -234,22 +234,41 @@ def test_lifespan_full_cycle_with_requests_in_between():
     async def run():
         app = create_app(EXAMPLE)
         try:
-            lifespan = ScriptedChannel([
-                {"type": "lifespan.startup"},
-                {"type": "lifespan.shutdown"},
-            ])
+            # The shutdown message must not be delivered until the
+            # requests are done: a real ASGI server only sends it
+            # after it stops accepting traffic. The previous
+            # ScriptedChannel delivered both messages up front, so
+            # the lifespan task could run startup *and* shutdown —
+            # retiring the sync executor — before the first request
+            # (a single ``await asyncio.sleep(0)`` does not stop it:
+            # every lifespan await completes without yielding to the
+            # loop). Requests after that shutdown then failed with
+            # "cannot schedule new futures after shutdown".
+            incoming = asyncio.Queue()
+            await incoming.put({"type": "lifespan.startup"})
+            sent = []
+
+            async def lifespan_send(message):
+                sent.append(message)
+
             task = asyncio.create_task(
-                app({"type": "lifespan"}, lifespan.receive, lifespan.send)
+                app({"type": "lifespan"}, incoming.get, lifespan_send)
             )
-            await asyncio.sleep(0)
+
+            async def _wait_startup():
+                while sent != [{"type": "lifespan.startup.complete"}]:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(_wait_startup(), 5)
             channel = ScriptedChannel(request_messages(b""))
             await app(http_scope(), channel.receive, channel.send)
             assert channel.sent[0]["status"] == 200
             channel = ScriptedChannel(request_messages(b""))
             await app(http_scope("GET", "/api/users"), channel.receive, channel.send)
             assert channel.sent[0]["status"] == 200
+            await incoming.put({"type": "lifespan.shutdown"})
             await asyncio.wait_for(task, 5)
-            assert lifespan.sent == [
+            assert sent == [
                 {"type": "lifespan.startup.complete"},
                 {"type": "lifespan.shutdown.complete"},
             ]
@@ -296,7 +315,7 @@ def test_lifespan_shutdown_failure_sends_failed_instead_of_raising():
                 {"type": "lifespan.shutdown"},
             ])
 
-            async def failing_close():
+            async def failing_close(*args, **kwargs):
                 raise RuntimeError("cache teardown failed")
 
             app.isr.close = failing_close

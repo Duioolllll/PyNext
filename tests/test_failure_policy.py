@@ -258,13 +258,14 @@ def test_cli_passes_failure_policies(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "serve", serve)
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root),
+                                      "--workers", "1",
                                       "--rate-limit", "10", "--rate-limit-backend", "redis",
                                       "--rate-limit-failure-policy", "fail_open",
                                       "--cache-backend", "redis",
                                       "--cache-failure-policy", "fail_closed"])
     cli.main()
     assert seen["limiter"] == (10, 60.0, {"trusted_proxies": [],
-                                           "exempt_paths": (),
+                                           "exempt_paths": ("/healthz", "/readyz"),
                                            "ipv6_prefix_len": 64,
                                            "namespace": "default",
                                            "failure_policy": "fail_open"})

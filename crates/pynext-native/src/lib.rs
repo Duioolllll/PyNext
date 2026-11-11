@@ -20,12 +20,16 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tower_service::Service as TowerService;
 
@@ -418,20 +422,57 @@ struct ServerState {
     capacity: Arc<Semaphore>,
     waiting_capacity: Arc<Semaphore>,
     acquire_timeout: Duration,
+    /// Adaptive ceiling for the slot wait (C-P1-5); `None` keeps the
+    /// fixed `acquire_timeout`.
+    acquire_timeout_max: Option<Duration>,
+    /// EWMA of slot hold times, feeding the adaptive timeout.
+    hold_stats: Arc<HoldTimeStats>,
     body_capacity: Arc<Semaphore>,
     body_timeout: Duration,
+    // Fast-path budget (S-P1-11 / M-1): static assets and Fresh ISR pages
+    // bypass the execution semaphore, so without their own cap a flood on
+    // those paths is bounded only by the connection limits (1024/128).
+    // A permit is held from dispatch until the response body has been
+    // fully consumed by hyper (see `capped_body`); when the budget is
+    // exhausted the request is shed with 503 + Retry-After instead of
+    // falling through to the Python bridge, which would turn a cheap
+    // static flood into expensive Python work.
+    fast_path_capacity: Arc<Semaphore>,
     // Connection budget (A4): a semaphore for the total number of live TCP
     // connections, plus a per-IP count. Both are checked in the accept loop
     // before any request is read.
     connection_capacity: Arc<Semaphore>,
     per_ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
     max_connections_per_ip: usize,
+    // Trusted proxies (S-P1-18, M-8): the same list Python's ProxyTrust
+    // resolves X-Forwarded-For / Forwarded against. A peer in this list
+    // is exempt from the per-IP connection cap in the accept loop (see
+    // there for why); an empty list is the fail-closed default.
+    trusted_proxies: Vec<TrustedProxyNetwork>,
     // Bounds slow request headers and, because hyper applies it to every
     // header read on the connection, idle keep-alive time between requests.
     // Zero disables the timeout.
     header_read_timeout: Duration,
     // Minimum average body receive rate in bytes/second (0 disables).
     body_min_rate: usize,
+    // S-P1-14: total lifetime cap for one streaming response, from the
+    // first chunk to the last (0 disables). The per-chunk 30s timeout
+    // alone lets a client hold an execution slot forever by sending
+    // one byte every 29 seconds; the lifetime cap bounds that.
+    streaming_max_lifetime: Duration,
+    // S-P1-15: per-IP cap on concurrent body slots. The global
+    // body_capacity semaphore still applies; this stops one IP from
+    // rotating through all 16 body slots and 503ing legitimate uploads.
+    body_per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    max_body_per_ip: usize,
+    // S-P1-16: WebSocket idle timeout, maximum session lifetime, and
+    // the interval at which the server pings an idle session (0
+    // disables each). A ping unanswered for WS_PONG_TIMEOUT closes
+    // the session; accepted TCP connections also get OS keepalive
+    // probes (see the accept loop).
+    ws_idle_timeout: Duration,
+    ws_max_lifetime: Duration,
+    ws_ping_interval: Duration,
     static_pages: HashMap<String, Bytes>,
     public_assets: HashMap<String, PublicAsset>,
     client_assets: HashMap<String, Bytes>,
@@ -448,6 +489,9 @@ struct ServerState {
     /// applied to the same Rust-built responses. Each rule carries its own
     /// one-pattern router, so every matching rule applies.
     path_headers: Vec<PathHeaderRule>,
+    /// Host allowlist (S-P1-19, M-9): compiled `allowed_hosts` patterns,
+    /// checked for every request at the top of `dispatch`.
+    allowed_hosts: Vec<HostPattern>,
     websocket_router: Router,
     websocket_paths: std::collections::HashSet<String>,
     websocket_protocols: HashMap<String, Vec<String>>,
@@ -459,9 +503,62 @@ struct ServerState {
     ws_rate_limit_callback: Option<Py<PyAny>>,
     http_rate_limit_callback: Option<Py<PyAny>>,
     rate_limit_capacity: Arc<Semaphore>,
+    // H-2: rate-limit decisions that could not be produced (decision
+    // gate full or the 2s deadline expired) and failed open instead of
+    // 503. Read through `NativeServer::rate_limit_fail_open_count`.
+    rate_limit_fail_open: Arc<AtomicU64>,
+    // Per-IP execution quota (H-5): how many execution slots one client
+    // IP may hold at once, and the live per-IP counts. The global pool
+    // is `capacity`; without a per-IP cap one IP could take every slot
+    // with slow requests and 503 all other users.
+    per_ip_executions: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    max_concurrent_per_ip: usize,
     ws_origin_capacity: Arc<Semaphore>,
     ws_auth_callback: Option<Py<PyAny>>,
     ws_auth_capacity: Arc<Semaphore>,
+}
+
+/// One held per-IP execution slot (H-5); releases the IP's count on drop,
+/// so the quota is freed even when the request ends early (body error,
+/// timeout, client disconnect) and for streaming responses, whose guard
+/// travels with the stream until it ends.
+struct IpExecutionGuard {
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl Drop for IpExecutionGuard {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+impl ServerState {
+    /// Try to take one execution slot for `ip` (H-5). Returns `None`
+    /// when the IP already holds `max_concurrent_per_ip` slots; the
+    /// caller answers 503 without touching the global pool or its wait
+    /// queue, so one IP cannot starve the others' queue access either.
+    fn try_acquire_ip_execution(&self, ip: IpAddr) -> Option<IpExecutionGuard> {
+        let mut counts = self
+            .per_ip_executions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let count = counts.entry(ip).or_insert(0);
+        if *count >= self.max_concurrent_per_ip {
+            return None;
+        }
+        *count += 1;
+        Some(IpExecutionGuard {
+            counts: Arc::clone(&self.per_ip_executions),
+            ip,
+        })
+    }
 }
 
 #[pyclass(name = "_RequestCancellation")]
@@ -497,15 +594,42 @@ fn close_stream(stream: Arc<Py<PyAny>>) {
     });
 }
 
-fn streaming_body(stream: Py<PyAny>, permit: OwnedSemaphorePermit) -> Body {
+fn streaming_body(
+    stream: Py<PyAny>,
+    permit: Option<OwnedSemaphorePermit>,
+    ip_guard: Option<IpExecutionGuard>,
+    hold_stats: Arc<HoldTimeStats>,
+    acquired_at: Instant,
+    max_lifetime: Duration,
+) -> Body {
     let stream = Arc::new(stream);
     let (sender, receiver) = tokio_mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     let failed = Arc::new(AtomicBool::new(false));
+    let lifetime_exceeded = Arc::new(AtomicBool::new(false));
     let producer_failed = Arc::clone(&failed);
+    let producer_expired = Arc::clone(&lifetime_exceeded);
+    let started = tokio::time::Instant::now();
     tokio::spawn(async move {
         let _permit = permit;
+        // The per-IP slot stays held until the stream ends, like the
+        // global execution slot (H-5).
+        let _ip_guard = ip_guard;
         loop {
-            let slot = match tokio::time::timeout(Duration::from_secs(30), sender.reserve()).await {
+            // S-P1-14: total lifetime cap, checked before every chunk.
+            // A stream that keeps trickling inside the per-chunk 30s
+            // timeout is cut off here, freeing its execution slot.
+            if !max_lifetime.is_zero() && started.elapsed() >= max_lifetime {
+                producer_expired.store(true, Ordering::Release);
+                break;
+            }
+            // Bound the reserve wait by the remaining lifetime too, so
+            // a stalled stream cannot overshoot the cap by a full 30s.
+            let reserve_timeout = if max_lifetime.is_zero() {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_secs(30).min(max_lifetime.saturating_sub(started.elapsed()))
+            };
+            let slot = match tokio::time::timeout(reserve_timeout, sender.reserve()).await {
                 Ok(Ok(slot)) => slot,
                 Ok(Err(_)) => break,
                 Err(_) => {
@@ -534,19 +658,30 @@ fn streaming_body(stream: Py<PyAny>, permit: OwnedSemaphorePermit) -> Body {
                 }
             }
         }
+        // The slot is held until the stream ends: record the full hold
+        // so the adaptive timeout (C-P1-5) sees streaming lifetimes too.
+        hold_stats.record(acquired_at.elapsed());
         close_stream(stream);
     });
-    let body =
-        futures_util::stream::unfold((receiver, failed), |(mut receiver, failed)| async move {
+    let body = futures_util::stream::unfold(
+        (receiver, failed, lifetime_exceeded),
+        |(mut receiver, failed, lifetime_exceeded)| async move {
             match receiver.recv().await {
-                Some(item) => Some((item, (receiver, failed))),
+                Some(item) => Some((item, (receiver, failed, lifetime_exceeded))),
+                None if lifetime_exceeded.swap(false, Ordering::AcqRel) => Some((
+                    Err(std::io::Error::other(
+                        "PyNext response stream lifetime exceeded",
+                    )),
+                    (receiver, failed, lifetime_exceeded),
+                )),
                 None if failed.swap(false, Ordering::AcqRel) => Some((
                     Err(std::io::Error::other("PyNext response stream stalled")),
-                    (receiver, failed),
+                    (receiver, failed, lifetime_exceeded),
                 )),
                 None => None,
             }
-        });
+        },
+    );
     Body::from_stream(body)
 }
 
@@ -768,11 +903,33 @@ fn apply_path_headers_for_raw_path(
     }
 }
 
+/// A fast-path response body that holds its concurrency permit until the
+/// body has been fully consumed (or the connection is dropped): the permit
+/// lives in the stream state, so it is released when hyper polls the stream
+/// to its end or drops it — not when `dispatch` returns. Holding the permit
+/// only across `dispatch` would be useless, because the fast-path section
+/// has no await point and hyper streams the body after `dispatch` returns;
+/// under socket backpressure hyper stops polling the body, so a slow reader
+/// keeps the permit (and the budget) occupied, which is exactly what the
+/// cap must bound.
+fn capped_body(content: Bytes, permit: Option<OwnedSemaphorePermit>) -> Body {
+    let Some(permit) = permit else {
+        return Body::from(content);
+    };
+    let stream =
+        futures_util::stream::unfold((Some(content), Some(permit)), |(data, permit)| async move {
+            let data = data?;
+            Some((Ok::<_, std::convert::Infallible>(data), (None, permit)))
+        });
+    Body::from_stream(stream)
+}
+
 fn static_response(
     parts: &axum::http::request::Parts,
     content: &Bytes,
     policy: AssetPolicy<'_>,
     security_headers: &[(Vec<u8>, Vec<u8>)],
+    fast_path_permit: Option<OwnedSemaphorePermit>,
 ) -> AxumResponse<Body> {
     let length = content.len();
     let mut status = StatusCode::OK;
@@ -828,9 +985,9 @@ fn static_response(
     {
         Body::empty()
     } else if let Some((start, end)) = range {
-        Body::from(content.slice(start..end + 1))
+        capped_body(content.slice(start..end + 1), fast_path_permit)
     } else {
-        Body::from(content.clone())
+        capped_body(content.clone(), fast_path_permit)
     };
     let mut builder = AxumResponse::builder()
         .status(status)
@@ -907,6 +1064,65 @@ fn retry_after_for_timeout(timeout: Duration) -> u64 {
     (timeout.as_millis() as u64).div_ceil(1000).max(1)
 }
 
+/// Exponentially weighted moving average of execution-slot hold times
+/// (C-P1-5). One sample per completed request: the time from slot
+/// acquisition to slot release — handler execution for buffered
+/// responses, the whole stream lifetime for streaming ones.
+struct HoldTimeStats {
+    /// EWMA in milliseconds; `None` until the first request completes.
+    ewma_ms: Mutex<Option<f64>>,
+}
+
+impl HoldTimeStats {
+    fn new() -> Self {
+        Self {
+            ewma_ms: Mutex::new(None),
+        }
+    }
+
+    fn record(&self, hold: Duration) {
+        let sample = hold.as_secs_f64() * 1000.0;
+        let mut guard = self
+            .ewma_ms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(match *guard {
+            Some(ewma) => 0.8 * ewma + 0.2 * sample,
+            None => sample,
+        });
+    }
+
+    fn ewma_ms(&self) -> Option<f64> {
+        *self
+            .ewma_ms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Effective slot-acquire timeout for one waiter (C-P1-5).
+///
+/// Without a ceiling (`None`) the timeout stays fixed at `base` — the
+/// historical behaviour. With a ceiling, the wait adapts to the
+/// observed slot-hold time: twice the EWMA, so a waiter survives
+/// roughly one full slot turnover, clamped to `[base, max]` so the
+/// wait stays bounded (each waiter can hold a fully buffered body).
+/// Until the first request completes there is no EWMA and the base
+/// applies.
+fn effective_acquire_timeout(
+    base: Duration,
+    max: Option<Duration>,
+    ewma_ms: Option<f64>,
+) -> Duration {
+    let Some(max) = max else {
+        return base;
+    };
+    let Some(ewma_ms) = ewma_ms else {
+        return base;
+    };
+    Duration::from_secs_f64(ewma_ms / 1000.0 * 2.0).clamp(base, max)
+}
+
 fn busy_response(
     retry_after_secs: u64,
     security_headers: &[(Vec<u8>, Vec<u8>)],
@@ -922,6 +1138,51 @@ fn busy_response(
     .expect("busy response is valid")
 }
 
+/// Control characters (CTL) in a header name or value (S-P1-7).
+///
+/// The same rule on both sides, matching aiohttp's `_safe_header` /
+/// `_write_str_raise_on_nlcr` (RFC 9110 §5.5, RFC 9112 §4): a header
+/// value may not contain `0x00-0x08`, `0x0A-0x1F` or `0x7F` (HTAB
+/// `0x09` is a legal field-value byte); a header name may not contain
+/// any byte below `0x20` or `0x7F` at all. A CTL in a header value is
+/// the classic response-splitting / request-smuggling primitive
+/// (CVE-2023-37276, CVE-2026-34519/34520), so the request parser
+/// rejects the request with 400 (see [`dispatch`]) and the response
+/// writer rejects the response (see [`bridge_response_header`]).
+fn header_value_contains_ctl(value: &[u8]) -> bool {
+    value
+        .iter()
+        .any(|b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
+}
+
+fn header_name_contains_ctl(name: &[u8]) -> bool {
+    name.iter().any(|b| *b < 0x20 || *b == 0x7F)
+}
+
+fn headers_contain_ctl(headers: &HeaderMap) -> bool {
+    headers.iter().any(|(name, value)| {
+        header_name_contains_ctl(name.as_str().as_bytes())
+            || header_value_contains_ctl(value.as_bytes())
+    })
+}
+
+/// Validate one response header the Python bridge hands back, before it
+/// is written to the wire (S-P1-7, writer side). Returns `None` when
+/// the name/value cannot go on the wire — in particular when either
+/// carries a control character, under the same rule as
+/// [`headers_contain_ctl`]. The caller turns `None` into a 500: the app
+/// set a header the wire format cannot carry, so the response is
+/// rejected whole instead of letting hyper fail the write mid-response.
+fn bridge_response_header(key: &[u8], value: &[u8]) -> Option<(HeaderName, HeaderValue)> {
+    if header_name_contains_ctl(key) || header_value_contains_ctl(value) {
+        return None;
+    }
+    Some((
+        HeaderName::from_bytes(key).ok()?,
+        HeaderValue::from_bytes(value).ok()?,
+    ))
+}
+
 /// Conflicting `Content-Length` headers must fail as a clean 400 in dispatch
 /// instead of reaching hyper as a protocol error that just drops the
 /// connection. Identical duplicates are one value and pass; anything
@@ -929,14 +1190,9 @@ fn busy_response(
 ///
 /// This check is a backstop, not the deciding layer in the cases the tests
 /// cover: for an ordinary request hyper's parser turns conflicting
-/// `Content-Length` values into an automatic 400 before dispatch ever runs,
-/// and when `Transfer-Encoding: chunked` is present hyper drops
-/// `Content-Length` entirely (it removes earlier CL headers and skips later
-/// ones), so the request is framed as chunked and the conflicting values
-/// never reach dispatch — see
-/// `test_transfer_encoding_wins_over_conflicting_content_length`. Keep the
-/// check anyway: it is the layer that catches conflicting values if hyper's
-/// parsing ever lets them through.
+/// `Content-Length` values into an automatic 400 before dispatch ever runs.
+/// Keep the check anyway: it is the layer that catches conflicting values
+/// if hyper's parsing ever lets them through.
 fn conflicting_content_length(headers: &HeaderMap) -> bool {
     let mut values = std::collections::HashSet::new();
     for value in headers.get_all(header::CONTENT_LENGTH).iter() {
@@ -951,6 +1207,253 @@ fn conflicting_content_length(headers: &HeaderMap) -> bool {
         }
     }
     values.len() > 1
+}
+
+/// Host header validation (S-P1-19, M-9; Django `ALLOWED_HOSTS`
+/// semantics). Python uses the Host for same-origin decisions and for
+/// building absolute URLs (password-reset mail links and the like), so
+/// an unvalidated Host is an injection vector. The check runs at the
+/// top of `dispatch`, before the WebSocket branch, the fast path and
+/// the Python bridge, so it covers every transport the native server
+/// serves. A missing or disallowed Host is a 400; the allowlist is
+/// configured through `allowed_hosts` (`pynext.config`), defaulting
+/// to loopback only.
+enum HostPattern {
+    /// `*`: any host.
+    Any,
+    /// An exact hostname or IP literal, lowercased.
+    Exact(String),
+    /// `.example.com`: the domain itself and every subdomain.
+    DomainAndSubdomains(String),
+    /// `*.example.com`: subdomains only, not the bare domain.
+    Subdomains(String),
+}
+
+/// The default allowlist, matching `pynext.config.DEFAULT_ALLOWED_HOSTS`.
+fn default_host_patterns() -> Vec<HostPattern> {
+    vec![
+        HostPattern::Exact("localhost".to_string()),
+        HostPattern::Exact("127.0.0.1".to_string()),
+        HostPattern::Exact("::1".to_string()),
+    ]
+}
+
+/// Compile one `allowed_hosts` entry. Entries are bare hosts — no
+/// scheme, no port (the request Host's port is stripped at match time),
+/// no path or query — mirroring the Python validator in
+/// `pynext.config._validate_allowed_host`, so a direct `NativeServer`
+/// caller cannot smuggle in a pattern Python would have rejected.
+fn parse_host_pattern(entry: &str) -> Result<HostPattern, String> {
+    let invalid = || format!("invalid allowed host {entry:?}");
+    let lowered = entry.to_ascii_lowercase();
+    if lowered == "*" {
+        return Ok(HostPattern::Any);
+    }
+    if lowered.is_empty()
+        || lowered.contains("://")
+        || lowered
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '@'))
+    {
+        return Err(invalid());
+    }
+    let (suffix, body) = if let Some(rest) = lowered.strip_prefix("*.") {
+        (true, rest)
+    } else if let Some(rest) = lowered.strip_prefix('.') {
+        (true, rest)
+    } else {
+        (false, lowered.as_str())
+    };
+    if body.contains('*') {
+        return Err(invalid());
+    }
+    let (bracketed, body) = if body.starts_with('[') && body.ends_with(']') {
+        (true, &body[1..body.len() - 1])
+    } else {
+        (false, body)
+    };
+    if body.is_empty() || body.len() > 253 {
+        return Err(invalid());
+    }
+    // An IP literal (v4 or v6) is exact only: `.127.0.0.1` names no
+    // subdomain tree. Anything with a colon that is not a valid IP is
+    // a port (or malformed) and is rejected. A bracketed name that is
+    // not an IP literal is rejected too.
+    if bracketed && body.parse::<std::net::IpAddr>().is_err() {
+        return Err(invalid());
+    }
+    if body.parse::<std::net::IpAddr>().is_ok() {
+        if suffix {
+            return Err(invalid());
+        }
+        return Ok(HostPattern::Exact(body.to_string()));
+    }
+    if body.contains(':') {
+        return Err(invalid());
+    }
+    if !body.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    }) {
+        return Err(invalid());
+    }
+    let suffix_text = format!(".{body}");
+    if suffix {
+        if lowered.starts_with("*.") {
+            Ok(HostPattern::Subdomains(suffix_text))
+        } else {
+            Ok(HostPattern::DomainAndSubdomains(suffix_text))
+        }
+    } else {
+        Ok(HostPattern::Exact(body.to_string()))
+    }
+}
+
+fn parse_host_patterns(entries: Vec<String>) -> Result<Vec<HostPattern>, String> {
+    entries
+        .iter()
+        .map(|entry| parse_host_pattern(entry))
+        .collect()
+}
+
+/// Strip a port from a Host header value and return the bare host,
+/// lowercased, or `None` when the value is not a usable host. A
+/// trailing dot is stripped (`example.com.` is `example.com`).
+/// Bracketed IPv6 (`[::1]:3000`) and bare IPv6 (`::1`, which carries
+/// no port) are handled; a single `host:port` pair loses the port.
+fn bare_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#' | '@'))
+    {
+        return None;
+    }
+    let mut host = if let Some(rest) = value.strip_prefix('[') {
+        let (inside, after) = rest.split_once(']')?;
+        if !after.is_empty() && !after.starts_with(':') {
+            return None;
+        }
+        inside.to_string()
+    } else if value.matches(':').count() > 1 {
+        // A bare IPv6 literal: no port can be attached to this form.
+        value.to_string()
+    } else if let Some((before, port)) = value.split_once(':') {
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        before.to_string()
+    } else {
+        value.to_string()
+    };
+    if host.ends_with('.') {
+        host.pop();
+    }
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+fn host_matches(host: &str, pattern: &HostPattern) -> bool {
+    match pattern {
+        HostPattern::Any => true,
+        HostPattern::Exact(exact) => host == exact,
+        HostPattern::DomainAndSubdomains(suffix) => {
+            host == &suffix[1..] || host.ends_with(suffix.as_str())
+        }
+        HostPattern::Subdomains(suffix) => host.ends_with(suffix.as_str()),
+    }
+}
+
+/// The request Host must be present and on the allowlist. Missing is
+/// 400 (HTTP/1.1 requests without Host are already rejected by hyper
+/// before dispatch; this is the layer that catches HTTP/1.0 and any
+/// other form hyper lets through). h2c carries no Host header: the
+/// `:authority` pseudo-header (exposed as the request URI authority)
+/// stands in for it, so it is the fallback source when the header is
+/// absent.
+fn host_header_allowed(
+    headers: &HeaderMap,
+    authority: Option<&str>,
+    patterns: &[HostPattern],
+) -> bool {
+    let text = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or(authority);
+    let Some(text) = text else {
+        return false;
+    };
+    let Some(host) = bare_host(text) else {
+        return false;
+    };
+    patterns.iter().any(|pattern| host_matches(&host, pattern))
+}
+/// Marker header the first-request sniff (`SmugglingGuardIo`) inserts when
+/// a request carries both `Content-Length` and `Transfer-Encoding`
+/// (S-P1-31, Sanic CVE-2026-85078). hyper strips `Content-Length` from the
+/// header map as soon as `Transfer-Encoding` is present (it removes earlier
+/// CL headers and skips later ones), so by the time dispatch runs the
+/// combination is invisible — the marker is the only trace of it. The
+/// name is in Python's `INTERNAL_HEADERS`, so a client-sent copy is
+/// stripped at both entry points before any handler sees it; on the native
+/// path the sniff is the only producer, and a client that sends the marker
+/// itself only gets its own request rejected.
+const SMUGGLING_MARKER_NAME: &str = "x-pynext-smuggling";
+/// Value the sniff inserts for a `Content-Length` + `Transfer-Encoding`
+/// combination.
+const SMUGGLING_MARKER_CL_TE: &str = "cl-te";
+
+fn has_smuggling_marker(headers: &HeaderMap) -> bool {
+    headers
+        .get(SMUGGLING_MARKER_NAME)
+        .is_some_and(|v| v.as_bytes() == SMUGGLING_MARKER_CL_TE.as_bytes())
+}
+
+/// A `Transfer-Encoding` whose final coding is not `chunked` is a 400
+/// (RFC 9112 section 6.1: the message body length cannot be determined
+/// reliably otherwise). hyper already rejects this at parse time, so this
+/// is a backstop mirroring hyper's own rule — only the last header line's
+/// last comma-separated coding decides — in case hyper's parsing ever lets
+/// one through. `Transfer-Encoding` on HTTP/1.0 is likewise invalid.
+fn invalid_transfer_encoding(headers: &HeaderMap, version: Version) -> bool {
+    if !headers.contains_key(header::TRANSFER_ENCODING) {
+        return false;
+    }
+    if version == Version::HTTP_10 {
+        return true;
+    }
+    let Some(last) = headers
+        .get_all(header::TRANSFER_ENCODING)
+        .iter()
+        .next_back()
+    else {
+        return false;
+    };
+    let Ok(text) = last.to_str() else {
+        return true;
+    };
+    !text
+        .rsplit(',')
+        .next()
+        .is_some_and(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+}
+
+/// Request-smuggling framing (S-P1-31): ambiguous framing is a 400 with
+/// `Connection: close`, never a request the handler runs. Covers the
+/// sniff marker (`Content-Length` + `Transfer-Encoding`), conflicting
+/// `Content-Length` values, and a non-`chunked` `Transfer-Encoding`.
+fn smuggling_framing(headers: &HeaderMap, version: Version) -> bool {
+    has_smuggling_marker(headers)
+        || conflicting_content_length(headers)
+        || invalid_transfer_encoding(headers, version)
 }
 
 enum BodyReadError {
@@ -999,11 +1502,35 @@ async fn read_limited_body(
         };
         let Some(frame) = frame else { break };
         let frame = frame.map_err(|_| BodyReadError::BadRequest)?;
+        // Chunk trailers (S-P1-31, Sanic CVE-2026-85078): hyper delivers
+        // any trailer fields after the final 0-chunk as a trailers frame.
+        // A trailer must never be silently accepted — in the CVE the
+        // trailer bytes were left in the keep-alive buffer and re-parsed
+        // as a smuggled request — so any trailer frame is a 400. The
+        // caller closes the connection (`close_with_unread_body`), so the
+        // bytes can never be reused as another request. A plain
+        // `0\r\n\r\n` terminator carries no trailer frame, so ordinary
+        // chunked requests are unaffected.
+        if frame.is_trailers() {
+            return Err(BodyReadError::BadRequest);
+        }
         if let Ok(data) = frame.into_data() {
             if buf.len() + data.len() > limit {
                 return Err(BodyReadError::TooLarge);
             }
             buf.extend_from_slice(&data);
+            // S-P1-15: cumulative rate check on every frame, not only
+            // while stalled. The stall branch below never fires for a
+            // client that sends 1 byte every 250 ms, because each byte
+            // arrives just before the 250 ms check would run; checking
+            // here closes that trickle bypass. The grace window still
+            // protects short bodies and slow starts.
+            if min_rate > 0
+                && started.elapsed() >= BODY_MIN_RATE_GRACE
+                && (buf.len() as f64) < min_rate as f64 * started.elapsed().as_secs_f64()
+            {
+                return Err(BodyReadError::TooSlow);
+            }
         }
     }
     Ok(Bytes::from(buf))
@@ -1116,6 +1643,11 @@ fn ws_close_frame(code: u16, reason: &str) -> Message {
     }))
 }
 
+/// Grace period for a pong after the server pings an idle WebSocket
+/// session (S-P1-16): a peer that never answers is half-open, so the
+/// session is closed instead of held forever.
+const WS_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Drive one upgraded WebSocket connection: forward frames to the Python
 /// handler's session inbox and forward the handler's outbox items as frames.
 /// The Python handler owns the application logic; this task only translates
@@ -1156,6 +1688,13 @@ async fn run_ws_session(
         }
     };
     let mut sent_close = false;
+    // S-P1-16: idle timeout, maximum lifetime, and ping/pong liveness.
+    // `last_activity` moves on any socket frame (including ping/pong)
+    // and on any frame sent to the peer; the 5s outgoing wait returning
+    // empty does not count as activity.
+    let started = tokio::time::Instant::now();
+    let mut last_activity = tokio::time::Instant::now();
+    let mut awaiting_pong_since: Option<tokio::time::Instant> = None;
     // Hold one outgoing wait across loop iterations. Recreating the wait
     // inside `select!` would drop it whenever a socket message wins, but
     // the dropped wait's blocking task keeps waiting on the outbox and can
@@ -1164,10 +1703,36 @@ async fn run_ws_session(
     // so a finished handler is noticed promptly.
     let mut outgoing_wait = Box::pin(ws_take_outgoing(&session, Duration::from_secs(5)));
     loop {
+        // S-P1-16: earliest of the idle deadline, the lifetime
+        // deadline, the next ping, and the pong grace expiry.
+        // Recomputed every iteration because activity moves the
+        // idle/ping deadlines.
+        let idle_deadline = if state.ws_idle_timeout.is_zero() {
+            None
+        } else {
+            Some(last_activity + state.ws_idle_timeout)
+        };
+        let max_deadline = if state.ws_max_lifetime.is_zero() {
+            None
+        } else {
+            Some(started + state.ws_max_lifetime)
+        };
+        let ping_deadline = if state.ws_ping_interval.is_zero() {
+            None
+        } else {
+            Some(last_activity + state.ws_ping_interval)
+        };
+        let pong_deadline = awaiting_pong_since.map(|since| since + WS_PONG_TIMEOUT);
+        let timer_deadline = [idle_deadline, max_deadline, ping_deadline, pong_deadline]
+            .into_iter()
+            .flatten()
+            .min();
         tokio::select! {
             message = socket.recv() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
+                        last_activity = tokio::time::Instant::now();
+                        awaiting_pong_since = None;
                         if text.len() > state.websocket_max_message {
                             let _ = socket.send(ws_close_frame(1009, "message too large")).await;
                             sent_close = true;
@@ -1181,6 +1746,8 @@ async fn run_ws_session(
                         }
                     }
                     Some(Ok(Message::Binary(data))) => {
+                        last_activity = tokio::time::Instant::now();
+                        awaiting_pong_since = None;
                         if data.len() > state.websocket_max_message {
                             let _ = socket.send(ws_close_frame(1009, "message too large")).await;
                             sent_close = true;
@@ -1204,9 +1771,14 @@ async fn run_ws_session(
                         break;
                     }
                     Some(Ok(Message::Ping(data))) => {
+                        last_activity = tokio::time::Instant::now();
+                        awaiting_pong_since = None;
                         let _ = socket.send(Message::Pong(data)).await;
                     }
-                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Pong(_))) => {
+                        last_activity = tokio::time::Instant::now();
+                        awaiting_pong_since = None;
+                    }
                     Some(Err(_)) | None => {
                         // Tungstenite rejects an over-limit message at the
                         // protocol level before it is delivered, so the
@@ -1228,11 +1800,13 @@ async fn run_ws_session(
                         if sent.is_err() {
                             break;
                         }
+                        last_activity = tokio::time::Instant::now();
                     }
                     Some(WsOutgoing::Bytes(data)) => {
                         if socket.send(Message::Binary(data.into())).await.is_err() {
                             break;
                         }
+                        last_activity = tokio::time::Instant::now();
                     }
                     Some(WsOutgoing::Close(code, reason)) => {
                         let _ = socket.send(ws_close_frame(code, &reason)).await;
@@ -1249,6 +1823,53 @@ async fn run_ws_session(
                     }
                 }
                 outgoing_wait = Box::pin(ws_take_outgoing(&session, Duration::from_secs(5)));
+            }
+            // S-P1-16: idle timeout, maximum lifetime, ping/pong.
+            _ = async {
+                match timer_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let now = tokio::time::Instant::now();
+                if let Some(deadline) = max_deadline {
+                    if now >= deadline {
+                        let _ = socket
+                            .send(ws_close_frame(1000, "session lifetime exceeded"))
+                            .await;
+                        sent_close = true;
+                        ws_call(&session, "_push_disconnect", WsPush::None).await;
+                        break;
+                    }
+                }
+                if let Some(since) = awaiting_pong_since {
+                    if now >= since + WS_PONG_TIMEOUT {
+                        let _ = socket
+                            .send(ws_close_frame(1011, "ping timeout"))
+                            .await;
+                        sent_close = true;
+                        ws_call(&session, "_push_disconnect", WsPush::None).await;
+                        break;
+                    }
+                }
+                if let Some(deadline) = idle_deadline {
+                    if now >= deadline {
+                        let _ = socket
+                            .send(ws_close_frame(1000, "idle timeout"))
+                            .await;
+                        sent_close = true;
+                        ws_call(&session, "_push_disconnect", WsPush::None).await;
+                        break;
+                    }
+                }
+                if let Some(deadline) = ping_deadline {
+                    if now >= deadline && awaiting_pong_since.is_none() {
+                        if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                            break;
+                        }
+                        awaiting_pong_since = Some(now);
+                    }
+                }
             }
         }
     }
@@ -1284,10 +1905,12 @@ async fn rate_limit_denial(
         response
     };
     let Ok(permit) = Arc::clone(&state.rate_limit_capacity).try_acquire_owned() else {
-        return Some(apply_merged_path_headers(
-            unavailable(),
-            &merged_path_headers,
-        ));
+        // H-2: no decision capacity is left. Failing closed here turns
+        // the protection into a rejection device under load, so fail
+        // open and count it instead of 503ing a request the limiter
+        // would have allowed.
+        state.rate_limit_fail_open.fetch_add(1, Ordering::Relaxed);
+        return None;
     };
     let headers: Vec<(Vec<u8>, Vec<u8>)> = parts
         .headers
@@ -1337,6 +1960,16 @@ async fn rate_limit_denial(
             }
             Some(apply_merged_path_headers(response, &merged_path_headers))
         }
+        // H-2: the 2s decision deadline expired (Err) or the blocking
+        // task failed to spawn (Ok(Err)), so no decision exists. Fail
+        // open and count it. A callback that raised — including a
+        // limiter backend reporting itself unavailable, whose own
+        // failure policy decides — or a malformed decision still fails
+        // closed below.
+        Ok(Err(_)) | Err(_) => {
+            state.rate_limit_fail_open.fetch_add(1, Ordering::Relaxed);
+            None
+        }
         _ => Some(apply_merged_path_headers(
             unavailable(),
             &merged_path_headers,
@@ -1346,6 +1979,67 @@ async fn rate_limit_denial(
 
 async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> AxumResponse<Body> {
     let (parts, body) = request.into_parts();
+    // Host validation (S-P1-19, M-9) runs first, before the WebSocket
+    // branch, the fast path and the Python bridge: no request reaches
+    // any handler with a missing or disallowed Host.
+    if !host_header_allowed(
+        &parts.headers,
+        parts.uri.authority().map(|authority| authority.as_str()),
+        &state.allowed_hosts,
+    ) {
+        return close_with_unread_body(
+            apply_path_headers_for_raw_path(
+                plain_response(
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request",
+                    &state.security_headers,
+                ),
+                parts.uri.path(),
+                &state.path_headers,
+            ),
+            parts.version,
+        );
+    }
+    // S-P1-7 (parser side): a control character in a request header
+    // name or value is a clean 400, mirroring the conflicting
+    // Content-Length check below. hyper's parser already rejects most
+    // CTL on the wire; this is the explicit layer that also covers any
+    // header reaching dispatch through another path, and keeps the
+    // parser rule identical to the writer rule (see
+    // `bridge_response_header`) and to aiohttp's `_safe_header`.
+    if headers_contain_ctl(&parts.headers) {
+        return close_with_unread_body(
+            apply_path_headers_for_raw_path(
+                plain_response(
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request",
+                    &state.security_headers,
+                ),
+                parts.uri.path(),
+                &state.path_headers,
+            ),
+            parts.version,
+        );
+    }
+    // Request-smuggling framing (S-P1-31) runs before anything else,
+    // including the WebSocket upgrade below: an ambiguously framed
+    // request is a 400 with `Connection: close`, never an upgrade or a
+    // handler run. The body has not been read yet, so the connection
+    // must not be reused.
+    if smuggling_framing(&parts.headers, parts.version) {
+        return close_with_unread_body(
+            apply_path_headers_for_raw_path(
+                plain_response(
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request",
+                    &state.security_headers,
+                ),
+                parts.uri.path(),
+                &state.path_headers,
+            ),
+            parts.version,
+        );
+    }
     // A WebSocket upgrade is decided here, before any body handling: the
     // upgrade handshake must not compete for a Python execution slot, and a
     // request that is not a WebSocket route must not reach the HTTP bridge
@@ -1505,7 +2199,20 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
             Ok(upgrade) => upgrade,
             Err(rejection) => {
-                return rejection.into_response();
+                // A failed upgrade is still an HTTP response: give it
+                // the same A1 security headers every other Rust-built
+                // response carries instead of axum's bare rejection.
+                let mut response = rejection.into_response();
+                for (name, value) in &state.security_headers {
+                    if let (Ok(name), Ok(value)) =
+                        (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+                    {
+                        if !response.headers().contains_key(&name) {
+                            response.headers_mut().insert(name, value);
+                        }
+                    }
+                }
+                return response;
             }
         };
         // Bound the protocol-level message size as well as the application
@@ -1542,23 +2249,12 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             run_ws_session(state, path, query, headers, protocol, socket).await;
         });
     }
-    if conflicting_content_length(&parts.headers) {
-        return close_with_unread_body(
-            apply_path_headers_for_raw_path(
-                plain_response(
-                    StatusCode::BAD_REQUEST,
-                    "Bad Request",
-                    &state.security_headers,
-                ),
-                parts.uri.path(),
-                &state.path_headers,
-            ),
-            parts.version,
-        );
-    }
     // Decide admission from headers before polling the body. In particular,
     // an over-limit Expect: 100-continue request must never be told to upload.
     let decoded_path = static_path(parts.uri.path());
+    // Health probes are reserved framework paths (H-3): they never take
+    // an execution slot (see the slot acquisition below).
+    let is_health = matches!(decoded_path.as_deref(), Some("/healthz" | "/readyz"));
     if state.http_rate_limit_callback.is_some() {
         let Some(path) = decoded_path.as_ref() else {
             return close_with_unread_body(
@@ -1588,6 +2284,53 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     let body = if body.is_end_stream() {
         Bytes::new()
     } else {
+        // S-P1-15: per-IP cap on body slots, checked before the global
+        // semaphore so one IP rotating through uploads cannot take all
+        // 16 slots and 503 legitimate uploads. IPv4-mapped IPv6 counts
+        // under its IPv4 form, matching the accept loop. The guard
+        // lives until the body read finishes, then releases the slot.
+        let peer_ip = parts
+            .extensions
+            .get::<PeerAddr>()
+            .map(|peer| match peer.0.ip() {
+                IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                    Some(v4) => IpAddr::V4(v4),
+                    None => peer.0.ip(),
+                },
+                ip => ip,
+            });
+        let _body_ip_guard = match peer_ip {
+            Some(ip) => {
+                let admitted = {
+                    let mut counts = state
+                        .body_per_ip
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let count = counts.entry(ip).or_insert(0);
+                    if *count >= state.max_body_per_ip {
+                        false
+                    } else {
+                        *count += 1;
+                        true
+                    }
+                };
+                if !admitted {
+                    return close_with_unread_body(
+                        apply_path_headers_for_raw_path(
+                            busy_response(1, &state.security_headers),
+                            parts.uri.path(),
+                            &state.path_headers,
+                        ),
+                        parts.version,
+                    );
+                }
+                Some(PerIpBodyGuard {
+                    counts: Arc::clone(&state.body_per_ip),
+                    ip,
+                })
+            }
+            None => None,
+        };
         let _body_permit = match state.body_capacity.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -1663,6 +2406,19 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     {
         if let Some(path) = decoded_path {
             if let Some(content) = state.client_assets.get(&path) {
+                // S-P1-11 (M-1): the fast path bypasses the execution
+                // semaphore, so it has its own budget. The permit is
+                // only taken once a fast-path hit is confirmed — a
+                // dynamic request must never be shed by this cap — and
+                // exhaustion sheds with 503 + Retry-After instead of
+                // falling through to the Python bridge.
+                let Ok(fast_permit) = state.fast_path_capacity.clone().try_acquire_owned() else {
+                    return apply_path_headers_for_raw_path(
+                        busy_response(1, &state.security_headers),
+                        parts.uri.path(),
+                        &state.path_headers,
+                    );
+                };
                 return apply_path_headers(
                     static_response(
                         &parts,
@@ -1676,12 +2432,20 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                             vary: false,
                         },
                         &state.security_headers,
+                        Some(fast_permit),
                     ),
                     &path,
                     &state.path_headers,
                 );
             }
             if let Some(asset) = state.public_assets.get(&path) {
+                let Ok(fast_permit) = state.fast_path_capacity.clone().try_acquire_owned() else {
+                    return apply_path_headers_for_raw_path(
+                        busy_response(1, &state.security_headers),
+                        parts.uri.path(),
+                        &state.path_headers,
+                    );
+                };
                 return apply_path_headers(
                     static_response(
                         &parts,
@@ -1693,12 +2457,20 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                             vary: false,
                         },
                         &state.security_headers,
+                        Some(fast_permit),
                     ),
                     &path,
                     &state.path_headers,
                 );
             }
             if let Some(content) = state.static_pages.get(&path) {
+                let Ok(fast_permit) = state.fast_path_capacity.clone().try_acquire_owned() else {
+                    return apply_path_headers_for_raw_path(
+                        busy_response(1, &state.security_headers),
+                        parts.uri.path(),
+                        &state.path_headers,
+                    );
+                };
                 return apply_path_headers(
                     static_response(
                         &parts,
@@ -1710,6 +2482,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                             vary: true,
                         },
                         &state.security_headers,
+                        Some(fast_permit),
                     ),
                     &path,
                     &state.path_headers,
@@ -1720,11 +2493,19 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 && !parts.headers.contains_key("cookie")
             {
                 if let CacheResult::Fresh(content) = state.isr_cache.lookup(&path) {
+                    let Ok(fast_permit) = state.fast_path_capacity.clone().try_acquire_owned()
+                    else {
+                        return apply_path_headers_for_raw_path(
+                            busy_response(1, &state.security_headers),
+                            parts.uri.path(),
+                            &state.path_headers,
+                        );
+                    };
                     let length = content.len();
                     let body = if parts.method == axum::http::Method::HEAD {
                         Body::empty()
                     } else {
-                        Body::from(content)
+                        capped_body(content, Some(fast_permit))
                     };
                     return apply_path_headers(
                         apply_security_headers(
@@ -1758,44 +2539,92 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
     // shedding would drop requests that would have succeeded within the
     // timeout. The queue size is configurable via `max_waiting`; the
     // default stays `min(max_concurrent, 64)`.
-    let permit = match state.capacity.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let waiting = match state.waiting_capacity.clone().try_acquire_owned() {
-                Ok(permit) => permit,
-                // No waiting slot: the earliest a slot could free is
-                // unknown, so the advisory retry delay stays 1 second.
-                Err(_) => {
+    // H-3: health probes never take an execution slot. A probe flood
+    // could otherwise fill the queue and 503 real requests, and a probe
+    // queued behind 64 slow requests could 503 the probe itself.
+    // Readiness is still decided by the Python bridge below.
+    // H-5: one IP may hold at most max_concurrent_per_ip execution
+    // slots. The quota is taken before the global pool, so a single IP
+    // cannot fill the wait queue either; the guard releases the IP's
+    // count when the request finishes (streaming included).
+    let ip_guard = if is_health {
+        None
+    } else {
+        match parts.extensions.get::<PeerAddr>().map(|peer| peer.0.ip()) {
+            Some(ip) => match state.try_acquire_ip_execution(ip) {
+                Some(guard) => Some(guard),
+                None => {
                     return apply_path_headers_for_raw_path(
                         busy_response(1, &state.security_headers),
                         parts.uri.path(),
                         &state.path_headers,
                     )
                 }
-            };
-            match tokio::time::timeout(
-                state.acquire_timeout,
-                state.capacity.clone().acquire_owned(),
-            )
-            .await
-            {
-                Ok(Ok(permit)) => {
-                    drop(waiting);
-                    permit
-                }
-                _ => {
-                    return apply_path_headers_for_raw_path(
-                        busy_response(
-                            retry_after_for_timeout(state.acquire_timeout),
-                            &state.security_headers,
-                        ),
-                        parts.uri.path(),
-                        &state.path_headers,
-                    )
-                }
-            }
+            },
+            // No peer address (for example a Unix listener): nothing to
+            // quota against.
+            None => None,
         }
     };
+    let permit = if is_health {
+        None
+    } else {
+        Some(match state.capacity.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let waiting = match state.waiting_capacity.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    // No waiting slot: the earliest a slot could free is
+                    // unknown, so the advisory retry delay stays 1 second.
+                    Err(_) => {
+                        return apply_path_headers_for_raw_path(
+                            busy_response(1, &state.security_headers),
+                            parts.uri.path(),
+                            &state.path_headers,
+                        )
+                    }
+                };
+                // Adaptive wait (C-P1-5): the effective timeout follows the
+                // observed slot-hold time, so slow handlers stretch the
+                // wait instead of converting latency into 503s. Fairness is
+                // already FIFO: tokio's Semaphore grants permits in the
+                // order they were requested, so a waiter never starves
+                // behind later arrivals.
+                let effective_timeout = effective_acquire_timeout(
+                    state.acquire_timeout,
+                    state.acquire_timeout_max,
+                    state.hold_stats.ewma_ms(),
+                );
+                match tokio::time::timeout(
+                    effective_timeout,
+                    state.capacity.clone().acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => {
+                        drop(waiting);
+                        permit
+                    }
+                    _ => {
+                        return apply_path_headers_for_raw_path(
+                            busy_response(
+                                retry_after_for_timeout(effective_timeout),
+                                &state.security_headers,
+                            ),
+                            parts.uri.path(),
+                            &state.path_headers,
+                        )
+                    }
+                }
+            }
+        })
+    };
+    // Slot-hold clock for the adaptive timeout (C-P1-5): started when
+    // the permit is acquired, recorded when it is released (buffered
+    // responses below, streaming ones in streaming_body, bridge errors
+    // in the error arm).
+    let acquired_at = Instant::now();
+    let hold_stats = Arc::clone(&state.hold_stats);
     let method = parts.method.to_string();
     let path = parts.uri.path().to_string();
     let query = parts.uri.query().unwrap_or("").as_bytes().to_vec();
@@ -1811,6 +2640,9 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
         .get::<PeerAddr>()
         .map(|peer| peer.0.ip().to_string());
     let security_headers = state.security_headers.clone();
+    // The bridge task moves `state`, so capture the streaming lifetime
+    // cap beforehand (S-P1-14).
+    let streaming_max_lifetime = state.streaming_max_lifetime;
     // The bridge task moves `state`, so merge this request's path headers
     // beforehand for the plain 500s built below; bridge responses already
     // carry their path headers from Python dispatch.
@@ -1844,11 +2676,11 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             };
             Ok::<_, PyErr>((status, headers, body))
         });
-        (result, permit)
+        (result, permit, ip_guard)
     })
     .await;
     match result {
-        Ok((Ok((status, headers, body)), permit)) => {
+        Ok((Ok((status, headers, body)), permit, ip_guard)) => {
             let Ok(status) = StatusCode::from_u16(status) else {
                 if let BridgeBody::Streaming(stream) = body {
                     close_stream(Arc::new(stream));
@@ -1865,10 +2697,14 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             let mut response = AxumResponse::new(Body::empty());
             *response.status_mut() = status;
             for (key, value) in headers {
-                let (Ok(key), Ok(value)) = (
-                    HeaderName::from_bytes(&key),
-                    HeaderValue::from_bytes(&value),
-                ) else {
+                // S-P1-7 (writer side): a CTL in a response header name
+                // or value rejects the whole response with 500 — the app
+                // set a header the wire format cannot carry. A handler
+                // can smuggle one past `Response`'s constructor by
+                // appending to `response.headers` afterwards, so this
+                // check is the last gate before serialization, mirroring
+                // the ASGI-side strip in `app._send_response`.
+                let Some((key, value)) = bridge_response_header(&key, &value) else {
                     if let BridgeBody::Streaming(stream) = body {
                         close_stream(Arc::new(stream));
                     }
@@ -1885,21 +2721,57 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
             }
             *response.body_mut() = match body {
                 BridgeBody::Buffered(body) => {
+                    hold_stats.record(acquired_at.elapsed());
                     drop(permit);
+                    drop(ip_guard);
                     Body::from(body)
                 }
-                BridgeBody::Streaming(stream) => streaming_body(stream, permit),
+                BridgeBody::Streaming(stream) => streaming_body(
+                    stream,
+                    permit,
+                    ip_guard,
+                    hold_stats,
+                    acquired_at,
+                    streaming_max_lifetime,
+                ),
             };
             response
         }
-        _ => apply_merged_path_headers(
-            plain_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal Server Error",
-                &security_headers,
-            ),
-            &path_headers_for_request,
-        ),
+        _ => {
+            hold_stats.record(acquired_at.elapsed());
+            apply_merged_path_headers(
+                plain_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
+                    &security_headers,
+                ),
+                &path_headers_for_request,
+            )
+        }
+    }
+}
+
+/// RAII guard for one entry in the per-IP body-slot count (S-P1-15):
+/// created when a body intake is admitted, it decrements the count when
+/// the body read ends (success, rejection, or timeout) so a slot is
+/// never leaked.
+struct PerIpBodyGuard {
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl Drop for PerIpBodyGuard {
+    fn drop(&mut self) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -1926,6 +2798,172 @@ impl Drop for PerIpConnectionGuard {
     }
 }
 
+/// Last-activity clock for one connection (S-P1-13 / M-3): h2c has no
+/// header-read timeout, so idle h2c connections would otherwise sit in
+/// the connection budget forever. Time is millis since the connection
+/// started, stored atomically so the socket wrapper and the watchdog task
+/// can share it without a lock.
+struct IdleClock {
+    base: tokio::time::Instant,
+    last_millis: AtomicU64,
+}
+
+impl IdleClock {
+    fn new() -> Self {
+        Self {
+            base: tokio::time::Instant::now(),
+            last_millis: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_millis
+            .store(self.base.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn idle(&self) -> Duration {
+        let elapsed_millis = self.base.elapsed().as_millis() as u64;
+        Duration::from_millis(
+            elapsed_millis.saturating_sub(self.last_millis.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+/// A socket wrapper that records every successful read/write on the
+/// connection's [`IdleClock`]. Hyper never reports per-connection
+/// activity, so the idle watchdog in the accept loop needs this hook.
+struct IdleWatchStream<S> {
+    inner: S,
+    clock: Arc<IdleClock>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for IdleWatchStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result {
+            if buf.filled().len() > filled_before {
+                self.clock.touch();
+            }
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for IdleWatchStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = &result {
+            if *written > 0 {
+                self.clock.touch();
+            }
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// One trusted-proxy network (S-P1-18, M-8), parsed from the same
+/// `"IP"` / `"IP/prefix"` strings Python's `ProxyTrust` accepts, so the
+/// Rust accept loop and the Python forwarded-header resolution share one
+/// trust list (the Python side passes `app.proxy_trust` through
+/// `start_native`). No `ipnet` dependency: CIDR matching is a masked
+/// comparison on the address bits, in `std` only.
+struct TrustedProxyNetwork {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedProxyNetwork {
+    fn parse(value: &str) -> Result<Self, String> {
+        let invalid =
+            || format!("Invalid trusted proxy {value:?}: must be an IP address or CIDR network");
+        let (addr_text, prefix_text) = match value.split_once('/') {
+            Some((addr, prefix)) => (addr, Some(prefix)),
+            None => (value, None),
+        };
+        let addr: IpAddr = addr_text.parse().map_err(|_| invalid())?;
+        let addr = normalize_client_ip(addr);
+        let max_prefix = match addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        let prefix_len = match prefix_text {
+            Some(text) => text.parse::<u8>().map_err(|_| invalid())?,
+            None => max_prefix,
+        };
+        if prefix_len > max_prefix {
+            return Err(invalid());
+        }
+        Ok(Self {
+            network: mask_network(addr, prefix_len),
+            prefix_len,
+        })
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        let ip = normalize_client_ip(ip);
+        match (self.network, ip) {
+            (IpAddr::V4(network), IpAddr::V4(addr)) => {
+                mask_network(IpAddr::V4(addr), self.prefix_len) == IpAddr::V4(network)
+            }
+            (IpAddr::V6(network), IpAddr::V6(addr)) => {
+                mask_network(IpAddr::V6(addr), self.prefix_len) == IpAddr::V6(network)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// IPv4-mapped IPv6 (`::ffff:192.0.2.1`) counts as its IPv4 form, matching
+/// `pynext.proxy._normalize_ip`, so the same peer is not two different
+/// keys (and a mapped trusted proxy is recognised as trusted).
+fn normalize_client_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => ip,
+        },
+        ip => ip,
+    }
+}
+
+fn mask_network(ip: IpAddr, prefix_len: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(addr) => {
+            let mask = if prefix_len == 0 {
+                0u32
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            IpAddr::V4(std::net::Ipv4Addr::from(u32::from(addr) & mask))
+        }
+        IpAddr::V6(addr) => {
+            let mask = if prefix_len == 0 {
+                0u128
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
+            IpAddr::V6(std::net::Ipv6Addr::from(u128::from(addr) & mask))
+        }
+    }
+}
+
 /// The peer address of the TCP connection a request arrived on, carried in
 /// request extensions so dispatch can hand the client IP to the Python
 /// bridge. The Python rate limiter keys buckets on it (spec §11); without
@@ -1936,6 +2974,213 @@ struct PeerAddr(SocketAddr);
 /// Bridge from hyper's connection service to the axum router: the router is a
 /// tower service, so each connection polls it ready and then calls it with the
 /// request body converted to axum's `Body`.
+/// Bytes of the first request's header block the smuggling sniff holds
+/// back for inspection. A header block larger than this is passed through
+/// uninspected and left to hyper's own limits; a `Content-Length` +
+/// `Transfer-Encoding` combination hiding past 128 KiB of headers is not
+/// inspected, but hyper still closes the connection after such a request
+/// (`keep_alive = false` when both are present), so it cannot poison a
+/// reused connection.
+const SMUGGLING_SNIFF_LIMIT: usize = 128 * 1024;
+
+/// Find the end of the first request's header block: returns
+/// `(end, insert_at)` where `end` is the index just past the blank-line
+/// terminator and `insert_at` is where a marker header line goes (just
+/// before the final blank line). `None` while the block is incomplete.
+fn first_header_block_end(buf: &[u8]) -> Option<(usize, usize)> {
+    // Search CRLF CRLF first: it cannot contain a bare LF LF.
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((pos + 4, pos + 2));
+    }
+    if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+        return Some((pos + 2, pos + 1));
+    }
+    None
+}
+
+/// Scan the first request's header block for a `Content-Length` +
+/// `Transfer-Encoding` combination and, when found, insert the smuggling
+/// marker header just before the final blank line. Returns true when the
+/// marker was inserted. The request line (first line) is skipped, header
+/// names compare case-insensitively, and an h2c prior-knowledge preface
+/// (`PRI * HTTP/2.0`) is left untouched — it has no headers to scan and
+/// hyper-util's auto builder still needs the exact preface bytes.
+fn mark_smuggling_request(buf: &mut Vec<u8>, end: usize, insert_at: usize) -> bool {
+    let head = &buf[..end];
+    if head.starts_with(b"PRI * HTTP/2.0") {
+        return false;
+    }
+    let mut saw_cl = false;
+    let mut saw_te = false;
+    for (index, line) in head.split(|&b| b == b'\n').enumerate() {
+        if index == 0 {
+            continue; // request line
+        }
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let name = &line[..colon];
+        if name.eq_ignore_ascii_case(b"content-length") {
+            saw_cl = true;
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            saw_te = true;
+        }
+        if saw_cl && saw_te {
+            break;
+        }
+    }
+    if !(saw_cl && saw_te) {
+        return false;
+    }
+    let marker = format!("{SMUGGLING_MARKER_NAME}: {SMUGGLING_MARKER_CL_TE}\r\n");
+    buf.splice(insert_at..insert_at, marker.into_bytes());
+    true
+}
+
+/// Byte-stream wrapper that sniffs the first request on a connection for
+/// request-smuggling framing (S-P1-31) before hyper parses it.
+///
+/// hyper decides framing while parsing and strips `Content-Length` as
+/// soon as `Transfer-Encoding` is present, so dispatch can never see a
+/// `Content-Length` + `Transfer-Encoding` combination — the only place to
+/// catch it is the raw bytes. This wrapper holds back the first request's
+/// header block until its blank-line terminator arrives, scans it, and
+/// inserts the `x-pynext-smuggling` marker when both headers are present;
+/// dispatch then rejects with 400 and closes the connection. Everything
+/// else passes through byte-for-byte, including the h2c preface and any
+/// bytes after the header block.
+///
+/// Only the first request per connection is inspected: finding later
+/// requests would require re-implementing body framing (lengths and
+/// chunked boundaries) on this layer. That is the documented residual —
+/// hyper already closes the connection after any request that carries
+/// both headers, so a smuggled request cannot poison a reused
+/// connection; the first-request sniff additionally turns the
+/// still-executed handler run into a 400.
+///
+/// The hold-back is bounded by the same `header_read_timeout` hyper
+/// enforces once it sees bytes: the guard sits in front of hyper, so
+/// without its own deadline a client that never completes its first
+/// header block would starve hyper-util's auto-builder protocol sniff
+/// (`read_version` waits unboundedly for 24 bytes) and hyper's header
+/// read timeout would never get a chance to fire — the connection (and
+/// its accept-loop slot) would be held forever. When the deadline
+/// expires the guard fails closed with a timeout error, which aborts
+/// the connection; the partial block is never delivered uninspected, so
+/// a slow sender cannot bypass the smuggling scan. A zero timeout
+/// disables the bound, matching `header_read_timeout = 0`.
+struct SmugglingGuardIo<S> {
+    inner: S,
+    /// Bytes read from `inner` but not yet delivered to hyper.
+    pending: Vec<u8>,
+    /// The first header block has been inspected (or inspection was
+    /// abandoned at EOF / over the size cap).
+    inspected: bool,
+    /// Fires when the first header block has not completed within
+    /// `header_read_timeout` of the connection being accepted.
+    /// `None` when the timeout is disabled (zero).
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> SmugglingGuardIo<S> {
+    fn new(inner: S, header_read_timeout: Duration) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            inspected: false,
+            deadline: if header_read_timeout.is_zero() {
+                None
+            } else {
+                Some(Box::pin(tokio::time::sleep_until(
+                    tokio::time::Instant::now() + header_read_timeout,
+                )))
+            },
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SmugglingGuardIo<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if !this.inspected {
+            // Hold back bytes until the first header block is complete
+            // enough to scan; a partial header block must never leak to
+            // hyper uninspected.
+            loop {
+                if this.pending.len() >= SMUGGLING_SNIFF_LIMIT {
+                    this.inspected = true;
+                    break;
+                }
+                if let Some((end, insert_at)) = first_header_block_end(&this.pending) {
+                    mark_smuggling_request(&mut this.pending, end, insert_at);
+                    this.inspected = true;
+                    break;
+                }
+                // Bound the hold-back (see the struct docs): a first
+                // header block that never completes must abort the
+                // connection instead of starving hyper's protocol sniff
+                // forever. Polling the sleep registers this task's waker,
+                // so the connection is re-polled at the deadline even if
+                // no more bytes arrive.
+                if let Some(deadline) = this.deadline.as_mut() {
+                    if deadline.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "first header block did not complete within header_read_timeout",
+                        )));
+                    }
+                }
+                let mut chunk = [0u8; 8192];
+                let mut chunk_buf = ReadBuf::new(&mut chunk);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut chunk_buf) {
+                    Poll::Ready(Ok(())) => {
+                        let filled = chunk_buf.filled();
+                        if filled.is_empty() {
+                            // EOF before a complete header block: deliver
+                            // what we have; there is nothing to smuggle.
+                            this.inspected = true;
+                            break;
+                        }
+                        this.pending.extend_from_slice(filled);
+                    }
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+        if !this.pending.is_empty() {
+            let n = buf.remaining().min(this.pending.len());
+            buf.put_slice(&this.pending[..n]);
+            this.pending.drain(..n);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SmugglingGuardIo<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 struct HyperService {
     router: AxumRouter,
     peer_addr: Option<SocketAddr>,
@@ -2036,16 +3281,21 @@ fn take_python_listener(_py: Python<'_>, _listener: Py<PyAny>) -> PyResult<std::
 
 #[pyclass]
 struct NativeServer {
-    shutdown: Option<oneshot::Sender<()>>,
+    // stop() may pass the shutdown budget that is left when it is
+    // called; None keeps the construction-time drain bound.
+    shutdown: Option<oneshot::Sender<Option<Duration>>>,
     thread: Option<JoinHandle<()>>,
     #[pyo3(get)]
     address: String,
+    // H-2: shared with ServerState so the fail-open count stays readable
+    // after the state moves into the server thread.
+    rate_limit_fail_open: Arc<AtomicU64>,
 }
 
 #[pymethods]
 impl NativeServer {
     #[new]
-    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None))]
+    #[pyo3(signature = (callback, host, port, static_pages, public_assets, client_assets, isr_cache, asset_etags, max_concurrent=64, acquire_timeout_ms=1000, max_waiting=None, body_capacity=16, body_timeout_ms=10000, websocket_paths=None, websocket_callback=None, reuse_port=false, route_patterns=None, middleware_enabled=false, shared_cache_enabled=false, websocket_protocols=None, websocket_max_message=65536, listener=None, max_connections=1024, max_connections_per_ip=128, header_read_timeout_ms=10000, body_min_rate_bytes_per_sec=1024, security_headers=None, drain_timeout_secs=30.0, websocket_origin_callback=None, websocket_rate_limit_callback=None, websocket_auth_callback=None, http_rate_limit_callback=None, path_headers=None, max_concurrent_per_ip=16, acquire_timeout_max_ms=None, fast_path_max_concurrent=None, streaming_max_lifetime_secs=300, body_capacity_per_ip=4, ws_idle_timeout_secs=300, ws_max_lifetime_secs=3600, ws_ping_interval_secs=60, trusted_proxies=None, allowed_hosts=None))]
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn new(
@@ -2083,6 +3333,16 @@ impl NativeServer {
         websocket_auth_callback: Option<Py<PyAny>>,
         http_rate_limit_callback: Option<Py<PyAny>>,
         path_headers: Option<Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>>,
+        max_concurrent_per_ip: usize,
+        acquire_timeout_max_ms: Option<u64>,
+        fast_path_max_concurrent: Option<usize>,
+        streaming_max_lifetime_secs: u64,
+        body_capacity_per_ip: usize,
+        ws_idle_timeout_secs: u64,
+        ws_max_lifetime_secs: u64,
+        ws_ping_interval_secs: u64,
+        trusted_proxies: Option<Vec<String>>,
+        allowed_hosts: Option<Vec<String>>,
     ) -> PyResult<Self> {
         // The drain bound is a shutdown budget, not a request timeout:
         // negative or NaN values would silently become "no drain at
@@ -2130,6 +3390,36 @@ impl NativeServer {
                 "max_connections_per_ip is outside the supported range",
             ));
         }
+        if max_concurrent_per_ip == 0 || max_concurrent_per_ip > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "max_concurrent_per_ip is outside the supported range",
+            ));
+        }
+        // S-P1-11: the fast-path budget defaults to 4x the execution
+        // slots — generous for cheap static responses, but still a cap
+        // instead of the bare connection limit. An explicit 0 would shed
+        // every fast-path response, so it is rejected like the other
+        // zero capacities.
+        let fast_path_max_concurrent = fast_path_max_concurrent
+            .unwrap_or_else(|| max_concurrent.saturating_mul(4).min(Semaphore::MAX_PERMITS));
+        if fast_path_max_concurrent == 0 || fast_path_max_concurrent > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "fast_path_max_concurrent is outside the supported range",
+            ));
+        }
+        if body_capacity_per_ip == 0 || body_capacity_per_ip > Semaphore::MAX_PERMITS {
+            return Err(PyValueError::new_err(
+                "body_capacity_per_ip is outside the supported range",
+            ));
+        }
+        // Trusted proxies (S-P1-18): invalid entries fail at startup, like
+        // Python's parse_trusted_proxies, instead of silently trusting
+        // nobody — or everybody.
+        let trusted_proxies = trusted_proxies
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| TrustedProxyNetwork::parse(&value).map_err(PyValueError::new_err))
+            .collect::<PyResult<Vec<_>>>()?;
         if static_pages
             .keys()
             .chain(public_assets.keys())
@@ -2178,6 +3468,15 @@ impl NativeServer {
                 Ok(PathHeaderRule { router, headers })
             })
             .collect::<PyResult<Vec<_>>>()?;
+        // Host allowlist (S-P1-19, M-9): an explicit list is compiled
+        // as given; None or an empty list means the loopback default,
+        // matching `pynext.config.effective_allowed_hosts`.
+        let allowed_hosts = match allowed_hosts {
+            Some(entries) if !entries.is_empty() => {
+                parse_host_patterns(entries).map_err(PyValueError::new_err)?
+            }
+            _ => default_host_patterns(),
+        };
         let isr_cache = isr_cache.inner.clone();
         let public_assets = public_assets
             .into_iter()
@@ -2209,7 +3508,11 @@ impl NativeServer {
             .local_addr()
             .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?
             .to_string();
-        let (shutdown, rx) = oneshot::channel();
+        let (shutdown, rx) = oneshot::channel::<Option<Duration>>();
+        // H-2: created here so both the server thread's state and this
+        // handle share one fail-open counter.
+        let rate_limit_fail_open = Arc::new(AtomicU64::new(0));
+        let rate_limit_fail_open_state = Arc::clone(&rate_limit_fail_open);
         // The spawned thread reports its startup result back: previously a
         // panic in `.expect` here only killed the thread while `new()` had
         // already returned Ok with an address, leaving a dead server behind.
@@ -2244,6 +3547,8 @@ impl NativeServer {
                         max_waiting.unwrap_or_else(|| max_concurrent.min(64)),
                     )),
                     acquire_timeout: Duration::from_millis(acquire_timeout_ms),
+                    acquire_timeout_max: acquire_timeout_max_ms.map(Duration::from_millis),
+                    hold_stats: Arc::new(HoldTimeStats::new()),
                     // Body intake gets fewer slots than Python execution on
                     // purpose: a flood of slow uploads can then only take the
                     // body slots, leaving execution slots free for requests
@@ -2253,11 +3558,21 @@ impl NativeServer {
                     // bottleneck.
                     body_capacity: Arc::new(Semaphore::new(body_capacity)),
                     body_timeout: Duration::from_millis(body_timeout_ms),
+                    fast_path_capacity: Arc::new(Semaphore::new(fast_path_max_concurrent)),
                     connection_capacity: Arc::new(Semaphore::new(max_connections)),
                     per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
                     max_connections_per_ip,
+                    trusted_proxies,
                     header_read_timeout: Duration::from_millis(header_read_timeout_ms),
                     body_min_rate: body_min_rate_bytes_per_sec,
+                    // S-P1-14/15/16 (0 disables the streaming lifetime,
+                    // the WS idle timeout, the WS lifetime, and WS pings).
+                    streaming_max_lifetime: Duration::from_secs(streaming_max_lifetime_secs),
+                    body_per_ip: Arc::new(Mutex::new(HashMap::new())),
+                    max_body_per_ip: body_capacity_per_ip,
+                    ws_idle_timeout: Duration::from_secs(ws_idle_timeout_secs),
+                    ws_max_lifetime: Duration::from_secs(ws_max_lifetime_secs),
+                    ws_ping_interval: Duration::from_secs(ws_ping_interval_secs),
                     static_pages: static_pages
                         .into_iter()
                         .map(|(path, body)| (path, Bytes::from(body)))
@@ -2273,6 +3588,7 @@ impl NativeServer {
                     shared_cache_enabled,
                     security_headers: security_headers.unwrap_or_default(),
                     path_headers,
+                    allowed_hosts,
                     websocket_router,
                     websocket_paths: websocket_paths.into_iter().collect(),
                     websocket_protocols: websocket_protocols.unwrap_or_default(),
@@ -2282,6 +3598,9 @@ impl NativeServer {
                     ws_rate_limit_callback: websocket_rate_limit_callback,
                     http_rate_limit_callback,
                     rate_limit_capacity: Arc::new(Semaphore::new(64)),
+                    rate_limit_fail_open: rate_limit_fail_open_state,
+                    per_ip_executions: Arc::new(Mutex::new(HashMap::new())),
+                    max_concurrent_per_ip,
                     ws_origin_capacity: Arc::new(Semaphore::new(64)),
                     ws_auth_callback: websocket_auth_callback,
                     ws_auth_capacity: Arc::new(Semaphore::new(64)),
@@ -2290,14 +3609,15 @@ impl NativeServer {
                 // this handle; the router takes its own clone via with_state.
                 let limits = Arc::clone(&state);
                 let app = AxumRouter::new().fallback(any(dispatch)).with_state(state);
-                let mut shutdown = std::pin::pin!(async {
-                    let _ = rx.await;
-                });
+                // stop() may pass the shutdown budget that is left when
+                // it is called; None keeps the construction-time bound
+                // (used when the server is dropped without stop()).
+                let mut shutdown = std::pin::pin!(async { rx.await.ok().flatten() });
                 let mut connections = tokio::task::JoinSet::new();
                 let (connection_shutdown, _) = watch::channel(false);
-                loop {
+                let drain_override = loop {
                     tokio::select! {
-                        _ = &mut shutdown => break,
+                        override_value = &mut shutdown => break override_value,
                         accepted = listener.accept() => {
                             let (stream, peer_addr) = match accepted {
                                 Ok(pair) => pair,
@@ -2306,6 +3626,19 @@ impl NativeServer {
                                     continue;
                                 }
                             };
+                            // S-P1-16: TCP keepalive probes catch
+                            // half-open peers (idle WebSocket sessions
+                            // especially) that no application timeout can
+                            // see until it tries to write. Best-effort:
+                            // a platform that cannot set it keeps the
+                            // application-level ping/pong instead.
+                            {
+                                let keepalive = socket2::TcpKeepalive::new()
+                                    .with_time(Duration::from_secs(60))
+                                    .with_interval(Duration::from_secs(10));
+                                let _ = socket2::SockRef::from(&stream)
+                                    .set_tcp_keepalive(&keepalive);
+                            }
                             // Connection budget (A4): the total cap and the
                             // per-IP cap are enforced here, before any
                             // request is read, so a flood of idle or slow
@@ -2316,14 +3649,9 @@ impl NativeServer {
                             // exists to answer yet. Both permits are held
                             // for the lifetime of the connection task.
                             // IPv4-mapped IPv6 addresses count under their
-                            // IPv4 form, matching the Python rate limiter.
-                            let peer_ip = match peer_addr.ip() {
-                                IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                                    Some(v4) => IpAddr::V4(v4),
-                                    None => peer_addr.ip(),
-                                },
-                                ip => ip,
-                            };
+                            // IPv4 form, matching the Python rate limiter
+                            // (pynext.proxy normalizes the same way).
+                            let peer_ip = normalize_client_ip(peer_addr.ip());
                             let total_permit = match limits
                                 .connection_capacity
                                 .clone()
@@ -2332,32 +3660,69 @@ impl NativeServer {
                                 Ok(permit) => permit,
                                 Err(_) => continue,
                             };
-                            let per_ip_admitted = {
-                                let mut counts = limits
-                                    .per_ip_connections
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                let count = counts.entry(peer_ip).or_insert(0);
-                                if *count >= limits.max_connections_per_ip {
-                                    false
-                                } else {
-                                    *count += 1;
-                                    true
+                            // Per-IP cap, trust-aware (S-P1-18, M-8): the
+                            // accept loop runs before any request is read,
+                            // so no X-Forwarded-For / Forwarded header
+                            // exists yet to resolve a client IP from — the
+                            // peer is the only identity available here.
+                            // Keying the cap on the peer is correct for a
+                            // direct client, but behind a trusted proxy
+                            // every user would share the proxy's single
+                            // 128-connection budget. A peer in
+                            // `trusted_proxies` (the same list Python's
+                            // ProxyTrust resolves forwarded headers
+                            // against) is therefore exempt from the per-IP
+                            // cap: the total connection cap still bounds
+                            // it, and per-client limits behind the proxy
+                            // are enforced at request time, where headers
+                            // exist — the Python rate limiter keys buckets
+                            // on the trust-resolved client IP, and an
+                            // untrusted peer's forwarded headers are
+                            // ignored there. Exempting an unlisted peer
+                            // would let any client mint unlimited
+                            // connections, so only a listed peer is exempt.
+                            let per_ip_guard = if limits
+                                .trusted_proxies
+                                .iter()
+                                .any(|network| network.contains(peer_ip))
+                            {
+                                None
+                            } else {
+                                let per_ip_admitted = {
+                                    let mut counts = limits
+                                        .per_ip_connections
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    let count = counts.entry(peer_ip).or_insert(0);
+                                    if *count >= limits.max_connections_per_ip {
+                                        false
+                                    } else {
+                                        *count += 1;
+                                        true
+                                    }
+                                };
+                                if !per_ip_admitted {
+                                    drop(total_permit);
+                                    continue;
                                 }
-                            };
-                            if !per_ip_admitted {
-                                drop(total_permit);
-                                continue;
-                            }
-                            let per_ip_guard = PerIpConnectionGuard {
-                                counts: Arc::clone(&limits.per_ip_connections),
-                                ip: peer_ip,
+                                Some(PerIpConnectionGuard {
+                                    counts: Arc::clone(&limits.per_ip_connections),
+                                    ip: peer_ip,
+                                })
                             };
                             let header_read_timeout = limits.header_read_timeout;
                             let service = HyperService {
                                 router: app.clone(),
                                 peer_addr: Some(peer_addr),
                             };
+                            // Request-smuggling sniff (S-P1-31): wrap the
+                            // stream so the first request's header block is
+                            // scanned for a `Content-Length` +
+                            // `Transfer-Encoding` combination before hyper
+                            // parses it. The wrap happens here, outside the
+                            // h2c/auto-builder setup below, and only changes
+                            // the byte stream's first header block.
+                            let stream = SmugglingGuardIo::new(stream, header_read_timeout);
                             let mut stop_connection = connection_shutdown.subscribe();
                             // Auto-detect the protocol per connection: a
                             // client that opens with the HTTP/2
@@ -2366,12 +3731,52 @@ impl NativeServer {
                             // old Http1Builder-only loop turned the h2
                             // preface into a VersionH2 error and dropped the
                             // connection. The header read timeout applies to
-                            // the HTTP/1.1 side via `.http1()`; h2c
-                            // connections have no idle timeout, only the
-                            // connection caps above.
+                            // the HTTP/1.1 side via `.http1()`; h2c gets the
+                            // same bound from the idle watchdog below
+                            // (S-P1-13), since hyper has no h2c idle
+                            // timeout of its own.
                             connections.spawn(async move {
                                 let _total_permit = total_permit;
                                 let _per_ip_guard = per_ip_guard;
+                                // S-P1-13 (M-3): tell h2c apart from
+                                // HTTP/1.1 by peeking at the prior-knowledge
+                                // preface. Hyper auto-detects the protocol
+                                // itself; the peek only decides whether the
+                                // idle watchdog applies, so a slow or
+                                // partial preface merely fails open to "no
+                                // watchdog". The peek consumes nothing, and
+                                // a client that has not sent anything yet
+                                // only delays connection setup by the peek
+                                // timeout.
+                                let is_h2c = {
+                                    let mut preface = [0u8; 24];
+                                    match tokio::time::timeout(
+                                        Duration::from_millis(100),
+                                        // The stream is already wrapped in
+                                        // SmugglingGuardIo (S-P1-31), which
+                                        // has no peek of its own: peek the
+                                        // inner TcpStream directly. The guard
+                                        // has not read anything yet (hyper
+                                        // reads first), so its pending buffer
+                                        // is empty and the peek sees the same
+                                        // bytes hyper will.
+                                        stream.inner.peek(&mut preface),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(n)) => {
+                                            n >= 24
+                                                && preface
+                                                    == *b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+                                        }
+                                        _ => false,
+                                    }
+                                };
+                                let idle_clock = Arc::new(IdleClock::new());
+                                let watched = IdleWatchStream {
+                                    inner: stream,
+                                    clock: Arc::clone(&idle_clock),
+                                };
                                 let mut builder = AutoBuilder::new(TokioExecutor::new());
                                 {
                                     let mut http1 = builder.http1();
@@ -2385,7 +3790,7 @@ impl NativeServer {
                                 // the upgrade future failing with "upgrade
                                 // expected but low level API in use".
                                 let connection = builder
-                                    .serve_connection_with_upgrades(TokioIo::new(stream), service);
+                                    .serve_connection_with_upgrades(TokioIo::new(watched), service);
                                 tokio::pin!(connection);
                                 tokio::select! {
                                     _ = &mut connection => {}
@@ -2393,18 +3798,44 @@ impl NativeServer {
                                         connection.as_mut().graceful_shutdown();
                                         let _ = connection.await;
                                     }
+                                    // Idle timeout for h2c only: HTTP/1.1
+                                    // already gets the header-read timeout
+                                    // from hyper, and applying this watchdog
+                                    // there too would kill long handlers that
+                                    // stay silent for a while. Activity is
+                                    // any socket read/write, so a live stream
+                                    // or a peer answering frames keeps the
+                                    // connection; only a connection idle for
+                                    // the whole timeout is dropped, which
+                                    // releases its connection-budget permits.
+                                    _ = async {
+                                        if !is_h2c || header_read_timeout.is_zero() {
+                                            return futures_util::future::pending::<()>().await;
+                                        }
+                                        loop {
+                                            let idle = idle_clock.idle();
+                                            if idle >= header_read_timeout {
+                                                return;
+                                            }
+                                            tokio::time::sleep(header_read_timeout - idle).await;
+                                        }
+                                    } => {}
                                 }
                             });
                         }
                         _ = connections.join_next(), if !connections.is_empty() => {}
                     }
-                }
+                };
                 let _ = connection_shutdown.send(true);
                 // Drain in-flight connections, bounded so `stop()` cannot
-                // hang on a stuck connection. The bound is the Python
-                // shutdown timeout (B6): serve() already waited that long
-                // for Python handlers, so this only covers connections
-                // whose close handshake is still in flight.
+                // hang on a stuck connection. The bound is the shutdown
+                // budget that is left when stop() is called (serve()
+                // passes what remains of its shared budget); a bare
+                // stop() or a drop falls back to the construction-time
+                // bound, which only covers connections whose close
+                // handshake is still in flight after serve() already
+                // waited for Python handlers.
+                let drain_timeout = drain_override.unwrap_or(drain_timeout);
                 let _ = tokio::time::timeout(drain_timeout, async {
                     while connections.join_next().await.is_some() {}
                 })
@@ -2426,12 +3857,25 @@ impl NativeServer {
             shutdown: Some(shutdown),
             thread: Some(thread),
             address,
+            rate_limit_fail_open,
         })
     }
 
-    fn stop(&mut self, py: Python<'_>) {
+    /// Stop the server, draining connections for at most ``timeout``
+    /// seconds when given; without one the drain bound the server was
+    /// constructed with applies. ``serve()`` passes the shutdown
+    /// budget that is left, so the whole shutdown stays within one
+    /// shared timeout instead of each stage taking a fresh budget.
+    #[pyo3(signature = (timeout=None))]
+    fn stop(&mut self, py: Python<'_>, timeout: Option<f64>) {
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            // Clamped like the construction-time value, so a negative
+            // or NaN budget becomes "no drain at all" instead of
+            // hanging the shutdown.
+            let drain = timeout.map(|secs| {
+                Duration::from_secs_f64(if secs.is_finite() { secs.max(0.0) } else { 0.0 })
+            });
+            let _ = shutdown.send(drain);
         }
         if let Some(thread) = self.thread.take() {
             py.detach(move || {
@@ -2439,12 +3883,18 @@ impl NativeServer {
             });
         }
     }
+
+    /// H-2: how many rate-limit decisions failed open (no decision
+    /// could be produced) since this server started.
+    fn rate_limit_fail_open_count(&self) -> u64 {
+        self.rate_limit_fail_open.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for NativeServer {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            let _ = shutdown.send(None);
         }
     }
 }
@@ -2465,6 +3915,85 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use serde_json::json;
+
+    // Host allowlist (S-P1-19, M-9): Django ALLOWED_HOSTS semantics —
+    // exact, `.domain` (domain + subdomains), `*.domain` (subdomains
+    // only), `*` (any), with the request port stripped before matching.
+    #[test]
+    fn host_patterns_match_django_semantics() {
+        let patterns = parse_host_patterns(vec![
+            "example.com".to_string(),
+            ".example.org".to_string(),
+            "*.example.net".to_string(),
+        ])
+        .unwrap();
+        let allowed = |host: &str| {
+            let bare = bare_host(host).unwrap();
+            patterns.iter().any(|p| host_matches(&bare, p))
+        };
+        assert!(allowed("example.com"));
+        assert!(allowed("example.com:3000"));
+        assert!(allowed("EXAMPLE.COM"));
+        assert!(allowed("example.com."));
+        assert!(!allowed("sub.example.com"));
+        assert!(!allowed("evil.com"));
+        assert!(allowed("example.org"));
+        assert!(allowed("www.example.org"));
+        assert!(allowed("deep.sub.example.org"));
+        assert!(allowed("www.example.net"));
+        assert!(!allowed("example.net"));
+        assert!(!allowed("example.com.evil.com"));
+    }
+
+    #[test]
+    fn host_patterns_reject_bad_entries() {
+        for bad in [
+            "",
+            "https://example.com",
+            "example.com:3000",
+            "example.com/path",
+            "exa mple.com",
+            "foo.*.example.com",
+            ".127.0.0.1",
+            "*.127.0.0.1",
+            "[example.com]",
+            "example..com",
+            "-example.com",
+            "example.com-",
+        ] {
+            assert!(parse_host_pattern(bad).is_err(), "{bad}");
+        }
+        assert!(parse_host_pattern("*").is_ok());
+        assert!(parse_host_pattern("[::1]").is_ok());
+        assert!(parse_host_pattern("::1").is_ok());
+        assert!(matches!(
+            parse_host_pattern("EXAMPLE.COM").unwrap(),
+            HostPattern::Exact(ref h) if h == "example.com"
+        ));
+    }
+
+    #[test]
+    fn host_header_requires_a_present_allowed_host() {
+        let patterns = default_host_patterns();
+        let mut headers = HeaderMap::new();
+        assert!(!host_header_allowed(&headers, None, &patterns));
+        // h2c carries :authority instead of a Host header: the URI
+        // authority is the fallback source.
+        assert!(host_header_allowed(
+            &headers,
+            Some("127.0.0.1:3000"),
+            &patterns
+        ));
+        assert!(!host_header_allowed(&headers, Some("evil.com"), &patterns));
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:3000"));
+        assert!(host_header_allowed(&headers, None, &patterns));
+        headers.insert(header::HOST, HeaderValue::from_static("[::1]:3000"));
+        assert!(host_header_allowed(&headers, None, &patterns));
+        headers.insert(header::HOST, HeaderValue::from_static("evil.com"));
+        assert!(!host_header_allowed(&headers, None, &patterns));
+        headers.insert(header::HOST, HeaderValue::from_static(""));
+        assert!(!host_header_allowed(&headers, None, &patterns));
+    }
 
     // Property-based coverage for the HTML serializer (finding #48, spec §13).
     // These tests call the pure-Rust render_node directly; the same renderer
@@ -2510,5 +4039,267 @@ mod tests {
             let mut output = String::new();
             let _ = render_node(&node, &mut output, 0, None);
         }
+    }
+
+    // Adaptive admission timeout (C-P1-5): the effective wait follows the
+    // observed slot-hold time, capped by the configured ceiling.
+    #[test]
+    fn adaptive_timeout_stays_fixed_without_ceiling_or_samples() {
+        let base = Duration::from_millis(1000);
+        assert_eq!(effective_acquire_timeout(base, None, Some(5000.0)), base);
+        assert_eq!(
+            effective_acquire_timeout(base, Some(Duration::from_millis(5000)), None),
+            base
+        );
+    }
+
+    #[test]
+    fn adaptive_timeout_tracks_hold_time_ewma() {
+        let base = Duration::from_millis(1000);
+        let max = Duration::from_millis(5000);
+        // Mean hold 500 ms -> 2x = 1000 ms, the base: no stretch.
+        assert_eq!(
+            effective_acquire_timeout(base, Some(max), Some(500.0)),
+            base
+        );
+        // Mean hold 1500 ms -> 2x = 3000 ms.
+        assert_eq!(
+            effective_acquire_timeout(base, Some(max), Some(1500.0)),
+            Duration::from_millis(3000)
+        );
+        // Mean hold 10 s -> 2x = 20 s, capped at the 5000 ms ceiling.
+        assert_eq!(
+            effective_acquire_timeout(base, Some(max), Some(10000.0)),
+            max
+        );
+    }
+
+    #[test]
+    fn hold_time_ewma_learns_from_samples() {
+        let stats = HoldTimeStats::new();
+        assert_eq!(stats.ewma_ms(), None);
+        stats.record(Duration::from_millis(1000));
+        assert_eq!(stats.ewma_ms(), Some(1000.0));
+        stats.record(Duration::from_millis(2000));
+        let ewma = stats.ewma_ms().unwrap();
+        assert!((ewma - 1200.0).abs() < 1e-6, "ewma was {ewma}");
+    }
+
+    // S-P1-30: the native bridge builds response headers with
+    // `HeaderValue::from_bytes` / `HeaderName::from_bytes` and turns a
+    // failure into a 500 instead of writing the bytes, so a CR, LF or NUL
+    // in a Python-supplied header can never split the response on the
+    // wire. Pin that `http`-crate rejection here: if a future upgrade
+    // ever accepted these bytes, the bridge's 500 fallback would silently
+    // stop defending the response.
+    #[test]
+    fn bridge_header_bytes_reject_crlf() {
+        assert!(HeaderValue::from_bytes(b"ok").is_ok());
+        assert!(HeaderName::from_bytes(b"x-custom").is_ok());
+        for bad_value in [
+            &b"a\r\nInjected: 1"[..],
+            &b"a\rb"[..],
+            &b"a\nb"[..],
+            &b"a\x00b"[..],
+        ] {
+            assert!(
+                HeaderValue::from_bytes(bad_value).is_err(),
+                "{bad_value:?} must be rejected"
+            );
+        }
+        assert!(HeaderName::from_bytes(b"x-bad\r\nname").is_err());
+    }
+    // Trusted-proxy networks (S-P1-18, M-8): the accept loop's trust
+    // decision, mirroring pynext.proxy.parse_trusted_proxies.
+    #[test]
+    fn trusted_proxy_network_matches_host_and_cidr() {
+        let host = TrustedProxyNetwork::parse("127.0.0.1").unwrap();
+        assert!(host.contains("127.0.0.1".parse().unwrap()));
+        assert!(!host.contains("127.0.0.2".parse().unwrap()));
+        let cidr = TrustedProxyNetwork::parse("10.0.0.0/8").unwrap();
+        assert!(cidr.contains("10.1.2.3".parse().unwrap()));
+        assert!(cidr.contains("10.255.255.255".parse().unwrap()));
+        assert!(!cidr.contains("11.0.0.1".parse().unwrap()));
+        assert!(!cidr.contains("192.0.2.9".parse().unwrap()));
+        // A /32 is a single host; a /0 trusts the whole family.
+        assert!(TrustedProxyNetwork::parse("192.0.2.9/32")
+            .unwrap()
+            .contains("192.0.2.9".parse().unwrap()));
+        assert!(TrustedProxyNetwork::parse("0.0.0.0/0")
+            .unwrap()
+            .contains("203.0.113.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxy_network_handles_ipv6_and_mapped_ipv4() {
+        let v6 = TrustedProxyNetwork::parse("2001:db8::/32").unwrap();
+        assert!(v6.contains("2001:db8::1".parse().unwrap()));
+        assert!(!v6.contains("2001:db9::1".parse().unwrap()));
+        // IPv4-mapped IPv6 normalizes to IPv4 on both sides, matching
+        // pynext.proxy: a mapped trusted proxy and a mapped peer match.
+        let mapped = TrustedProxyNetwork::parse("::ffff:10.0.0.0/8").unwrap();
+        assert!(mapped.contains("10.1.2.3".parse().unwrap()));
+        assert!(mapped.contains("::ffff:10.1.2.3".parse().unwrap()));
+        let v4 = TrustedProxyNetwork::parse("10.0.0.0/8").unwrap();
+        assert!(v4.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!v4.contains("::ffff:11.0.0.1".parse().unwrap()));
+        // Families do not cross: an IPv4 network never matches IPv6.
+        assert!(!v4.contains("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxy_network_rejects_bad_entries() {
+        for bad in [
+            "not-an-ip",
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "10.0.0.0/",
+            "/8",
+            "",
+            "10.0.0.0/8/1",
+        ] {
+            assert!(TrustedProxyNetwork::parse(bad).is_err(), "{bad}");
+        }
+    }
+    // S-P1-7: header CTL validation, parser and writer sides share one rule.
+    #[test]
+    fn header_value_ctl_set_matches_aiohttp_safe_header() {
+        // Every CTL byte aiohttp rejects in a header value.
+        for byte in (0x00..=0x08).chain(0x0A..=0x1F).chain([0x7F]) {
+            assert!(
+                header_value_contains_ctl(&[b'a', byte, b'b']),
+                "byte 0x{byte:02x} must be a CTL in a header value"
+            );
+        }
+        // HTAB, SP, printable ASCII and obs-text are legal field-value bytes.
+        assert!(!header_value_contains_ctl(b"a\tb c~d"));
+        assert!(!header_value_contains_ctl(&[0x80, 0xFF]));
+        assert!(!header_value_contains_ctl(b""));
+    }
+
+    #[test]
+    fn header_name_ctl_rejects_any_byte_below_space_or_del() {
+        for byte in (0x00..=0x1F).chain([0x7F]) {
+            assert!(
+                header_name_contains_ctl(&[b'x', byte]),
+                "byte 0x{byte:02x} must be a CTL in a header name"
+            );
+        }
+        assert!(!header_name_contains_ctl(b"x-header"));
+    }
+
+    #[test]
+    fn headers_contain_ctl_covers_names_and_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ok", HeaderValue::from_static("fine"));
+        assert!(!headers_contain_ctl(&headers));
+        // HeaderValue cannot hold a CTL, so exercise the value path via a
+        // raw map built from bytes that `HeaderValue::from_bytes` accepts
+        // only when clean; the CTL case is covered through
+        // `bridge_response_header` below.
+        headers.insert("x-tab", HeaderValue::from_static("a\tb"));
+        assert!(!headers_contain_ctl(&headers));
+    }
+
+    #[test]
+    fn bridge_response_header_rejects_ctl_and_accepts_clean() {
+        assert!(bridge_response_header(b"x-ok", b"fine").is_some());
+        assert!(bridge_response_header(b"x-tab", b"a\tb").is_some());
+        assert!(bridge_response_header(b"x-evil", b"a\x01b").is_none());
+        assert!(bridge_response_header(b"x-evil", b"a\nb").is_none());
+        assert!(bridge_response_header(b"x-evil", b"a\rb").is_none());
+        assert!(bridge_response_header(b"x-evil", b"a\x00b").is_none());
+        assert!(bridge_response_header(b"x-evil", b"a\x7fb").is_none());
+        assert!(bridge_response_header(b"x-\x01vil", b"a").is_none());
+        assert!(bridge_response_header(b"bad name", b"a").is_none());
+    }
+    // Request-smuggling sniff (S-P1-31): pure-function coverage for the
+    // first-request header scan. The live behaviour (400 + connection
+    // close) is covered from Python by tests/test_request_smuggling.py.
+    fn sniffed(raw: &str) -> (Vec<u8>, bool) {
+        let mut buf = raw.as_bytes().to_vec();
+        let marked = match first_header_block_end(&buf) {
+            Some((end, insert_at)) => mark_smuggling_request(&mut buf, end, insert_at),
+            None => false,
+        };
+        (buf, marked)
+    }
+
+    #[test]
+    fn sniff_marks_content_length_with_transfer_encoding() {
+        let (buf, marked) = sniffed(
+            "POST /api/input HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
+        );
+        assert!(marked);
+        assert!(String::from_utf8_lossy(&buf).contains("x-pynext-smuggling: cl-te"));
+        assert!(buf.ends_with(b"\r\n\r\nhello"));
+    }
+
+    #[test]
+    fn sniff_marks_transfer_encoding_before_content_length() {
+        let (buf, marked) = sniffed(
+            "POST /api/input HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+        );
+        assert!(marked);
+        assert!(String::from_utf8_lossy(&buf).contains("x-pynext-smuggling: cl-te"));
+    }
+
+    #[test]
+    fn sniff_leaves_clean_requests_untouched() {
+        for raw in [
+            "POST /api/input HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "POST /api/input HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello",
+            "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ] {
+            let (buf, marked) = sniffed(raw);
+            assert!(!marked, "{raw}");
+            assert_eq!(buf, raw.as_bytes(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn sniff_leaves_h2c_preface_untouched() {
+        let (buf, marked) = sniffed("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        assert!(!marked);
+        assert_eq!(buf, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    }
+
+    #[test]
+    fn sniff_handles_lf_only_header_block() {
+        let (buf, marked) = sniffed(
+            "POST /api/input HTTP/1.1\nHost: localhost\nContent-Length: 5\nTransfer-Encoding: chunked\n\nhello",
+        );
+        assert!(marked);
+        assert!(String::from_utf8_lossy(&buf).contains("x-pynext-smuggling: cl-te"));
+    }
+
+    #[test]
+    fn sniff_incomplete_header_block_is_not_marked() {
+        let mut buf =
+            b"POST /api/input HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n".to_vec();
+        assert_eq!(first_header_block_end(&buf), None);
+        assert!(!mark_smuggling_request(&mut buf, 0, 0));
+    }
+
+    #[test]
+    fn smuggling_framing_rejects_marker_and_bad_transfer_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-pynext-smuggling", HeaderValue::from_static("cl-te"));
+        assert!(smuggling_framing(&headers, Version::HTTP_11));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::TRANSFER_ENCODING, HeaderValue::from_static("gzip"));
+        assert!(smuggling_framing(&headers, Version::HTTP_11));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("gzip, chunked"),
+        );
+        assert!(!smuggling_framing(&headers, Version::HTTP_11));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        assert!(smuggling_framing(&headers, Version::HTTP_10));
     }
 }

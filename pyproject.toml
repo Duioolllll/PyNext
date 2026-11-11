@@ -36,6 +36,9 @@ dev = [
 redis = [
     "redis>=5,<8",
 ]
+encryption = [
+    "cryptography>=50,<51",
+]
 images = [
     "pillow>=13,<14",
 ]

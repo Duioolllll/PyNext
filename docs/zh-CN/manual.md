@@ -110,9 +110,9 @@ app = create_app(".", security=SecurityConfig(
 ))
 ~~~
 
-来自允许来源的预检请求（携带 `Origin` 和 `Access-Control-Request-Method` 的 `OPTIONS`）会返回 204 以及 `Allow` 和 `Access-Control-Allow-*` 请求头；来源、方法或请求头不在允许范围内的预检请求返回 403。来自允许来源的实际跨源请求会带有 `Access-Control-Allow-Origin`（如已配置，还会带有 `Access-Control-Allow-Credentials: true`）；其他来源则不带 CORS 请求头，浏览器会拒绝向调用方页面暴露响应。所有携带 `Origin` 的请求的响应还会带有 `Vary: Origin`。同源请求永远不会被 CORS 拦截，因此即使未配置来源，同源页面也可以携带自定义请求头调用应用自身的 API。`cors_allowed_origins=("*",)` 表示允许任意来源；当 `cors_allow_credentials=True` 时，将原样回显确切来源，而不是 `*`。
+来自允许来源的预检请求（携带 `Origin` 和 `Access-Control-Request-Method` 的 `OPTIONS`）会返回 204 以及 `Allow` 和 `Access-Control-Allow-*` 请求头；来源、方法或请求头不在允许范围内的预检请求返回 403。来自允许来源的实际跨源请求会带有 `Access-Control-Allow-Origin`（如已配置，还会带有 `Access-Control-Allow-Credentials: true`）；其他来源则不带 CORS 请求头，浏览器会拒绝向调用方页面暴露响应。所有携带 `Origin` 的请求的响应还会带有 `Vary: Origin`。同源请求永远不会被 CORS 拦截，因此即使未配置来源，同源页面也可以携带自定义请求头调用应用自身的 API。`cors_allowed_origins=("*",)` 表示允许任意来源。如果在配置文件中将其与 `cors_allow_credentials=True` 一起设置，加载时会被 `ConfigError` 拒绝；使用凭据时请列出明确的来源。直接构造 `SecurityConfig`（绕过配置校验）时，不会原样回显请求来源，而是返回 `Access-Control-Allow-Origin: *`。浏览器会忽略凭据请求中的通配符，因此跨源页面无法读取响应。
 
-静态文件、SSG 页面和已缓存的 ISR 响应由原生服务器直接提供，不带 CORS 请求头；CORS 仅适用于经 Python 分发产生的响应（API 路由和动态渲染页面）。
+静态文件、SSG 页面和已缓存的 ISR 响应由原生服务器直接提供，但携带 `Origin` 的请求会适用与 ASGI 响应相同的 CORS 策略（包括条件请求、范围请求和 HEAD 响应）。CORS 并不仅适用于经 Python 分发产生的响应（API 路由和动态渲染页面）。
 
 默认 CSP 为 `script-src 'self'; object-src 'none'`。设置 `SecurityConfig(csp_nonce_enabled=True)` 后，每个动态渲染页面都会获得一个新的按请求生成的 nonce：响应头变为 `script-src 'self' 'nonce-<值>'; object-src 'none'`，同一个 nonce 也会添加到 island 运行时 `<script>` 标签上。nonce 每次响应都不同，请勿自行缓存带有 nonce 的页面。预渲染的 SSG 页面、已缓存的 ISR 响应和静态文件保持不带 nonce 的静态策略：嵌入共享 HTML 的 nonce 会在多个响应中被重复使用，从而失去 nonce 的意义。携带 Cookie 或 Authorization 请求头的 ISR 请求会按请求重新渲染，因此会获得 nonce。
 
@@ -172,7 +172,7 @@ async def stream():
 
 `route.py` 可以在 HTTP 处理函数之外再导出一个 `@websocket` 处理函数。处理函数接收一个 `WebSocket`，在收发消息之前必须调用 `await websocket.accept()`。支持文本和二进制消息往返；对方断开连接时 `receive()` 会抛出 `WebSocketDisconnect`，因此每个连接的清理工作应放在 `finally` 块中。
 
-开发版本在 ASGI 和 Axum 接受连接前检查 `Origin`，默认只允许同源。通过向 `create_app(..., security=...)` 传入 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`，或重复指定 `--ws-allowed-origin https://client.example`，可以添加 HTTP(S) 来源。来源须包含协议及非默认端口；不接受 `*` 和 `null`。不发送 `Origin` 的现有非浏览器客户端必须通过 `websocket_allow_missing_origin=True` 或 `--ws-allow-missing-origin` 显式允许。已发布的 0.1.0 不包含此检查。客户端可以伪造或省略 `Origin`。在握手完成之前，升级请求还会经过全局中间件链（包括会话中间件）和处理函数的 `@require_auth`/`@require_permission` 策略（ASGI 和 Axum 均适用）；被拒绝的升级会在 101 响应之前被拦截（Axum 返回 HTTP 403，ASGI 返回 close 1008），处理函数不会执行。应用仍须负责建立身份（例如登录路由设置 `session["user_id"]`），会话之外的凭证方式（如令牌）须在中间件中验证。使用代理时，只通过 `--trusted-proxy` 指定实际的代理，并配置代理覆盖客户端提供的转发头。
+开发版本在 ASGI 和 Axum 接受连接前检查 `Origin`，默认只允许同源。通过向 `create_app(..., security=...)` 传入 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`，或重复指定 `--ws-allowed-origin https://client.example`，可以添加 HTTP(S) 来源。来源须包含协议及非默认端口；不接受 `*` 和 `null`。不发送 `Origin` 的现有非浏览器客户端必须通过 `websocket_allow_missing_origin=True` 或 `--ws-allow-missing-origin` 显式允许。已发布的 0.1.0 不包含此检查。客户端可以伪造或省略 `Origin`。在握手完成之前，升级请求还会经过全局中间件链（包括会话中间件）和处理函数的 `@require_auth`/`@require_permission` 策略（ASGI 和 Axum 均适用）；被拒绝的升级会在 101 响应之前被拦截（ASGI 和 Axum 均返回 HTTP 403，拒绝会被记录到日志），处理函数不会执行。应用仍须负责建立身份（例如登录路由设置 `session["user_id"]`），会话之外的凭证方式（如令牌）须在中间件中验证。使用代理时，只通过 `--trusted-proxy` 指定实际的代理，并配置代理覆盖客户端提供的转发头。
 
 为了让 PyNext 在 ASGI 下识别可信代理，服务器须在 `scope["client"]` 中保留原始对端地址。如果由 PyNext 解释转发头，请关闭 ASGI 服务器提前处理代理头的功能（Uvicorn 使用 `--no-proxy-headers`）。
 
@@ -291,7 +291,7 @@ OpenTelemetry 追踪默认关闭且为可选项：安装 `opentelemetry-api`（�
 
 ## 限流
 
-限流是可选项，采用按进程的令牌桶：`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的请求返回 429，并带有以秒为单位的 `Retry-After` 头。WebSocket 握手也以同样方式限流：每次握手从同一个按 IP 划分的桶中消耗一个令牌，超限的握手返回 429 并带有 `Retry-After`。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失。使用 `--rate-limit-backend redis` 时桶在进程间共享；Redis 不可达时遵循故障策略：默认（`fail_closed`，`--rate-limit-failure-policy fail_closed`）返回 503，`fail_open` 则放行请求。配置的限流同样适用于两个适配器的静态文件、SSG 和新鲜的 ISR 页面。
+限流默认开启，采用按进程的令牌桶：`pynext start` 表示每个客户端 IP 每 60 秒允许 300 个请求，`--rate-limit 0` 可关闭（启动时会警告）。`pynext start --rate-limit 100 --rate-limit-window 60` 表示每个客户端 IP 每 60 秒允许 100 个请求（突发量即上限）。超限的请求返回 429，并带有以秒为单位的 `Retry-After` 头。WebSocket 握手也以同样方式限流：每次握手从同一个按 IP 划分的桶中消耗一个令牌，超限的握手返回 429 并带有 `Retry-After`。键为客户端 IP；只有 `--trusted-proxy`（IP 或 CIDR，可重复指定）列出的对端发来的 `X-Forwarded-For` 才会被信任，不受信任代理的该头部会被忽略，因为它可以被伪造。代码中使用 `create_app(path, rate_limit=RateLimiter(100, 60, trusted_proxies=["10.0.0.0/8"]))`。桶按进程划分，重启后消失。使用 `--rate-limit-backend redis` 时桶在进程间共享；Redis 不可达时遵循故障策略：默认（`fail_closed`，`--rate-limit-failure-policy fail_closed`）返回 503，`fail_open` 则放行请求。配置的限流同样适用于两个适配器的静态文件、SSG 和新鲜的 ISR 页面。
 
 开发版本在两个适配器中均先根据请求头限流，再接收请求体，包括使用 `Expect: 100-continue` 的请求。准入时扣除一个令牌；后续上传中断、大小或速率超限、执行槽不足均不退还。Axum 的 HTTP 与 WebSocket 限流判定合计最多并发 64 个，期限为 2 秒；饱和、超时或意外错误返回 503 和 `Retry-After: 1`。该预算也适用于 `fail_open`，该策略只处理在期限内返回的后端故障。带未读请求体的 HTTP/1.1 拒绝连接会关闭，HTTP/2 的其他流仍可使用。健康检查绕过限流，豁免路径在严格解码后判定，编码后的问号仍属于路径，不作为查询分隔符。已发布的 0.1.0 不包含此改进。
 
