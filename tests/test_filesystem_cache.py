@@ -9,6 +9,7 @@ one process.
 import asyncio
 import json
 import multiprocessing as mp
+import threading
 import time
 from pathlib import Path
 
@@ -93,6 +94,108 @@ def test_key_collision_lease_is_per_key(tmp_path, monkeypatch):
     # And B cannot release a lease it does not own.
     assert backend.release_lease("/news/b", "worker-a") is False
     assert backend.release_lease("/news/b", "worker-b") is True
+
+
+def _race_write(backend, key, body, observe):
+    """Run ``observe()`` while a write is paused just after publishing
+    the body (meta not yet written). Returns ``(blocked, reader, writer)``:
+    whether the observation was still blocked 0.3s after it started,
+    the observation outcome, and the writer outcome. The observation
+    runs in its own thread because, once reads are serialized with
+    writes, it legitimately blocks until the writer finishes.
+    """
+    body_written, resume = threading.Event(), threading.Event()
+    atomic = backend._atomic_write
+    writer_outcome = {}
+    reader_outcome = {}
+
+    def paused(path, data):
+        atomic(path, data)
+        if str(path).endswith(".body"):
+            body_written.set()
+            if not resume.wait(10):
+                raise RuntimeError("reader timed out")
+
+    def writer():
+        try:
+            writer_outcome["insert"] = backend.insert_fenced(key, body, 60, 0, None)
+        except BaseException as exc:  # noqa: BLE001
+            writer_outcome["error"] = repr(exc)
+
+    def reader():
+        try:
+            reader_outcome["result"] = observe()
+        except BaseException as exc:  # noqa: BLE001
+            reader_outcome["error"] = repr(exc)
+
+    backend._atomic_write = paused
+    worker = threading.Thread(target=writer)
+    worker.start()
+    try:
+        assert body_written.wait(10), "writer timed out"
+        looker = threading.Thread(target=reader)
+        looker.start()
+        time.sleep(0.3)
+        blocked = looker.is_alive()
+        resume.set()
+        worker.join(10)
+        looker.join(10)
+    finally:
+        backend._atomic_write = atomic
+    assert not worker.is_alive() and not looker.is_alive()
+    return blocked, reader_outcome, writer_outcome
+
+
+def test_lookup_during_write_waits_for_atomic_publish(tmp_path):
+    """A read landing mid-write must wait, not observe a torn entry.
+
+    P1-2: the body is published before the meta, so a lock-free read
+    between the two renames saw a body without a meta, deleted it as
+    a torn write, and the writer still reported success — the entry
+    was lost. Reads now take the same lock the writer holds, so the
+    read waits and then sees the complete new version.
+    """
+    backend = FileSystemCacheBackend(tmp_path)
+    blocked, reader, writer = _race_write(
+        backend, "/new", b"new-body", lambda: backend.lookup("/new"))
+    assert blocked, "lookup must block while the writer holds the lock"
+    assert writer.get("insert") is True
+    assert reader.get("result") == ("fresh", b"new-body")
+    assert backend.lookup("/new") == ("fresh", b"new-body")
+
+
+def test_lookup_during_colliding_write_never_serves_other_key_body(tmp_path, monkeypatch):
+    """A read racing a colliding write must never serve the other key's body.
+
+    P1-2: with two keys on one file stem, a read for Alice landing
+    after Bob's body rename but before Bob's meta rename returned
+    Bob's body as Alice's (the meta still named Alice). Reads now
+    wait for the write to finish, so Alice sees a miss once Bob's
+    meta lands — never Bob's body.
+    """
+    backend = FileSystemCacheBackend(tmp_path)
+    monkeypatch.setattr("pynext.cache._fs_entry_name", lambda key: "collided-stem")
+    assert backend.insert("/alice", b"alice-body", 60, 0) is True
+    blocked, reader, writer = _race_write(
+        backend, "/bob", b"bob-body", lambda: backend.lookup("/alice"))
+    assert blocked, "lookup must block while the writer holds the lock"
+    assert writer.get("insert") is True
+    assert reader.get("result") == ("miss", None)
+    assert backend.lookup("/alice") == ("miss", None)
+    assert backend.lookup("/bob") == ("fresh", b"bob-body")
+
+
+def test_backend_lock_is_reentrant_in_one_thread(tmp_path):
+    """A nested _locked() hold in one thread must not self-deadlock.
+
+    flock on a fresh fd would block against the outer hold from the
+    same process, so the nested case yields instead of re-taking it.
+    """
+    backend = FileSystemCacheBackend(tmp_path)
+    with backend._locked():
+        with backend._locked():
+            assert backend.insert("/page", b"x", 30.0, 60.0) is True
+    assert backend.lookup("/page") == ("fresh", b"x")
 
 
 def test_insert_lookup_fresh_stale_expired(tmp_path):

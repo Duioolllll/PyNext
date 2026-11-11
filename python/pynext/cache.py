@@ -2268,9 +2268,15 @@ class FileSystemCacheBackend(CacheBackend):
     Mutations (fenced writes, leases, removals, variant generations)
     take one global lock: an in-process ``RLock`` plus an ``flock``/
     ``msvcrt`` byte lock on ``.lock``, released automatically if a
-    worker dies. Reads are lock-free — atomic renames make them
-    consistent — and version checks fence every write, exactly like
-    the SQLite backend. Entries are bounded (``max_entries`` /
+    worker dies. Entry reads take the same lock: a rename is atomic
+    per file, but the body+meta pair is not — a lock-free read could
+    observe a body whose meta has not landed yet (and delete it as a
+    torn write), or read a body that a concurrent colliding write
+    already replaced while the meta still names the old key. Holding
+    the lock across the whole read makes publication atomic: a read
+    sees the old complete version or the new complete version, never
+    a half-published pair. Version checks fence every write, exactly
+    like the SQLite backend. Entries are bounded (``max_entries`` /
     ``max_bytes``, oldest-first eviction on insert); leased entries
     are never evicted.
     """
@@ -2290,6 +2296,7 @@ class FileSystemCacheBackend(CacheBackend):
         self._tags_dir = os.path.join(self.path, "tags")
         self._lock_path = os.path.join(self.path, ".lock")
         self._lock = threading.RLock()
+        self._lock_depth = threading.local()
         try:
             os.makedirs(self._entries_dir, exist_ok=True)
             os.makedirs(self._leases_dir, exist_ok=True)
@@ -2321,7 +2328,18 @@ class FileSystemCacheBackend(CacheBackend):
 
     @contextmanager
     def _locked(self):
-        """Serialize mutations in-process and cross-process."""
+        """Serialize mutations in-process and cross-process.
+
+        Re-entrant within one thread: a nested hold just yields,
+        because the outer hold already excludes other threads and
+        processes. (``flock`` on a fresh fd would self-deadlock if
+        re-acquired, so the nested case must skip the flock, not
+        re-take it.)
+        """
+        depth = getattr(self._lock_depth, "depth", 0)
+        if depth > 0:
+            yield
+            return
         with self._lock:
             handle = open(self._lock_path, "a+b")
             try:
@@ -2330,9 +2348,11 @@ class FileSystemCacheBackend(CacheBackend):
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 elif msvcrt is not None:
                     msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                self._lock_depth.depth = depth + 1
                 try:
                     yield
                 finally:
+                    self._lock_depth.depth = depth
                     if fcntl is not None:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                     elif msvcrt is not None:
@@ -2435,6 +2455,22 @@ class FileSystemCacheBackend(CacheBackend):
         return min(candidates) if candidates else 0.0
 
     def _read_entry(self, key, now, now_mono):
+        """Read one entry atomically with respect to writers.
+
+        The whole read runs under the same lock ``insert_fenced``
+        holds while publishing body+meta, so a concurrent read can
+        never observe the half-published pair (body written, meta
+        not yet): it sees the old complete version or the new
+        complete version. Without this, a read landing between the
+        two renames deletes the fresh body as a torn write (and the
+        writer still reports success), or — on a file-stem
+        collision — serves the other key's freshly written body
+        under the old key's meta.
+        """
+        with self._locked():
+            return self._read_entry_locked(key, now, now_mono)
+
+    def _read_entry_locked(self, key, now, now_mono):
         name = _fs_entry_name(key)
         raw_meta = self._read_meta(name)
         if raw_meta is None:
@@ -2458,10 +2494,11 @@ class FileSystemCacheBackend(CacheBackend):
             lease = self._read_lease(name, now, now_mono, key)
             if lease is not None:
                 return SharedEntry("expired", None, meta["version"], 0.0, 0.0)
-            # Delete only the exact expired version seen, and only if
-            # no live generation owns it (re-checked under the lock by
-            # the caller-visible remove path; here the meta match is
-            # the fence against a concurrent replacement). The
+            # Delete only the exact expired version seen. This read
+            # holds the lock, so no concurrent writer can replace
+            # the entry between the re-check and the delete; the
+            # version+generated_at match is the fence against a
+            # replacement that landed before this read started. The
             # key-aware read also fences against a concurrent write
             # for a colliding key.
             current = self._read_meta_for_key(name, key)
