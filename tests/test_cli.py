@@ -300,7 +300,9 @@ def test_cli_warm_isr_reaches_serve(tmp_path, monkeypatch):
         seen.append(("serve", received_app, host, port, warm_isr))
 
     monkeypatch.setattr(cli, "serve", serve)
-    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--warm-isr"])
+    # C-P0-1: pin single-process; the default now takes the supervisor path.
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--workers", "1",
+                                      "--warm-isr"])
     cli.main()
     assert seen[1] == ("serve", app, "127.0.0.1", 3000, True)
 

@@ -20,7 +20,6 @@ import httpx
 import pytest
 
 from pynext import ObservabilityConfig, RateLimiter, Response, create_app
-from pynext.admission import DecisionUnavailable
 from pynext.observability import (
     JsonFormatter,
     MetricsCollector,
@@ -132,7 +131,7 @@ def test_collector_decision_counters():
     collector.observe_middleware("error")
     collector.observe_middleware("bogus")
     snap = collector.snapshot()
-    assert snap["rate_limit"] == {"allowed": 1, "denied": 1, "exempt": 1, "error": 1}
+    assert snap["rate_limit"] == {"allowed": 1, "denied": 1, "exempt": 1, "error": 1, "fail_open": 0}
     assert snap["middleware"] == {"continued": 1, "short_circuited": 1, "error": 1}
     text = collector.prometheus_text()
     assert 'pynext_rate_limit_total{outcome="allowed"} 1' in text
@@ -240,7 +239,7 @@ def test_asgi_rate_limit_outcomes_in_log_and_counters(tmp_path):
     assert access[1]["route"] == "/" and access[1]["rate_limit"] == "allowed"
     assert access[2]["rate_limit"] == "exempt"
     snap = app.metrics.snapshot()
-    assert snap["rate_limit"] == {"allowed": 1, "denied": 1, "exempt": 2, "error": 0}
+    assert snap["rate_limit"] == {"allowed": 1, "denied": 1, "exempt": 2, "error": 0, "fail_open": 0}
     # The B-1 detection shape: exempt decisions next to 404s.
     assert snap["routes"]["__not_found__"]["status"] == {"404": 2}
 
@@ -250,8 +249,12 @@ def test_asgi_rate_limit_decision_failure_is_counted_as_error(tmp_path):
     app = create_app(tmp_path, rate_limit=RateLimiter(10, 60))
 
     class _FailingGate:
+        # A generic failure (not DecisionUnavailable): the decision gate
+        # could not decide because the limiter itself broke. H-2 fails
+        # open only on DecisionUnavailable (gate full / deadline); any
+        # other failure fails closed and is counted as an error.
         async def check(self, callback):
-            raise DecisionUnavailable("no capacity")
+            raise RuntimeError("limiter backend failed")
 
     app._asgi_admission = _FailingGate()
 
@@ -263,7 +266,7 @@ def test_asgi_rate_limit_decision_failure_is_counted_as_error(tmp_path):
 
     _run(run())
     assert app.metrics.snapshot()["rate_limit"] == {
-        "allowed": 0, "denied": 0, "exempt": 0, "error": 1}
+        "allowed": 0, "denied": 0, "exempt": 0, "error": 1, "fail_open": 0}
 
 
 # -- trace context survives middleware header rewrites ----------------------
@@ -356,7 +359,7 @@ def test_middleware_and_rate_limit_counters_on_both_transports(tmp_path, mode):
     _run(run())
     snap = app.metrics.snapshot()
     assert snap["middleware"] == {"continued": 2, "short_circuited": 1, "error": 0}
-    assert snap["rate_limit"] == {"allowed": 2, "denied": 0, "exempt": 1, "error": 0}
+    assert snap["rate_limit"] == {"allowed": 2, "denied": 0, "exempt": 1, "error": 0, "fail_open": 0}
     text = app.metrics.prometheus_text()
     assert 'pynext_middleware_total{outcome="short_circuited"} 1' in text
     assert 'pynext_rate_limit_total{outcome="exempt"} 1' in text
@@ -387,7 +390,7 @@ def test_rate_limit_denied_is_counted_on_both_transports(tmp_path, mode):
 
     _run(run())
     assert app.metrics.snapshot()["rate_limit"] == {
-        "allowed": 1, "denied": 1, "exempt": 1, "error": 0}
+        "allowed": 1, "denied": 1, "exempt": 1, "error": 0, "fail_open": 0}
 
 
 # -- spans ------------------------------------------------------------------
