@@ -1529,8 +1529,13 @@ class App:
                     elif not is_dynamic and generator is not None:
                         raise ValueError(f"Static SSG page {spec['entry']} cannot export generate_static_params")
                     self.static_generators[pattern] = generator
+                # Optional request parameters pass signature validation and
+                # receive the current request through _invoke. Never share
+                # a shell that can contain that request's personalized data.
                 self._layout_shell_dynamic[pattern] = any(
-                    getattr(layout_fn, "__pynext_layout_dynamic__", False) for layout_fn in layouts
+                    getattr(layout_fn, "__pynext_layout_dynamic__", False)
+                    or "request" in inspect.signature(layout_fn).parameters
+                    for layout_fn in layouts
                 )
                 self.entries[pattern] = (fn, layouts)
                 self.route_auth[pattern] = {"GET": authorization_policy(fn)}
@@ -2283,12 +2288,11 @@ class App:
 
         The entry holds the layouts applied once to a marker text node
         (the unbound shell tree, plus a rendered prefix/suffix split
-        once a streaming page needs it). Layouts only receive
-        ``children``, so the shell cannot depend on the request or the
-        route params; a layout that reads other mutable state must opt
-        out with ``@layout(dynamic=True)``, in which case this returns
-        None and the caller renders the shell on every request. Returns
-        the entry dict, or None for dynamic layouts.
+        once a streaming page needs it). Layouts accepting ``request``
+        are excluded before any cache lookup. A layout that reads other
+        mutable state must opt out with ``@layout(dynamic=True)``.
+        Either case returns None and the caller renders every layout on
+        each request. Otherwise, returns the cached entry dict.
 
         ``request`` is threaded through to the layout invocations so a
         sync layout runs under the sync-worker limit (``_invoke_sync``)
@@ -2376,11 +2380,12 @@ class App:
         The layout shell is rendered once per route and cached; the
         cached prefix is sent first, each page chunk is serialized and
         sent as it arrives, and the cached suffix closes the document.
-        Layouts that opted out with ``@layout(dynamic=True)`` are still
-        rendered on every request, exactly as before. Layouts must render
-        their children exactly once; anything else fails before headers
-        are sent. SSG consumes the stream during the build. ISR streams
-        its first generation while retaining a bounded copy for the cache.
+        Layouts accepting ``request`` or opting out with
+        ``@layout(dynamic=True)`` are rendered on every request. Layouts
+        must render their children exactly once; anything else fails
+        before headers are sent. SSG consumes the stream during the build.
+        ISR streams its first generation while retaining a bounded copy
+        for the cache.
 
         When ``tracker`` is given, the stream owns it: ``page_stream()``
         exits it when the body is fully consumed or the stream is closed,
@@ -2543,7 +2548,7 @@ class App:
             raise TypeError(f"Page {pattern} must return a render node dict, got {type(tree).__name__}")
         entry = await self._layout_shell(pattern, layouts, request)
         if entry is None:
-            # Dynamic layouts: render the shell on every request.
+            # Dynamic or request-aware layouts: render on every request.
             for layout_fn in reversed(layouts):
                 tree = await _invoke(layout_fn, children=tree, request=request)
                 if not isinstance(tree, dict):
