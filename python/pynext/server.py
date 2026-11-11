@@ -499,6 +499,28 @@ def _trusted_proxy_strings(app):
     return tuple(str(network) for network in getattr(trust, "networks", ()))
 
 
+def _path_has_custom_route(custom_routes, path):
+    """True when any custom-route rule matches ``path`` (P1-4).
+
+    The native fast path serves static pages/assets without Python
+    dispatch, so it never applies custom routes (redirects, rewrites,
+    headers). A path matching any rule must fall through to the Python
+    bridge, which runs the same dispatch as ASGI. All rewrite phases
+    are checked: a beforeFiles rewrite changes what is served, and an
+    afterFiles/fallback rewrite that cannot apply (the file exists)
+    is still excluded — the bridge reaches the same result, only
+    without the fast-path shortcut.
+    """
+    if not custom_routes:
+        return False
+    if custom_routes.match_redirect(path) is not None:
+        return True
+    for phase in ("beforeFiles", "afterFiles", "fallback"):
+        if custom_routes.match_rewrite(path, phase) is not None:
+            return True
+    return bool(custom_routes.headers_for(path))
+
+
 def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_CONFIG.max_concurrent,
                  acquire_timeout_ms=DEFAULT_CONFIG.acquire_timeout_ms,
                  body_capacity=16, body_timeout_ms=10000, observability=None, *, reuse_port=False, listener=None,
@@ -875,7 +897,30 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_
             future.cancel()
             return None
 
-    return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store, app.asset_etags,
+    # P1-4: the native fast path serves static pages/assets without
+    # Python dispatch, so it never applies custom routes. Paths
+    # matching any custom-route rule are left out of the fast-path
+    # tables (filtered copies; the app's own tables are untouched),
+    # so those requests fall through to the Python bridge, which runs
+    # the same dispatch as ASGI. Routes without custom routes keep
+    # the fast path. ISR-cache entries cannot be excluded per path
+    # from Python — a custom-routed ISR route served fresh from the
+    # native cache is a known remaining gap (needs a Rust-side
+    # exclusion list).
+    custom_routes = getattr(app, "custom_routes", None)
+    if custom_routes:
+        static_pages = {p: b for p, b in app.static_pages.items()
+                        if not _path_has_custom_route(custom_routes, p)}
+        public_assets = {p: v for p, v in app.public_assets.items()
+                         if not _path_has_custom_route(custom_routes, p)}
+        client_assets = {p: b for p, b in app.client_assets.items()
+                         if not _path_has_custom_route(custom_routes, p)}
+    else:
+        static_pages = app.static_pages
+        public_assets = app.public_assets
+        client_assets = app.client_assets
+
+    return _native.NativeServer(bridge, host, port, static_pages, public_assets, client_assets, app.isr.store, app.asset_etags,
                                 max_concurrent=max_concurrent, acquire_timeout_ms=acquire_timeout_ms,
                                 acquire_timeout_max_ms=acquire_timeout_max_ms,
                                 max_waiting=max_waiting,
