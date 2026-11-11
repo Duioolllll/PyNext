@@ -123,6 +123,29 @@ def test_missing_static_file_is_rerendered(tmp_path):
     assert static_digests(tmp_path) == first
 
 
+def test_missing_file_of_multi_page_pattern_rebuilds_without_duplicate(tmp_path):
+    # P2-1: one pattern generating several pages (/blog/[slug] -> /blog/a,
+    # /blog/b). Deleting one page's HTML marks the whole pattern stale, so
+    # the rebuild re-renders every path of that pattern. The still-valid
+    # page must be reused, not reported as a duplicate of its own fresh
+    # render.
+    blog = tmp_path / "app" / "blog" / "[slug]"
+    blog.mkdir(parents=True)
+    (blog / "page.py").write_text(
+        'from pynext import page, h\n'
+        'def generate_static_params(): return [{"slug": "a"}, {"slug": "b"}]\n'
+        '@page(render="ssg")\ndef Page(params): return h("p", {}, params["slug"])\n',
+        encoding="utf-8")
+    write_manifest(tmp_path)
+    first = static_digests(tmp_path)
+    assert set(first) == {"/blog/a", "/blog/b"}
+    (tmp_path / ".pynext" / "static" / f"{first['/blog/b']}.html").unlink()
+    write_manifest(tmp_path)
+    pages = report(tmp_path)["static_pages"]
+    assert pages["rendered"] == 1 and pages["reused"] == 1 and pages["total"] == 2
+    assert static_digests(tmp_path) == first
+
+
 def test_build_report_covers_routes_islands_and_public_files(tmp_path, esbuild):
     make_app(tmp_path)
     islands = tmp_path / "islands"

@@ -1170,7 +1170,10 @@ def _render_incremental(app, manifest, previous, *, _on_pattern_error=None):
     source changed, the public files and island sources are unchanged
     (island digests are embedded in the HTML), and its digest file is
     still on disk with a matching hash. Anything else re-renders the
-    whole pattern.
+    whole pattern, which also re-renders the pattern's reused paths;
+    the reused entries win and those duplicate fresh copies are
+    dropped (their inputs are unchanged, so they can only reproduce
+    the same body).
     """
     prev_pages = _previous_static_pages(previous)
     prev_sources = previous.get("sources", {}) if isinstance(previous, dict) else {}
@@ -1212,9 +1215,19 @@ def _render_incremental(app, manifest, previous, *, _on_pattern_error=None):
             stale_patterns.add(pattern)
     rendered = asyncio.run(_render_static_pages(
         app, patterns=stale_patterns, existing=len(reused), _on_pattern_error=_on_pattern_error))
-    overlap = set(rendered) & set(reused)
-    if overlap:
-        raise ValueError(f"Duplicate generated path: {sorted(overlap)[0]}")
+    # A stale pattern re-renders whole, so paths of that pattern that
+    # were already verified and reused are rendered again. The reused
+    # entry is authoritative: its inputs are unchanged (dependencies,
+    # layouts, shared sources and digest file all verified above), so
+    # the fresh render can only reproduce the same body. Drop the
+    # duplicate fresh copies instead of failing the build. Genuine
+    # duplicates are still caught inside _render_static_pages, which
+    # rejects two parameter sets materialising to the same path, and a
+    # path rendered by one pattern can never belong to another (the
+    # router reachability check there rejects it), so no real collision
+    # is masked here.
+    for path in set(rendered) & set(reused):
+        del rendered[path]
     shadowed = set(reused) & set(app.public_assets)
     if shadowed:
         raise ValueError(f"Public file shadows a generated page: {sorted(shadowed)[0]}")
