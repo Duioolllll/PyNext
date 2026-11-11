@@ -59,6 +59,9 @@ class RequestMemo:
     def __init__(self):
         self._values = {}
         self._inflight = {}
+        # Bumped by clear(): completions from an older generation must
+        # not store their value back into the memo (P2-3).
+        self._generation = 0
 
     def __contains__(self, key):
         return key in self._values or key in self._inflight
@@ -81,15 +84,25 @@ class RequestMemo:
 
     def clear(self):
         """Drop every memoized value. See the module docstring for when
-        the framework does this (in-request invalidation)."""
+        the framework does this (in-request invalidation).
+
+        In-flight computations started before the clear are invalidated
+        too: the generation is bumped, so when they finish their value
+        is discarded instead of stored back into the memo (P2-3 — a
+        pre-clear value must not resurrect after the clear).
+        """
         self._values.clear()
         self._inflight.clear()
+        self._generation += 1
 
     async def get_or_compute(self, key, compute):
         """Return the memoized value, computing it once if absent.
 
         ``compute`` is a zero-argument async callable. Concurrent calls
         for the same key await the same task; a failure is not cached.
+        A computation that was in flight when :meth:`clear` ran is
+        discarded instead of stored, so a pre-clear value never comes
+        back after the clear.
         """
         if key in self._values:
             return self._values[key]
@@ -97,12 +110,20 @@ class RequestMemo:
         if task is None:
             task = asyncio.ensure_future(compute())
             self._inflight[key] = task
+        generation = self._generation
         try:
             value = await asyncio.shield(task)
         except BaseException:
             if self._inflight.get(key) is task:
                 self._inflight.pop(key, None)
             raise
+        if generation != self._generation:
+            # A clear() happened while this computation was in flight.
+            # The awaiting caller still gets the computed value, but it
+            # must not be stored back into the memo.
+            if self._inflight.get(key) is task:
+                self._inflight.pop(key, None)
+            return value
         self._values[key] = value
         self._inflight.pop(key, None)
         return value

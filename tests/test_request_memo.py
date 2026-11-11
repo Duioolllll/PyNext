@@ -1,0 +1,121 @@
+"""Regression tests for RequestMemo (track C, PR #26 finding P2-3).
+
+P2-3: a computation started before ``clear()`` used to store its value
+back into the memo when it finished, resurrecting the pre-clear value.
+``clear()`` now bumps a generation counter and completions from an older
+generation are discarded instead of stored.
+"""
+
+import asyncio
+
+from pynext.request_memo import RequestMemo
+
+
+def test_clear_invalidates_inflight_computation():
+    """Mirror of the P2-3 repro: clear, then the old compute finishes.
+
+    After the clear the memo must stay empty and the next read must
+    compute a fresh value, not see the pre-clear one.
+    """
+
+    async def run():
+        memo = RequestMemo()
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        async def old():
+            started.set()
+            await resume.wait()
+            return "old"
+
+        pending = asyncio.create_task(memo.get_or_compute("key", old))
+        await started.wait()
+        memo.clear()
+        assert memo.get("key") is None
+
+        resume.set()
+        assert await pending == "old"  # the awaiting caller still gets its value
+        assert memo.get("key") is None  # ... but it must not come back into the memo
+
+        async def new():
+            return "new"
+
+        assert await memo.get_or_compute("key", new) == "new"
+        assert memo.get("key") == "new"
+
+    asyncio.run(run())
+
+
+def test_old_inflight_compute_does_not_clobber_post_clear_value():
+    """A compute started after clear() must keep its stored value even
+    when the pre-clear computation finishes afterwards."""
+
+    async def run():
+        memo = RequestMemo()
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        async def old():
+            started.set()
+            await resume.wait()
+            return "old"
+
+        pending = asyncio.create_task(memo.get_or_compute("key", old))
+        await started.wait()
+        memo.clear()
+
+        async def new():
+            return "new"
+
+        assert await memo.get_or_compute("key", new) == "new"
+        assert memo.get("key") == "new"
+
+        resume.set()
+        assert await pending == "old"
+        assert memo.get("key") == "new"
+
+    asyncio.run(run())
+
+
+def test_clear_drops_cached_value_and_recompute_stores():
+    """Basic clear contract: cached values go away, later computes store."""
+
+    async def run():
+        memo = RequestMemo()
+        assert await memo.get_or_compute("key", _return("first")) == "first"
+        memo.clear()
+        assert memo.get("key") is None
+        assert await memo.get_or_compute("key", _return("second")) == "second"
+        assert memo.get("key") == "second"
+
+    asyncio.run(run())
+
+
+def test_concurrent_callers_share_one_computation():
+    """Unchanged behaviour guard: concurrent calls for the same key
+    still share one in-flight computation."""
+
+    async def run():
+        memo = RequestMemo()
+        calls = 0
+
+        async def compute():
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0)
+            return "shared"
+
+        first, second = await asyncio.gather(
+            memo.get_or_compute("key", compute),
+            memo.get_or_compute("key", compute),
+        )
+        assert first == second == "shared"
+        assert calls == 1
+        assert memo.get("key") == "shared"
+
+    asyncio.run(run())
+
+
+def _return(value):
+    async def compute():
+        return value
+
+    return compute
