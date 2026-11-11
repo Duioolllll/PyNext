@@ -1,9 +1,10 @@
 """Layout shell caching: a route's layout shell is rendered once, not per request.
 
-Layouts only receive ``children``, so the shell (the layouts applied to a
-marker in place of the page) is the same for every request to a route.
+Layouts without ``request`` or ``dynamic=True`` share a shell (the layouts
+applied to a marker in place of the page) across requests to a route.
 These tests count layout invocations through a counter file the layout
-appends to, and check that cached and uncached responses are identical.
+appends to, check that cached and uncached responses are identical, and
+verify that request-aware layouts do not share user data.
 """
 import asyncio
 import re
@@ -33,6 +34,15 @@ LAYOUT = (
 )
 
 DYNAMIC_LAYOUT = LAYOUT.replace("@layout\n", "@layout(dynamic=True)\n")
+
+REQUEST_LAYOUT = (
+    "from pynext import h, layout\n"
+    "@layout\n"
+    "def Layout(children, request=None):\n"
+    "    headers = dict(request.headers) if request is not None else {}\n"
+    "    user = headers.get(b\"x-user\", b\"anonymous\").decode()\n"
+    "    return h(\"section\", {}, h(\"header\", {}, f\"layout-user:{user}\"), children)\n"
+)
 
 SECTION_LAYOUT = (
     "import os\n"
@@ -177,6 +187,52 @@ def test_dynamic_layout_renders_on_every_request(tmp_path):
             assert layout_calls(tmp_path) == 3
         finally:
             await app.isr.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("production", [False, True], ids=["development", "production"])
+@pytest.mark.parametrize("nested", [False, True], ids=["root-layout", "nested-layout"])
+@pytest.mark.parametrize("async_layout", [False, True], ids=["sync-layout", "async-layout"])
+@pytest.mark.parametrize("streaming", [False, True], ids=["buffered", "streaming"])
+def test_request_layout_does_not_leak_data_between_users(
+    tmp_path, production, nested, async_layout, streaming
+):
+    layout = REQUEST_LAYOUT
+    if async_layout:
+        layout = layout.replace("def Layout(", "async def Layout(")
+    app_dir = tmp_path / "app"
+    page_dir = app_dir / "section" if nested else app_dir
+    page_dir.mkdir(parents=True)
+    (app_dir / "layout.py").write_text(LAYOUT if nested else layout, encoding="utf-8")
+    if nested:
+        (page_dir / "layout.py").write_text(layout, encoding="utf-8")
+    (page_dir / "page.py").write_text(STREAM_PAGE if streaming else PLAIN_PAGE, encoding="utf-8")
+    if production:
+        write_manifest(tmp_path)
+    app = create_app(tmp_path, production=production)
+    path = "/section" if nested else "/"
+
+    async def run():
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://test") as client:
+                alice = await client.get(path, headers={"x-user": "alice"})
+                bob = await client.get(path, headers={"x-user": "bob"})
+            assert alice.status_code == 200 and bob.status_code == 200
+            assert "<header>layout-user:alice</header>" in alice.text
+            assert "layout-user:alice" not in bob.text
+            assert "<header>layout-user:bob</header>" in bob.text
+            assert "layout-user:bob" not in alice.text
+            body = ("<p>chunk-one</p>", "<p>chunk-two</p>") if streaming else ("<p>buffered</p>",)
+            assert all(chunk in response.text for response in (alice, bob) for chunk in body)
+            assert path not in app._layout_shells
+            assert path not in app._layout_shell_locks
+            if nested:
+                # One request-aware ancestor excludes the whole composed shell.
+                assert layout_calls(tmp_path) == 2
+        finally:
+            await app.shutdown()
 
     asyncio.run(run())
 
@@ -336,10 +392,9 @@ USER_PAGE = (
 
 
 def test_shell_cache_does_not_leak_request_data_between_users(tmp_path):
-    # The layout shell is cached per route, but layouts only receive
-    # ``children`` — never the request — so per-request page content
-    # must not bleed into the shared shell: two users get their own
-    # page body under the same shell, and the layout renders once.
+    # This request-independent layout is cached per route. Per-request
+    # page content must not bleed into the shared shell: two users get
+    # their own page body under the same shell, and the layout renders once.
     app_dir = tmp_path / "app"
     (app_dir / "plain").mkdir(parents=True)
     (app_dir / "plain" / "page.py").write_text(USER_PAGE, encoding="utf-8")
