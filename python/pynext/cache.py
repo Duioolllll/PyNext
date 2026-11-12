@@ -4095,6 +4095,15 @@ class ISRCache:
                 status, body = "miss", None
             elif tag_status == "stale":
                 status = "stale"
+            elif key in self._regen_failures and self._regen_backoff_remaining(key) <= 0:
+                # A retained entry re-stored after a failed regeneration
+                # is fresh for the backoff window, but once the backoff
+                # has elapsed the next request must retry instead of
+                # serving the retained copy as fresh. Demote it so the
+                # stale path (which consults the backoff) triggers the
+                # retry; while the backoff is still active the entry
+                # keeps serving as fresh above.
+                status = "stale"
         if status == "fresh" and self.shared is None:
             return body
         if self.shared is None:
