@@ -4354,7 +4354,12 @@ class ISRCache:
             # retained previous body (C-2).
             raise
         except Exception:
-            if previous is not None:
+            # Only the first consecutive failure serves the retained
+            # value. A retained window from a prior failure has already
+            # expired by the time this path runs again, so a repeat
+            # failure surfaces instead of masking the outage forever.
+            failures = self._regen_failures.get(key, {}).get("failures", 0)
+            if previous is not None and failures <= 1:
                 return previous
             raise
 
@@ -4476,8 +4481,13 @@ class ISRCache:
             raise
         except Exception:
             # C-2: a failed (re)generation serves the retained previous
-            # value instead of erroring, when one exists.
+            # value instead of erroring, when one exists — but only on
+            # the first consecutive failure. A retained window from a
+            # prior failure has already expired by the time this path
+            # runs again, so a repeat failure surfaces instead of
+            # masking the outage.
             previous = await self._retained_body(key, tags)
-            if previous is not None:
+            failures = self._regen_failures.get(key, {}).get("failures", 0)
+            if previous is not None and failures <= 1:
                 return previous
             raise
