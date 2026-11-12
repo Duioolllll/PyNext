@@ -3217,6 +3217,18 @@ class ISRCache:
             self._inflight = {}
             self._task_leases = {}
             self._tasks = set()
+            # C-2 retention: ``_retained`` maps a key to its last-known-good
+            # ``(body, retained_at)`` — the previous entry a failed
+            # regeneration falls back to, even after the backends have
+            # dropped the expired entry itself. ``_regen_failures`` maps a
+            # key to ``{"failures", "next_retry_at", "last_error"}`` for the
+            # retry backoff. Both are process-local (same as the
+            # cache_backend path below). Without these, the cache_handler
+            # path returned early and get_or_render failed with
+            # AttributeError on ``_regen_failures``.
+            self._retained = OrderedDict()
+            self._retained_bytes = 0
+            self._regen_failures = {}
             # In-flight shared writes, keyed by cache key (Next.js ``pendingSets``):
             # a second write for the same key waits on the event instead of
             # issuing a duplicate write, and a read waits (bounded) and re-reads
