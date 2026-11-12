@@ -998,8 +998,16 @@ def main():
     # supervisor whenever the resolved worker count is above one, default
     # included.
     if args.command == "dev":
-        workers_explicit = (resolved is not None
-                            and resolved.source_of("workers") != "default")
+        # "auto" is excluded from cli_overrides (it is not a config
+        # value), so resolved.source_of("workers") reports "default"
+        # even when --workers auto was given explicitly. Count an
+        # explicit --workers flag as explicit too, so `pynext dev
+        # --workers auto` reaches the supervisor when auto resolves
+        # above one instead of falling through to run_dev and
+        # blocking forever on the watch/reload loop.
+        workers_explicit = ((resolved is not None
+                             and resolved.source_of("workers") != "default")
+                            or "workers" in explicit)
         use_supervisor = workers_explicit and workers > 1
     else:
         use_supervisor = workers > 1
