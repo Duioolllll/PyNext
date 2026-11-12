@@ -104,12 +104,15 @@ def test_isr_single_flight_stale_failure_cancellation_and_native_hit(tmp_path):
                 assert app.isr.store.lookup("/blog/alpha")[0] == "fresh"
                 assert (await client.get("/blog/alpha")).text == "<p>old</p>"
                 assert module.calls == previous_calls + 2
-                # C-2 also serves the retained copy after the extended
-                # cache entry itself expires.
-                await until(lambda: app.isr.store.lookup("/blog/alpha")[0] == "expired", timeout=8)
+                # C-2: after the retained window expires, a repeat
+                # regeneration failure surfaces instead of serving the
+                # retained copy again — only the first consecutive
+                # failure serves retained (see the 43% fix). The
+                # retained window is fresh 30s + stale 3s for this
+                # policy, so the wait must cover it.
+                await until(lambda: app.isr.store.lookup("/blog/alpha")[0] == "expired", timeout=40)
                 final = await client.get("/blog/alpha")
-                assert final.status_code == 200
-                assert final.text == "<p>old</p>"
+                assert final.status_code == 500
 
                 # One cancelled caller cannot cancel a shared generation.
                 module.fail = False
