@@ -624,7 +624,14 @@ def test_cli_metrics_endpoint_flag_reaches_create_app(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "create_app", fake_create_app)
     monkeypatch.setattr(cli, "serve", fake_serve)
-    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path), "--metrics-endpoint"])
+    # --workers 1 forces the single-process path: with the default
+    # workers=2, `pynext start` takes the supervisor path and never calls
+    # cli.create_app / cli.serve in this process — instead it spawns real
+    # workers that crash-loop on the missing build manifest and block
+    # forever. The flag plumbing is what this test verifies, so pin the
+    # worker count and let the patched fakes observe the call.
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path),
+                                      "--workers", "1", "--metrics-endpoint"])
     cli.main()
     assert seen["create_app"]["observability"].metrics_endpoint is True
 
