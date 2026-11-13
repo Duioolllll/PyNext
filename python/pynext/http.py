@@ -1084,6 +1084,17 @@ def _compile_path_pattern(source):
         raise TypeError(f"path header source must be a str, got {type(source).__name__}")
     if not source.startswith("/") or (len(source) > 1 and source.endswith("/")) or "//" in source:
         raise ValueError(f"Invalid path header source {source!r}: must be an absolute normalized path")
+    # A1-L9: '%' must not appear, like matcher.compile_matcher rejects it.
+    # A literal '%' in a source could never match what its author intends:
+    # the rule is evaluated against the decoded routing path, where '%2F'
+    # has already become '/', so a source carrying '%2F' silently never
+    # fires — while the matcher (the other per-path header system) rejects
+    # the same source at startup. Reject it here too so the two systems
+    # agree and a bad rule fails at startup instead of never matching.
+    if "%" in source:
+        raise ValueError(
+            f"Invalid path header source {source!r}: '%' must not appear "
+            "(a decoded routing path never contains it, so this pattern could never match)")
     if source == "/":
         return re.compile(r"/")
     segments = source[1:].split("/")
