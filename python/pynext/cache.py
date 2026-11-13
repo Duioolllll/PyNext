@@ -3948,7 +3948,11 @@ class ISRCache:
             if entry is _SHARED_UNAVAILABLE:
                 break
             if entry is not None and entry.status == "fresh":
-                self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                # Populate L1 from the shared entry — via _store_insert so
+                # the body is also remembered as this worker's retained
+                # last-known-good value (C-2), like the normal fresh-hit
+                # path (A-2).
+                self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
                 return True, True
             # The earlier set finished without leaving a fresh entry
             # (failed, fenced out, or private); loop and register our own
@@ -4486,7 +4490,9 @@ class ISRCache:
         if refreshed is not None:
             entry = refreshed
             if entry.status == "fresh":
-                self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                # Via _store_insert so the coalesced body is also retained
+                # (C-2), like the fresh-hit path just above (A-2).
+                self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
                 return entry.body
         task = self._inflight.get(key)
         if task is not None:

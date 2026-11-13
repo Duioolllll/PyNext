@@ -152,3 +152,58 @@ def test_failed_set_resolves_its_waiters_and_leaves_no_registration(tmp_path):
             await cache.close()
 
     asyncio.run(run())
+
+
+def test_coalesced_set_also_retains_last_known_good(tmp_path):
+    """A-2: a coalesced set must retain the winning body (C-2), like a
+    normal fresh hit — before the fix the coalesce branch filled L1
+    with a raw store.insert and skipped retention, so a later failed
+    regeneration had no fallback even though this worker had just
+    served the good body."""
+    async def run():
+        cache = ISRCache(cache_backend="sqlite", cache_path=str(tmp_path / "cache.sqlite"))
+        try:
+            await asyncio.to_thread(
+                cache.shared.insert_fenced, "/page", b"fresh-body", 3600.0, 3600.0, None)
+            cache._pending_sets["/page"] = asyncio.Event()  # in-flight write
+            cache._pending_sets["/page"].set()
+            stored, coalesced = await cache._store_shared("/page", b"my-body", POLICY, None, None)
+            assert (stored, coalesced) == (True, True)
+            assert cache.store.lookup("/page") == ("fresh", b"fresh-body")
+            assert await cache._retained_body("/page") == b"fresh-body"
+        finally:
+            await cache.close()
+
+    asyncio.run(run())
+
+
+def test_pending_set_fresh_body_is_retained(tmp_path):
+    """A-2: a get that coalesces onto a landing write must retain the
+    fresh body it serves — before the fix the _await_pending_set fresh
+    branch filled L1 only, so the C-2 fallback was empty."""
+    async def run():
+        cache = ISRCache(cache_backend="sqlite", cache_path=str(tmp_path / "cache.sqlite"))
+        try:
+            await asyncio.to_thread(
+                cache.shared.insert_fenced, "/page", b"stale-body", 0.05, 3600.0, 0)
+            await asyncio.sleep(0.1)
+            assert cache.shared.lookup("/page")[0] == "stale"
+
+            async def _render_must_not_run():
+                raise AssertionError("get must not render while a pending set lands")
+
+            event = asyncio.Event()
+            cache._pending_sets["/page"] = event
+            result = asyncio.create_task(
+                cache.get_or_render("/page", POLICY, _render_must_not_run))
+            await asyncio.sleep(0.05)
+            assert not result.done()
+            await asyncio.to_thread(
+                cache.shared.insert_fenced, "/page", b"fresh-body", 30.0, 60.0, None)
+            event.set()
+            assert await result == b"fresh-body"
+            assert await cache._retained_body("/page") == b"fresh-body"
+        finally:
+            await cache.close()
+
+    asyncio.run(run())
