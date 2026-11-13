@@ -77,7 +77,7 @@ TEMPLATE_FILES = {
     "api": {"app/page.py", "app/api/hello/route.py", "README.md", ".gitignore"},
 }
 
-GITIGNORE = ".pynext/\n__pycache__/\n*.pyc\n"
+GITIGNORE = ".pynext/\n__pycache__/\n*.pyc\n.env*\n*.pem\n*.key\n"
 
 
 def _check_app(project, production=False):
@@ -245,3 +245,16 @@ def test_init_failure_cleans_created_ancestors_only(tmp_path, monkeypatch, keep_
         assert (parent / "keep.txt").read_text() == "keep"
     else:
         assert not parent.exists()
+
+
+def test_init_gitignore_covers_secrets(tmp_path, monkeypatch):
+    # A-6: the scaffold .gitignore must cover .env files (the
+    # framework loads .env, so a secret there must not be committed)
+    # and private keys.
+    import fnmatch
+    project = tmp_path / "project"
+    monkeypatch.setattr(sys, "argv", ["pynext", "init", "--dir", str(project)])
+    cli.main()
+    patterns = (project / ".gitignore").read_text().splitlines()
+    for secret in (".env", ".env.local", ".env.production", "cert.pem", "id.key"):
+        assert any(fnmatch.fnmatch(secret, pattern) for pattern in patterns), secret
