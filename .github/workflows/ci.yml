@@ -2,7 +2,13 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+# A newer commit to the same PR supersedes the previous check run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -31,6 +37,8 @@ jobs:
         python-version: ["3.13", "3.14"]
         deploy: [axum, uvicorn]
     runs-on: ${{ matrix.os }}
+    # A stalled test must not occupy a runner until the 6-hour platform limit.
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -72,7 +80,14 @@ jobs:
         run: cargo test --locked --workspace --all-features
 
       - name: Run Python tests
-        run: uv run --locked --extra dev --extra images --extra database --extra django --extra encryption --extra redis pytest -q
+        # Verbose node IDs expose the active test in Actions logs. pytest's
+        # built-in faulthandler dumps all thread stacks and exits on a
+        # per-test hang, instead of silently waiting for 6 hours.
+        run: >-
+          uv run --locked --extra dev --extra images --extra database
+          --extra django --extra encryption --extra redis
+          pytest -vv -o faulthandler_timeout=180
+          -o faulthandler_exit_on_timeout=true
 
       - name: Verify example production build
         run: uv run pynext build --dir examples/basic
