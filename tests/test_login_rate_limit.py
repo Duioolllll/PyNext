@@ -162,3 +162,30 @@ def test_check_login_response_is_not_cacheable():
     blocked = limiter.check_login(IP, ACCOUNT, now=1010.0)
     assert dict(blocked.headers)[b"cache-control"] == b"private, no-store"
     assert limiter.check_login(IP, ACCOUNT, now=1010.0).body == b"Too Many Login Attempts"
+
+
+def test_account_key_is_hashed_to_fixed_length_a3_l2():
+    """A3-L2: the (IP, account) key must not carry the raw account string.
+
+    A ~1 MiB username would otherwise let 10,000 distinct keys grow the
+    table to gigabytes. The key is a fixed-length SHA-256 hex digest of
+    the case-folded account, so long accounts still share one counter
+    per (IP, account) pair but cost a constant 64 characters.
+    """
+    from pynext.auth import _login_key
+
+    long_account = "a" * 1_000_000
+    ip, account_key = _login_key(IP, long_account)
+    assert ip == IP
+    assert len(account_key) == 64
+    assert long_account not in account_key
+    # Same account, different case/whitespace: still one key.
+    assert _login_key(IP, "  ALICE@EXAMPLE.COM ") == _login_key(IP, "alice@example.com")
+    # Different accounts: different keys.
+    assert _login_key(IP, "alice@example.com") != _login_key(IP, "bob@example.com")
+    # And the limiter still blocks on the long account.
+    limiter = LoginRateLimiter()
+    for attempt in range(LOGIN_MAX_FAILURES):
+        limiter.record_failure(IP, long_account, now=1000.0 + attempt)
+    assert limiter.is_blocked(IP, long_account, now=1010.0)
+    assert limiter.stats()["keys"] == 1
