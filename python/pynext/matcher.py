@@ -192,9 +192,14 @@ def _compile_has_value(condition_type, value):
             f"has/missing value for {condition_type!r} exceeds {MAX_HAS_VALUE_LENGTH} characters")
     if any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise ValueError(f"has/missing value for {condition_type!r} must not contain control characters")
-    text = value.lower() if condition_type == "host" else value
+    # Host candidates are already lowercased by _request_host, so the
+    # pattern must match case-insensitively without rewriting its text:
+    # lowercasing the text itself corrupts regex escapes (A1-M1) —
+    # ``\A`` becomes the BEL escape ``\a``, ``\D`` becomes ``\d``, and
+    # ``\Z`` becomes the invalid escape ``\z``.
+    flags = re.IGNORECASE if condition_type == "host" else 0
     try:
-        return re.compile(text)
+        return re.compile(value, flags)
     except re.error as exc:
         raise ValueError(f"Invalid has/missing value regex {value!r}: {exc}") from exc
 
@@ -240,7 +245,11 @@ class HasCondition:
             if candidate is None:
                 return False
         else:  # host
-            candidate = host or ""
+            # Lowercase the candidate so a direct matches() call agrees
+            # with matches_request(), where _request_host already
+            # lowercases it (A1-M1). The compiled pattern is
+            # case-insensitive, so this is belt and braces.
+            candidate = (host or "").lower()
             if not candidate:
                 return False
         if self._regex is None:

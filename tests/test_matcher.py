@@ -554,3 +554,25 @@ def test_scoped_middleware_and_headers_on_both_transports(tmp_path, mode):
             await app.isr.close()
 
     asyncio.run(run())
+
+
+def test_host_has_value_keeps_regex_escapes_intact():
+    """A1-M1: compiling a host has/missing value must not lowercase the
+    pattern text — lowercasing corrupts regex escapes (\\A -> \\a,
+    \\D -> \\d, \\Z -> invalid escape). Host matching is case-insensitive
+    via re.IGNORECASE instead, and a direct matches() call lowercases
+    the candidate like matches_request() does.
+    """
+    anchor = compile_has_condition({"type": "host", "value": r"\Aexample\.com"})
+    assert anchor.matches(host="example.com")
+    assert anchor.matches(host="EXAMPLE.COM")
+    assert not anchor.matches(host="other.com")
+    assert not anchor.matches(host="example.com.evil.com")
+
+    negated = compile_has_condition({"type": "host", "value": r"\D+"})
+    assert negated.matches(host="example")
+    assert not negated.matches(host="123")
+
+    end_anchor = compile_has_condition({"type": "host", "value": r"example\.com\Z"})
+    assert end_anchor.matches(host="example.com")
+    assert not end_anchor.matches(host="example.com.evil.com")
