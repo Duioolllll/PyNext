@@ -104,3 +104,28 @@ def test_materialize_stays_unencoded_for_ssg_manifest_keys():
         _materialize("/blog/[slug]", {"slug": "a/b"})
     with pytest.raises(ValueError):
         _materialize("/blog/[slug]", {"slug": "x", "extra": "y"})
+
+
+def test_url_for_rejects_patterns_the_router_rejects():
+    """A1-L1: a catch-all anywhere but last, an empty segment, a trailing
+    slash, or a '.' / '..' segment must raise ValueError instead of
+    silently producing a URL no route can ever match."""
+    with pytest.raises(ValueError, match="must be the last segment"):
+        url_for("/docs/[...path]/edit", {"path": ["a", "b"]})
+    with pytest.raises(ValueError, match="must be the last segment"):
+        url_for("/docs/[[...path]]/edit", {"path": ["a"]})
+    with pytest.raises(ValueError, match="empty"):
+        url_for("/docs//edit", {})
+    with pytest.raises(ValueError, match="must not end with"):
+        url_for("/docs/", {})
+    with pytest.raises(ValueError, match="must not end with"):
+        url_for("/docs/[id]/", {"id": "x"})
+    with pytest.raises(ValueError, match="empty"):
+        url_for("/docs/./edit", {})
+    with pytest.raises(ValueError, match="empty"):
+        url_for("/docs/../edit", {})
+    # The valid shapes still work, including an optional catch-all with
+    # no segments and a catch-all in last position.
+    assert url_for("/docs/[...path]", {"path": ["a", "b"]}) == "/docs/a/b"
+    assert url_for("/docs/[[...path]]", {"path": []}) == "/docs"
+    assert url_for("/", {}) == "/"
