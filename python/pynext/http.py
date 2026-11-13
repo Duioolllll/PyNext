@@ -1705,6 +1705,12 @@ class Response:
             self.body = bytes(body)
         else:
             raise TypeError(f"Response body must be str or bytes, got {type(body).__name__}")
+        # A1-L7: 1xx, 204 and 304 responses must not carry a body (RFC 9110
+        # §15), like StreamingResponse already enforces. Reject a body
+        # here instead of letting the server silently drop it (or worse,
+        # frame it); an empty body with those statuses stays legal.
+        if self.body and (status < 200 or status in (204, 304)):
+            raise ValueError("Response body is not allowed with this status")
         self.status = status
         self.headers = [(bytes(k).lower(), bytes(v)) for k, v in headers]
         for key, value in self.headers:
