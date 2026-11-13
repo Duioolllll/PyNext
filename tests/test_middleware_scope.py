@@ -385,3 +385,74 @@ def test_ws_preflight_ignores_out_of_scope_middleware(tmp_path):
         assert await app._authorize_websocket("/ws", b"", [(b"host", b"test")]) is None
         await app.isr.close()
     asyncio.run(run())
+
+
+def test_scoped_middleware_applies_under_base_path(tmp_path):
+    """A1-H2: a scoped middleware must run for requests under base_path.
+
+    With base_path="/app", the scope /api/[...rest] used to be evaluated
+    against the raw path /app/api/echo (no match) while the router served
+    the preprocessed /api/echo — so a scoped auth middleware silently did
+    nothing for every request.
+    """
+    make_project(tmp_path)
+
+    async def api_auth(request, call_next):
+        return Response("forbidden", status=403)
+
+    app = create_app(tmp_path, production=True, base_path="/app",
+                     middleware=[scoped(api_auth, source="/api/[...rest]")])
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://test") as client:
+            response = await client.get("/app/api/echo")
+            assert response.status_code == 403
+            response = await client.get("/app/")
+            assert response.status_code == 200
+        await app.isr.close()
+
+    asyncio.run(run())
+
+
+def test_scoped_middleware_applies_with_trailing_slash_ignored(tmp_path):
+    """A1-H2: with trailing_slash="ignore", a trailing slash must not let
+    a request escape a scoped middleware."""
+    make_project(tmp_path)
+
+    async def api_auth(request, call_next):
+        return Response("forbidden", status=403)
+
+    app = create_app(tmp_path, production=True, trailing_slash="ignore",
+                     middleware=[scoped(api_auth, source="/api/[id]")])
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://test") as client:
+            response = await client.get("/api/echo/")
+            assert response.status_code == 403
+            response = await client.get("/api/echo")
+            assert response.status_code == 403
+        await app.isr.close()
+
+    asyncio.run(run())
+
+
+def test_path_header_rule_applies_under_base_path(tmp_path):
+    """A1-H2: a per-path header rule must apply to responses under base_path."""
+    make_project(tmp_path)
+    app = create_app(tmp_path, production=True, base_path="/app", headers=[
+        ("/api/[[...slug]]", {"Cache-Control": "no-store"}),
+    ])
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://test") as client:
+            response = await client.get("/app/api/echo")
+            assert response.status_code == 200
+            assert response.headers["cache-control"] == "no-store"
+            response = await client.get("/app/")
+            assert response.headers.get("cache-control") != "no-store"
+        await app.isr.close()
+
+    asyncio.run(run())

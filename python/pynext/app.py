@@ -52,7 +52,7 @@ from .build import _config_error, _short_repr
 from .fetch_cache import FetchCache, fetch_cache_scope
 from .request_memo import clear_request_memo, ensure_request_memo, request_memo_scope
 from .matcher import compile_header_rules, compile_middleware_entries
-from .middleware import MAX_MIDDLEWARE_REWRITES, MiddlewareResult, ScopedMiddleware
+from .middleware import MAX_MIDDLEWARE_REWRITES, MiddlewareResult, MiddlewareScope, ScopedMiddleware
 from .custom_routes import compile_custom_routes
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .observability import (
@@ -3658,6 +3658,26 @@ class App:
             html = "<!DOCTYPE html>" + html
         return Response(html, media_type="text/html; charset=utf-8", csp_nonce=nonce)
 
+    def _scope_match_path(self, path):
+        """Return the path scopes and header rules are evaluated against.
+
+        Scopes and header rules are written against the app-relative
+        path the router sees (A1-H2): the same
+        :func:`pynext.routing.preprocess_pathname` the dispatcher uses,
+        so a ``base_path`` prefix is stripped and the trailing-slash
+        policy applied before matching. A path outside the base path
+        preprocesses to ``None``; it is returned unchanged so evaluation
+        falls back to the raw path instead of crashing — ``_dispatch``
+        answers 404 for it anyway. A path that is already app-relative
+        (a middleware rewrite, the WebSocket pre-flight synthetic
+        request, a path ``_dispatch`` already preprocessed) passes
+        through unchanged, so this is safe to apply at every evaluation
+        point.
+        """
+        preprocessed = preprocess_pathname(path, base_path=self.base_path,
+                                           trailing_slash=self.trailing_slash)
+        return preprocessed if preprocessed is not None else path
+
     async def _run_middleware(self, request, terminal):
         """Run the global middleware chain around ``terminal(request)``.
 
@@ -3762,8 +3782,19 @@ class App:
             if index == len(self.middleware):
                 return await terminal_wrapper(current)
             scope = self.middleware_scopes[index]
-            if scope is not None and not scope.matches_request(current):
-                return await invoke(index + 1, current)
+            if scope is not None:
+                # A1-H2: scopes are evaluated against the app-relative
+                # routing path, the same value the router sees. A
+                # matcher Scope and a pynext.scoped MiddlewareScope
+                # share this check (compile_middleware_entries unwraps
+                # both into this tuple).
+                match_path = self._scope_match_path(current.path)
+                if isinstance(scope, MiddlewareScope):
+                    matched = scope.matches(current, path=match_path)
+                else:
+                    matched = scope.matches_request(current, path=match_path)
+                if not matched:
+                    return await invoke(index + 1, current)
             called = False
             downstream_raised = False
 
@@ -3851,7 +3882,7 @@ class App:
             return response
         present = {key for key, _value in response.headers}
         for rule in self.header_rules:
-            if not rule.matches_request(request):
+            if not rule.matches_request(request, path=self._scope_match_path(request.path)):
                 continue
             for key, value in rule.headers:
                 if key in present:
@@ -3884,7 +3915,7 @@ class App:
             response = await self._dispatch_response(request)
         except _SyncHandlerBusy:
             response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
-            apply_path_headers(response, request.path, path_headers=self.path_headers)
+            apply_path_headers(response, self._scope_match_path(request.path), path_headers=self.path_headers)
             apply_cors_headers(request, response, config=self.security)
             apply_security_headers(response, config=self.security, production=self.production)
             if request.method == "HEAD":
@@ -3995,7 +4026,7 @@ class App:
                                     headers=[(b"retry-after", b"1")])
             # Health responses skip the security-header step here (the
             # transport applies it); path headers still apply, before it.
-            return apply_path_headers(response, request.path, path_headers=self.path_headers)
+            return apply_path_headers(response, self._scope_match_path(request.path), path_headers=self.path_headers)
         preflight = cors_preflight_response(request, config=self.security)
         if self.middleware:
             async def terminal(current):
@@ -4008,7 +4039,7 @@ class App:
             self._apply_path_headers(request, response)
             if preflight is None:
                 apply_cors_headers(request, response, config=self.security)
-            apply_path_headers(response, request.path, path_headers=self.path_headers)
+            apply_path_headers(response, self._scope_match_path(request.path), path_headers=self.path_headers)
             apply_security_headers(response, config=self.security, production=self.production)
             self.custom_routes.apply_to_response(response, request.path)
             if request.method == "HEAD":
@@ -4019,14 +4050,14 @@ class App:
             return response
         if preflight is not None:
             self._apply_path_headers(request, preflight)
-            apply_path_headers(preflight, request.path, path_headers=self.path_headers)
+            apply_path_headers(preflight, self._scope_match_path(request.path), path_headers=self.path_headers)
             apply_security_headers(preflight, config=self.security, production=self.production)
             self.custom_routes.apply_to_response(preflight, request.path)
             return preflight
         response = await self._dispatch_timed(request)
         self._apply_path_headers(request, response)
         apply_cors_headers(request, response, config=self.security)
-        apply_path_headers(response, request.path, path_headers=self.path_headers)
+        apply_path_headers(response, self._scope_match_path(request.path), path_headers=self.path_headers)
         apply_security_headers(response, config=self.security, production=self.production)
         self.custom_routes.apply_to_response(response, request.path)
         return response

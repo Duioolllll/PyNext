@@ -799,12 +799,14 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_
         # Timeout/unavailable responses built here bypass dispatch, so apply
         # the headers here; routed responses already have them (idempotent).
         # The raw path may not decode; then no rule can match it anyway.
+        # Header rules are evaluated against the app-relative path the
+        # router sees (A1-H2), like the ASGI transport.
         try:
             bridge_path = _decode_path(raw_path, raw_path.encode("ascii"))
         except (ValueError, UnicodeError):
             bridge_path = None
         if bridge_path is not None:
-            apply_path_headers(response, bridge_path, path_headers=app.path_headers)
+            apply_path_headers(response, app._scope_match_path(bridge_path), path_headers=app.path_headers)
         apply_security_headers(response, config=app.security, production=app.production)
         body = (_NativeStream(response, loop, app,
                               chunk_timeout=(STREAM_CHUNK_TIMEOUT if response_timeout_ms is None
