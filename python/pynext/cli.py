@@ -912,8 +912,12 @@ def main():
                 parser.error(str(exc))
             print(f"Exported {summary['pages']} static pages to {summary['output']}")
             print(f"Serve with: python -m http.server --directory {summary['output']}")
-        print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
-        _print_build_summary(root, analyze=args.analyze)
+        # The mode branch above already printed the per-mode line
+        # ("Built"/"Compiled"/"Generated"). Stage builds write no build
+        # report, so their summary would be the previous build's
+        # numbers; only print the summary for builds that wrote one.
+        if not (args.only_islands or args.only_static):
+            _print_build_summary(root, analyze=args.analyze)
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
             try:
