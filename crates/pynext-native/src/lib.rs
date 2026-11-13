@@ -630,6 +630,7 @@ fn streaming_body(
     hold_stats: Arc<HoldTimeStats>,
     acquired_at: Instant,
     max_lifetime: Duration,
+    busy: Option<BusyGuard>,
 ) -> Body {
     let stream = Arc::new(stream);
     let (sender, receiver) = tokio_mpsc::channel::<Result<Bytes, std::io::Error>>(1);
@@ -692,20 +693,22 @@ fn streaming_body(
         hold_stats.record(acquired_at.elapsed());
         close_stream(stream);
     });
+    // The busy guard lives in the stream state so the connection stays
+    // busy until the body ends, not just until the handler returned.
     let body = futures_util::stream::unfold(
-        (receiver, failed, lifetime_exceeded),
-        |(mut receiver, failed, lifetime_exceeded)| async move {
+        (receiver, failed, lifetime_exceeded, busy),
+        |(mut receiver, failed, lifetime_exceeded, busy)| async move {
             match receiver.recv().await {
-                Some(item) => Some((item, (receiver, failed, lifetime_exceeded))),
+                Some(item) => Some((item, (receiver, failed, lifetime_exceeded, busy))),
                 None if lifetime_exceeded.swap(false, Ordering::AcqRel) => Some((
                     Err(std::io::Error::other(
                         "PyNext response stream lifetime exceeded",
                     )),
-                    (receiver, failed, lifetime_exceeded),
+                    (receiver, failed, lifetime_exceeded, busy),
                 )),
                 None if failed.swap(false, Ordering::AcqRel) => Some((
                     Err(std::io::Error::other("PyNext response stream stalled")),
-                    (receiver, failed, lifetime_exceeded),
+                    (receiver, failed, lifetime_exceeded, busy),
                 )),
                 None => None,
             }
@@ -2035,6 +2038,10 @@ async fn rate_limit_denial(
 
 async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> AxumResponse<Body> {
     let (parts, body) = request.into_parts();
+    // R5-L2: the per-connection idle clock, if the service provided
+    // one. A streaming response keeps the connection busy until its
+    // body ends (the service-level guard only covers the handler run).
+    let idle_clock = parts.extensions.get::<Arc<IdleClock>>().cloned();
     // Host validation (S-P1-19, M-9) runs first, before the WebSocket
     // branch, the fast path and the Python bridge: no request reaches
     // any handler with a missing or disallowed Host.
@@ -2825,6 +2832,7 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                     hold_stats,
                     acquired_at,
                     streaming_max_lifetime,
+                    idle_clock.as_ref().map(BusyGuard::new),
                 ),
             };
             response
@@ -2898,6 +2906,11 @@ impl Drop for PerIpConnectionGuard {
 struct IdleClock {
     base: tokio::time::Instant,
     last_millis: AtomicU64,
+    // In-flight requests (R5-L2): a connection handling a request is
+    // not idle even though its socket is silent, so the h2c watchdog
+    // must not drop it for staying quiet. HTTP/2 multiplexes streams,
+    // so this is a count, not a flag.
+    busy: AtomicU64,
 }
 
 impl IdleClock {
@@ -2905,6 +2918,7 @@ impl IdleClock {
         Self {
             base: tokio::time::Instant::now(),
             last_millis: AtomicU64::new(0),
+            busy: AtomicU64::new(0),
         }
     }
 
@@ -2918,6 +2932,45 @@ impl IdleClock {
         Duration::from_millis(
             elapsed_millis.saturating_sub(self.last_millis.load(Ordering::Relaxed)),
         )
+    }
+
+    fn mark_busy(&self) {
+        self.busy.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn mark_idle(&self) {
+        // Saturating: a guard must never drive the count below zero.
+        let _ = self.busy.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
+            Some(count.saturating_sub(1))
+        });
+    }
+
+    fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire) > 0
+    }
+}
+
+/// RAII guard marking a connection busy while a request is handled.
+/// Dropping it releases the count and touches the clock: the
+/// connection was just active, so the idle window restarts from the
+/// end of the request instead of from its last socket read.
+struct BusyGuard {
+    clock: Arc<IdleClock>,
+}
+
+impl BusyGuard {
+    fn new(clock: &Arc<IdleClock>) -> Self {
+        clock.mark_busy();
+        Self {
+            clock: Arc::clone(clock),
+        }
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.clock.mark_idle();
+        self.clock.touch();
     }
 }
 
@@ -3276,6 +3329,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SmugglingGuardIo<S> {
 struct HyperService {
     router: AxumRouter,
     peer_addr: Option<SocketAddr>,
+    // Per-connection idle clock (R5-L2): set while a request is
+    // handled so the h2c watchdog does not drop a connection whose
+    // handler stays silent. None for services built without a clock
+    // (tests and non-accept-loop callers).
+    idle_clock: Option<Arc<IdleClock>>,
 }
 
 impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for HyperService {
@@ -3288,7 +3346,12 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for HyperSer
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
         let mut router = self.router.clone();
         let peer_addr = self.peer_addr;
+        let idle_clock = self.idle_clock.clone();
         Box::pin(async move {
+            // The connection is not idle while this request is handled,
+            // even though the socket is silent: hold the busy count
+            // until the response is produced.
+            let _busy = idle_clock.as_ref().map(BusyGuard::new);
             std::future::poll_fn(|cx| {
                 <AxumRouter as TowerService<Request>>::poll_ready(&mut router, cx)
             })
@@ -3296,6 +3359,11 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for HyperSer
             let mut req = req.map(Body::new);
             if let Some(addr) = peer_addr {
                 req.extensions_mut().insert(PeerAddr(addr));
+            }
+            // Hand the clock to dispatch so a streaming response can
+            // keep the connection busy until its body ends.
+            if let Some(clock) = &idle_clock {
+                req.extensions_mut().insert(Arc::clone(clock));
             }
             router.call(req).await
         })
@@ -3829,9 +3897,16 @@ impl NativeServer {
                                 })
                             };
                             let header_read_timeout = limits.header_read_timeout;
+                            // The idle clock is shared with the service so
+                            // request handling can mark the connection busy
+                            // (R5-L2); the watchdog below reads the same
+                            // clock. Created here, before the connection
+                            // task, so the service can hold a clone.
+                            let idle_clock = Arc::new(IdleClock::new());
                             let service = HyperService {
                                 router: app.clone(),
                                 peer_addr: Some(peer_addr),
+                                idle_clock: Some(Arc::clone(&idle_clock)),
                             };
                             // Request-smuggling sniff (S-P1-31): wrap the
                             // stream so the first request's header block is
@@ -3890,7 +3965,6 @@ impl NativeServer {
                                         _ => false,
                                     }
                                 };
-                                let idle_clock = Arc::new(IdleClock::new());
                                 let watched = IdleWatchStream {
                                     inner: stream,
                                     clock: Arc::clone(&idle_clock),
@@ -3931,6 +4005,16 @@ impl NativeServer {
                                             return futures_util::future::pending::<()>().await;
                                         }
                                         loop {
+                                            if idle_clock.is_busy() {
+                                                // A request is being handled:
+                                                // the connection is not idle
+                                                // even though the socket is
+                                                // silent (R5-L2). Wait out
+                                                // the timeout and re-check
+                                                // instead of dropping it.
+                                                tokio::time::sleep(header_read_timeout).await;
+                                                continue;
+                                            }
                                             let idle = idle_clock.idle();
                                             if idle >= header_read_timeout {
                                                 return;
