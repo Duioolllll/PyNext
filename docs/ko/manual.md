@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [日本語](../ja/manual.md) · [简体中文](../zh-CN/manual.md)
 
-이 설명서는 현재 체크아웃한 코드인 **0.1.2** 실험판를 기준으로 합니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
+이 설명서는 현재 체크아웃한 코드인 **0.1.3** 실험판를 기준으로 합니다. PyNext는 Python과 Rust로 만드는 실험적 풀스택 프레임워크이며 Next.js, React, React Server Components와 호환되지 않습니다. 현재 프로토타입을 인터넷에 직접 공개하거나 신뢰할 수 없는 앱 실행에 사용하지 마세요. [버전별 변경 내용](../../CHANGELOG.md)과 [향후 작업](../PRODUCTION_ROADMAP.md)을 참고하세요.
 
 > 이 문서는 영문 매뉴얼의 번역본입니다. 내용이 다르면 영문 매뉴얼이 우선합니다. 기능 목록은 코드에서 자동 생성됩니다 — [FEATURES](../FEATURES.md) 참고.
 

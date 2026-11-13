@@ -166,7 +166,7 @@ def test_successful_build_writes_done_diagnostics(tmp_path):
     write_manifest(tmp_path)
     data = _read_diagnostics(tmp_path)
     assert data["stage"] == "done"
-    assert data["pynext_version"] == "0.1.2"
+    assert data["pynext_version"] == "0.1.3"
     assert data["updated_at"].endswith("Z")
     assert isinstance(data["duration_ms"], float)
     assert "failed_route" not in data
@@ -178,7 +178,7 @@ def test_failed_discover_build_records_stage_and_anonymous_event(tmp_path):
         write_manifest(tmp_path)
     data = _read_diagnostics(tmp_path)
     assert data["stage"] == "discover"
-    assert data["pynext_version"] == "0.1.2"
+    assert data["pynext_version"] == "0.1.3"
     assert "failed_route" not in data
     assert len(data["events"]) == 1
     event = data["events"][0]

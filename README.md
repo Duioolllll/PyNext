@@ -8,13 +8,13 @@
 
 **Wiki:** [English](docs/wiki/en/Home.md) · [한국어](docs/wiki/ko/Home.md) · [Wiki index](docs/wiki/README.md)
 
-**버전:** [패키지 0.1.2](https://pypi.org/project/pynext-framework/0.1.2/) / [릴리스 v0.1.2](https://github.com/Duioolllll/PyNext/releases/tag/v0.1.2) · [변경 이력](CHANGELOG.md) · [아키텍처 명세](docs/ARCHITECTURE_SPEC.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
+**버전:** [패키지 0.1.3](https://pypi.org/project/pynext-framework/0.1.3/) / [릴리스 v0.1.3](https://github.com/Duioolllll/PyNext/releases/tag/v0.1.3) · [변경 이력](CHANGELOG.md) · [아키텍처 명세](docs/ARCHITECTURE_SPEC.md) · [프로덕션 로드맵](docs/PRODUCTION_ROADMAP.md)
 
 이 문서는 현재 체크아웃한 저장소의 코드를 설명합니다.
 
 PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust로 구현하는 실험적 풀스택 프레임워크입니다. 이 저장소는 구현의 출발점이며, Next.js나 React의 호환 구현은 아닙니다.
 
-**현재 사용 범위:** 소규모 웹 프로젝트의 학습·개발·기능 검증에 한정해 사용하세요. 0.1.2도 보안과 장애 대응이 완성되지 않아 공개 운영 서비스나 중요한 데이터를 처리하는 서비스에 부적합합니다. 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하지 마세요. 적용 범위를 넓히기 위한 기준과 개선 계획은 [로드맵](docs/ROADMAP.md)에 정리합니다.
+**현재 사용 범위:** 소규모 웹 프로젝트의 학습·개발·기능 검증에 한정해 사용하세요. 0.1.3도 보안과 장애 대응이 완성되지 않아 공개 운영 서비스나 중요한 데이터를 처리하는 서비스에 부적합합니다. 인터넷에 직접 공개하거나 신뢰할 수 없는 앱을 실행하지 마세요. 적용 범위를 넓히기 위한 기준과 개선 계획은 [로드맵](docs/ROADMAP.md)에 정리합니다.
 
 현재는 Next.js 원본의 경로 정렬·충돌 검사를 참고해 Rust 라우터를 구현하고, Python 페이지·API 및 Rust HTML 렌더러와 연결했습니다. 참고한 원본의 고정 커밋과 MIT 라이선스는 [third_party/NEXTJS.md](third_party/NEXTJS.md)에 있습니다.
 
@@ -29,7 +29,7 @@ PyNext는 Next.js의 파일 기반 라우팅 경험을 참고해 Python과 Rust�
 CPython 3.13 또는 3.14에서 공개 패키지를 설치할 수 있습니다.
 
 ```bash
-pip install pynext-framework==0.1.2
+pip install pynext-framework==0.1.3
 ```
 
 이 버전은 이전 개발 후보 `0.7.0a1`보다 낮으므로 기존 설치에서 전환할 때 버전을 명시하세요. 아래 명령은 저장소의 예제를 빌드하고 실행하는 방법입니다.

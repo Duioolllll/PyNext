@@ -2,7 +2,7 @@
 
 [English](../en/manual.md) · [한국어](../ko/manual.md) · [简体中文](../zh-CN/manual.md)
 
-このマニュアルは、チェックアウトした **0.1.2** の実験版のコードを対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
+このマニュアルは、チェックアウトした **0.1.3** の実験版のコードを対象とします。PyNext は Python と Rust で構築する実験的なフルスタックフレームワークです。Next.js、React、React Server Components との互換性はありません。現時点ではインターネットに直接公開したり、信頼できないアプリを実行したりしないでください。[変更履歴](../../CHANGELOG.md)と[今後の計画](../PRODUCTION_ROADMAP.md)も参照してください。
 
 > このマニュアルは英語マニュアルの翻訳です。内容が異なる場合は英語マニュアルが優先されます。機能一覧はコードから自動生成されています — [FEATURES](../FEATURES.md) を参照してください。
 

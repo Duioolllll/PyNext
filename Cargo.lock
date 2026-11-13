@@ -580,14 +580,14 @@ dependencies = [
 
 [[package]]
 name = "pynext-cache"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "bytes",
 ]
 
 [[package]]
 name = "pynext-native"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "axum",
  "futures-util",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "pynext-router"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "proptest",
 ]

@@ -1,6 +1,6 @@
 # PyNext Wiki / PyNext 위키
 
-**Official bilingual developer guides for the experimental PyNext 0.1.2 source tree.**
+**Official bilingual developer guides for the experimental PyNext 0.1.3 source tree.**
 
 > Canonical source: the [English manual](../en/manual.md) is the single source of truth for PyNext documentation. This wiki is a companion to it; if the wiki and the manual disagree, the manual wins. The capability list is generated from code — see [FEATURES](../FEATURES.md). / 정본: [영문 매뉴얼](../en/manual.md)이 PyNext 문서의 유일한 정본입니다. 이 위키는 보조 문서이며, 위키와 매뉴얼이 다르면 매뉴얼이 우선합니다. 기능 목록은 코드에서 자동 생성됩니다 — [FEATURES](../FEATURES.md) 참고.
 

@@ -271,7 +271,7 @@ def test_standalone_writes_bundle_manifest(tmp_path, monkeypatch):
     build_standalone(project, output)
     info = json.loads((output / "bundle-manifest.json").read_text(encoding="utf-8"))
     assert info["version"] == 1
-    assert info["pynext_version"] == "0.1.2"
+    assert info["pynext_version"] == "0.1.3"
     assert info["python_version"] == platform.python_version()
     assert info["python_implementation"] == "CPython"
     assert len(info["build_id"]) == 16 and all(c in "0123456789abcdef" for c in info["build_id"])
@@ -356,14 +356,14 @@ def test_read_and_log_bundle_manifest(tmp_path, caplog):
     assert read_bundle_manifest(app_dir) is None
     log_bundle_info(app_dir)  # not a bundle: silent no-op
     manifest = {
-        "version": 1, "pynext_version": "0.1.2", "python_version": platform.python_version(),
+        "version": 1, "pynext_version": "0.1.3", "python_version": platform.python_version(),
         "build_id": "0123456789abcdef", "copied_packages": [{"name": "x", "version": "1"}],
         "files": 3, "bytes": 42,
     }
     (tmp_path / "bundle" / "bundle-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with caplog.at_level(logging.INFO, logger="pynext"):
         log_bundle_info(app_dir)
-    assert "Standalone bundle: pynext 0.1.2" in caplog.text
+    assert "Standalone bundle: pynext 0.1.3" in caplog.text
     assert "0123456789abcdef" in caplog.text
     # A bundle built with another Python warns instead of failing.
     manifest["python_version"] = "3.99.0"
