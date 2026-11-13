@@ -119,3 +119,82 @@ def _return(value):
         return value
 
     return compute
+
+
+def test_set_during_inflight_compute_is_not_clobbered_a6_l4():
+    """A6-L4: a value set() while a computation is in flight must win.
+
+    Before the fix, get_or_compute stored its result unconditionally on
+    completion, so a slow computation overwrote a newer explicit set()
+    (read-your-own-writes violation). The awaiting caller still gets the
+    computed value; only the memo keeps the set value.
+    """
+
+    async def run():
+        memo = RequestMemo()
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        async def slow():
+            started.set()
+            await resume.wait()
+            return "STALE-COMPUTED"
+
+        pending = asyncio.create_task(memo.get_or_compute("k", slow))
+        await started.wait()
+        memo.set("k", "FRESH-SET")
+        assert memo.get("k") == "FRESH-SET"
+
+        resume.set()
+        assert await pending == "STALE-COMPUTED"
+        assert memo.get("k") == "FRESH-SET"
+
+    asyncio.run(run())
+
+
+def test_invalidate_during_inflight_compute_is_not_resurrected_a6_l4():
+    """Same generation guard as A6-L4, for invalidate(): a computation
+    in flight when its key is invalidated must not store back."""
+
+    async def run():
+        memo = RequestMemo()
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        async def slow():
+            started.set()
+            await resume.wait()
+            return "STALE-COMPUTED"
+
+        pending = asyncio.create_task(memo.get_or_compute("k", slow))
+        await started.wait()
+        assert memo.invalidate("k") is True
+        assert memo.get("k") is None
+
+        resume.set()
+        assert await pending == "STALE-COMPUTED"
+        assert memo.get("k") is None
+
+    asyncio.run(run())
+
+
+def test_set_without_inflight_compute_leaves_other_computes_alone():
+    """A set() that displaces no computation must not disturb an
+    in-flight computation for another key."""
+
+    async def run():
+        memo = RequestMemo()
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        async def slow():
+            started.set()
+            await resume.wait()
+            return "computed-j"
+
+        pending = asyncio.create_task(memo.get_or_compute("j", slow))
+        await started.wait()
+        memo.set("k", "fresh-k")
+        resume.set()
+        assert await pending == "computed-j"
+        assert memo.get("j") == "computed-j"
+        assert memo.get("k") == "fresh-k"
+
+    asyncio.run(run())

@@ -74,13 +74,31 @@ class RequestMemo:
         return self._values.get(key, default)
 
     def set(self, key, value):
-        """Memoize ``value`` under ``key`` (overwrites any prior value)."""
+        """Memoize ``value`` under ``key`` (overwrites any prior value).
+
+        Bumps the generation when it displaces an in-flight computation
+        for the same key (A6-L4): the computation's completion must not
+        store its stale result over the freshly set value
+        (read-your-own-writes). A set that does not displace a
+        computation leaves the generation alone, so unrelated in-flight
+        computations still store normally.
+        """
         self._values[key] = value
-        self._inflight.pop(key, None)
+        if self._inflight.pop(key, None) is not None:
+            self._generation += 1
 
     def invalidate(self, key):
-        """Drop one memoized key (value and in-flight compute, if any)."""
-        return self._values.pop(key, None) is not None or self._inflight.pop(key, None) is not None
+        """Drop one memoized key (value and in-flight compute, if any).
+
+        Like :meth:`set`, bumps the generation when it displaces an
+        in-flight computation, so the computation cannot store its value
+        back after the invalidation (same class as A6-L4).
+        """
+        dropped = self._values.pop(key, None) is not None
+        if self._inflight.pop(key, None) is not None:
+            self._generation += 1
+            dropped = True
+        return dropped
 
     def clear(self):
         """Drop every memoized value. See the module docstring for when
@@ -118,9 +136,10 @@ class RequestMemo:
                 self._inflight.pop(key, None)
             raise
         if generation != self._generation:
-            # A clear() happened while this computation was in flight.
-            # The awaiting caller still gets the computed value, but it
-            # must not be stored back into the memo.
+            # A clear()/set()/invalidate() happened while this
+            # computation was in flight. The awaiting caller still gets
+            # the computed value, but it must not be stored back into
+            # the memo.
             if self._inflight.get(key) is task:
                 self._inflight.pop(key, None)
             return value
