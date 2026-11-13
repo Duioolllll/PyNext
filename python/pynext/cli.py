@@ -669,7 +669,7 @@ def _build_parser():
                                  type=_bounded(1, MAX_CONCURRENT, "--max-concurrent-per-ip"),
                                  default=None,
                                  help="execution slots one client IP may hold at once (1-1000000; "
-                                      "default 16, a quarter of the 64-slot pool, so one IP cannot "
+                                      "default 16, one eighth of the 128-slot pool, so one IP cannot "
                                       "take every slot with slow requests)")
             command.add_argument("--header-read-timeout-ms",
                                  type=_bounded(0, MAX_TIMEOUT_MS, "--header-read-timeout-ms"),
