@@ -100,7 +100,11 @@ class Matcher:
         match = self.regex.match(path)
         if match is None:
             return None
-        return {name: match.group(name) for name in self.param_names}
+        # Group names are positional (p0, p1, ...) because parameter
+        # names may contain hyphens or start with a digit (A1-M2),
+        # which Python regex group names forbid; param_names maps them
+        # back to the original names.
+        return {name: match.group(f"p{index}") for index, name in enumerate(self.param_names)}
 
 
 def compile_matcher(source):
@@ -151,17 +155,24 @@ def compile_matcher(source):
                 raise ValueError(f"Optional catch-all must use [[...name]]: {segment!r} in {source!r}")
             if name in names:
                 raise ValueError(f"Duplicate matcher parameter {name!r} in {source!r}")
+            # Parameter names are [A-Za-z0-9_-]+, but Python regex group
+            # names must be identifiers: a hyphen or a leading digit
+            # (``[my-id]``, ``[0id]``) is a valid route parameter the
+            # router accepts, yet ``(?P<my-id>...)`` fails to compile
+            # (A1-M2). Use a positional group name and map it back in
+            # Matcher.matches.
+            group = f"p{len(names)}"
             names.append(name)
             if double_open:
                 if not last:
                     raise ValueError(f"Optional catch-all must be the last segment: {source!r}")
-                parts.append(rf"(?:/(?P<{name}>.*))?")
+                parts.append(rf"(?:/(?P<{group}>.*))?")
             elif dots:
                 if not last:
                     raise ValueError(f"Catch-all must be the last segment: {source!r}")
-                parts.append(rf"/(?P<{name}>.+)")
+                parts.append(rf"/(?P<{group}>.+)")
             else:
-                parts.append(rf"/(?P<{name}>[^/]+)")
+                parts.append(rf"/(?P<{group}>[^/]+)")
             continue
         if segment in (".", ".."):
             raise ValueError(f"matcher source must not contain '.' or '..' segments: {source!r}")
