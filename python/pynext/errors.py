@@ -288,7 +288,14 @@ def digest_for_error(exc):
     digest = getattr(exc, "_pynext_digest", None)
     if digest is not None:
         entry = _REGISTRY.lookup(digest)
-        return digest, entry["count"] if entry is not None else 1
+        if entry is not None:
+            return digest, entry["count"]
+        # A1-L6: the record was evicted from the bounded registry after
+        # the digest was cached on the exception — re-register it instead
+        # of returning a count for a record lookup_error can never
+        # resolve. The digest stays the same, so the 500 response still
+        # resolves back to a record.
+        return digest, _REGISTRY.record(exc, digest)
     digest = compute_digest(exc)
     try:
         exc._pynext_digest = digest

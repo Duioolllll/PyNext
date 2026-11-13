@@ -393,3 +393,37 @@ def test_500_for_exploding_str_error_is_a_normal_response(tmp_path):
     record = lookup_error(digest)
     assert record is not None
     assert record["type"] == "BadStr"
+
+
+def test_digest_for_error_reregisters_after_eviction(monkeypatch):
+    """A1-L6: when the registry evicts a record whose digest is still
+    cached on the exception instance, digest_for_error re-registers it
+    instead of returning a count lookup_error can never resolve."""
+    from pynext import errors
+    from pynext.errors import _ErrorRegistry
+
+    # A fresh registry: the process-global one already holds entries from
+    # other tests, so its oldest entry is not ours.
+    monkeypatch.setattr(errors, "_REGISTRY", _ErrorRegistry())
+    monkeypatch.setattr(errors, "_MAX_REGISTRY_ENTRIES", 2)
+    first_exc = None
+    try:
+        _raise_value_error("l6-first-errdigest")
+    except ValueError as exc:
+        first_exc = exc
+        digest, count = digest_for_error(exc)
+        assert lookup_error(digest) is not None
+    # Fill the registry past the bound so the first record is evicted.
+    for i in range(2):
+        try:
+            _raise_value_error(f"l6-filler-{i}-errdigest")
+        except ValueError as filler:
+            digest_for_error(filler)
+    assert lookup_error(digest) is None
+    # The same instance again: the cached digest must resolve.
+    digest_again, count_again = digest_for_error(first_exc)
+    assert digest_again == digest
+    record = lookup_error(digest)
+    assert record is not None
+    assert record["type"] == "ValueError"
+    assert record["count"] == count_again
