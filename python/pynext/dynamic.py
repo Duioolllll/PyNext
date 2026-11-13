@@ -70,6 +70,14 @@ context variable, so a synchronous page function running on a worker thread
 shared state. The monkeypatches are process-global while installed, but
 their wrappers only record when a tracking state is active in the current
 context, so concurrent dynamic requests are unaffected.
+
+One honest limit of the context-variable design (A1-M6): a plain
+``threading.Thread`` starts with an *empty* context, so dynamic accesses
+inside a thread a page spawns itself are silently missed — the clock read
+happens, but no access is recorded and the page can be baked static with
+a dynamic value inside. Spawn prerender work with
+:func:`run_in_prerender_context` (or ``asyncio.to_thread``, or run it
+under :func:`prerender_context`) so the tracking state travels with it.
 """
 
 import contextvars
@@ -98,6 +106,8 @@ __all__ = [
     "mark_dynamic_access",
     "no_store",
     "now",
+    "prerender_context",
+    "run_in_prerender_context",
     "suppress_dynamic_tracking",
     "track_prerender",
     "utcnow",
@@ -539,5 +549,56 @@ class PrerenderTracker:
 
 
 def track_prerender(pattern, dynamic_mode, *, on_finish=None):
-    """Create a :class:`PrerenderTracker` for one SSG/ISR render."""
+    """Create a :class:`PrerenderTracker` for one SSG/ISR render.
+
+    Work the render spawns on plain ``threading.Thread`` threads does not
+    inherit the tracking context (A1-M6): run it with
+    :func:`run_in_prerender_context`, or under :func:`prerender_context`.
+    ``asyncio.to_thread`` copies the context on its own.
+    """
     return PrerenderTracker(pattern, dynamic_mode, on_finish=on_finish)
+
+
+def prerender_context():
+    """Return a copy of the current context, for spawning threads.
+
+    A plain ``threading.Thread`` starts with an empty context, so the
+    prerender tracking state (a context variable) is invisible inside
+    it and dynamic accesses there are silently missed (A1-M6). Run
+    spawned work under a copied context instead::
+
+        ctx = prerender_context()
+        threading.Thread(target=ctx.run, args=(work,)).start()
+
+    or use :func:`run_in_prerender_context` for a single spawned call.
+    Outside a prerender the copy is still valid — it just carries no
+    tracking state.
+    """
+    return contextvars.copy_context()
+
+
+def run_in_prerender_context(func, *args, **kwargs):
+    """Run ``func`` in a new thread with the prerender context copied.
+
+    The spawned thread records dynamic accesses into the current
+    prerender (A1-M6); a plain ``threading.Thread`` would miss them
+    because a new thread starts with an empty context. The thread is
+    joined before returning, so the result is available and any
+    exception — including a :class:`StaticGenBailoutError` in
+    ``dynamic="error"`` mode — is re-raised in the caller.
+    """
+    ctx = contextvars.copy_context()
+    outcome = {}
+
+    def _run():
+        try:
+            outcome["value"] = ctx.run(func, *args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    thread.join()
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]

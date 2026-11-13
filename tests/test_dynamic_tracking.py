@@ -355,3 +355,57 @@ def test_prerender_datetime_swap_does_not_break_other_threads():
     assert results["isinstance_date"] is True
     assert json.loads(results["json"]) == {
         "at": "2026-01-02T03:04:05", "on": "2026-01-02"}
+
+
+def test_spawned_plain_thread_misses_dynamic_access():
+    """A1-M6 (documented limit): a plain threading.Thread starts with an
+    empty context, so a clock read inside it is silently missed by
+    prerender tracking. This test pins the behaviour so the limit is
+    visible, not silently fixed by accident."""
+    import threading
+
+    with track_prerender("/unit", "auto") as state:
+        def read_clock():
+            time.time()
+
+        thread = threading.Thread(target=read_clock)
+        thread.start()
+        thread.join()
+    assert state.accesses == []
+
+
+def test_run_in_prerender_context_records_spawned_access():
+    """A1-M6: the helper copies the tracking context into the spawned
+    thread, so its clock read is recorded."""
+    from pynext.dynamic import run_in_prerender_context
+
+    with track_prerender("/unit", "auto") as state:
+        result = run_in_prerender_context(lambda: time.time() > 0)
+    assert result is True
+    assert [a.expression for a in state.accesses] == ["time.time()"]
+
+
+def test_run_in_prerender_context_reraises_bailout():
+    """A1-M6: in dynamic='error' mode a bailout raised in the spawned
+    thread is re-raised in the caller, so the prerender still fails."""
+    from pynext.dynamic import run_in_prerender_context
+
+    with pytest.raises(StaticGenBailoutError) as excinfo:
+        with track_prerender("/unit", "error"):
+            run_in_prerender_context(lambda: time.time() > 0)
+    assert "time.time()" in str(excinfo.value)
+
+
+def test_prerender_context_covers_executor_work():
+    """A1-M6: prerender_context() lets an executor's worker record
+    accesses too (ThreadPoolExecutor does not copy the context)."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from pynext.dynamic import prerender_context
+
+    with track_prerender("/unit", "auto") as state:
+        ctx = prerender_context()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(ctx.run, lambda: time.time() > 0).result()
+    assert [a.expression for a in state.accesses] == ["time.time()"]
