@@ -2400,12 +2400,20 @@ async fn dispatch(State(state): State<Arc<ServerState>>, request: Request) -> Ax
                 );
             }
         };
-        match tokio::time::timeout(
-            state.body_timeout,
-            read_limited_body(body, MAX_REQUEST_BODY, state.body_min_rate),
-        )
-        .await
-        {
+        // A zero body timeout disables the timeout (the same "0 =
+        // disabled" convention as the other native timeouts and the
+        // ASGI path): await the read directly instead of wrapping it
+        // in a zero timeout, which would fail immediately.
+        let body_result = if state.body_timeout.is_zero() {
+            Ok(read_limited_body(body, MAX_REQUEST_BODY, state.body_min_rate).await)
+        } else {
+            tokio::time::timeout(
+                state.body_timeout,
+                read_limited_body(body, MAX_REQUEST_BODY, state.body_min_rate),
+            )
+            .await
+        };
+        match body_result {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
                 let (status, message, retry_after) = match error {
