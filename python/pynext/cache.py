@@ -945,6 +945,27 @@ class SharedCacheHandler(CacheHandler):
     def variant_generation(self, key, *, invalidate=False):
         """Get or replace a path generation atomically across workers."""
 
+    @abstractmethod
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation in the shared manifest.
+
+        ``expire=None`` marks entries carrying the tag expired
+        immediately; ``expire`` seconds keeps them merely stale until
+        that delay passes. Entries generated after this call are
+        unaffected. Returns True when the record was stored, so other
+        workers see it on their next lookup. Backends without a shared
+        store may keep the record process-local.
+        """
+
+    @abstractmethod
+    def get_tag_times(self, tags):
+        """Return ``{tag: (stale_at, expired_at)}`` in wall-clock seconds.
+
+        A missing tag maps to ``(None, None)``. ``ISRCache`` consults
+        this to keep a retained previous body from resurrecting after a
+        cross-worker invalidation.
+        """
+
     def lookup(self, key):
         """``CacheBackend``-compatible read: ``(status, body)``.
 
@@ -1277,6 +1298,33 @@ class SQLiteCacheHandler(SharedCacheHandler):
             self._meta_conn.commit()
         return None
 
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation in the shared manifest (A-1).
+
+        The backend's ``tags`` table is what cross-worker lookups
+        consult (``lookup_entry``), so the shared record goes there.
+        The handler's own ``get`` judges entries against
+        ``handler_tags``, so the same invalidation is mirrored there
+        too — same instant, same semantics as :meth:`update_tags`.
+        The mirror is best-effort: the shared record is what other
+        workers see, and a failed mirror only affects entries written
+        through :meth:`set` (which carry no backend tags).
+        """
+        tag = _validate_tag(tag)
+        expire = _validate_tag_expire(expire)
+        recorded = self.backend.revalidate_tag(tag, expire)
+        if recorded:
+            try:
+                durations = {"expire": expire} if expire is not None else None
+                self.update_tags([tag], durations)
+            except Exception:
+                log.warning("SQLite handler tag mirror failed for %s", tag, exc_info=True)
+        return recorded
+
+    def get_tag_times(self, tags):
+        """Tag invalidation instants from the shared manifest (A-1)."""
+        return self.backend.get_tag_times(tags)
+
     # -- SharedCacheHandler coordination (delegated to the backend) ------
     def lookup_entry(self, key):
         return self.backend.lookup_entry(key)
@@ -1470,6 +1518,21 @@ class RedisCacheHandler(SharedCacheHandler):
             self.client.set(self._tag_key(tag),
                             f"{stale_at},{expired_at}".encode("ascii"), px=ttl_ms)
         return None
+
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation through the shared backend (A-1).
+
+        The backend's string tag record is what both the shared lookup
+        path (``lookup_entry``) and this handler's ``get`` consult —
+        A-4 unified the encodings — so a single backend write covers
+        both. Raises :class:`SharedCacheUnavailable` when Redis is
+        unreachable, like the other backend-delegated calls.
+        """
+        return self.backend.revalidate_tag(tag, expire)
+
+    def get_tag_times(self, tags):
+        """Tag invalidation instants from the shared manifest (A-1)."""
+        return self.backend.get_tag_times(tags)
 
     # -- SharedCacheHandler coordination (delegated to the backend) ------
     def lookup_entry(self, key):
@@ -3018,6 +3081,16 @@ class _PlainHandlerSharedAdapter(SharedCacheHandler):
         self.handler.update_tags([tag], durations)
         self._tags.update([tag], durations)
         return True
+
+    def get_tag_times(self, tags):
+        """Tag invalidation instants from the local mirror (A-1).
+
+        The wrapped handler keeps its own tag store, but the adapter
+        judges entries by the render-start time, so the mirror — not
+        the handler — is the authority here, exactly like
+        :meth:`_tag_times`.
+        """
+        return self._tags.times(tags)
 
     def refresh_tags(self):
         return self.handler.refresh_tags()
