@@ -478,3 +478,50 @@ def test_asgi_dynamic_route_auth_uses_path_params(tmp_path):
         await app.isr.close()
 
     _run(run())
+
+
+def test_asgi_encoded_delimiter_cannot_bypass_ws_require_auth(tmp_path):
+    """A1-H1: an encoded delimiter (%2F) must not let an unauthenticated
+    handshake reach a @require_auth handler through a shorter public route.
+
+    Routes: /ws/[name] (public) + /ws/[name]/[y] (@require_auth). The
+    handshake path decodes to /ws/a/b for the handler lookup (protected
+    route), but the pre-flight used to re-match the normalized encoded
+    form /ws/a%2Fb (public route), so the upgrade was accepted and
+    secret-data leaked.
+    """
+    name_dir = tmp_path / "app" / "ws" / "[name]"
+    name_dir.mkdir(parents=True)
+    (name_dir / "route.py").write_text(PUBLIC_SOURCE)
+    y_dir = name_dir / "[y]"
+    y_dir.mkdir()
+    (y_dir / "route.py").write_text(SECRET_SOURCE)
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite3")
+    app = create_app(tmp_path, middleware=[SessionMiddleware(store, secure=False)])
+
+    def _scope(path, raw_path):
+        return {"type": "websocket", "path": path, "raw_path": raw_path,
+                "headers": _cookie_headers(None), "query_string": b""}
+
+    async def run():
+        # Plain protected path: denied.
+        denied = _ScriptedConnection([{"type": "websocket.connect"}])
+        await app(_scope("/ws/a/b", b"/ws/a/b"), denied.receive, denied.send)
+        assert denied.sent == [{"type": "websocket.close", "code": 1008}]
+        # Encoded delimiter: must be denied too, never accepted.
+        bypass = _ScriptedConnection([{"type": "websocket.connect"}])
+        await app(_scope("/ws/a/b", b"/ws/a%2Fb"), bypass.receive, bypass.send)
+        assert bypass.sent == [{"type": "websocket.close", "code": 1008}]
+        assert not any(m.get("text") == "secret-data" for m in bypass.sent)
+        # The public route still works.
+        public = _ScriptedConnection([
+            {"type": "websocket.connect"},
+            {"type": "websocket.receive", "text": "x"},
+            {"type": "websocket.disconnect", "code": 1000},
+        ])
+        await app(_scope("/ws/ab", b"/ws/ab"), public.receive, public.send)
+        assert public.sent[0] == {"type": "websocket.accept"}
+        assert public.sent[1] == {"type": "websocket.send", "text": "public-data"}
+        await app.isr.close()
+
+    _run(run())

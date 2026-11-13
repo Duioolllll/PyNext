@@ -357,9 +357,17 @@ class MiddlewareScope:
         object.__setattr__(self, "missing", _coerce_conditions(self.missing, "missing"))
         object.__setattr__(self, "_source_re", _compile_source(self.source))
 
-    def _matches_source(self, request: "Request") -> bool:
-        if self._source_re.fullmatch(request.path):
+    def _matches_source(self, request: "Request", path=None) -> bool:
+        # ``path`` overrides the path the source pattern is evaluated
+        # against: callers pass the app-relative routing path (the same
+        # value the router sees) so a ``base_path`` prefix or a trailing
+        # slash cannot silently bypass a scope (A1-H2). Defaults to
+        # ``request.path``.
+        target = path if path is not None else request.path
+        if self._source_re.fullmatch(target):
             return True
+        if path is not None:
+            return False
         # Fail-closed OR: also try the raw (still-encoded) target the
         # transport recorded. An encoded path must not dodge the scope.
         raw = getattr(request, "raw_path", None)
@@ -371,15 +379,17 @@ class MiddlewareScope:
             decoded = raw.decode("latin-1") if isinstance(raw, (bytes, bytearray)) else str(raw)
         return decoded != request.path and self._source_re.fullmatch(decoded) is not None
 
-    def matches(self, request: "Request") -> bool:
+    def matches(self, request: "Request", path=None) -> bool:
         """Return whether the middleware should run for ``request``.
 
         A scope that cannot be evaluated (for example a malformed query
         string) matches: execution is fail-closed, so the middleware runs
-        rather than being silently skipped.
+        rather than being silently skipped. ``path`` overrides the path
+        the ``source`` pattern is evaluated against (see
+        :meth:`_matches_source`).
         """
         try:
-            if self._source_re is not None and not self._matches_source(request):
+            if self._source_re is not None and not self._matches_source(request, path):
                 return False
             return (all(item.matches(request) for item in self.has)
                     and not any(item.matches(request) for item in self.missing))

@@ -139,8 +139,13 @@ class RedirectError(SignalError):
     def __init__(self, location, status=307, replace=False):
         if not isinstance(location, str) or not location:
             raise ValueError("redirect location must be a non-empty string")
-        if any(c in location for c in "\r\n"):
-            raise ValueError("redirect location must not contain CR or LF")
+        # A1-L5: reject every C0 control character and DEL here, not just
+        # CR/LF. to_response() encodes the location into a Location header,
+        # and the HTTP layer refuses control characters there — so a
+        # location carrying \x00, \t or \x7f used to fail at response time
+        # instead of at construction time.
+        if any(ord(c) < 32 or ord(c) == 127 for c in location):
+            raise ValueError("redirect location must not contain control characters")
         try:
             location.encode("ascii")
         except UnicodeEncodeError as exc:
@@ -210,12 +215,22 @@ def compute_digest(exc):
     repeats dedup to one digest. Tracebacks carry file paths, line numbers
     and source lines but no addresses, so the hash is stable per process
     and across processes running the same code.
+
+    An exception whose ``__str__`` raises (A1-M5) must not kill the 500
+    handler that is trying to report it: the whole computation is
+    guarded, and on failure the digest falls back to the exception's
+    type identity alone, so dispatch still produces a normal 500
+    response with a digest and request_id.
     """
-    text = (
-        f"{type(exc).__name__}:{exc}\n"
-        + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    )
-    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+    try:
+        text = (
+            f"{type(exc).__name__}:{exc}\n"
+            + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        )
+        return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+    except Exception:
+        fallback = f"unhashable:{type(exc).__module__}.{type(exc).__qualname__}"
+        return hashlib.sha256(fallback.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 class _ErrorRegistry:
@@ -233,9 +248,15 @@ class _ErrorRegistry:
             if entry is None:
                 if len(self._entries) >= _MAX_REGISTRY_ENTRIES:
                     self._entries.pop(next(iter(self._entries)))
+                try:
+                    message = str(exc)[:_MAX_MESSAGE_CHARS]
+                except Exception:
+                    # A1-M5: an exception whose __str__ raises must not
+                    # kill the 500 handler recording it.
+                    message = f"<unprintable {type(exc).__name__}>"
                 entry = {
                     "type": type(exc).__name__,
-                    "message": str(exc)[:_MAX_MESSAGE_CHARS],
+                    "message": message,
                     "count": 0,
                     "first_seen": now,
                     "last_seen": now,
@@ -267,7 +288,14 @@ def digest_for_error(exc):
     digest = getattr(exc, "_pynext_digest", None)
     if digest is not None:
         entry = _REGISTRY.lookup(digest)
-        return digest, entry["count"] if entry is not None else 1
+        if entry is not None:
+            return digest, entry["count"]
+        # A1-L6: the record was evicted from the bounded registry after
+        # the digest was cached on the exception — re-register it instead
+        # of returning a count for a record lookup_error can never
+        # resolve. The digest stays the same, so the 500 response still
+        # resolves back to a record.
+        return digest, _REGISTRY.record(exc, digest)
     digest = compute_digest(exc)
     try:
         exc._pynext_digest = digest

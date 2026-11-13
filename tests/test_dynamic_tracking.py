@@ -355,3 +355,144 @@ def test_prerender_datetime_swap_does_not_break_other_threads():
     assert results["isinstance_date"] is True
     assert json.loads(results["json"]) == {
         "at": "2026-01-02T03:04:05", "on": "2026-01-02"}
+
+
+def test_spawned_plain_thread_misses_dynamic_access():
+    """A1-M6 (documented limit): a plain threading.Thread starts with an
+    empty context, so a clock read inside it is silently missed by
+    prerender tracking. This test pins the behaviour so the limit is
+    visible, not silently fixed by accident."""
+    import threading
+
+    with track_prerender("/unit", "auto") as state:
+        def read_clock():
+            time.time()
+
+        thread = threading.Thread(target=read_clock)
+        thread.start()
+        thread.join()
+    assert state.accesses == []
+
+
+def test_run_in_prerender_context_records_spawned_access():
+    """A1-M6: the helper copies the tracking context into the spawned
+    thread, so its clock read is recorded."""
+    from pynext.dynamic import run_in_prerender_context
+
+    with track_prerender("/unit", "auto") as state:
+        result = run_in_prerender_context(lambda: time.time() > 0)
+    assert result is True
+    assert [a.expression for a in state.accesses] == ["time.time()"]
+
+
+def test_run_in_prerender_context_reraises_bailout():
+    """A1-M6: in dynamic='error' mode a bailout raised in the spawned
+    thread is re-raised in the caller, so the prerender still fails."""
+    from pynext.dynamic import run_in_prerender_context
+
+    with pytest.raises(StaticGenBailoutError) as excinfo:
+        with track_prerender("/unit", "error"):
+            run_in_prerender_context(lambda: time.time() > 0)
+    assert "time.time()" in str(excinfo.value)
+
+
+def test_prerender_context_covers_executor_work():
+    """A1-M6: prerender_context() lets an executor's worker record
+    accesses too (ThreadPoolExecutor does not copy the context)."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from pynext.dynamic import prerender_context
+
+    with track_prerender("/unit", "auto") as state:
+        ctx = prerender_context()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(ctx.run, lambda: time.time() > 0).result()
+    assert [a.expression for a in state.accesses] == ["time.time()"]
+
+
+def test_exec_and_eval_clock_reads_are_tracked():
+    """A1-L2: a clock read inside exec()/eval() code is recorded against
+    the exec/eval call site, not silently missed."""
+    with track_prerender("/unit", "auto") as state:
+        exec("time.time()")
+        eval("time.time()")
+    assert [a.expression for a in state.accesses] == ["time.time()", "time.time()"]
+    # The location is the real file that ran the exec, not "<string>".
+    for access in state.accesses:
+        assert "test_dynamic_tracking.py" in access.location
+        assert "<string>" not in access.location
+
+
+def test_stdlib_clock_read_still_not_tracked():
+    """A1-L2 guard: walking past "<string>" frames must not turn a
+    standard-library clock read into a dynamic access — logging reading
+    the clock for a record still does not count."""
+    import logging
+
+    logger = logging.getLogger("pynext-test-a1l2")
+    with track_prerender("/unit", "auto") as state:
+        logger.info("a log line during a prerender")
+    assert state.accesses == []
+
+
+def test_tracked_datetime_returns_original_class():
+    """A1-L3: during a prerender, datetime.now()/utcnow()/today() and
+    date.today() return plain datetime/date instances — not the tracking
+    subclass — so concurrent requests see no leaked type."""
+    import datetime as dt
+
+    with track_prerender("/unit", "auto"):
+        now = dt.datetime.now()
+        utc = dt.datetime.utcnow()
+        today = dt.datetime.today()
+        date_today = dt.date.today()
+    assert type(now) is dt.datetime
+    assert type(utc) is dt.datetime
+    assert type(today) is dt.datetime
+    assert type(date_today) is dt.date
+    assert now.tzinfo is None and utc.tzinfo is None
+    # Values are still correct datetimes.
+    assert isinstance(now, dt.datetime) and isinstance(date_today, dt.date)
+
+
+def test_tracked_datetime_returns_original_class_in_other_thread():
+    """A1-L3: the leak also shows in a concurrent thread's request — a
+    plain datetime created there must be exactly datetime.datetime."""
+    import datetime as dt
+    import threading
+
+    results = {}
+
+    def read_clock():
+        results["now_type"] = type(dt.datetime.now())
+        results["today_type"] = type(dt.date.today())
+
+    with track_prerender("/unit", "auto"):
+        thread = threading.Thread(target=read_clock)
+        thread.start()
+        thread.join()
+    assert results["now_type"] is dt.datetime
+    assert results["today_type"] is dt.date
+
+
+def test_dropped_accesses_are_counted_in_manifest_and_logged(tmp_path, caplog):
+    """A1-L4: accesses beyond the 32-access cap are counted per pattern
+    in the manifest (dynamic_accesses_dropped) and warned about, instead
+    of silently disappearing."""
+    write_page(tmp_path, (
+        "from pynext import h, page\n"
+        "import time\n"
+        "@page(render=\"ssg\")\n"
+        "async def Page():\n"
+        "    for _ in range(40):\n"
+        "        time.time()\n"
+        "    return h(\"p\", {}, \"x\")\n"
+    ))
+    with caplog.at_level(logging.WARNING, logger="pynext"):
+        manifest = write_manifest(tmp_path)
+    accesses = manifest["dynamic_accesses"]["/"]
+    assert len(accesses) == 32
+    assert manifest["dynamic_accesses_dropped"] == {"/": 8}
+    assert "dropped 8 dynamic access" in caplog.text
+    assert "32-access cap" in caplog.text

@@ -554,3 +554,42 @@ def test_scoped_middleware_and_headers_on_both_transports(tmp_path, mode):
             await app.isr.close()
 
     asyncio.run(run())
+
+
+def test_host_has_value_keeps_regex_escapes_intact():
+    """A1-M1: compiling a host has/missing value must not lowercase the
+    pattern text — lowercasing corrupts regex escapes (\\A -> \\a,
+    \\D -> \\d, \\Z -> invalid escape). Host matching is case-insensitive
+    via re.IGNORECASE instead, and a direct matches() call lowercases
+    the candidate like matches_request() does.
+    """
+    anchor = compile_has_condition({"type": "host", "value": r"\Aexample\.com"})
+    assert anchor.matches(host="example.com")
+    assert anchor.matches(host="EXAMPLE.COM")
+    assert not anchor.matches(host="other.com")
+    assert not anchor.matches(host="example.com.evil.com")
+
+    negated = compile_has_condition({"type": "host", "value": r"\D+"})
+    assert negated.matches(host="example")
+    assert not negated.matches(host="123")
+
+    end_anchor = compile_has_condition({"type": "host", "value": r"example\.com\Z"})
+    assert end_anchor.matches(host="example.com")
+    assert not end_anchor.matches(host="example.com.evil.com")
+
+
+def test_compile_matcher_accepts_hyphen_and_digit_param_names():
+    """A1-M2: hyphenated or digit-leading parameter names are valid route
+    parameters (the router and the Rust trie accept them), so a matcher
+    must compile them too — the parameter name is mapped to a positional
+    regex group name instead of being used as the group name directly.
+    """
+    assert compile_matcher("/api/[my-id]").matches("/api/42") == {"my-id": "42"}
+    assert compile_matcher("/api/[0id]").matches("/api/42") == {"0id": "42"}
+    assert compile_matcher("/api/[...my-rest]").matches("/api/a/b") == {"my-rest": "a/b"}
+    assert compile_matcher("/api/[[...my-rest]]").matches("/api") == {"my-rest": None}
+    assert compile_matcher("/api/[[...my-rest]]").matches("/api/a/b") == {"my-rest": "a/b"}
+    assert compile_matcher("/api/[my_id]").matches("/api/42") == {"my_id": "42"}
+    assert compile_matcher("/api/[id2]").matches("/api/42") == {"id2": "42"}
+    assert compile_matcher("/api/[a-b]/[0c]").matches("/api/x/y") == {"a-b": "x", "0c": "y"}
+    assert compile_matcher("/api/[my-id]").matches("/api") is None

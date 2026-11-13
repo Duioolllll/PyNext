@@ -70,6 +70,14 @@ context variable, so a synchronous page function running on a worker thread
 shared state. The monkeypatches are process-global while installed, but
 their wrappers only record when a tracking state is active in the current
 context, so concurrent dynamic requests are unaffected.
+
+One honest limit of the context-variable design (A1-M6): a plain
+``threading.Thread`` starts with an *empty* context, so dynamic accesses
+inside a thread a page spawns itself are silently missed — the clock read
+happens, but no access is recorded and the page can be baked static with
+a dynamic value inside. Spawn prerender work with
+:func:`run_in_prerender_context` (or ``asyncio.to_thread``, or run it
+under :func:`prerender_context`) so the tracking state travels with it.
 """
 
 import contextvars
@@ -98,6 +106,8 @@ __all__ = [
     "mark_dynamic_access",
     "no_store",
     "now",
+    "prerender_context",
+    "run_in_prerender_context",
     "suppress_dynamic_tracking",
     "track_prerender",
     "utcnow",
@@ -361,6 +371,13 @@ def _record_call(expression):
     ``logging`` (which reads the clock for every record) or framework code
     does not. The call chain is user code -> wrapper -> this function, so
     the user frame is two hops up.
+
+    ``exec()``/``eval()`` code runs in a ``"<string>"`` frame with no real
+    file (A1-L2): the walk skips those frames to reach the user frame that
+    ran the exec, so a clock read inside dynamically executed code is
+    recorded against the exec call site. Only ``"<string>"`` frames are
+    skipped — a standard-library frame in between still stops the walk,
+    so ``logging`` reading the clock never counts.
     """
     state = _active_state()
     if state is None:
@@ -369,6 +386,8 @@ def _record_call(expression):
     try:
         wrapper_frame = frame.f_back if frame is not None else None
         caller = wrapper_frame.f_back if wrapper_frame is not None else None
+        while caller is not None and caller.f_code.co_filename == "<string>":
+            caller = caller.f_back
         if caller is None or not _is_user_file(caller.f_code.co_filename):
             return
     finally:
@@ -415,31 +434,56 @@ class _TrackedDateMeta(type):
 
 
 class _TrackedDatetime(_ORIGINAL_DATETIME, metaclass=_TrackedDatetimeMeta):
-    """``datetime.datetime`` that records ``now``/``utcnow``/``today`` reads."""
+    """``datetime.datetime`` that records ``now``/``utcnow``/``today`` reads.
+
+    The classmethods return instances of the *original* ``datetime``
+    class (A1-L3): during a prerender ``datetime.datetime`` is this
+    subclass, so a naive ``super().now()`` would hand concurrent
+    requests ``_TrackedDatetime`` instances, breaking ``type(x) is
+    datetime.datetime`` checks outside the prerender.
+    """
 
     @classmethod
     def now(cls, tz=None):
         _record_call("datetime.now()")
-        return super().now(tz)
+        return _as_original_datetime(super().now(tz))
 
     @classmethod
     def utcnow(cls):
         _record_call("datetime.now()")
-        return super().now(_datetime.timezone.utc).replace(tzinfo=None)
+        return _as_original_datetime(
+            super().now(_datetime.timezone.utc).replace(tzinfo=None))
 
     @classmethod
     def today(cls):
         _record_call("datetime.today()")
-        return super().today()
+        return _as_original_datetime(super().today())
+
+
+def _as_original_datetime(value):
+    """Rebuild ``value`` as a plain ``datetime.datetime`` (A1-L3)."""
+    return _ORIGINAL_DATETIME(
+        value.year, value.month, value.day,
+        value.hour, value.minute, value.second, value.microsecond,
+        tzinfo=value.tzinfo, fold=value.fold,
+    )
+
+
+def _as_original_date(value):
+    """Rebuild ``value`` as a plain ``datetime.date`` (A1-L3)."""
+    return _ORIGINAL_DATE(value.year, value.month, value.day)
 
 
 class _TrackedDate(_ORIGINAL_DATE, metaclass=_TrackedDateMeta):
-    """``datetime.date`` that records ``today()`` reads."""
+    """``datetime.date`` that records ``today()`` reads.
+
+    Returns a plain ``datetime.date`` (A1-L3), like ``_TrackedDatetime``.
+    """
 
     @classmethod
     def today(cls):
         _record_call("date.today()")
-        return super().today()
+        return _as_original_date(super().today())
 
 
 _PATCH_TARGETS = (
@@ -539,5 +583,56 @@ class PrerenderTracker:
 
 
 def track_prerender(pattern, dynamic_mode, *, on_finish=None):
-    """Create a :class:`PrerenderTracker` for one SSG/ISR render."""
+    """Create a :class:`PrerenderTracker` for one SSG/ISR render.
+
+    Work the render spawns on plain ``threading.Thread`` threads does not
+    inherit the tracking context (A1-M6): run it with
+    :func:`run_in_prerender_context`, or under :func:`prerender_context`.
+    ``asyncio.to_thread`` copies the context on its own.
+    """
     return PrerenderTracker(pattern, dynamic_mode, on_finish=on_finish)
+
+
+def prerender_context():
+    """Return a copy of the current context, for spawning threads.
+
+    A plain ``threading.Thread`` starts with an empty context, so the
+    prerender tracking state (a context variable) is invisible inside
+    it and dynamic accesses there are silently missed (A1-M6). Run
+    spawned work under a copied context instead::
+
+        ctx = prerender_context()
+        threading.Thread(target=ctx.run, args=(work,)).start()
+
+    or use :func:`run_in_prerender_context` for a single spawned call.
+    Outside a prerender the copy is still valid — it just carries no
+    tracking state.
+    """
+    return contextvars.copy_context()
+
+
+def run_in_prerender_context(func, *args, **kwargs):
+    """Run ``func`` in a new thread with the prerender context copied.
+
+    The spawned thread records dynamic accesses into the current
+    prerender (A1-M6); a plain ``threading.Thread`` would miss them
+    because a new thread starts with an empty context. The thread is
+    joined before returning, so the result is available and any
+    exception — including a :class:`StaticGenBailoutError` in
+    ``dynamic="error"`` mode — is re-raised in the caller.
+    """
+    ctx = contextvars.copy_context()
+    outcome = {}
+
+    def _run():
+        try:
+            outcome["value"] = ctx.run(func, *args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    thread.join()
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]

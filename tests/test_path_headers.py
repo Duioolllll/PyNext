@@ -112,6 +112,9 @@ def test_path_header_rule_accepts_mapping_and_pairs():
     "/api/x?y",
     "/api/x#y",
     "/api/x\\y",
+    "/api/%2F",  # A1-L9: '%' in a literal segment could never match a decoded path
+    "/api/100%",
+    "/api/[a%2F]",
 ])
 def test_compile_path_headers_rejects_bad_sources(source):
     with pytest.raises(ValueError, match="path header source"):
