@@ -434,3 +434,43 @@ def test_stdlib_clock_read_still_not_tracked():
     with track_prerender("/unit", "auto") as state:
         logger.info("a log line during a prerender")
     assert state.accesses == []
+
+
+def test_tracked_datetime_returns_original_class():
+    """A1-L3: during a prerender, datetime.now()/utcnow()/today() and
+    date.today() return plain datetime/date instances — not the tracking
+    subclass — so concurrent requests see no leaked type."""
+    import datetime as dt
+
+    with track_prerender("/unit", "auto"):
+        now = dt.datetime.now()
+        utc = dt.datetime.utcnow()
+        today = dt.datetime.today()
+        date_today = dt.date.today()
+    assert type(now) is dt.datetime
+    assert type(utc) is dt.datetime
+    assert type(today) is dt.datetime
+    assert type(date_today) is dt.date
+    assert now.tzinfo is None and utc.tzinfo is None
+    # Values are still correct datetimes.
+    assert isinstance(now, dt.datetime) and isinstance(date_today, dt.date)
+
+
+def test_tracked_datetime_returns_original_class_in_other_thread():
+    """A1-L3: the leak also shows in a concurrent thread's request — a
+    plain datetime created there must be exactly datetime.datetime."""
+    import datetime as dt
+    import threading
+
+    results = {}
+
+    def read_clock():
+        results["now_type"] = type(dt.datetime.now())
+        results["today_type"] = type(dt.date.today())
+
+    with track_prerender("/unit", "auto"):
+        thread = threading.Thread(target=read_clock)
+        thread.start()
+        thread.join()
+    assert results["now_type"] is dt.datetime
+    assert results["today_type"] is dt.date

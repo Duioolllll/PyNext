@@ -434,31 +434,56 @@ class _TrackedDateMeta(type):
 
 
 class _TrackedDatetime(_ORIGINAL_DATETIME, metaclass=_TrackedDatetimeMeta):
-    """``datetime.datetime`` that records ``now``/``utcnow``/``today`` reads."""
+    """``datetime.datetime`` that records ``now``/``utcnow``/``today`` reads.
+
+    The classmethods return instances of the *original* ``datetime``
+    class (A1-L3): during a prerender ``datetime.datetime`` is this
+    subclass, so a naive ``super().now()`` would hand concurrent
+    requests ``_TrackedDatetime`` instances, breaking ``type(x) is
+    datetime.datetime`` checks outside the prerender.
+    """
 
     @classmethod
     def now(cls, tz=None):
         _record_call("datetime.now()")
-        return super().now(tz)
+        return _as_original_datetime(super().now(tz))
 
     @classmethod
     def utcnow(cls):
         _record_call("datetime.now()")
-        return super().now(_datetime.timezone.utc).replace(tzinfo=None)
+        return _as_original_datetime(
+            super().now(_datetime.timezone.utc).replace(tzinfo=None))
 
     @classmethod
     def today(cls):
         _record_call("datetime.today()")
-        return super().today()
+        return _as_original_datetime(super().today())
+
+
+def _as_original_datetime(value):
+    """Rebuild ``value`` as a plain ``datetime.datetime`` (A1-L3)."""
+    return _ORIGINAL_DATETIME(
+        value.year, value.month, value.day,
+        value.hour, value.minute, value.second, value.microsecond,
+        tzinfo=value.tzinfo, fold=value.fold,
+    )
+
+
+def _as_original_date(value):
+    """Rebuild ``value`` as a plain ``datetime.date`` (A1-L3)."""
+    return _ORIGINAL_DATE(value.year, value.month, value.day)
 
 
 class _TrackedDate(_ORIGINAL_DATE, metaclass=_TrackedDateMeta):
-    """``datetime.date`` that records ``today()`` reads."""
+    """``datetime.date`` that records ``today()`` reads.
+
+    Returns a plain ``datetime.date`` (A1-L3), like ``_TrackedDatetime``.
+    """
 
     @classmethod
     def today(cls):
         _record_call("date.today()")
-        return super().today()
+        return _as_original_date(super().today())
 
 
 _PATCH_TARGETS = (
