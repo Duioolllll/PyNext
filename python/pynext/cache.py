@@ -1369,10 +1369,15 @@ class RedisCacheHandler(SharedCacheHandler):
 
     The body, leases and generations live in :class:`RedisCacheBackend`;
     entry metadata lives in a ``:meta`` hash next to the entry key and
-    tag revalidation instants in ``pynext:isr:tag:<sha256>`` hashes, so
-    both are shared across processes. Tag rows expire after
-    ``MAX_CACHE_SECONDS`` (entries cannot outlive that), meta rows
-    expire with their entry.
+    tag revalidation instants in ``pynext:isr:tag:<sha256>`` strings
+    (``"stale_ms,expired_ms"``, the same encoding
+    :class:`RedisCacheBackend` uses), so both are shared across
+    processes. Tag rows expire after ``MAX_CACHE_SECONDS`` (entries
+    cannot outlive that), meta rows expire with their entry.
+
+    The tag encoding is deliberately the backend's string format, not
+    a hash: handler and backend share the tag key, so two encodings
+    would collide with WRONGTYPE when the APIs are mixed (A-4).
     """
 
     name = "redis"
@@ -1437,26 +1442,33 @@ class RedisCacheHandler(SharedCacheHandler):
         cleaned = _validate_tags(tags)
         if cleaned is None:
             raise ValueError("tags must be a list or tuple of up to 64 non-empty strings")
+        values = self.client.mget([self._tag_key(tag) for tag in cleaned])
         instants = []
-        for tag in cleaned:
-            row = self.client.hmget(self._tag_key(tag), "stale_at", "expired_at")
-            stale_at, expired_at = row[0], row[1]
-            if stale_at is not None or expired_at is not None:
-                instants.append(float(stale_at) if stale_at is not None else float(expired_at))
+        for value in values:
+            if not value:
+                continue
+            try:
+                stale_at, _expired_at = (
+                    int(part) for part in value.decode("ascii").split(",", 1))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            instants.append(stale_at / 1000)
         return max(instants) if instants else 0.0
 
     def update_tags(self, tags, durations=None):
+        # Tag records share the backend's "stale_ms,expired_ms" string
+        # encoding (see RedisCacheBackend.revalidate_tag): handler and
+        # backend read and write the same key, so the encodings must
+        # match or a mixed read raises WRONGTYPE (A-4).
         cleaned, expire = _validate_tag_update(tags, durations)
-        now = time.time()
+        now_ms = math.ceil(time.time() * 1000)
+        ttl_ms = (math.ceil(expire * 1000) if expire is not None else 0) \
+            + math.ceil(MAX_CACHE_SECONDS * 1000) + math.ceil(LEASE_TTL * 1000)
         for tag in cleaned:
-            key = self._tag_key(tag)
-            if expire is None:
-                self.client.hset(key, mapping={"expired_at": repr(now)})
-                self.client.hdel(key, "stale_at")
-            else:
-                self.client.hset(key, mapping={"stale_at": repr(now),
-                                               "expired_at": repr(now + expire)})
-            self.client.pexpire(key, math.ceil(MAX_CACHE_SECONDS * 1000))
+            stale_at = now_ms
+            expired_at = now_ms if expire is None else now_ms + math.ceil(expire * 1000)
+            self.client.set(self._tag_key(tag),
+                            f"{stale_at},{expired_at}".encode("ascii"), px=ttl_ms)
         return None
 
     # -- SharedCacheHandler coordination (delegated to the backend) ------
@@ -1515,12 +1527,22 @@ class RedisCacheHandler(SharedCacheHandler):
         return bool(self.client.delete(self._meta_key(key)))
 
     def _tag_times(self, tags):
+        # Same "stale_ms,expired_ms" string encoding as the backend
+        # (see update_tags): a missing or unparseable record maps to
+        # (None, None), mirroring RedisCacheBackend.get_tag_times.
+        values = self.client.mget([self._tag_key(tag) for tag in tags])
         times = {}
-        for tag in tags:
-            row = self.client.hmget(self._tag_key(tag), "stale_at", "expired_at")
-            stale_at = float(row[0]) if row[0] is not None else None
-            expired_at = float(row[1]) if row[1] is not None else None
-            times[tag] = (stale_at, expired_at)
+        for tag, value in zip(tags, values):
+            if not value:
+                times[tag] = (None, None)
+                continue
+            try:
+                stale_at, expired_at = (
+                    int(part) for part in value.decode("ascii").split(",", 1))
+            except (ValueError, UnicodeDecodeError):
+                times[tag] = (None, None)
+                continue
+            times[tag] = (stale_at / 1000, expired_at / 1000)
         return times
 
 
