@@ -11,8 +11,9 @@ and tested without going through the trie.
 
 Ordering rule (most specific first), per route segment left to right:
 
-1. segment specificity: static (0) < dynamic ``[id]`` (1) < catch-all
-   ``[...rest]`` (2) < optional catch-all ``[[...rest]]`` (3);
+1. segment specificity: static (0) < affixed dynamic ``v[version]`` (1) <
+   dynamic ``[id]`` (2) < catch-all ``[...rest]`` (3) < optional catch-all
+   ``[[...rest]]`` (4);
 2. same specificity: lexicographic order;
 3. one route a prefix of the other: the shorter route first.
 
@@ -29,6 +30,13 @@ Two deliberate deviations from the TypeScript original:
 * ``compare_routes`` returns exactly ``-1``, ``0`` or ``1``. The original
   returns the raw specificity difference and the ``localeCompare`` result,
   whose magnitudes callers must not rely on; only the sign is meaningful.
+* The specificity tiers add an affixed-dynamic tier (1) between static (0)
+  and plain dynamic (2). Next.js has no affixed segments, but PyNext does
+  (``v[version]``, ``[name].json``), and the Rust trie ranks them there
+  (``static > affixed > dynamic``). Without the tier, an affixed segment
+  fell through to static (0) and sorted ahead of a static segment it
+  cannot beat at runtime (A1-M4; same tier as
+  ``pynext.catchall._SPECIFICITY``).
 
 Source: Next.js ``packages/next/src/shared/lib/router/utils/sortable-routes.ts``
 at commit ``0cf37690`` (the revision the Next.js/PyNext comparison report
@@ -39,6 +47,7 @@ rendered-page distinction, so a plain route pattern is its own source page;
 """
 
 from functools import cmp_to_key
+import re
 
 __all__ = [
     "get_segment_specificity",
@@ -48,23 +57,35 @@ __all__ = [
     "sort_sortable_routes",
 ]
 
+# An affixed dynamic parameter: a well-formed [name] with a static prefix
+# and/or suffix (v[version], [name].json, api[version]). Same segment
+# grammar as build._segment_param / catchall._SEGMENT_RE; catch-all
+# parameters cannot carry affixes, so "..." never appears here.
+_AFFIXED_PARAM = re.compile(r"[^[\]]*\[[A-Za-z0-9_-]+\][^[\]]*")
+
 
 def get_segment_specificity(segment):
-    """Specificity of one route segment: 0 static, 1 dynamic, 2 catch-all, 3 optional catch-all.
+    """Specificity of one route segment: 0 static, 1 affixed dynamic,
+    2 dynamic, 3 catch-all, 4 optional catch-all.
 
-    Mirrors Next.js ``getSegmentSpecificity`` exactly, including its
-    fallbacks: a segment containing ``[`` without forming a well-formed
-    parameter (for example ``api[version]`` or ``[id``) is static (0), and a
-    malformed optional catch-all missing its closing brackets
-    (``[[...slug]``) falls through to dynamic (1).
+    Deliberately departs from Next.js ``getSegmentSpecificity`` (which
+    has no affixed tier): PyNext supports affixed dynamic parameters
+    (``v[version]``, ``[name].json``), and the Rust trie ranks them
+    between static and plain dynamic (A1-M4; same tier as
+    ``pynext.catchall._SPECIFICITY``). A segment containing ``[``
+    without forming a well-formed parameter (for example ``[id``) is
+    still static (0), and a malformed optional catch-all missing its
+    closing brackets (``[[...slug]``) still falls through to dynamic (2).
     """
     if "[" not in segment:
         return 0
     if segment.startswith("[[...") and segment.endswith("]]"):
-        return 3
+        return 4
     if segment.startswith("[...") and segment.endswith("]"):
-        return 2
+        return 3
     if segment.startswith("[") and segment.endswith("]"):
+        return 2
+    if _AFFIXED_PARAM.fullmatch(segment) is not None:
         return 1
     return 0
 
