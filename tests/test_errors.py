@@ -314,3 +314,75 @@ def test_signals_and_500_on_both_transports(tmp_path, mode, caplog):
 def test_signal_error_is_base_class():
     assert issubclass(NotFoundError, SignalError)
     assert issubclass(RedirectError, SignalError)
+
+
+class _BadStrError(Exception):
+    """An exception whose __str__ raises (A1-M5)."""
+
+    def __str__(self):
+        raise RuntimeError("boom in str")
+
+
+def test_compute_digest_survives_exploding_str():
+    """A1-M5: compute_digest must not propagate an exception whose
+    __str__ raises — the 500 handler would die instead of answering.
+    The fallback digest is stable per exception type."""
+    try:
+        raise _BadStrError("x")
+    except _BadStrError as exc:
+        first = compute_digest(exc)
+        second = compute_digest(exc)
+    assert re.fullmatch(r"[0-9a-f]{16}", first)
+    assert first == second
+    # A different exploding-str type gets a different fallback digest.
+    class _OtherBadStr(Exception):
+        def __str__(self):
+            raise RuntimeError("boom too")
+
+    try:
+        raise _OtherBadStr("x")
+    except _OtherBadStr as exc:
+        assert compute_digest(exc) != first
+
+
+def test_digest_for_error_registers_exploding_str():
+    """A1-M5: digest_for_error registers an exploding-str exception and
+    lookup_error restores it, with an unprintable-message placeholder."""
+    try:
+        raise _BadStrError("m5-unique-errdigest")
+    except _BadStrError as exc:
+        digest, count = digest_for_error(exc)
+    assert re.fullmatch(r"[0-9a-f]{16}", digest)
+    record = lookup_error(digest)
+    assert record is not None
+    assert record["type"] == "_BadStrError"
+    assert record["count"] == count
+
+
+def test_500_for_exploding_str_error_is_a_normal_response(tmp_path):
+    """A1-M5: a page raising an exception whose __str__ raises still gets
+    a normal 500 response carrying a digest and request_id, not a
+    transport failure."""
+    _write_page(tmp_path, "badstr",
+                "class BadStr(Exception):\n"
+                "        def __str__(self):\n"
+                "            raise RuntimeError('boom in str')\n"
+                "    raise BadStr('x')")
+    write_manifest(tmp_path)
+    app = create_app(tmp_path)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get("/badstr")
+
+    response = asyncio.run(run())
+    assert response.status_code == 500
+    match = re.fullmatch(r"Internal Server Error \(request_id: ([0-9a-f-]+), "
+                         r"digest: ([0-9a-f]{16})\)", response.text)
+    assert match, response.text
+    request_id, digest = match.groups()
+    assert response.headers["x-request-id"] == request_id
+    record = lookup_error(digest)
+    assert record is not None
+    assert record["type"] == "BadStr"

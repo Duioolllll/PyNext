@@ -210,12 +210,22 @@ def compute_digest(exc):
     repeats dedup to one digest. Tracebacks carry file paths, line numbers
     and source lines but no addresses, so the hash is stable per process
     and across processes running the same code.
+
+    An exception whose ``__str__`` raises (A1-M5) must not kill the 500
+    handler that is trying to report it: the whole computation is
+    guarded, and on failure the digest falls back to the exception's
+    type identity alone, so dispatch still produces a normal 500
+    response with a digest and request_id.
     """
-    text = (
-        f"{type(exc).__name__}:{exc}\n"
-        + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    )
-    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+    try:
+        text = (
+            f"{type(exc).__name__}:{exc}\n"
+            + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        )
+        return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+    except Exception:
+        fallback = f"unhashable:{type(exc).__module__}.{type(exc).__qualname__}"
+        return hashlib.sha256(fallback.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 class _ErrorRegistry:
@@ -233,9 +243,15 @@ class _ErrorRegistry:
             if entry is None:
                 if len(self._entries) >= _MAX_REGISTRY_ENTRIES:
                     self._entries.pop(next(iter(self._entries)))
+                try:
+                    message = str(exc)[:_MAX_MESSAGE_CHARS]
+                except Exception:
+                    # A1-M5: an exception whose __str__ raises must not
+                    # kill the 500 handler recording it.
+                    message = f"<unprintable {type(exc).__name__}>"
                 entry = {
                     "type": type(exc).__name__,
-                    "message": str(exc)[:_MAX_MESSAGE_CHARS],
+                    "message": message,
                     "count": 0,
                     "first_seen": now,
                     "last_seen": now,
