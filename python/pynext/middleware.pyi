@@ -1,8 +1,63 @@
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Final, Literal, overload
 from .http import Request, Response
 from .types import Middleware, NextHandler
+
+MiddlewareKind = Literal["next", "rewrite", "redirect", "response"]
+
+MAX_MIDDLEWARE_REWRITES: Final[int] = ...
+REDIRECT_STATUSES: Final[frozenset[int]] = ...
+
+
+def classify_response(response: Response) -> MiddlewareKind: ...
+
+
+def is_redirect_response(response: Response) -> bool: ...
+
+
+def redirect_response(location: str, status: int = ...) -> Response: ...
+
+
+def rewrite_request(request: Request, path: str,
+                    query_string: str | bytes | bytearray | memoryview | None = ...) -> Request: ...
+
+
+class _MiddlewareResultResponse:
+    """Descriptor modelling ``MiddlewareResult.response``.
+
+    At runtime the ``response`` factory is attached to the class after
+    the dataclass is built (see ``middleware.py``), so the class
+    attribute is the factory while an instance's ``response`` is the
+    stored ``Response | None`` field. A stub cannot declare both a
+    field and a classmethod under one name, so this descriptor models
+    that split: class access returns the factory, instance access
+    returns the field value.
+    """
+
+    @overload
+    def __get__(self, obj: None, objtype: type[MiddlewareResult]) -> Callable[[Response], MiddlewareResult]: ...
+    @overload
+    def __get__(self, obj: MiddlewareResult, objtype: type[MiddlewareResult] | None = ...) -> Response | None: ...
+
+
+@dataclass(frozen=True)
+class MiddlewareResult:
+    kind: MiddlewareKind
+    request: Request | None = ...
+    response: _MiddlewareResultResponse = ...
+    @property
+    def is_terminal(self) -> bool: ...
+    @property
+    def is_continue(self) -> bool: ...
+    @classmethod
+    def next(cls, request: Request) -> MiddlewareResult: ...
+    @classmethod
+    def rewrite(cls, request: Request) -> MiddlewareResult: ...
+    @classmethod
+    def redirect(cls, location: str, status: int = ...) -> MiddlewareResult: ...
+    def __init__(self, kind: MiddlewareKind, request: Request | None = ...,
+                 response: Response | None = ...) -> None: ...
 
 @dataclass(frozen=True)
 class RouteHas:

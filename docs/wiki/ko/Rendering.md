@@ -36,6 +36,8 @@ def Page(params):
 
 정적 렌더링은 동적 접근을 추적합니다. SSG 페이지가 빌드 중 렌더링되거나 ISR 페이지가 생성되는 동안 `time.time()`, `datetime.now()`, `random.*`, `uuid.uuid4()`, `Database.session()` 같은 읽기는 읽은 페이지 위치와 함께 기록됩니다. 기본값 `@page(dynamic="auto")`은 빌드를 계속하고 접근 내역을 빌드 매니페스트의 `dynamic_accesses` 리포트에 경고와 함께 남깁니다. `@page(dynamic="error")`는 처음 기록된 접근에서 빌드(또는 ISR 생성)를 실패시키고, `@page(render="ssg", dynamic="force-dynamic")`는 빌드 시 생성을 건너뛰고 운영에서는 페이지를 동적으로 제공합니다. `no_store()`는 스코프를 의도적으로 동적으로 표시하고, `mark_dynamic_access("...")`은 자동 후크가 볼 수 없는 나머지(외부 fetch나, 프리렌더 패치를 피해 가는 `from datetime import datetime` 바인딩)를 기록합니다. 개발 모드에서 `generate_static_params()`가 만들지 않을 SSG 경로를 요청하면 운영에서 404가 될 것이라는 경고를 남깁니다. `pynext dev --strict-ssg`(또는 `create_app(..., strict_ssg=True)`)를 쓰면 개발 모드에서도 404로 응답합니다.
 
+생성하지 않은 동적 경로는 404 대신 fallback을 선택할 수 있습니다. `@page(render="ssg", fallback="blocking")`은 첫 요청 때 페이지를 생성한 뒤 정적으로 제공하고, `fallback="prerender"`는 레이아웃 셸을 먼저 스트리밍한 뒤 생성된 페이지를 보내고 이후에는 정적으로 제공합니다. 기본값은 `fallback="not_found"`입니다. `dynamic_params=False`이면 fallback을 지정해도 생성하지 않은 경로는 404입니다. 첫 요청이 동시에 여러 개 와도 생성은 한 번만 일어나며, 생성에 실패하면 500을 반환하고 다음 요청에서 다시 시도합니다.
+
 ## ISR (공개 캐시)
 
 ~~~python
@@ -46,8 +48,9 @@ def Page(params):
     return h("h1", {}, params["slug"])
 ~~~
 
-`app/news/[slug]/page.py`처럼 쓰면 최초 요청에 생성하고, 신선한 HTML은 재사용하며, 만료 후에는 한 개의 백그라운드 재생성 중 오래된 HTML을 제공할 수 있습니다. 캐시는 크기가 제한됩니다. 기본 `memory` 백엔드는 프로세스별이지만 `sqlite`·`redis` 백엔드는 워커 간 항목을 공유합니다. ISR은 `request` 인자를 받거나 `generate_static_params()`를 내보낼 수 없습니다.
+`app/news/[slug]/page.py`처럼 쓰면 최초 요청에 생성하고, 신선한 HTML은 재사용하며, 만료 후에는 한 개의 백그라운드 재생성 중 오래된 HTML을 제공할 수 있습니다. 캐시는 크기가 제한됩니다. 기본 `memory` 백엔드는 프로세스별이지만 `sqlite`·`redis`·`filesystem` 백엔드는 워커 간 항목을 공유합니다. ISR은 `request` 인자를 받을 수 없습니다.
 
+동적 ISR 페이지는 `generate_static_params()`를 내보낼 수 있습니다(정적 ISR 경로는 불가). 나열된 경로는 빌드 시점에 열거되고, 시작 시 백그라운드에서 캐시를 미리 채우므로 배포 직후 첫 요청이 전체 렌더 비용을 치르지 않습니다. 웜업은 베스트 에포트입니다. 웜업에 실패한 경로는 로그를 남기고 요청 시점에 그대로 렌더링됩니다.
 - 익명 요청의 **쿼리 문자열은 ISR 캐시 키에 포함되지 않습니다.**
 - `Cookie` 또는 `Authorization` 헤더가 있으면 공유 캐시를 우회하며 `private, no-store`로 응답합니다.
 - ISR 공개 페이지에 비밀값·사용자별 데이터를 넣으면 안 됩니다.

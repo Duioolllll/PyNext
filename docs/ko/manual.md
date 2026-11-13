@@ -24,6 +24,18 @@ http://127.0.0.1:3000/, /about, /guides/intro, /news/example, /hydrate, /strateg
 
 `pynext dev --dir examples/basic`는 빌드 없이 소스를 제공하며 `app/`·`islands/`·`public/`·`pynext.config.py` 변경 시 같은 포트로 서버를 다시 시작합니다. `pynext start`는 빌드 manifest를 사용하며 추적하는 소스가 바뀌면 재빌드를 요구합니다. island가 없는 앱에는 Node와 esbuild가 필요하지 않습니다. 설치 안내의 기준은 저장소 소스이며 PyPI 배포를 의미하지 않습니다.
 
+### 빌드 모드
+
+일반 `pynext build`는 두 빌드 단계를 모두 수행합니다. island 번들을 esbuild로 묶는 컴파일 단계와 정적 페이지를 렌더링하는 생성 단계입니다. 두 단계는 따로 실행할 수 있습니다(Next.js `experimentalBuildMode`의 `compile`/`generate` 분리 상당).
+
+- `pynext build --only-islands`는 island만 묶어 manifest를 갱신하고 정적 페이지는 렌더링하지 않습니다. 소스가 그대로면 이전 빌드의 정적 페이지를 재사용합니다. island 번들이 바뀌면 이전 페이지는 낡은 번들 digest를 포함하므로 stale이 되어, 페이지를 다시 렌더링할 때까지 manifest에서 생성 단계가 빠집니다.
+- `pynext build --only-static`은 이전 컴파일의 island 번들로 정적 페이지만 렌더링하고 esbuild를 다시 실행하지 않습니다. 이전 컴파일이 없거나 그 뒤 island 소스가 바뀌었으면 실패하므로, 그 경우 `--only-islands`를 먼저 실행합니다.
+- `pynext start`는 부분 빌드를 거부하고 빠진 단계를 알려주므로, 절반만 빌드된 앱이 실수로 서비스되지 않습니다.
+
+`pynext build --static-only`는 정적 전용 사이트를 내보냅니다. 렌더링된 SSG 페이지·public 자산·island 번들을 일반 파일로 배치합니다(페이지마다 `index.html` 하나, 자산은 URL 경로 그대로, 번들은 `_pynext/static/` 아래). 기본 출력은 `.pynext/export`(`--export-dir <dir>`로 변경 가능)이며, PyNext 서버 없이 `python -m http.server --directory <dir>`로 서빙할 수 있습니다. 의도적으로 좁은 모드이며 완전한 정적 내보내기가 아닙니다. 동적 SSR·ISR·API 라우트가 있는 앱은 조용히 빠뜨리는 대신 거부합니다. `--static-only`는 완전한 빌드를 먼저 수행하므로 `--only-islands`·`--only-static`·`--standalone`과 함께 쓸 수 없습니다.
+
+빌드는 증분 방식입니다. `pynext build`는 소스 해시를 이전 manifest와 비교해 진입점·레이아웃·공유 임포트가 바뀐 정적 페이지만 다시 렌더합니다. island나 public 파일이 바뀌면 island digest가 HTML에 들어가므로 모든 정적 페이지를 다시 렌더합니다. 빌드는 요약(렌더 모드별 라우트 수, 다시 렌더한/재사용한 정적 페이지 수, island 번들 크기, 소요 시간)을 출력하고 같은 내용을 `.pynext/build-report.json`에 기록합니다. `pynext build --analyze`는 번들별 esbuild 입력 중 가장 큰 파일도 보여줍니다. `pynext info`는 버그 신고에 필요한 환경(PyNext/Python/esbuild 버전, 네이티브 확장, manifest 상태)을 출력하고, `pynext doctor`는 같은 항목을 검사해 빠진 것이 있으면 0이 아닌 코드로 종료합니다.
+
 개발 감시기는 네이티브 파일 이벤트와 해시를 사용하고 필요하면 폴링으로 대체합니다. JS/TS island 수정은 영향받은 모듈만 다시 빌드해 문서 새로고침 없이 교체합니다. 이전 정리 함수가 호출되며 해당 island 상태는 초기화될 수 있습니다. 다른 소스 변경은 서버를 재시작하고 열린 문서를 새로고침합니다. 잘못된 수정은 이전 정상 버전을 유지합니다. `--port 0`으로 시작해도 재시작 시 처음 할당된 포트를 재사용합니다.
 
 ## 프로젝트 구조와 라우팅
@@ -219,7 +231,7 @@ async def stream():
 
 `route.py`는 HTTP 핸들러와 함께 `@websocket` 핸들러를 하나 내보낼 수 있습니다. 핸들러는 `WebSocket`을 받아 보내거나 받기 전에 `await websocket.accept()`를 호출해야 합니다. 텍스트와 바이너리 메시지를 주고받을 수 있으며, 상대가 연결을 끊으면 `receive()`에서 `WebSocketDisconnect`가 발생하므로 연결별 정리는 `finally` 블록에 둡니다.
 
-개발 버전은 ASGI·Axum에서 연결을 수락하기 전에 `Origin`을 검사하며, 기본적으로 같은 출처만 허용합니다. 다른 HTTP(S) 출처는 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`를 `create_app(..., security=...)`에 전달하거나 `--ws-allowed-origin https://client.example`을 반복 지정하세요. 스킴과 기본값이 아닌 포트를 포함하며 `*`와 `null`은 허용하지 않습니다. `Origin`을 생략하는 기존 비브라우저 클라이언트는 `websocket_allow_missing_origin=True` 또는 `--ws-allow-missing-origin`으로 명시적으로 허용해야 합니다. 공개된 0.1.0 패키지에는 이 검사가 없습니다. 클라이언트는 `Origin`을 위조하거나 생략할 수 있습니다. 핸드셰이크 전에는 업그레이드 요청에 전역 미들웨어 체인(세션 미들웨어 포함)과 핸들러의 `@require_auth`/`@require_permission` 정책이 ASGI·Axum 모두에서 적용되며, 거부된 업그레이드는 101 응답 전에 차단됩니다(ASGI·Axum 모두 HTTP 403, 거부 사실이 로그에 남습니다). 따라서 핸들러는 실행되지 않습니다. 신원 확립(예: 로그인 라우트에서 `session["user_id"]` 설정)은 여전히 앱의 책임이며, 세션 외의 자격 증명 방식(예: 토큰)은 미들웨어에서 검증해야 합니다. 프록시 뒤에서는 실제 프록시만 `--trusted-proxy`로 지정하고 클라이언트가 보낸 전달 헤더를 프록시가 덮어쓰도록 설정하세요.
+개발 버전은 ASGI·Axum에서 연결을 수락하기 전에 `Origin`을 검사하며, 기본적으로 같은 출처만 허용합니다. 다른 HTTP(S) 출처는 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`를 `create_app(..., security=...)`에 전달하거나 `--ws-allowed-origin https://client.example`을 반복 지정하세요. 스킴과 기본값이 아닌 포트를 포함합니다. `null`은 허용하지 않으며, 와일드카드 패턴도 쓸 수 있습니다: `*`는 DNS 레이블 하나(`https://*.example.com`), `**`는 맨 앞 레이블에서만 하나 이상의 앞부분 레이블(`https://**.example.com`)과 일치하고, `https://*.com`처럼 전체 도메인을 가리는 패턴은 거부됩니다. `Origin`을 생략하는 기존 비브라우저 클라이언트는 `websocket_allow_missing_origin=True` 또는 `--ws-allow-missing-origin`으로 명시적으로 허용해야 합니다. 공개된 0.1.0 패키지에는 이 검사가 없습니다. 클라이언트는 `Origin`을 위조하거나 생략할 수 있습니다. 핸드셰이크 전에는 업그레이드 요청에 전역 미들웨어 체인(세션 미들웨어 포함)과 핸들러의 `@require_auth`/`@require_permission` 정책이 ASGI·Axum 모두에서 적용되며, 거부된 업그레이드는 101 응답 전에 차단됩니다(ASGI·Axum 모두 HTTP 403, 거부 사실이 로그에 남습니다). 따라서 핸들러는 실행되지 않습니다. 신원 확립(예: 로그인 라우트에서 `session["user_id"]` 설정)은 여전히 앱의 책임이며, 세션 외의 자격 증명 방식(예: 토큰)은 미들웨어에서 검증해야 합니다. 프록시 뒤에서는 실제 프록시만 `--trusted-proxy`로 지정하고 클라이언트가 보낸 전달 헤더를 프록시가 덮어쓰도록 설정하세요.
 
 ASGI에서 PyNext가 신뢰 프록시를 판정하려면 서버가 `scope["client"]`에 원래 피어 주소를 보존해야 합니다. PyNext가 전달 헤더를 해석할 때는 ASGI 서버의 선행 프록시 헤더 처리를 끄세요(Uvicorn은 `--no-proxy-headers`).
 
@@ -271,6 +283,8 @@ SSG 빌드는 최대 10,000페이지를 생성하며 개발 모드에서는 요�
 
 정적 렌더링은 동적 접근을 추적합니다. SSG 페이지가 빌드 중 렌더링되거나 ISR 페이지가 생성되는 동안 `time.time()`, `datetime.now()`, `random.*`, `uuid.uuid4()`, `Database.session()` 같은 읽기는 읽은 페이지 위치와 함께 기록됩니다. `no_store()`는 스코프를 의도적으로 동적으로 표시하고, `mark_dynamic_access("...")`은 자동 후크가 볼 수 없는 나머지(외부 fetch나, 프리렌더 패치를 피해 가는 `from datetime import datetime` 바인딩)를 기록합니다. 기본값 `@page(dynamic="auto")`은 빌드를 계속하고 접근 내역을 빌드 매니페스트의 `dynamic_accesses` 리포트에 경고와 함께 남깁니다. `@page(dynamic="error")`는 처음 기록된 접근에서 빌드(또는 ISR 생성)를 실패시키고, 에러에 표현식과 사용자 코드 위치를 포함합니다. 운영 환경의 ISR/SSG 페이지에는 `dynamic="error"`를 권장합니다. 자동 탐지는 환경변수, 파일, 네트워크 호출, 프레임워크 밖의 데이터베이스를 볼 수 없고, 기본값 `auto`는 경고만 하고 값을 그대로 굽기 때문입니다. `@page(render="ssg", dynamic="force-dynamic")`는 빌드 시 생성을 건너뛰고 운영에서는 페이지를 동적으로 제공합니다. 개발 모드에서 `generate_static_params()`가 만들지 않을 SSG 경로를 요청하면 운영에서 404가 될 것이라는 경고를 남깁니다. `pynext dev --strict-ssg`(또는 `create_app(..., strict_ssg=True)`)를 쓰면 개발 모드에서도 404로 응답합니다.
 
+`pynext start --warm-isr`는 서버가 리스닝을 시작한 뒤 동적 세그먼트나 쿼리 키가 없는 ISR 경로를 백그라운드에서 미리 생성해 캐시를 채웁니다. 웜업은 시작을 막지 않고, 웜업 중 들어온 요청은 일반적인 캐시 미스 경로를 탑니다. 동적 ISR 경로와 쿼리 변형 경로는 건너뛰고, 페이지별 실패는 경고로 남기고 개수만 셉니다. 시작하지 않고 코드에서 미리 채우려면 `await app.warm_isr_cache()`를 호출하세요. 워커마다 자기 캐시를 채우며, 공유 백엔드가 있으면 lease로 생성이 중복되지 않습니다.
+
 권한을 확인한 API 핸들러에서는 `await request.revalidate("/news/example")`, 앱 인스턴스를 가진 코드에서는 `await app.revalidate(path)`를 사용할 수 있습니다. 쿼리 문자열이 없는 디코딩된 ISR 경로를 전달합니다. 로컬 또는 공유 캐시 항목을 제거하거나 진행 중인 생성을 무효화했다면 `True`를 반환합니다. 공유 백엔드가 있는 경우 저장소에 닿을 수 있을 때는 공유 항목도 함께 제거되지만, `fail_open` 모드에서는 공유 저장소에 닿지 않을 때 `True`여도 공유 항목이 제거됐다고 보장하지 않습니다(공유 제거는 최선 노력 방식이라 다른 워커는 만료될 때까지 오래된 항목을 계속 제공할 수 있습니다) — 적용되지 않은 무효화를 성공으로 보고하지 않으려면 `fail_closed`를 사용하세요. 기존 요청은 이전 생성 결과를 받을 수 있지만 그 결과가 캐시를 다시 덮어쓰지는 않습니다. 메모리 백엔드에서는 무효화가 프로세스별이며 다른 워커에 전파되지 않고, SQLite 백엔드에서는 공유 항목도 제거되며 정상 상태의 다른 워커는 다음 조회에서 이를 확인합니다. 외부에 노출하는 엔드포인트는 인증·권한 검사가 필요합니다.
 
 ## 공개 파일과 islands
@@ -304,7 +318,7 @@ def Page():
 
 ## 클라이언트 탐색
 
-모든 페이지가 클라이언트 런타임을 로드합니다. 같은 출처 링크는 문서 메타데이터와 CSP가 호환되면 부분 탐색하고 그렇지 않으면 전체 이동합니다. 호버·포커스·뷰포트 prefetch는 동시 4개, 응답당 1 MiB로 제한합니다. 명시적으로 공개되고 유효하며 `Vary: Cookie` 또는 `Authorization`이 없는 응답만 최대 60초, 20개까지 보관합니다. 외부 출처·다운로드·같은 페이지 해시 링크는 브라우저 기본 동작을 유지합니다. `window.__pynextNav`에서 디버깅 함수를 사용할 수 있습니다.
+모든 페이지가 클라이언트 런타임을 로드합니다. 같은 출처 링크는 문서 메타데이터와 CSP가 호환되면 부분 탐색하고 그렇지 않으면 전체 이동합니다. 호버·포커스·뷰포트 prefetch는 동시 4개, 응답당 1 MiB로 제한합니다. 명시적으로 공개되고 유효하며 `Vary: Cookie` 또는 `Authorization`이 없는 응답만 최대 60초, 20개까지 보관합니다. 보관된 항목은 복사본이 stale이 되기까지 남은 초(`stale`)도 함께 기록합니다. 정적 페이지와 유효한 ISR 응답은 그 값을 `X-PyNext-Stale-Time` 응답 헤더로 보냅니다 — 페이지 stale 시간과 레이아웃 stale 시간(`@layout(stale=<초>)`, 선언하지 않은 레이아웃은 제한하지 않음) 중 최솟값입니다. 정적 페이지는 300초, 유효한 ISR 응답은 남은 fresh 기간(새로 생성된 경우 `revalidate`)을 보고합니다. stale로 제공되거나 비공개이거나 동적인 응답에는 힌트가 없어, 이미 stale인 복사본이 prefetch로 보관되지 않습니다. 이 힌트는 prefetch 보관에서는 `Cache-Control: max-age`보다 우선합니다(이 응답들은 공유 캐시용으로 `max-age=0`을 달고 있습니다). 보관 상한은 여전히 60초입니다. 외부 출처·다운로드·같은 페이지 해시 링크는 브라우저 기본 동작을 유지합니다. `window.__pynextNav`에서 디버깅 함수를 사용할 수 있습니다.
 
 ## Python 클라이언트 DSL (실험적)
 
@@ -330,9 +344,13 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 
 구조화 로그가 기본으로 켜져 있습니다. `pynext` 로거는 한 줄마다 `timestamp`, `level`, `message`, `request_id`, `trace_id`(`traceparent` 헤더를 받은 경우), `route`, `status`, `latency_ms`를 담은 JSON 객체 하나를 출력합니다. 요청마다 요청 ID가 부여됩니다. 유효한 `X-Request-Id` 헤더가 있으면 그대로 사용하고, 없으면 새로 생성해 요청 전체에 전파하고 `x-request-id` 응답 헤더로 반환합니다. 로그 메시지에는 헤더·쿠키·본문·`Authorization` 값을 절대 넣지 마세요. JSON 포맷터는 자격 증명처럼 보이는 이름의 추가 필드를 버리며, 액세스 로그는 원시 URL이 아니라 라우트 패턴(예: `/blog/[slug]`)만 기록합니다.
 
-지표는 메모리에서 수집되며 기본으로 켜져 있습니다. `app.metrics.snapshot()`은 라우트 패턴별 요청 수·상태 코드, 라우트별 지연 p50/p95/p99, Python 실행 큐 길이와 대기 시간, Python 실행 시간 대 Rust 렌더링 시간, ISR 캐시 hit/miss/stale와 재생성 성공·실패·시작, 워커 시작·타임아웃·불가용, 응답 크기와 island 번들 크기를 반환합니다. `app.metrics.prometheus_text()`는 같은 카운터를 Prometheus 텍스트 형식으로 노출합니다. 지연 샘플은 라우트당 2048개로 제한됩니다. Rust가 Python을 거치지 않고 제공하는 신선한 ISR 히트는 여기서 집계되지 않습니다. Python dispatch에 도달한 ISR 결과만 집계됩니다.
+지표는 메모리에서 수집되며 기본으로 켜져 있습니다. `app.metrics.snapshot()`은 라우트 패턴별 요청 수·상태 코드, 라우트별 지연 p50/p95/p99, Python 실행 큐 길이와 대기 시간, Python 실행 시간 대 Rust 렌더링 시간, ISR 캐시 hit/miss/stale와 재생성 성공·실패·시작, ISR 웜업 warmed/skipped/failed/pending/timed_out, 워커 시작·타임아웃·불가용, 응답 크기와 island 번들 크기를 반환합니다. `app.metrics.prometheus_text()`는 같은 카운터를 Prometheus 텍스트 형식으로 노출합니다. 지연 샘플은 라우트당 2048개로 제한됩니다. Rust가 Python을 거치지 않고 제공하는 신선한 ISR 히트는 여기서 집계되지 않습니다. Python dispatch에 도달한 ISR 결과만 집계됩니다.
 
 OpenTelemetry 트레이싱은 기본으로 꺼져 있으며 선택 사항입니다. `opentelemetry-api`(및 원하는 SDK/익스포터)를 설치하고 `--tracing` 또는 `PYNEXT_TRACING=1`로 켜세요. 켜면 `pynext.request`와 `pynext.render` 스팬이 생성되고 들어온 W3C `traceparent`/`tracestate` 컨텍스트가 전파됩니다. 패키지가 설치돼 있지 않으면 트레이싱은 no-op이며 아무것도 깨지지 않습니다.
+
+빌드 텔레메트리는 `build_failed` 이벤트 하나만 로컬에 기록합니다. `pynext build`가 실패하면 빌드 단계(`discover`, `render`, `write` 중 하나)와 빌드 소요 시간이 `.pynext/telemetry.jsonl`에 추가됩니다(최근 100건까지만 유지). 이벤트에는 프로젝트 이름·경로·에러 메시지·사용자 코드가 들어가지 않으며, 외부로 전송되는 것은 아무것도 없습니다. 로컬 기록을 끄려면 `PYNEXT_TELEMETRY_DISABLED=1`을 설정하세요.
+
+요청 인사이트는 최근의 느리거나 실패한 요청을 개별 스냅샷으로 남겨, 로그를 뒤지지 않고도 느린 요청 하나를 살펴볼 수 있게 합니다. `app.request_insights.snapshot()`은 보관된 항목(`request_id`, 라우트 패턴, 상태 코드, `latency_ms`, `python_ms`, `rust_ms`, `queue_wait_ms`, 실패 시 `error_type`)과 `observed`/`recorded` 카운터를 반환합니다. 실패한 요청(상태 코드 500 이상 또는 에러 발생)이나 임계값을 넘긴 느린 요청만 보관합니다. 임계값은 고정값(`request_insights_slow_ms`)이며, 지정하지 않으면 최근 지연의 실행 p95입니다. 버퍼는 bounded(`request_insights_max`, 기본 100)이며 이를 제공하는 HTTP 엔드포인트는 없습니다. 인프로세스·디버그 전용 API로, 개발 모드에서는 기본으로 켜지고 운영 모드에서는 꺼집니다. `ObservabilityConfig(request_insights=True/False)`나 `PYNEXT_REQUEST_INSIGHTS=1/0`으로 강제하고, `PYNEXT_REQUEST_INSIGHTS_MAX` / `PYNEXT_REQUEST_INSIGHTS_SLOW_MS`로 조정합니다.
 
 CLI 플래그 `--structured-logs` / `--no-structured-logs`, `--metrics` / `--no-metrics`, `--tracing` / `--no-tracing`, 환경 변수 `PYNEXT_STRUCTURED_LOGS`, `PYNEXT_METRICS`, `PYNEXT_TRACING`, `PYNEXT_LOG_LEVEL`, 또는 코드에서 `create_app(..., observability=ObservabilityConfig(...))`로 설정합니다.
 
@@ -346,7 +364,7 @@ CLI 플래그 `--structured-logs` / `--no-structured-logs`, `--metrics` / `--no-
 
 전달된 주소는 오른쪽부터 신뢰하는 프록시를 거슬러 가장 가까운 비신뢰 주소를 사용합니다. 모든 중간 프록시를 정확히 등록해야 합니다. 프로세스당 버킷은 최대 10,000개이며, 모두 사용 중이면 새 주소가 가장 오래된 버킷을 내보내고 들어갑니다(기존 주소가 429를 받지는 않습니다). 신규 주소 생성은 윈도우당 최대 10,000개까지의 전역 슬라이딩 윈도우로 제한합니다. 버킷 점수는 Redis `TIME`에서 가져온 정수 마이크로초입니다. 두 스크립트가 같은 마이크로초를 읽을 수 있는데, 그 경우 동점인 버킷은 똑같이 오래된 것이므로 버킷 키 기준으로 결정적으로 내보낼 버킷을 정합니다. 내보내진 소유자는 거부되지 않고 다음 요청에서 새 버킷을 받습니다. 점수는 최대 1년 윈도우를 훨씬 넘어서도 정확한 정수로 유지됩니다(현재 epoch 기준 마지막 자리 단위는 0.25 µs). 따라서 수 분에서 수 시간의 현실적인 윈도우는 배정밀도 한계의 영향을 받지 않습니다. IPv6 주소는 /64 접두사별로 버킷을 공유합니다. 이 묶음은 트레이드오프입니다. /48 전체를 가진 공격자는 서로 다른 /64를 65,536개 만들어 테이블과 신규 주소 윈도우를 채울 수 있고, 그러면 진짜 신규 주소는 윈도우가 지날 때까지 거부됩니다(내보내진 기존 주소는 거부되지 않습니다). `--rate-limit-ipv6-prefix-len 48`은 /48 전체를 하나의 버킷으로 묶어 이 공격을 막지만, 해당 접두사를 공유하는 모든 호스트가 하나의 버킷을 공유하므로 붐비는 /48에서는 무고한 사용자까지 함께 제한됩니다. 기본값은 64로 유지됩니다. `--rate-limit-exempt-path`(예: `/healthz`)로 지정한 경로는 속도 제한을 건너뜁니다.
 
-여러 워커: `pynext start --workers 4`는 하나의 리스너를 공유하는 워커 수퍼바이저를 실행합니다. `--port 0`으로 시작하면 할당된 포트를 워커 재시작 시에도 유지합니다. 워커의 인터프리터와 이벤트 루프는 독립적이며 메모리 캐시와 기본 요청 제한은 워커별입니다. SQLite·Redis ISR과 Redis 요청 제한은 공유할 수 있습니다. 수퍼바이저가 실패한 워커를 재시작하고 종료를 조정합니다. 처리 중 중단된 요청은 실패하므로 재시도해야 합니다. 공유 리스너 워커의 실행과 재시작은 Linux·macOS·Windows CI에서 검사하며, 신호 기반 수퍼바이저 검사는 Linux·macOS에서 수행합니다.
+여러 워커: `pynext start --workers 4`는 하나의 리스너를 공유하는 워커 수퍼바이저를 실행합니다. `--workers auto`는 개수를 머신에서 정합니다. CPU 코어당 1개, 가용 메모리 1GiB당 최대 1개, 상한 8개, 최소 1개이며, 결정 근거는 시작 로그 한 줄(`PyNext workers: auto -> ...`)에 남습니다. `--port 0`으로 시작하면 할당된 포트를 워커 재시작 시에도 유지합니다. 워커의 인터프리터와 이벤트 루프는 독립적이며 메모리 캐시와 기본 요청 제한은 워커별입니다. SQLite·Redis ISR과 Redis 요청 제한은 공유할 수 있습니다. 수퍼바이저가 실패한 워커를 재시작하고 종료를 조정합니다. 처리 중 중단된 요청은 실패하므로 재시도해야 합니다. 공유 리스너 워커의 실행과 재시작은 Linux·macOS·Windows CI에서 검사하며, 신호 기반 수퍼바이저 검사는 Linux·macOS에서 수행합니다.
 
 ## 환경 파일(`.env`)
 

@@ -82,10 +82,18 @@ def test_acquire_timeout_max_below_base_warns(tmp_path):
 
 def test_cli_workers_auto_reaches_supervisor(tmp_path, monkeypatch):
     from pynext import cli
+    from pynext import supervisor
     import sys
 
     seen = []
     monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    # decide_auto_workers is memory-aware (one worker per GiB): in a
+    # low-memory environment auto resolves to 1, taking the
+    # single-process path — which needs a build manifest and never
+    # reaches run_supervisor. Pin available memory so the decision is
+    # deterministic (4 cpus, 8 GiB -> 4 workers) and the supervisor
+    # path is exercised.
+    monkeypatch.setattr(supervisor, "_available_memory_bytes", lambda: 8 * 1024 ** 3)
     monkeypatch.setattr(cli, "run_supervisor", lambda config, workers: seen.append(workers) or 0)
     monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(tmp_path), "--workers", "auto"])
     assert cli.main() == 0

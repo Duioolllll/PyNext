@@ -46,6 +46,7 @@ BACKEND_NOTES = {
     "memory": "Process-local memory cache (default).",
     "sqlite": "Shared SQLite file; entries are visible to all workers.",
     "redis": "Shared Redis store via `PYNEXT_REDIS_URL`.",
+    "filesystem": "Shared directory of human-readable `.body` + `.meta` sidecar files (Next.js `FileSystemCache`-style); entries are visible to all workers, bounded to 1024 entries / 512 MiB by default (oldest-first eviction).",
 }
 
 # The build/dev/start subcommands carry no help= text in cli.py; these
@@ -195,7 +196,8 @@ def _config_defaults() -> dict[str, str]:
 
 def server_controls() -> list[tuple[str, str]]:
     """Extract selected operational CLI controls and their declared defaults."""
-    wanted = {"--max-waiting", "--max-connections", "--max-connections-per-ip", "--shutdown-timeout"}
+    wanted = {"--max-waiting", "--max-connections", "--max-connections-per-ip", "--shutdown-timeout",
+              "--metrics-endpoint"}
     rows = {}
     config_defaults = _config_defaults()
     for node in ast.walk(_parse(ROOT / "python" / "pynext" / "cli.py")):
@@ -303,7 +305,7 @@ def render() -> str:
         "",
         "## Health endpoints",
         "",
-        "Reserved GET/HEAD paths; readiness reflects startup and draining, not upstream health.",
+        "Reserved GET/HEAD paths; readiness reflects startup, draining, and fail_closed backend health.",
         "",
         "| Path |",
         "| --- |",

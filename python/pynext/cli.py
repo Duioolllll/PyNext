@@ -8,20 +8,21 @@ import traceback
 from pathlib import Path
 
 from .app import create_app
-from .build import write_manifest
+from .build import export_static, format_bytes, read_build_report, write_manifest
 from .check import DeploySettings, run_deploy_checks
 from .client import compile_client, discover_client
 from .env import load_env
-from .config import DEFAULT_CONFIG, ConfigError, load_config, resolve_workers
+from .config import DEFAULT_CONFIG, ConfigError, load_config
 from .http import MAX_WS_MESSAGE, SecurityConfig
+from .info import collect_info, format_info
 from .observability import ObservabilityConfig
 from .ratelimit import RateLimiter
 from .redis_rate import RedisRateLimiter
-from .scaffold import init_project
+from .scaffold import TEMPLATES, init_project
 from .server import (MAX_BODY_CAPACITY, MAX_BODY_MIN_RATE_BYTES_PER_SEC,
                      MAX_CONCURRENT, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_IP,
                      MAX_SHUTDOWN_TIMEOUT, MAX_TIMEOUT_MS, MAX_WAITING, serve)
-from .supervisor import MAX_WORKERS, WorkerConfig, run_supervisor
+from .supervisor import MAX_WORKERS, WorkerConfig, decide_auto_workers, run_supervisor
 from .standalone import build_standalone
 from .watch import Watcher
 
@@ -80,18 +81,28 @@ def _bounded(minimum, maximum, label):
     return convert
 
 
-def _workers_value(value):
-    """``--workers`` value: an integer 1..64, or ``"auto"`` (C-P1-5).
+def _workers(value):
+    """argparse type for --workers: an integer in [1, MAX_WORKERS] or "auto".
 
-    ``"auto"`` means one worker per CPU, clamped to 1..64 — the
-    Sanic ``fast=True`` rule. The probe parse in
-    :func:`_explicit_cli_values` runs this converter too, so an
-    explicit ``--workers auto`` is already an int by the time the
-    config is resolved.
+    "auto" resolves later, in main(), via decide_auto_workers() — the
+    machine's CPU/memory count is only read once the rest of the flags
+    have parsed, so a bad --workers value still fails fast at parse
+    time. Error wording keeps the existing "[1, 64]" / ">= 1" / "<= 64"
+    messages (test_cli asserts on them) with 'auto' added to the
+    not-an-integer case.
     """
-    if isinstance(value, str) and value.strip().lower() == "auto":
-        return resolve_workers(value)
-    return _bounded(1, MAX_WORKERS, "--workers")(value)
+    if value == "auto":
+        return value
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--workers must be an integer in [1, 64] or 'auto'") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("--workers must be an integer >= 1")
+    if number > MAX_WORKERS:
+        raise argparse.ArgumentTypeError("--workers must be an integer <= 64")
+    return number
 
 
 async def _wait_for_change(watcher, server_task):
@@ -115,7 +126,7 @@ async def _wait_for_change(watcher, server_task):
 
 async def _reload_dev_client(app, root):
     sources = await asyncio.to_thread(discover_client, root)
-    manifest, assets = await asyncio.to_thread(compile_client, root, sources)
+    manifest, assets, _report = await asyncio.to_thread(compile_client, root, sources)
     if await asyncio.to_thread(discover_client, root) != sources:
         raise ValueError("Island sources changed during compilation; retry the edit")
     app.update_dev_client(manifest, assets)
@@ -519,12 +530,47 @@ def _add_audit_args(command):
                               "via the PYNEXT_DEBUG environment variable)")
 
 
+def _print_build_summary(root, analyze=False):
+    """Print the per-build summary from `.pynext/build-report.json`."""
+    report = read_build_report(root)
+    if report is None:
+        return
+    counts = report["routes"]
+    pages = report["static_pages"]
+    islands = report["islands"]
+    bundle_bytes = (sum(bundle["bytes"] for bundle in islands["bundles"].values())
+                    + islands.get("runtime_bytes", 0))
+    print(f"Routes: {counts['total']} total ({counts['ssg']} SSG, {counts['isr']} ISR, "
+          f"{counts['ssr']} SSR, {counts['api']} API)")
+    print(f"Static pages: {pages['total']} total ({pages['rendered']} rendered, "
+          f"{pages['reused']} reused, {format_bytes(pages['bytes'])})")
+    esbuild = (f" (esbuild {islands['esbuild_version']})" if islands["esbuild_version"] else "")
+    print(f"Islands: {len(islands['bundles'])} bundles, {format_bytes(bundle_bytes)} total{esbuild}")
+    print(f"Public assets: {report['public_assets']['count']} files, "
+          f"{format_bytes(report['public_assets']['bytes'])}")
+    print(f"Build finished in {report['duration_seconds']}s")
+    if analyze:
+        for name, bundle in sorted(islands["bundles"].items()):
+            print(f"  {name}: {format_bytes(bundle['bytes'])}")
+            for entry in bundle["inputs"][:5]:
+                print(f"    {format_bytes(entry['bytes'])}  {entry['path']}")
+
+
 def _build_parser():
     """Build the ``pynext`` argument parser (defaults from DEFAULT_CONFIG)."""
+
+
     parser = argparse.ArgumentParser(prog="pynext")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="create a minimal application")
     init.add_argument("--dir", default=".", help="application project directory")
+    init.add_argument("--template", choices=TEMPLATES, default="basic",
+                      help="project template: basic (default), islands (browser counter island),"
+                           " or api (example JSON route)")
+    init.add_argument("--with-middleware", action="store_true",
+                      help="also create an example middleware.py")
+    init.add_argument("--no-gitignore", action="store_true",
+                      help="do not create a .gitignore")
     check = sub.add_parser(
         "check",
         help="audit the deployment configuration for security mistakes "
@@ -538,6 +584,9 @@ def _build_parser():
         help="audit the deployment configuration (alias for 'check --deploy')")
     doctor.add_argument("--dir", default=".", help="application project directory")
     _add_audit_args(doctor)
+    info = sub.add_parser("info",
+                          help="Print environment diagnostics")
+    info.add_argument("--dir", default=".", help="application project directory")
     for name in ("build", "dev", "start"):
         command = sub.add_parser(name)
         command.add_argument("--dir", default=".", help="application project directory")
@@ -550,6 +599,30 @@ def _build_parser():
             command.add_argument("--standalone-exclude", action="append", default=[], metavar="PACKAGE",
                                  help="omit a top-level site-packages entry from the standalone bundle "
                                       "(repeatable; recorded in bundle-manifest.json)")
+            command.add_argument("--deployment-id", default=None, metavar="ID",
+                                 help="deployment label recorded in the manifest and sent as "
+                                      "X-PyNext-Deployment-Id (also via PYNEXT_DEPLOYMENT_ID)")
+            command.add_argument("--only-islands", action="store_true",
+                                 help="compile only: bundle the island modules and update the manifest"
+                                      " without rendering static pages (Next.js 'compile' build mode)")
+            command.add_argument("--only-static", action="store_true",
+                                 help="generate only: render the static pages from the island bundles of"
+                                      " an earlier compile, without re-running the bundler"
+                                      " (Next.js 'generate' build mode)")
+            command.add_argument("--static-only", action="store_true",
+                                 help="export a static-only site (SSG pages, public assets and island"
+                                      " bundles) to a directory servable without a server; refuses apps"
+                                      " with dynamic, ISR or API routes")
+            command.add_argument("--export-dir", default=None,
+                                 help="output directory for --static-only"
+                                      " (default: <project>/.pynext/export)")
+            command.add_argument("--analyze", action="store_true",
+                                 help="list the largest esbuild inputs per island bundle")
+        if name == "start":
+            command.add_argument("--warm-isr", action="store_true",
+                                 help="pre-fill the ISR cache for statically addressable ISR routes"
+                                      " in the background after the server starts listening;"
+                                      " warmup is best-effort and never blocks startup")
         if name != "build":
             command.add_argument("--host", default=DEFAULT_CONFIG.host)
             command.add_argument("--port", type=_port, default=DEFAULT_CONFIG.port)
@@ -608,15 +681,18 @@ def _build_parser():
                                                "--body-min-rate-bytes-per-sec"), default=None,
                                  help="minimum average body receive rate in bytes/second after a 2s grace "
                                       "window; slower bodies get a 408 (0 disables; max 1000000000)")
-            command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis"),
+            command.add_argument("--cache-backend", choices=("memory", "sqlite", "redis", "filesystem"),
                                  default=DEFAULT_CONFIG.cache_backend,
-                                 help="ISR page cache backend: process-local memory (default) or a"
-                                      " shared SQLite file or Redis via PYNEXT_REDIS_URL"
+                                 help="ISR page cache backend: process-local memory (default), a"
+                                      " shared SQLite file, Redis via PYNEXT_REDIS_URL, or a"
+                                      " shared filesystem directory of .body + .meta files"
                                       " (recommended with --workers > 1: the memory cache"
                                       " is per-process and not shared between workers)")
             command.add_argument("--cache-path", default=None,
-                                 help="SQLite cache file for --cache-backend sqlite;"
-                                      " defaults to <project>/.pynext/isr-cache.sqlite3")
+                                 help="SQLite cache file for --cache-backend sqlite, or cache"
+                                      " directory for --cache-backend filesystem;"
+                                      " defaults to <project>/.pynext/isr-cache.sqlite3"
+                                      " (sqlite) or <project>/.pynext/isr-cache (filesystem)")
             command.add_argument("--cache-failure-policy", choices=("fail_open", "fail_closed"),
                                  default=DEFAULT_CONFIG.cache_failure_policy,
                                  help="shared ISR cache behaviour when its backend is unavailable:"
@@ -628,13 +704,17 @@ def _build_parser():
             command.add_argument("--metrics", dest="metrics",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="collect in-memory request/cache/queue metrics (default: on)")
+            command.add_argument("--metrics-endpoint", dest="metrics_endpoint",
+                                 action=argparse.BooleanOptionalAction, default=None,
+                                 help="serve Prometheus text at the reserved /metrics path (default: off)")
             command.add_argument("--tracing", dest="tracing",
                                  action=argparse.BooleanOptionalAction, default=None,
                                  help="emit OpenTelemetry spans when the opentelemetry packages are installed (default: off)")
-            command.add_argument("--workers", type=_workers_value,
+            command.add_argument("--workers", type=_workers,
                                  default=DEFAULT_CONFIG.workers,
                                  help=f"worker processes sharing the port: an integer 1-64, or 'auto' "
-                                      f"for one per CPU (default {DEFAULT_CONFIG.workers} for start, "
+                                      f"for one per CPU core and per GiB of available memory (max 8); "
+                                      f"(default {DEFAULT_CONFIG.workers} for start, "
                                       "single process for dev; max 64); "
                                       "a supervisor restarts crashed workers")
             command.add_argument("--rate-limit", type=_at_least(0, "--rate-limit"),
@@ -727,8 +807,12 @@ def main():
     resolved = None
     cli_overrides = {}
     if command in ("dev", "build", "start", "check", "doctor"):
+        # "auto" is not a config value: it resolves later, in main(),
+        # via decide_auto_workers(), so it must not reach load_config's
+        # integer validation for "workers".
         cli_overrides = {key: explicit[dest] for dest, key in _CLI_CONFIG_MAP.items()
-                         if dest in explicit}
+                         if dest in explicit
+                         and not (key == "workers" and explicit[dest] == "auto")}
         try:
             # A deploy audit reads the production posture ("start" phase):
             # the checks ask what ``pynext start`` would actually run with.
@@ -757,22 +841,62 @@ def main():
     root = Path(args.dir).resolve()
     if args.command == "init":
         try:
-            init_project(root)
+            init_project(root, template=args.template, with_middleware=args.with_middleware,
+                         gitignore=not args.no_gitignore)
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
-        print(f"Created a PyNext app in {root}")
+        print(f"Created a PyNext app in {root} (template: {args.template})")
+        print()
+        print("Next steps:")
+        print(f"  cd {root}")
+        print("  pynext dev    # serve the source with reload")
+        print("  pynext build  # render static pages and bundle islands")
+        print("  pynext start  # serve the production build")
+        if args.template == "islands":
+            print("Islands need Node.js and esbuild for `pynext build`.")
+        return
+    if args.command == "info":
+        info = collect_info(root)
+        print(format_info(info), end="")
         return
     if args.command == "build":
         if args.standalone_dir and not args.standalone:
             parser.error("--standalone-dir requires --standalone")
+        if args.only_islands and args.only_static:
+            parser.error("--only-islands and --only-static are mutually exclusive; "
+                         "run a plain `pynext build` for both stages")
+        if args.static_only and (args.only_islands or args.only_static):
+            parser.error("--static-only runs a complete build first; combine it with "
+                         "neither --only-islands nor --only-static")
+        if args.export_dir and not args.static_only:
+            parser.error("--export-dir requires --static-only")
+        if args.standalone and (args.only_islands or args.only_static):
+            parser.error("--standalone requires a complete build; combine it with "
+                         "neither --only-islands nor --only-static")
         try:
             # write_manifest and build_standalone each take the build
             # lock, so a second build waits (up to --lock-timeout) and a
             # standalone copy always sees one consistent, completed build.
-            manifest = write_manifest(root, lock_timeout=args.lock_timeout)
-            print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
+            # Partial builds take only the stage they need; the full build
+            # also records the deployment id. (The call shapes differ per
+            # mode so the CLI tests can stub write_manifest per mode.)
+            if args.only_islands:
+                manifest = write_manifest(root, stages=("compile",))
+            elif args.only_static:
+                manifest = write_manifest(root, stages=("generate",))
+            else:
+                manifest = write_manifest(root, deployment_id=args.deployment_id,
+                                          lock_timeout=args.lock_timeout)
+            if args.only_islands:
+                print(f"Compiled {len(manifest['client']['bundles'])} island bundles in {root / '.pynext'}")
+            elif args.only_static:
+                print(f"Generated {len(manifest['static_pages'])} static pages in {root / '.pynext'}")
+            else:
+                build_id = manifest.get("build_id")
+                suffix = f" (build {build_id})" if build_id else ""
+                print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}{suffix}")
         except (OSError, ValueError) as exc:
-            parser.error(str(exc))
+            parser.error(f"{exc}\nRun `pynext info --dir {root}` for environment details to include in a bug report")
         coverage = manifest.get("catch_all_coverage") or {}
         shadowed = coverage.get("shadowed") or {}
         dynamic_only = coverage.get("dynamic_only") or []
@@ -780,6 +904,16 @@ def main():
             print(f"Catch-all coverage: {len(shadowed)} static page(s) also match a catch-all "
                   f"route (the static page wins); {len(dynamic_only)} catch-all route(s) serve "
                   f"only paths generate_static_params did not enumerate")
+        if args.static_only:
+            output = Path(args.export_dir) if args.export_dir else None
+            try:
+                summary = export_static(root, manifest, output)
+            except (OSError, ValueError) as exc:
+                parser.error(str(exc))
+            print(f"Exported {summary['pages']} static pages to {summary['output']}")
+            print(f"Serve with: python -m http.server --directory {summary['output']}")
+        print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
+        _print_build_summary(root, analyze=args.analyze)
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
             try:
@@ -812,7 +946,7 @@ def main():
     values = resolved.values if resolved is not None else DEFAULT_CONFIG
     obs_config = _observability_from_config(resolved) if resolved is not None else None
     if (args.structured_logs is not None or args.metrics is not None
-            or args.tracing is not None):
+            or args.metrics_endpoint is not None or args.tracing is not None):
         # CLI flags override the config: create_app() already reads the
         # same PYNEXT_* variables, so the default path stays exactly the
         # old call shape.
@@ -822,6 +956,8 @@ def main():
             obs_config.structured_logs = args.structured_logs
         if args.metrics is not None:
             obs_config.metrics = args.metrics
+        if args.metrics_endpoint is not None:
+            obs_config.metrics_endpoint = args.metrics_endpoint
         if args.tracing is not None:
             obs_config.tracing = args.tracing
     try:
@@ -842,6 +978,17 @@ def main():
         value = getattr(args, key)
         if value is not None and value != getattr(DEFAULT_CONFIG, key):
             conn_kwargs[key] = value
+    # Resolve "auto" once, in main(), via decide_auto_workers (memory-aware).
+    # The track (E P2-10) asks for the decision basis on one startup
+    # line: the resolved count and what capped it. Printed here, not
+    # in run_supervisor, so an auto decision of 1 — the
+    # single-process path, no supervisor — is reported too.
+    if args.workers == "auto":
+        decision = decide_auto_workers()
+        workers = decision.count
+        print(f"PyNext workers: {decision.describe()}", flush=True)
+    else:
+        workers = args.workers
     # `pynext dev` stays on the single-process run_dev path (file watching
     # and reload) unless workers were configured explicitly — via --workers,
     # a config file, or the environment. The multi-worker default
@@ -851,11 +998,19 @@ def main():
     # supervisor whenever the resolved worker count is above one, default
     # included.
     if args.command == "dev":
-        workers_explicit = (resolved is not None
-                            and resolved.source_of("workers") != "default")
-        use_supervisor = workers_explicit and args.workers > 1
+        # "auto" is excluded from cli_overrides (it is not a config
+        # value), so resolved.source_of("workers") reports "default"
+        # even when --workers auto was given explicitly. Count an
+        # explicit --workers flag as explicit too, so `pynext dev
+        # --workers auto` reaches the supervisor when auto resolves
+        # above one instead of falling through to run_dev and
+        # blocking forever on the watch/reload loop.
+        workers_explicit = ((resolved is not None
+                             and resolved.source_of("workers") != "default")
+                            or "workers" in explicit)
+        use_supervisor = workers_explicit and workers > 1
     else:
-        use_supervisor = args.workers > 1
+        use_supervisor = workers > 1
     if use_supervisor:
         config = WorkerConfig(root=str(root), host=args.host, port=args.port,
                               production=args.command == "start",
@@ -880,8 +1035,9 @@ def main():
                               observability=obs_config, security=security,
                               websocket_max_message=args.ws_max_message_bytes,
                               shutdown_timeout=args.shutdown_timeout, strict_ssg=args.strict_ssg,
-                              allowed_hosts=values.allowed_hosts)
-        return run_supervisor(config, workers=args.workers)
+                              allowed_hosts=values.allowed_hosts,
+                              warm_isr=getattr(args, "warm_isr", False))
+        return run_supervisor(config, workers=workers)
     # Only forward a stage/adaptive timeout that differs from serve()'s
     # default: the historical call shape is preserved otherwise (see
     # test_cli_without_observability_flags_keeps_old_call_shape, whose
@@ -934,6 +1090,7 @@ def main():
                           shutdown_timeout=args.shutdown_timeout,
                           **({"allowed_hosts": values.allowed_hosts} if values.allowed_hosts else {}),
                           **({"max_waiting": args.max_waiting} if args.max_waiting is not None else {}),
+                          **({"warm_isr": True} if getattr(args, "warm_isr", False) else {}),
                           **extra, **conn_kwargs, **timeout_kwargs))
     except KeyboardInterrupt:
         pass

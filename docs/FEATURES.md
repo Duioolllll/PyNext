@@ -75,8 +75,15 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `PathHeaders` | `pynext.http` |
 | `apply_path_headers` | `pynext.http` |
 | `compile_path_headers` | `pynext.http` |
+| `Matcher` | `pynext.matcher` |
+| `HeaderRule` | `pynext.matcher` |
+| `ScopedMiddleware` | `pynext.matcher` |
+| `scoped_middleware` | `pynext.matcher` |
+| `compile_matcher` | `pynext.matcher` |
+| `compile_header_rules` | `pynext.matcher` |
 | `ObservabilityConfig` | `pynext.observability` |
 | `MetricsCollector` | `pynext.observability` |
+| `RequestInsights` | `pynext.observability` |
 | `WebSocket` | `pynext.http` |
 | `WebSocketDisconnect` | `pynext.http` |
 | `MAX_WS_MESSAGE` | `pynext.http` |
@@ -120,10 +127,32 @@ Exported from `pynext` (`python/pynext/__init__.py`).
 | `fetch_cache_store_key` | `pynext.fetch_cache` |
 | `generate_fetch_cache_key` | `pynext.fetch_cache` |
 | `generate_simple_fetch_cache_key` | `pynext.fetch_cache` |
+| `FetchCache` | `pynext.fetch_cache` |
+| `FetchPolicy` | `pynext.fetch_cache` |
+| `FetchResult` | `pynext.fetch_cache` |
+| `fetch_cache_key` | `pynext.fetch_cache` |
+| `resolve_fetch_policy` | `pynext.fetch_cache` |
+| `urllib_fetcher` | `pynext.fetch_cache` |
+| `fetch_cache_scope` | `pynext.fetch_cache` |
+| `fetch_cached` | `pynext.fetch_cache` |
+| `get_fetch_cache` | `pynext.fetch_cache` |
+| `RequestMemo` | `pynext.request_memo` |
+| `request_memo_scope` | `pynext.request_memo` |
+| `current_memo` | `pynext.request_memo` |
+| `ensure_request_memo` | `pynext.request_memo` |
+| `clear_request_memo` | `pynext.request_memo` |
+| `memoize` | `pynext.request_memo` |
+| `memoize_sync` | `pynext.request_memo` |
 | `MiddlewareScope` | `pynext.middleware` |
 | `RouteHas` | `pynext.middleware` |
-| `ScopedMiddleware` | `pynext.middleware` |
 | `scoped` | `pynext.middleware` |
+| `url_for` | `pynext.routing` |
+| `preprocess_pathname` | `pynext.routing` |
+| `add_base_path` | `pynext.routing` |
+| `MiddlewareResult` | `pynext.middleware` |
+| `rewrite_request` | `pynext.middleware` |
+| `redirect_response` | `pynext.middleware` |
+| `MAX_MIDDLEWARE_REWRITES` | `pynext.middleware` |
 | `StaticPathError` | `pynext.static` |
 | `resolve_static_path` | `pynext.static` |
 | `validate_static_request_path` | `pynext.static` |
@@ -182,6 +211,7 @@ Backends accepted by `ISRCache` (`--cache-backend`, `create_app(..., cache_backe
 | `memory` | Process-local memory cache (default). |
 | `sqlite` | Shared SQLite file; entries are visible to all workers. |
 | `redis` | Shared Redis store via `PYNEXT_REDIS_URL`. |
+| `filesystem` | Shared directory of human-readable `.body` + `.meta` sidecar files (Next.js `FileSystemCache`-style); entries are visible to all workers, bounded to 1024 entries / 512 MiB by default (oldest-first eviction). |
 
 ## CLI commands (`pynext`)
 
@@ -191,6 +221,7 @@ Backends accepted by `ISRCache` (`--cache-backend`, `create_app(..., cache_backe
 | `check` | audit the deployment configuration for security mistakes (Django 'check --deploy' pattern) |
 | `dev` | Start the development server with file watching. |
 | `doctor` | audit the deployment configuration (alias for 'check --deploy') |
+| `info` | Print environment diagnostics |
 | `init` | create a minimal application |
 | `start` | Start the built application (production mode). |
 
@@ -203,15 +234,17 @@ CLI defaults of `None` defer to server defaults; see the manual for scope and un
 | `--max-connections` | `None` |
 | `--max-connections-per-ip` | `None` |
 | `--max-waiting` | `None` |
+| `--metrics-endpoint` | `None` |
 | `--shutdown-timeout` | `30.0` |
 
 ## Health endpoints
 
-Reserved GET/HEAD paths; readiness reflects startup and draining, not upstream health.
+Reserved GET/HEAD paths; readiness reflects startup, draining, and fail_closed backend health.
 
 | Path |
 | --- |
 | `/healthz` |
+| `/metrics` |
 | `/readyz` |
 
 ## Island activation strategies

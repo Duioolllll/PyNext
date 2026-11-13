@@ -4,8 +4,9 @@ Design notes
 ------------
 * Structured logs are on by default, metrics are on by default, tracing is
   off by default and is a no-op unless the ``opentelemetry`` packages are
-  installed *and* tracing is enabled. Nothing here imports OpenTelemetry at
-  module import time.
+  installed *and* tracing is enabled. Request insights (recent slow/failed
+  request snapshots) are on in development mode only, by default. Nothing
+  here imports OpenTelemetry at module import time.
 * Sensitive values are never logged by default: the JSON formatter drops
   extra fields whose names look like credentials/headers/cookies/bodies, and
   the request log line records only the route *pattern* (never the raw URL),
@@ -19,6 +20,20 @@ Design notes
   stack) are aggregated in the in-process snapshot only, capped at 256
   distinct digests with the rest folded into an ``__overflow__`` bucket,
   and are emitted in Prometheus under an empty ``digest`` label.
+* Error counters (``observe_error``) are keyed by route pattern and
+  exception class name, never by message or URL, for the same reason.
+* Backend health (``BackendHealth``) is last-seen state only: components
+  report success/failure when they actually touch a shared backend, so
+  ``/readyz`` never pings Redis on the probe path.
+* Repeated request failures are logged in full once per callsite per
+  window (``DedupedErrorLogger``); well-known transport noise
+  (client disconnects, cancellations) logs at INFO instead of ERROR.
+* Slow spans can also be recorded locally without OpenTelemetry: when
+  ``PYNEXT_TRACE_SPAN_THRESHOLD_MS`` is set, ``pynext.request`` /
+  ``pynext.render`` spans slower than the threshold are appended as JSON
+  Lines to ``.pynext/trace.jsonl`` (see :func:`configure_local_trace`).
+  The file restarts from scratch at 50 MiB. Only route patterns, methods
+  and status codes are recorded — never raw URLs, headers or bodies.
 * Native (Rust) fresh ISR hits are served without entering Python, so they
   are invisible to the Python metrics below. That gap is documented in the
   manuals; only ISR outcomes that reach :meth:`App.dispatch` are counted.
@@ -50,8 +65,10 @@ Design notes
   input that happens to contain one. Scrubbing is pattern-based, not a
   full allowlist: a bare secret with no key next to it is not recognised.
 """
+import asyncio
 import contextlib
 import contextvars
+import importlib
 import json
 import logging
 import os
@@ -59,16 +76,25 @@ import re
 import sys
 import threading
 import time
+import traceback
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
+
+from .failure_policy import FAIL_CLOSED
 
 __all__ = [
     "ObservabilityConfig",
     "MetricsCollector",
+    "RequestInsights",
+    "BackendHealth",
+    "DedupedErrorLogger",
+    "classify_request_error",
     "JsonFormatter",
     "configure_logging",
+    "configure_local_trace",
     "new_request_id",
     "get_request_id",
     "get_trace_id",
@@ -265,6 +291,15 @@ trace_span_id_var = contextvars.ContextVar("pynext_trace_span_id", default=None)
 route_var = contextvars.ContextVar("pynext_route", default=None)
 queue_wait_var = contextvars.ContextVar("pynext_queue_wait_ms", default=None)
 render_ms_var = contextvars.ContextVar("pynext_render_ms", default=None)
+# Middleware/security decision for the current request (P2-2, §3.3 #18):
+# set by ``App._run_middleware`` / ``App._rate_limit_denied`` so the access
+# log line and the ``pynext.request`` span carry the decision. The values
+# are bounded outcome words (never paths or user input), so they are safe
+# as log fields and span attributes.
+middleware_outcome_var = contextvars.ContextVar("pynext_middleware_outcome", default=None)
+middleware_actor_var = contextvars.ContextVar("pynext_middleware_actor", default=None)
+middleware_rewrote_path_var = contextvars.ContextVar("pynext_middleware_rewrote_path", default=None)
+rate_limit_outcome_var = contextvars.ContextVar("pynext_rate_limit_outcome", default=None)
 _otel_context_var = contextvars.ContextVar("pynext_otel_context", default=None)
 
 
@@ -275,6 +310,42 @@ def _env_bool(name, default):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_float(name, default=None):
+    """Parse an env var as a float, or ``default`` when unset/unrecognized."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _env_tristate(name):
+    """Parse an env var as True/False, or None when unset/unrecognized (auto)."""
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _env_int(name, default, minimum=None):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip(), 10)
+    except ValueError:
+        return default
+    return max(minimum, value) if minimum is not None else value
+
+
 @dataclass
 class ObservabilityConfig:
     """Flags controlling structured logs, metrics and tracing.
@@ -283,12 +354,35 @@ class ObservabilityConfig:
     is installed and tracing is enabled. Environment overrides:
     ``PYNEXT_STRUCTURED_LOGS``, ``PYNEXT_METRICS``, ``PYNEXT_TRACING``,
     ``PYNEXT_LOG_LEVEL``.
+
+    Request insights (recent slow/failed request snapshots, see
+    :class:`RequestInsights`) are off unless enabled: ``request_insights``
+    forces them on (``True``) or off (``False``); ``None`` (the default)
+    means "auto" — on in development (``debug=True``) apps, off in
+    production. Environment overrides: ``PYNEXT_REQUEST_INSIGHTS``
+    (``1``/``0``), ``PYNEXT_REQUEST_INSIGHTS_MAX`` (ring-buffer size,
+    default 100), ``PYNEXT_REQUEST_INSIGHTS_SLOW_MS`` (fixed slow
+    threshold in ms; unset means the running p95 of recent latencies).
+    ``metrics_endpoint`` (``PYNEXT_METRICS_ENDPOINT``) serves the
+    Prometheus text at the reserved ``/metrics`` path; off by default so
+    route/status counters are not exposed to unauthenticated clients.
+    ``log_dedup_window_s`` (``PYNEXT_LOG_DEDUP_WINDOW_S``) groups repeated
+    request failures by callsite; 0 disables the grouping.
+    ``backend_health_ttl_s`` (``PYNEXT_BACKEND_HEALTH_TTL_S``) is how long
+    a last-seen backend state counts for ``/readyz`` before it is
+    forgotten (unknown backends read as healthy).
     """
 
     structured_logs: bool = True
     metrics: bool = True
     tracing: bool = False
     log_level: str = "INFO"
+    request_insights: bool | None = None
+    request_insights_max: int = 100
+    request_insights_slow_ms: float | None = None
+    metrics_endpoint: bool = False
+    log_dedup_window_s: float = 60.0
+    backend_health_ttl_s: float = 300.0
 
     @classmethod
     def from_env(cls):
@@ -297,6 +391,12 @@ class ObservabilityConfig:
             metrics=_env_bool("PYNEXT_METRICS", True),
             tracing=_env_bool("PYNEXT_TRACING", False),
             log_level=os.environ.get("PYNEXT_LOG_LEVEL", "INFO"),
+            request_insights=_env_tristate("PYNEXT_REQUEST_INSIGHTS"),
+            request_insights_max=_env_int("PYNEXT_REQUEST_INSIGHTS_MAX", 100, minimum=1),
+            request_insights_slow_ms=_env_float("PYNEXT_REQUEST_INSIGHTS_SLOW_MS"),
+            metrics_endpoint=_env_bool("PYNEXT_METRICS_ENDPOINT", False),
+            log_dedup_window_s=_env_float("PYNEXT_LOG_DEDUP_WINDOW_S", 60.0),
+            backend_health_ttl_s=_env_float("PYNEXT_BACKEND_HEALTH_TTL_S", 300.0),
         )
 
 
@@ -357,6 +457,10 @@ def begin_request_context(headers):
         (route_var, route_var.set(None)),
         (queue_wait_var, queue_wait_var.set(None)),
         (render_ms_var, render_ms_var.set(None)),
+        (middleware_outcome_var, middleware_outcome_var.set(None)),
+        (middleware_actor_var, middleware_actor_var.set(None)),
+        (middleware_rewrote_path_var, middleware_rewrote_path_var.set(None)),
+        (rate_limit_outcome_var, rate_limit_outcome_var.set(None)),
     )
     context = _extract_otel_context(headers) if parsed is not None else None
     # Clear any inherited request context when this request has no valid
@@ -487,6 +591,12 @@ def _percentiles(samples):
     }
 
 
+def _prom_label(value):
+    """Escape one Prometheus label value (backslash, quote, newline)."""
+    return (str(value).replace("\\", "\\\\")
+            .replace('"', '\\"').replace("\n", "\\n"))
+
+
 class MetricsCollector:
     """Cheap in-memory metrics. All observe methods are no-ops when disabled.
 
@@ -521,10 +631,13 @@ class MetricsCollector:
         self._rust_ms_count = 0
         self._cache = {"hit": 0, "miss": 0, "stale": 0, "busy": 0}
         self._regeneration = {"success": 0, "failure": 0, "started": 0}
+        self._rate_limit = {"allowed": 0, "denied": 0, "exempt": 0, "error": 0, "fail_open": 0}
+        self._middleware = {"continued": 0, "short_circuited": 0, "error": 0}
+        self._warmup = {"warmed": 0, "skipped": 0, "failed": 0, "pending": 0, "timed_out": 0}
         self._workers = {"starts": 0, "timeouts": 0, "unavailable": 0}
-        # H-2: rate-limit decisions that could not be produced (decision
-        # gate full or deadline expired) and failed open instead of 503.
-        self._rate_limit = {"fail_open": 0}
+        # H-2: "fail_open" counts rate-limit decisions that could not be
+        # produced (decision gate full or deadline expired) and failed
+        # open instead of 503.
         # Per-stage timeout counts (C-P1-7): which request stage ran out
         # of its budget — body read, handler execution, response sending,
         # or admission (rate-limit decision gate). A handler timeout
@@ -539,6 +652,8 @@ class MetricsCollector:
         # this dict without bound.
         self._errors = {}
         self._error_digests = set()
+        # (component, policy, outcome) -> count of failure-policy activations.
+        self._degraded = {}
 
     # -- errors -----------------------------------------------------------
     def observe_error(self, route, error_type, digest=None):
@@ -602,6 +717,15 @@ class MetricsCollector:
         with self._lock:
             self._rust_ms_total += float(rust_ms)
             self._rust_ms_count += 1
+
+    def observe_degraded(self, component, policy, outcome):
+        """Count one failure-policy activation (e.g. a dead shared backend
+        refusing a request under ``fail_closed``)."""
+        if not self.enabled:
+            return
+        with self._lock:
+            key = (component, policy, outcome)
+            self._degraded[key] = self._degraded.get(key, 0) + 1
 
     # -- queue / workers --------------------------------------------------
     def observe_queue_enter(self):
@@ -695,6 +819,49 @@ class MetricsCollector:
         with self._lock:
             self._rate_limit["fail_open"] += 1
 
+    # -- middleware / security decisions ----------------------------------
+    def observe_rate_limit(self, outcome):
+        """Count one rate-limit admission decision.
+
+        Outcomes: ``allowed`` (token consumed), ``denied`` (429),
+        ``exempt`` (exempt path, no token charged), ``error`` (the
+        decision itself failed, fail closed with 503). Observed at the
+        decision on both transports, so a denied request is counted even
+        though it never reaches dispatch — and an exempt 404 shows up as
+        an ``exempt`` decision next to a 404 in the request counters,
+        which is the shape a B-1 style bypass takes. Unknown outcomes
+        are ignored so a typo can never corrupt the counters.
+        """
+        if not self.enabled or outcome not in self._rate_limit:
+            return
+        with self._lock:
+            self._rate_limit[outcome] += 1
+
+    def observe_middleware(self, outcome):
+        """Count one middleware-chain outcome.
+
+        Outcomes: ``continued`` (the chain reached the terminal),
+        ``short_circuited`` (a middleware answered on its own), ``error``
+        (a middleware raised or violated the chain contract). A failure
+        in the handler behind the terminal still counts as ``continued``:
+        the chain continued; the 500 is the handler's failure, not the
+        middleware's. Unknown outcomes are ignored.
+        """
+        if not self.enabled or outcome not in self._middleware:
+            return
+        with self._lock:
+            self._middleware[outcome] += 1
+
+    def observe_warmup(self, result):
+        """Add one ISR warmup run's summary counts to the warmup counters."""
+        if not self.enabled:
+            return
+        with self._lock:
+            for key in ("warmed", "skipped", "failed", "pending"):
+                self._warmup[key] += int(result.get(key, 0) or 0)
+            if result.get("timed_out"):
+                self._warmup["timed_out"] += 1
+
     # -- sizes ------------------------------------------------------------
     def observe_island_bundle(self, path, size_bytes):
         if not self.enabled:
@@ -723,19 +890,26 @@ class MetricsCollector:
                 total_bytes += entry["bytes"]
             bundle_sizes = dict(sorted(self._bundles.items()))
             errors_by_type = {}
+            errors_total = 0
             errors_by_digest = {}
             for (route, error_type, digest), count in sorted(self._errors.items()):
                 errors_by_type.setdefault(route, {})[error_type] = (
                     errors_by_type.setdefault(route, {}).get(error_type, 0) + count)
+                errors_total += count
                 if digest:
                     errors_by_digest.setdefault(route, {})[digest] = (
                         errors_by_digest.setdefault(route, {}).get(digest, 0) + count)
+            degraded = {}
+            for (component, policy, outcome), count in sorted(self._degraded.items()):
+                degraded.setdefault(component, {}).setdefault(policy, {})[outcome] = count
             return {
                 "enabled": True,
                 "requests_total": total_requests,
                 "response_bytes_total": total_bytes,
                 "routes": routes,
-                "errors": {"by_type": errors_by_type, "by_digest": errors_by_digest},
+                "errors": {"total": errors_total, "by_type": errors_by_type,
+                           "by_digest": errors_by_digest},
+                "degraded": degraded,
                 "queue": {
                     "current": self._queue_current,
                     "max": self._queue_max,
@@ -763,6 +937,9 @@ class MetricsCollector:
                 },
                 "cache": dict(self._cache),
                 "regeneration": dict(self._regeneration),
+                "rate_limit": dict(self._rate_limit),
+                "middleware": dict(self._middleware),
+                "warmup": dict(self._warmup),
                 "workers": dict(self._workers),
                 "rate_limit": dict(self._rate_limit),
                 "stage_timeouts": dict(self._stage_timeouts),
@@ -779,36 +956,54 @@ class MetricsCollector:
                  "# TYPE pynext_requests_total counter"]
         for route, entry in snap["routes"].items():
             for status, count in entry["status"].items():
-                lines.append(f'pynext_requests_total{{route="{route}",status="{status}"}} {count}')
+                lines.append(f'pynext_requests_total{{route="{_prom_label(route)}",status="{_prom_label(status)}"}} {count}')
         lines += ["# HELP pynext_response_bytes_total Response bytes sent, by route.",
                   "# TYPE pynext_response_bytes_total counter"]
         for route, entry in snap["routes"].items():
-            lines.append(f'pynext_response_bytes_total{{route="{route}"}} {entry["response_bytes"]}')
+            lines.append(f'pynext_response_bytes_total{{route="{_prom_label(route)}"}} {entry["response_bytes"]}')
         lines += ["# HELP pynext_request_latency_ms Request latency percentile, by route.",
                   "# TYPE pynext_request_latency_ms gauge"]
         for route, entry in snap["routes"].items():
             for name, value in entry["latency_ms"].items():
                 if name != "avg" and value is not None:
-                    lines.append(f'pynext_request_latency_ms{{route="{route}",quantile="{name}"}} {value}')
+                    lines.append(f'pynext_request_latency_ms{{route="{_prom_label(route)}",quantile="{_prom_label(name)}"}} {value}')
+        lines += ["# HELP pynext_degraded_total Failure-policy activations, by component, policy and outcome.",
+                  "# TYPE pynext_degraded_total counter"]
+        for component, by_policy in snap["degraded"].items():
+            for policy, by_outcome in by_policy.items():
+                for outcome, count in by_outcome.items():
+                    lines.append(f'pynext_degraded_total{{component="{_prom_label(component)}",policy="{_prom_label(policy)}",outcome="{_prom_label(outcome)}"}} {count}')
         lines += ["# HELP pynext_cache_total ISR cache outcomes.",
                   "# TYPE pynext_cache_total counter"]
         for outcome, count in snap["cache"].items():
-            lines.append(f'pynext_cache_total{{outcome="{outcome}"}} {count}')
+            lines.append(f'pynext_cache_total{{outcome="{_prom_label(outcome)}"}} {count}')
         lines += ["# HELP pynext_regeneration_total ISR regeneration outcomes.",
                   "# TYPE pynext_regeneration_total counter"]
         for outcome, count in snap["regeneration"].items():
-            lines.append(f'pynext_regeneration_total{{outcome="{outcome}"}} {count}')
+            lines.append(f'pynext_regeneration_total{{outcome="{_prom_label(outcome)}"}} {count}')
+        lines += ["# HELP pynext_rate_limit_total Rate-limit admission decisions, by outcome.",
+                  "# TYPE pynext_rate_limit_total counter"]
+        for outcome, count in snap["rate_limit"].items():
+            lines.append(f'pynext_rate_limit_total{{outcome="{_prom_label(outcome)}"}} {count}')
+        lines += ["# HELP pynext_middleware_total Middleware chain outcomes, by outcome.",
+                  "# TYPE pynext_middleware_total counter"]
+        for outcome, count in snap["middleware"].items():
+            lines.append(f'pynext_middleware_total{{outcome="{_prom_label(outcome)}"}} {count}')
+        lines += ["# HELP pynext_warmup_total ISR warmup outcomes.",
+                  "# TYPE pynext_warmup_total counter"]
+        for outcome, count in snap["warmup"].items():
+            lines.append(f'pynext_warmup_total{{outcome="{_prom_label(outcome)}"}} {count}')
         lines += ["# HELP pynext_worker_total Worker starts, timeouts and unavailability.",
                   "# TYPE pynext_worker_total counter"]
         for outcome, count in snap["workers"].items():
-            lines.append(f'pynext_worker_total{{outcome="{outcome}"}} {count}')
+            lines.append(f'pynext_worker_total{{outcome="{_prom_label(outcome)}"}} {count}')
         lines += ["# HELP pynext_rate_limit_fail_open_total Rate-limit decisions that could not be produced and failed open (H-2).",
                   "# TYPE pynext_rate_limit_fail_open_total counter",
                   f'pynext_rate_limit_fail_open_total {snap["rate_limit"]["fail_open"]}']
         lines += ["# HELP pynext_stage_timeouts_total Request-stage timeouts, by stage.",
                   "# TYPE pynext_stage_timeouts_total counter"]
         for stage, count in snap["stage_timeouts"].items():
-            lines.append(f'pynext_stage_timeouts_total{{stage="{stage}"}} {count}')
+            lines.append(f'pynext_stage_timeouts_total{{stage="{_prom_label(stage)}"}} {count}')
         lines += ["# HELP pynext_errors_total Errors, by route, exception type and digest.",
                   "# TYPE pynext_errors_total counter"]
         # Emit from the joint (route, error_type, digest) counts, not the
@@ -822,14 +1017,14 @@ class MetricsCollector:
         for (route, error_type, digest), count in joint:
             if digest.startswith("PYNEXT_"):
                 lines.append(
-                    f'pynext_errors_total{{route="{route}",error_type="{error_type}",'
-                    f'digest="{digest}"}} {count}')
+                    f'pynext_errors_total{{route="{_prom_label(route)}",error_type="{_prom_label(error_type)}",'
+                    f'digest="{_prom_label(digest)}"}} {count}')
             else:
                 key = (route, error_type)
                 folded[key] = folded.get(key, 0) + count
         for (route, error_type), count in sorted(folded.items()):
             lines.append(
-                f'pynext_errors_total{{route="{route}",error_type="{error_type}",'
+                f'pynext_errors_total{{route="{_prom_label(route)}",error_type="{_prom_label(error_type)}",'
                 f'digest=""}} {count}')
         lines += ["# HELP pynext_python_execution_queue_length Current Python execution queue depth.",
                   "# TYPE pynext_python_execution_queue_length gauge",
@@ -863,6 +1058,349 @@ class MetricsCollector:
                   "# TYPE pynext_island_bundles_total_bytes gauge",
                   f'pynext_island_bundles_total_bytes {snap["island_bundles_total_bytes"]}']
         return "\n".join(lines) + "\n"
+
+
+class BackendHealth:
+    """Last-seen health of the shared backends, for ``/readyz``.
+
+    Components (``"isr-cache"``, ``"rate-limit"``, ``"sessions"``) report
+    success or failure when they actually touch their backend; nothing
+    here ever pings a backend, so a readiness probe costs no I/O. A
+    report is forgotten after ``ttl_s`` (unknown backends read as
+    healthy, so a stale outage cannot keep a recovered process out of
+    rotation forever). ``policy`` is the component's failure policy
+    (``"fail_open"`` / ``"fail_closed"``): only a ``fail_closed``
+    component that is currently unhealthy makes the process unready.
+    """
+
+    def __init__(self, ttl_s=300.0, *, clock=time.monotonic):
+        self._ttl_s = float(ttl_s)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._state = {}  # component -> {"healthy", "policy", "seen"}
+
+    def set_ttl(self, ttl_s):
+        with self._lock:
+            self._ttl_s = float(ttl_s)
+
+    def report(self, component, *, healthy, policy):
+        with self._lock:
+            self._state[component] = {
+                "healthy": bool(healthy), "policy": policy, "seen": self._clock(),
+            }
+
+    def snapshot(self):
+        """Fresh reports only: {component: {healthy, policy, last_seen_s}}."""
+        now = self._clock()
+        with self._lock:
+            return {
+                name: {"healthy": entry["healthy"], "policy": entry["policy"],
+                       "last_seen_s": round(now - entry["seen"], 3)}
+                for name, entry in sorted(self._state.items())
+                if now - entry["seen"] <= self._ttl_s
+            }
+
+    def unhealthy_fail_closed(self):
+        """Components whose outage must stop traffic (fail_closed + down)."""
+        return [name for name, entry in self.snapshot().items()
+                if not entry["healthy"] and entry["policy"] == FAIL_CLOSED]
+
+    def degraded(self):
+        """Components that are down but fail open (traffic continues)."""
+        return [name for name, entry in self.snapshot().items()
+                if not entry["healthy"] and entry["policy"] != FAIL_CLOSED]
+
+
+def _error_callsite(exc):
+    """Innermost user-code frame of ``exc``'s traceback (framework frames skipped).
+
+    The raise site identifies the bug: the same exception raised from the
+    same line collapses even when reached through different callers, while
+    a different raise site on the same route stays separate. Falls back
+    to the innermost frame when the traceback never leaves the framework,
+    and to ``"unknown"`` when there is no traceback at all.
+    """
+    frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ else []
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    for frame in reversed(frames):
+        path = os.path.abspath(frame.filename)
+        try:
+            inside = os.path.commonpath([path, package_dir]) == package_dir
+        except ValueError:
+            inside = False
+        if not inside:
+            return f"{os.path.basename(frame.filename)}:{frame.lineno}:{frame.name}"
+    if frames:
+        last = frames[-1]
+        return f"{os.path.basename(last.filename)}:{last.lineno}:{last.name}"
+    return "unknown"
+
+
+def classify_request_error(exc):
+    """Return ``"known"`` for routine transport noise, else ``"error"``.
+
+    Known errors — a client that went away mid-request, or a cancelled
+    request — are not application failures, so they log at INFO and are
+    never exception-logged. Everything else is a real 500 and goes
+    through the dedup logger.
+    """
+    if isinstance(exc, (asyncio.CancelledError, ConnectionResetError, BrokenPipeError)):
+        return "known"
+    return "error"
+
+
+class DedupedErrorLogger:
+    """Log a repeated request failure in full once per window, keyed by
+    callsite (Next.js ``create-deduped-by-callsite-server-error-logger``,
+    adapted: PyNext dedups across requests for ``window_s`` seconds
+    instead of once per request).
+
+    The key is (exception class, innermost user-code frame, route pattern),
+    so the same bug on the same page collapses to one full traceback
+    plus a suppressed-repeat count; a new route or a new raise site logs
+    in full immediately. ``window_s <= 0`` disables grouping (every
+    failure logs in full). The message itself is never part of the key,
+    so request data cannot blow up the table.
+    """
+
+    def __init__(self, logger=None, window_s=60.0, *, clock=time.monotonic):
+        self._logger = logger if logger is not None else log
+        self._window_s = float(window_s)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._seen = {}  # key -> {"last_logged": float, "suppressed": int}
+
+    def set_window(self, window_s):
+        with self._lock:
+            self._window_s = float(window_s)
+
+    @property
+    def suppressed_counts(self):
+        """Pending suppressed-repeat counts by key (introspection/tests)."""
+        with self._lock:
+            return {key: entry["suppressed"] for key, entry in self._seen.items()
+                    if entry["suppressed"]}
+
+    def log_exception(self, exc, *, route=None):
+        error_type = type(exc).__name__
+        callsite = _error_callsite(exc)
+        key = (error_type, callsite, route)
+        now = self._clock()
+        if self._window_s <= 0:
+            self._logger.exception("Request failed", extra={
+                "error_type": error_type, "route": route, "callsite": callsite,
+                "dedup_suppressed": 0,
+            })
+            return
+        with self._lock:
+            entry = self._seen.get(key)
+            if entry is None or now - entry["last_logged"] >= self._window_s:
+                suppressed = entry["suppressed"] if entry else 0
+                self._seen[key] = {"last_logged": now, "suppressed": 0}
+            else:
+                entry["suppressed"] += 1
+                return
+        self._logger.exception("Request failed", extra={
+            "error_type": error_type, "route": route, "callsite": callsite,
+            "dedup_suppressed": suppressed,
+        })
+
+
+class RequestInsights:
+    """Bounded ring buffer of recent slow / failed request snapshots.
+
+    Separate from :class:`MetricsCollector`: metrics aggregate, this keeps
+    individual request snapshots so one slow request can be inspected
+    without digging through logs. A request is kept when it is slow —
+    slower than a fixed ``slow_threshold_ms`` when set, otherwise slower
+    than the running p95 of recent latencies — or when it failed (status
+    >= 500 or an ``error_type``). The buffer is a ``deque(maxlen=...)``
+    and the p95 window is bounded too, so memory cannot grow without
+    bound no matter how long the server runs. Snapshots record only the
+    route *pattern*, never the raw URL, so no user data or credentials
+    can leak in.
+
+    In-process API only: there is deliberately no HTTP endpoint serving
+    these snapshots (routes + latencies are internal debug data). Enabled
+    in development mode by default; see :class:`ObservabilityConfig`.
+    """
+
+    DEFAULT_MAX_ENTRIES = 100
+    _P95_WINDOW = 512
+    _MIN_SAMPLES = 20
+
+    def __init__(self, enabled=True, max_entries=DEFAULT_MAX_ENTRIES,
+                 slow_threshold_ms=None):
+        if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries < 1:
+            raise ValueError("max_entries must be a positive integer")
+        if (slow_threshold_ms is not None and
+                (isinstance(slow_threshold_ms, bool) or
+                 not isinstance(slow_threshold_ms, (int, float)) or slow_threshold_ms < 0)):
+            raise ValueError("slow_threshold_ms must be a non-negative number or None")
+        self.enabled = enabled
+        self.max_entries = max_entries
+        self.slow_threshold_ms = slow_threshold_ms
+        self._lock = threading.Lock()
+        self._entries = deque(maxlen=max_entries)
+        self._latencies = deque(maxlen=self._P95_WINDOW)
+        self._observed = 0
+        self._recorded = 0
+
+    def _is_slow(self, latency_ms):
+        if self.slow_threshold_ms is not None:
+            return latency_ms >= self.slow_threshold_ms
+        if len(self._latencies) < self._MIN_SAMPLES:
+            # Not enough of a population yet to know what "slow" means;
+            # only definite failures are kept during warm-up.
+            return False
+        return latency_ms > _percentiles(list(self._latencies))["p95"]
+
+    def observe(self, *, request_id, method, route, status, latency_ms,
+                python_ms=None, rust_ms=None, queue_wait_ms=None, error_type=None):
+        """Record one finished request if it is slow or failed. No-op when disabled."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._observed += 1
+            latency = float(latency_ms)
+            self._latencies.append(latency)
+            failed = status >= 500 or error_type is not None
+            if not failed and not self._is_slow(latency):
+                return
+            self._recorded += 1
+            self._entries.append({
+                "request_id": request_id,
+                "method": method,
+                "route": route,
+                "status": int(status),
+                "latency_ms": round(latency, 3),
+                "python_ms": round(float(python_ms), 3) if python_ms is not None else None,
+                "rust_ms": round(float(rust_ms), 3) if rust_ms is not None else None,
+                "queue_wait_ms": round(float(queue_wait_ms), 3) if queue_wait_ms is not None else None,
+                "error_type": error_type,
+                "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            })
+
+    def clear(self):
+        """Drop all kept snapshots and reset the counters / p95 window."""
+        with self._lock:
+            self._entries.clear()
+            self._latencies.clear()
+            self._observed = 0
+            self._recorded = 0
+
+    def snapshot(self):
+        """Return the kept snapshots, oldest first, plus filter counters."""
+        if not self.enabled:
+            return {"enabled": False}
+        with self._lock:
+            threshold = self.slow_threshold_ms
+            if threshold is None and len(self._latencies) >= self._MIN_SAMPLES:
+                threshold = _percentiles(list(self._latencies))["p95"]
+            return {
+                "enabled": True,
+                "max_entries": self.max_entries,
+                "observed": self._observed,
+                "recorded": self._recorded,
+                "slow_threshold_ms": threshold,
+                "requests": [dict(entry) for entry in self._entries],
+            }
+
+
+# -- Local trace file (Next.js trace/ light subset) -----------------------
+# Spans slower than the configured threshold are appended as JSON Lines
+# to a local file. Off by default: the threshold env var must be set.
+# Only pynext.request / pynext.render are recorded, and only with route
+# patterns / methods / status codes — never raw URLs, headers or bodies.
+# The file restarts from scratch once it reaches TRACE_FILE_MAX_BYTES
+# (50 MiB, the Next.js development cap). Recording is best effort and
+# never raises: a trace-file failure must not break request handling.
+TRACE_FILE_MAX_BYTES = 50 * 1024 * 1024
+TRACE_FILE_DEFAULT = ".pynext/trace.jsonl"
+_LOCAL_TRACE_SPAN_NAMES = frozenset({"pynext.request", "pynext.render"})
+
+_local_trace_lock = threading.Lock()
+_local_trace_configured = False
+_local_trace_threshold_ms = None  # None = off
+_local_trace_path = None
+
+
+def _parse_trace_threshold(value):
+    if value is None:
+        return None
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        return None
+    # NaN fails the >= comparison, so it is off as well.
+    return threshold if threshold >= 0 else None
+
+
+def _local_trace_settings():
+    global _local_trace_configured, _local_trace_threshold_ms, _local_trace_path
+    with _local_trace_lock:
+        if not _local_trace_configured:
+            _local_trace_threshold_ms = _parse_trace_threshold(
+                os.environ.get("PYNEXT_TRACE_SPAN_THRESHOLD_MS"))
+            _local_trace_path = os.environ.get("PYNEXT_TRACE_FILE") or TRACE_FILE_DEFAULT
+            _local_trace_configured = True
+        return _local_trace_threshold_ms, _local_trace_path
+
+
+def configure_local_trace(threshold_ms=None, *, path=None):
+    """Configure the local slow-span trace file.
+
+    ``threshold_ms`` is the minimum span duration in milliseconds to
+    record; ``None`` (the default) turns recording off. ``path`` overrides
+    the trace file location (default ``.pynext/trace.jsonl`` relative to
+    the working directory, or ``PYNEXT_TRACE_FILE`` when set in the
+    environment). Calling this replaces any environment-derived settings.
+    """
+    global _local_trace_configured, _local_trace_threshold_ms, _local_trace_path
+    threshold = _parse_trace_threshold(threshold_ms) if threshold_ms is not None else None
+    with _local_trace_lock:
+        _local_trace_threshold_ms = threshold
+        _local_trace_path = str(path) if path is not None else TRACE_FILE_DEFAULT
+        _local_trace_configured = True
+
+
+def _reset_local_trace_config():
+    """Test hook: forget any configured/env-derived local trace settings."""
+    global _local_trace_configured, _local_trace_threshold_ms, _local_trace_path
+    with _local_trace_lock:
+        _local_trace_configured = False
+        _local_trace_threshold_ms = None
+        _local_trace_path = None
+
+
+def _record_local_span(name, started_at, duration_ms, attributes, error_type):
+    threshold_ms, path = _local_trace_settings()
+    if threshold_ms is None or name not in _LOCAL_TRACE_SPAN_NAMES:
+        return
+    if duration_ms < threshold_ms:
+        return
+    try:
+        record = {
+            "timestamp": started_at,
+            "name": name,
+            "duration_ms": round(duration_ms, 3),
+            "attributes": {str(key): value for key, value in attributes.items()},
+            "error_type": error_type,
+        }
+        line = (json.dumps(record, ensure_ascii=False, default=repr) + "\n").encode("utf-8")
+    except Exception:
+        return
+    try:
+        with _local_trace_lock:
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_file() and target.stat().st_size >= TRACE_FILE_MAX_BYTES:
+                with open(target, "wb"):
+                    pass
+            with open(target, "ab") as handle:
+                handle.write(line)
+    except Exception:
+        pass
 
 
 # -- OpenTelemetry (optional) ---------------------------------------------
@@ -910,15 +1448,58 @@ def _extract_otel_context(headers):
 
 
 class _Span:
-    """Uniform wrapper: a real OTel span when available, else a no-op."""
+    """Uniform wrapper: a real OTel span when available, else a no-op.
 
-    def __init__(self, real=None):
+    Attributes set on the span are kept locally as well, so the local
+    trace file can record them without OpenTelemetry.
+    """
+
+    def __init__(self, real=None, name=None):
         self._real = real
+        self.name = name
+        self.attributes = {}
+        self.error_type = None
+        self.status_error = None
 
     def set_attribute(self, key, value):
+        try:
+            self.attributes[str(key)] = value
+        except Exception:
+            pass
         if self._real is not None:
             try:
                 self._real.set_attribute(key, value)
+            except Exception:
+                pass
+
+    def record_exception(self, exc):
+        """Record ``exc`` on the span (Next.js ``recordSpanError``).
+
+        Sets the ``error.type`` attribute and, for a real OTel span, the
+        exception event plus ERROR status. Idempotent: only the first
+        exception on a span is recorded. A no-op span keeps the error
+        type locally so tests can inspect it without OTel installed.
+        The status description is the exception class name only — the
+        message itself can carry request data and stays out of spans.
+        """
+        if self.error_type is not None:
+            return
+        self.error_type = type(exc).__name__
+        self.set_attribute("error.type", self.error_type)
+        if self._real is not None:
+            try:
+                self._real.record_exception(exc)
+            except Exception:
+                pass
+            self.set_status_error(self.error_type)
+
+    def set_status_error(self, message):
+        """Mark the span ERROR with ``message`` as the status description."""
+        self.status_error = str(message)
+        if self._real is not None:
+            try:
+                trace = importlib.import_module("opentelemetry.trace")
+                self._real.set_status(trace.Status(trace.StatusCode.ERROR, str(message)[:256]))
             except Exception:
                 pass
 
@@ -944,36 +1525,56 @@ def span(name, attributes=None, *, enabled=True):
     """Create a span named ``name`` when tracing is enabled and OTel is installed.
 
     Otherwise this is a no-op that still yields a span-like object, so
-    callers never need to branch on availability.
+    callers never need to branch on availability. An exception leaving
+    the body is recorded on the span (``error.type`` + ERROR status),
+    except cancellations, which are not errors.
+
+    Independent of OpenTelemetry, spans slower than the local trace
+    threshold (see :func:`configure_local_trace`) are appended to the
+    local trace file — that recording is off by default.
     """
     trace = _load_otel() if enabled else None
-    if trace is None:
-        yield _Span()
-        return
-    try:
-        tracer = trace.get_tracer("pynext")
-        context = _otel_context_var.get()
-        get_current = getattr(trace, "get_current_span", None)
-        if name != "pynext.request" and get_current is not None and get_current().get_span_context().is_valid:
-            context = None
-        cm = tracer.start_as_current_span(name, context=context) if context is not None else tracer.start_as_current_span(name)
-        real = cm.__enter__()
-    except Exception:
-        yield _Span()
-        return
-    wrapped = _Span(real)
+    real_cm = None
+    real = None
+    if trace is not None:
+        try:
+            tracer = trace.get_tracer("pynext")
+            context = _otel_context_var.get()
+            get_current = getattr(trace, "get_current_span", None)
+            if name != "pynext.request" and get_current is not None and get_current().get_span_context().is_valid:
+                context = None
+            real_cm = (tracer.start_as_current_span(name, context=context)
+                       if context is not None else tracer.start_as_current_span(name))
+            real = real_cm.__enter__()
+        except Exception:
+            real_cm = None
+            real = None
+    wrapped = _Span(real, name=name)
     for key, value in (attributes or {}).items():
         wrapped.set_attribute(key, value)
+    started = time.monotonic()
+    started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    error_type = None
     try:
         yield wrapped
-    except BaseException:
-        try:
-            cm.__exit__(*sys.exc_info())
-        except Exception:
-            pass
+    except BaseException as exc:
+        # Record the failure on the span (Next.js traceFn behaviour),
+        # except cancellations: a client that went away is not an error.
+        error_type = type(exc).__name__
+        if isinstance(exc, Exception):
+            wrapped.record_exception(exc)
+        if real_cm is not None:
+            try:
+                real_cm.__exit__(*sys.exc_info())
+            except Exception:
+                pass
         raise
     else:
-        try:
-            cm.__exit__(None, None, None)
-        except Exception:
-            pass
+        if real_cm is not None:
+            try:
+                real_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+    finally:
+        _record_local_span(name, started_at, (time.monotonic() - started) * 1000,
+                           dict(wrapped.attributes), error_type)

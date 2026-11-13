@@ -13,13 +13,15 @@ from . import _native
 from .app import _decode_path, _invoke, _split_request_path, _typed_params
 from .config import DEFAULT_CONFIG, effective_allowed_hosts
 from .errors import SignalError, digest_for_error
+from .cache import cache_control_header
 from .http import (MAX_WS_MESSAGE, BadRequest, Request, Response, StreamingResponse, WebSocket,
                    WebSocketDisconnect, _FALLBACK_CSRF_SIGNING_KEY, _RequestCancellation,
-                   apply_path_headers, apply_security_headers, ensure_shared_csrf_signing_key,
+                   apply_path_headers, apply_security_headers, build_headers,
+                   ensure_shared_csrf_signing_key,
                    filter_internal_headers, security_headers)
 from .mgmtplane import ManagementPlaneConfig
 from .observability import begin_request_context, get_request_id, queue_wait_var
-from .ratelimit import _is_exempt_path
+from .ratelimit import RateLimitUnavailable, _is_exempt_path
 from .standalone import log_bundle_info
 from .ws_origin import websocket_origin_allowed
 
@@ -497,6 +499,28 @@ def _trusted_proxy_strings(app):
     return tuple(str(network) for network in getattr(trust, "networks", ()))
 
 
+def _path_has_custom_route(custom_routes, path):
+    """True when any custom-route rule matches ``path`` (P1-4).
+
+    The native fast path serves static pages/assets without Python
+    dispatch, so it never applies custom routes (redirects, rewrites,
+    headers). A path matching any rule must fall through to the Python
+    bridge, which runs the same dispatch as ASGI. All rewrite phases
+    are checked: a beforeFiles rewrite changes what is served, and an
+    afterFiles/fallback rewrite that cannot apply (the file exists)
+    is still excluded — the bridge reaches the same result, only
+    without the fast-path shortcut.
+    """
+    if not custom_routes:
+        return False
+    if custom_routes.match_redirect(path) is not None:
+        return True
+    for phase in ("beforeFiles", "afterFiles", "fallback"):
+        if custom_routes.match_rewrite(path, phase) is not None:
+            return True
+    return bool(custom_routes.headers_for(path))
+
+
 def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_CONFIG.max_concurrent,
                  acquire_timeout_ms=DEFAULT_CONFIG.acquire_timeout_ms,
                  body_capacity=16, body_timeout_ms=10000, observability=None, *, reuse_port=False, listener=None,
@@ -675,11 +699,11 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_
                 if request_id and not any(k == b"x-request-id" for k, _ in response.headers):
                     response.headers.append((b"x-request-id", request_id.encode("ascii")))
             except BadRequest as exc:
-                log.info("Bad request: %s", exc)
+                log.info("Bad request", extra={"error_type": type(exc).__name__})
                 response = Response("Bad Request", status=400)
             except Exception as exc:
                 digest, _count = digest_for_error(exc)
-                log.exception("Request failed", extra={"error_digest": digest})
+                app.log_request_error(exc)
                 response = app.error_response(exc, digest=digest)
                 # error_response results bypass dispatch, so path headers
                 # are applied here; routed responses already have them.
@@ -821,10 +845,29 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_
     if limiter is not None:
         def rate_limit_callback(path, headers, peer_ip):
             headers = filter_internal_headers(headers)
+            # One observation per decision (P2-2), mirroring
+            # App._rate_limit_denied on ASGI. This runs on a Rust thread
+            # before dispatch, so only the counter is recorded here — the
+            # per-request log line / span cannot see it.
+            # The metrics endpoint bypasses the limiter when enabled, so
+            # a scraper is never throttled (same rule as the ASGI path).
+            if path == "/metrics" and app.observability_config.metrics_endpoint:
+                return True, None
             if _is_exempt_path(limiter, path):
+                app.metrics.observe_rate_limit("exempt")
                 return True, None
             key = limiter.key_for(peer_ip, headers)
-            return limiter.allow(key)
+            try:
+                allowed, retry_after = limiter.allow(key)
+            except RateLimitUnavailable:
+                app._report_rate_limit(limiter, refused=True)
+                raise
+            except Exception:
+                app.metrics.observe_rate_limit("error")
+                raise
+            app._report_rate_limit(limiter)
+            app.metrics.observe_rate_limit("allowed" if allowed else "denied")
+            return allowed, retry_after
 
     async def _ws_auth_decision(path, query, headers):
         # True allows the upgrade, False denies it (403), None is a
@@ -854,7 +897,30 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_
             future.cancel()
             return None
 
-    return _native.NativeServer(bridge, host, port, app.static_pages, app.public_assets, app.client_assets, app.isr.store, app.asset_etags,
+    # P1-4: the native fast path serves static pages/assets without
+    # Python dispatch, so it never applies custom routes. Paths
+    # matching any custom-route rule are left out of the fast-path
+    # tables (filtered copies; the app's own tables are untouched),
+    # so those requests fall through to the Python bridge, which runs
+    # the same dispatch as ASGI. Routes without custom routes keep
+    # the fast path. ISR-cache entries cannot be excluded per path
+    # from Python — a custom-routed ISR route served fresh from the
+    # native cache is a known remaining gap (needs a Rust-side
+    # exclusion list).
+    custom_routes = getattr(app, "custom_routes", None)
+    if custom_routes:
+        static_pages = {p: b for p, b in app.static_pages.items()
+                        if not _path_has_custom_route(custom_routes, p)}
+        public_assets = {p: v for p, v in app.public_assets.items()
+                         if not _path_has_custom_route(custom_routes, p)}
+        client_assets = {p: b for p, b in app.client_assets.items()
+                         if not _path_has_custom_route(custom_routes, p)}
+    else:
+        static_pages = app.static_pages
+        public_assets = app.public_assets
+        client_assets = app.client_assets
+
+    return _native.NativeServer(bridge, host, port, static_pages, public_assets, client_assets, app.isr.store, app.asset_etags,
                                 max_concurrent=max_concurrent, acquire_timeout_ms=acquire_timeout_ms,
                                 acquire_timeout_max_ms=acquire_timeout_max_ms,
                                 max_waiting=max_waiting,
@@ -879,6 +945,10 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_
                                 route_patterns=app.router.ordered_routes(),
                                 middleware_enabled=bool(app.middleware) or app.hot_reload,
                                 shared_cache_enabled=app.isr.shared is not None,
+                                isr_cache_control={
+                                    pattern: cache_control_header(policy)
+                                    for pattern, policy in app.isr_policies.items()
+                                },
                                 websocket_protocols=app.websocket_protocols,
                                 websocket_max_message=app.websocket_max_message, listener=listener,
                                 security_headers=security_headers(config=app.security,
@@ -895,15 +965,34 @@ def start_native(app, loop, host="127.0.0.1", port=3000, max_concurrent=DEFAULT_
                                 # behind it are enforced at request time by
                                 # the trust-resolved rate limiter.
                                 trusted_proxies=_trusted_proxy_strings(app),
-                                allowed_hosts=list(effective_allowed_hosts(allowed_hosts, host)))
+                                allowed_hosts=list(effective_allowed_hosts(allowed_hosts, host)),
+                                # The Rust layer serves static assets and
+                                # static HTML itself, so it needs the build
+                                # identity headers up front; bridge responses
+                                # already carry them from Python dispatch.
+                                build_headers=build_headers(
+                                    build_id=getattr(app, "build_id", None),
+                                    deployment_id=getattr(app, "deployment_id", None)),
+                                prefetch_stale_times=getattr(app, "prefetch_stale_times", {}))
+
+
+async def _warm_isr_in_background(app):
+    """Best-effort ISR warmup after the server starts listening.
+
+    Runs detached: requests are already being served, and a warmup
+    failure must never take the server down.
+    """
+    try:
+        await app.warm_isr_cache()
+    except Exception:
+        log.exception("ISR warmup failed")
 
 
 async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                 max_concurrent=DEFAULT_CONFIG.max_concurrent,
                 acquire_timeout_ms=DEFAULT_CONFIG.acquire_timeout_ms,
                 body_capacity=DEFAULT_CONFIG.body_capacity,
-                body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms, stop_event=None, observability=None, *,
-                reuse_port=False, on_ready=None, listener=None,
+                body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms, stop_event=None, observability=None, *,                reuse_port=False, on_ready=None, listener=None,
                 max_connections=DEFAULT_MAX_CONNECTIONS,
                 max_connections_per_ip=DEFAULT_MAX_CONNECTIONS_PER_IP,
                 max_concurrent_per_ip=DEFAULT_CONFIG.max_concurrent_per_ip,
@@ -920,7 +1009,7 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                 ws_idle_timeout_secs=DEFAULT_CONFIG.ws_idle_timeout_secs,
                 ws_max_lifetime_secs=DEFAULT_CONFIG.ws_max_lifetime_secs,
                 ws_ping_interval_secs=DEFAULT_CONFIG.ws_ping_interval_secs,
-                allowed_hosts=None):
+                allowed_hosts=None, warm_isr=False):
     """Run the native server until cancelled, or until ``stop_event`` is set.
 
     ``stop_event`` lets ``pynext dev`` stop the server cleanly and restart
@@ -980,6 +1069,7 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
     """
     await app.startup()
     server = None
+    warmup_task = None
     if stop_event is None:
         stop_event = asyncio.Event()
         if threading.current_thread() is threading.main_thread():
@@ -1012,7 +1102,19 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
                               ws_max_lifetime_secs=ws_max_lifetime_secs,
                               ws_ping_interval_secs=ws_ping_interval_secs,
                               allowed_hosts=allowed_hosts)
-        print(f"PyNext listening on http://{server.address}", flush=True)
+        # The build identity rides on the first log line, so an operator
+        # sees at a glance which build (and deployment) just started.
+        # It goes before the address so the address stays the last token.
+        listening = "PyNext listening"
+        build_id = getattr(app, "build_id", None)
+        if build_id is not None:
+            listening += f" (build {build_id}"
+            deployment_id = getattr(app, "deployment_id", None)
+            if deployment_id is not None:
+                listening += f", deployment {deployment_id}"
+            listening += ")"
+        listening += f" on http://{server.address}"
+        print(listening, flush=True)
         # S-P1-28 (M-19): a debug server bound to a non-loopback address
         # exposes detailed dev error pages to the network; warn at startup
         # and let the app suppress those pages while externally bound.
@@ -1024,10 +1126,19 @@ async def serve(app, host=DEFAULT_CONFIG.host, port=DEFAULT_CONFIG.port,
         # a Python/PyNext version mismatch) after the listening line so
         # the first line stays the address.
         log_bundle_info(getattr(app, "root", None))
+        print(f"PyNext listening on http://{server.address}", flush=True)
+        if warm_isr:
+            # Pre-fill the ISR cache in the background: the server is
+            # already listening, and requests that arrive mid-warmup
+            # take the normal miss path.
+            warmup_task = asyncio.create_task(_warm_isr_in_background(app))
         if on_ready is not None:
             on_ready(server.address)
         await stop_event.wait()
     finally:
+        if warmup_task is not None and not warmup_task.done():
+            warmup_task.cancel()
+            await asyncio.gather(warmup_task, return_exceptions=True)
         # Two-phase drain (C-P2-5): one shared shutdown budget starting
         # here. Every stage gets only what is left of it, so the whole
         # shutdown stays within shutdown_timeout instead of each stage

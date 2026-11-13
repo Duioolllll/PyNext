@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote_to_bytes
 
 from .forms import parse_form
-from .ws_origin import canonical_origin
+from .ws_origin import canonical_origin, parse_origin_pattern
 
 
 class BadRequest(Exception):
@@ -244,15 +244,20 @@ class SecurityConfig:
     once, before the 101 response, in :func:`pynext.ws_origin.websocket_origin_allowed`,
     and a denied handshake is answered HTTP 403 and logged (never a
     silent close). Allowlist semantics: ``websocket_allowed_origins``
-    holds exact serialized HTTP(S) origins — scheme, host and port all
-    take part in the comparison, with the default port implied
-    (``https://client.example`` matches ``:443`` and nothing else);
-    ``*``, ``null``, userinfo, paths, queries and fragments are
-    rejected as values, and a request carrying a duplicate or
-    unparseable ``Origin`` (or duplicate ``Host``) is denied. Without
-    an allowlist hit the origin must equal the request's effective
-    origin (``Host`` header, resolved through :class:`ProxyTrust` for
-    trusted proxies only). A missing ``Origin`` is denied unless
+    holds exact serialized HTTP(S) origins or wildcard patterns —
+    scheme, host and port all take part in the comparison, with the
+    default port implied (``https://client.example`` matches ``:443``
+    and nothing else); ``*`` matches exactly one DNS label
+    (``https://*.example.com``) and ``**`` — only as the leftmost
+    label — matches one or more leading labels
+    (``https://**.example.com``), and a pattern must keep at least two
+    literal labels, so ``https://*.com`` is rejected; ``null``,
+    userinfo, paths, queries and fragments are rejected as values,
+    and a request carrying a duplicate or unparseable ``Origin`` (or
+    duplicate ``Host``) is denied. Without an allowlist hit the origin
+    must equal the request's effective origin (``Host`` header,
+    resolved through :class:`ProxyTrust` for trusted proxies only). A
+    missing ``Origin`` is denied unless
     ``websocket_allow_missing_origin`` opts non-browser clients in
     explicitly. Origin checking does not replace authentication: the
     header is client-controlled and can be forged or omitted.
@@ -319,7 +324,7 @@ class SecurityConfig:
         if isinstance(self.websocket_allowed_origins, (str, bytes)):
             raise TypeError("websocket_allowed_origins must be a sequence of origins")
         self.websocket_allowed_origins = tuple(self.websocket_allowed_origins)
-        origin_keys = [canonical_origin(origin) for origin in self.websocket_allowed_origins]
+        origin_keys = [parse_origin_pattern(origin) for origin in self.websocket_allowed_origins]
         if any(origin is None for origin in origin_keys):
             raise ValueError("websocket_allowed_origins must contain valid HTTP(S) origins")
         key = self.csrf_signing_key
@@ -916,6 +921,40 @@ def content_security_policy(nonce=None, *, config=DEFAULT_SECURITY):
             f"; frame-ancestors {config.csp_frame_ancestors}")
 
 
+BUILD_ID_HEADER = b"x-pynext-build-id"
+DEPLOYMENT_ID_HEADER = b"x-pynext-deployment-id"
+
+
+def build_headers(*, build_id=None, deployment_id=None):
+    """Build-identity headers as ``(name, value)`` byte pairs.
+
+    ``X-PyNext-Build-Id`` names the build that produced the response;
+    ``X-PyNext-Deployment-Id`` names the deployment (rolling deploys)
+    when one is configured. A client holding an old HTML page can
+    compare these against a fresh API response to detect skew.
+    """
+    headers = []
+    if build_id is not None:
+        headers.append((BUILD_ID_HEADER, build_id.encode("ascii")))
+    if deployment_id is not None:
+        headers.append((DEPLOYMENT_ID_HEADER, deployment_id.encode("ascii")))
+    return headers
+
+
+def apply_build_headers(response, *, build_id=None, deployment_id=None):
+    """Add the build-identity headers to ``response`` (in place).
+
+    A header the response already carries wins and is never overwritten.
+    Idempotent: calling it twice, or on a response that already went
+    through dispatch, changes nothing. Returns the response for
+    call-site chaining.
+    """
+    for key, value in build_headers(build_id=build_id, deployment_id=deployment_id):
+        if not any(k == key for k, _ in response.headers):
+            response.headers.append((key, value))
+    return response
+
+
 def security_headers(*, config=DEFAULT_SECURITY, nonce=None, production=True):
     """Return the A1 default security headers as ``(name, value)`` byte pairs.
 
@@ -1177,6 +1216,12 @@ class PathHeaderRule:
     def matches(self, path):
         """True when this rule's source matches the decoded request ``path``."""
         return self._regex.fullmatch(path) is not None
+
+
+# A per-path header rule, either compiled or as a plain ``(source, headers)``
+# tuple (see :func:`compile_path_headers`). Mirrors the ``PathHeaderRuleInput``
+# alias in ``http.pyi`` so stubtest sees the name at runtime.
+PathHeaderRuleInput = PathHeaderRule | tuple[str, Mapping[str, str] | Iterable[tuple[str, str]]]
 
 
 class PathHeaders:
@@ -1576,6 +1621,14 @@ class Request:
             raise RequestCancelled("Request execution was cancelled")
 
     @property
+    def app(self):
+        """The :class:`App` this request is attached to (for
+        ``app.fetch_cache`` / ``app.revalidate`` from handlers)."""
+        if self._app is None:
+            raise RuntimeError("This request is not attached to an app")
+        return self._app
+
+    @property
     def resources(self):
         """Named application resources managed by the server lifespan."""
         if self._app is None:
@@ -1635,6 +1688,13 @@ class Request:
 
 
 class Response:
+    """A finished ("closing") response: the body is fully materialized.
+
+    Nothing more will ever be written to it — the stream is already closed
+    at construction time. Contrast :class:`StreamingResponse`, whose body
+    is still open (a "non-closing" stream) until its iterator ends.
+    """
+
     def __init__(self, body=b"", *, status=200, headers=(), media_type="text/plain; charset=utf-8",
                  csp_nonce=None):
         if not 100 <= status <= 599:
@@ -1680,7 +1740,16 @@ MAX_STREAM_CHUNK = 1_048_576
 
 
 class StreamingResponse(Response):
-    """A response produced by an asynchronous iterable, one bounded chunk at a time."""
+    """An open ("non-closing") response: chunks arrive from an async iterator.
+
+    The stream stays open until the iterator ends or :meth:`aclose` is
+    called — unlike :class:`Response`, whose body is complete at
+    construction. This is the "non-closing" side of the boundary Next.js
+    draws with ``createUnclosingStream``/``createClosingStream``: a tee
+    consumer (see ``_ISRStreamFeed`` in ``app.py``) must be given the
+    non-closing side so the producer can keep feeding the other consumer
+    after this stream ends.
+    """
 
     def __init__(self, content, *, status=200, headers=(), media_type="application/octet-stream"):
         if status < 200 or status in (204, 304):

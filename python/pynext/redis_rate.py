@@ -3,6 +3,7 @@ import hashlib
 import logging
 import math
 import os
+import time
 
 from .failure_policy import FAIL_CLOSED, FAIL_OPEN, normalize_failure_policy
 from .ratelimit import RateLimiter, RateLimitUnavailable, _IPV6_PREFIX_LEN, _MAX_BUCKETS
@@ -155,6 +156,12 @@ class RedisRateLimiter(RateLimiter):
         self.client = redis.Redis.from_url(url, socket_timeout=1, socket_connect_timeout=1)
         digest = hashlib.sha256(namespace.encode("utf-8")).hexdigest()
         self._base = f"pynext:rate:{{{digest}}}"
+        # Monotonic timestamp of the last Redis failure seen by allow(),
+        # or None when the last decision reached Redis. The transports
+        # read this to report rate-limit health to /readyz: under
+        # fail_open an outage is absorbed inside allow(), so without
+        # this marker a dead Redis would look healthy.
+        self.last_unavailable_at = None
 
     def allow(self, key, *, now=None):
         if now is not None:
@@ -167,11 +174,13 @@ class RedisRateLimiter(RateLimiter):
                                               max(1, math.ceil(self.window_seconds * 1000)),
                                               self.max_buckets, self.max_new_keys_per_window)
         except Exception as exc:
+            self.last_unavailable_at = time.monotonic()
             if self.failure_policy == FAIL_OPEN:
                 log.warning("Redis rate limiter unavailable; admitting request (fail_open)",
                             exc_info=True)
                 return True, None
             raise RateLimitUnavailable("Redis rate limiter unavailable") from exc
+        self.last_unavailable_at = None
         return bool(allowed), None if allowed else int(retry)
 
     def close(self):

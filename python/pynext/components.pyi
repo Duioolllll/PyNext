@@ -16,7 +16,9 @@ def page(*, render: Literal["ssr", "ssg", "isr"] = ..., revalidate: int | float 
          stale: int | None = ..., expire: int | float | None = ..., cache_life: str | None = ...,
          query_keys: Iterable[str] = ...,
          dynamic: Literal["auto", "error", "force-dynamic"] = ...,
-         tags: Iterable[str] = ...) -> Callable[[_F], _F]: ...
+         tags: Iterable[str] = ...,
+         fallback: Literal["not_found", "blocking", "prerender"] = ...,
+         dynamic_params: bool = ...) -> Callable[[_F], _F]: ...
 @overload
 def layout(fn: _F) -> _F: ...
 @overload

@@ -1387,6 +1387,29 @@ class SessionMiddleware:
         except Exception:
             log.debug("Could not delete an expired session entry", exc_info=True)
 
+    def _report_store(self, request, *, healthy):
+        """Report a shared session-store touch to ``/readyz`` health.
+
+        Only stores with a failure policy (Redis) are watched; local
+        stores have no backend to go down. A fail_closed outage counts
+        as a refused activation; under fail_open the outage is absorbed
+        inside the store, so it cannot be seen here and is not reported.
+        The request may not belong to an app (synthetic pre-flight), in
+        which case there is nothing to report to.
+        """
+        policy = getattr(self.store, "failure_policy", None)
+        if policy is None:
+            return
+        app = getattr(request, "_app", None)
+        health = getattr(app, "backend_health", None)
+        if health is None:
+            return
+        health.report("sessions", healthy=healthy, policy=policy)
+        if not healthy:
+            metrics = getattr(app, "metrics", None)
+            if metrics is not None:
+                metrics.observe_degraded("sessions", policy, "refused")
+
     async def __call__(self, request, call_next):
         self._ensure_purge_task()
         token = self._cookie(request)
@@ -1396,6 +1419,7 @@ class SessionMiddleware:
             # A fail_closed store reports the outage instead of serving
             # a request with no session state; fail_open stores never
             # raise here (they report a miss instead).
+            self._report_store(request, healthy=False)
             return Response("Session unavailable", status=503,
                             headers=[(b"retry-after", b"1"), (b"cache-control", b"no-store")])
         now = time.time()
@@ -1408,6 +1432,8 @@ class SessionMiddleware:
             log.info("Session expired: idle timeout reached; starting a fresh session")
             await self._best_effort_delete(token)
             loaded = None
+        if token is not None:
+            self._report_store(request, healthy=True)
         session = Session(*(loaded[:2]), token=token, version=loaded[2]) if loaded else Session()
         # Unknown timestamps (a third-party store without lifetime
         # metadata) mean "now": no lifetime is enforced for that store.
@@ -1446,6 +1472,7 @@ class SessionMiddleware:
                 try:
                     revoked = await self.store.delete(token_to_delete)
                 except SessionUnavailable:
+                    self._report_store(request, healthy=False)
                     return Response("Session unavailable", status=503,
                                     headers=[(b"retry-after", b"1"), (b"cache-control", b"no-store")])
                 if revoked is False:
@@ -1456,6 +1483,7 @@ class SessionMiddleware:
                     log.warning("Logout could not revoke the server session "
                                 "(fail_open); revocation is queued for recovery "
                                 "(%d pending)", len(pending))
+                self._report_store(request, healthy=True)
             self._set_cookie(response, "", 0)
         elif changed:
             old_token = session._token
@@ -1471,10 +1499,12 @@ class SessionMiddleware:
                 return Response("Session changed; retry the request", status=409,
                                 headers=[(b"cache-control", b"no-store")])
             except SessionUnavailable:
+                self._report_store(request, healthy=False)
                 if isinstance(response, StreamingResponse):
                     await response.aclose()
                 return Response("Session unavailable", status=503,
                                 headers=[(b"retry-after", b"1"), (b"cache-control", b"no-store")])
+            self._report_store(request, healthy=True)
             session._version = version
             session._last_seen = now
             # The cookie age is the idle timeout, not the remaining

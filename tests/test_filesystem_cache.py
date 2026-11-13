@@ -1,0 +1,513 @@
+"""Filesystem ISR cache backend (Next.js FileSystemCache-style).
+
+Covers the on-disk layout (``.body`` + ``.meta`` sidecar), version
+fencing, cross-process leases, variant generations, capacity eviction,
+and ISR integration. The multiprocessing test exercises the real
+cross-process path (``flock`` + lease files), not just two handles in
+one process.
+"""
+import asyncio
+import json
+import multiprocessing as mp
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from pynext import Response
+from pynext.cache import (
+    ISRCache,
+    FileSystemCacheBackend,
+    _fs_entry_name,
+)
+
+POLICY = {"revalidate": 30.0, "stale": 60.0}
+
+
+def _meta_for(backend, key):
+    name = _fs_entry_name(key)
+    return json.loads((Path(backend.path) / "entries" / (name + ".meta")).read_text(encoding="utf-8"))
+
+
+def _body_for(backend, key):
+    name = _fs_entry_name(key)
+    return (Path(backend.path) / "entries" / (name + ".body")).read_bytes()
+
+
+def test_entry_name_is_safe_and_collision_free():
+    assert "/" not in _fs_entry_name("/news/../etc/passwd")
+    assert ".." not in _fs_entry_name("../../../etc/passwd").split("-")[0]
+    assert _fs_entry_name("a/b") != _fs_entry_name("a:b")
+    assert _fs_entry_name("a/b") != _fs_entry_name("a_b")
+    assert "news_hello" in _fs_entry_name("build:abc:/news/hello")
+
+
+def test_key_collision_never_serves_another_path_body(tmp_path, monkeypatch):
+    """Two keys on one file stem must never serve each other's body.
+
+    The stem is ``{slug}-{digest[:16]}`` (64-bit digest), so a collision
+    is possible in principle. The stored meta ``key`` is the tie-breaker:
+    a lookup for a key whose meta names another key is a miss, and a
+    write for the colliding key starts fresh instead of inheriting the
+    other key's version.
+    """
+    backend = FileSystemCacheBackend(tmp_path)
+    monkeypatch.setattr("pynext.cache._fs_entry_name", lambda key: "collided-stem")
+    assert backend.insert("/news/a", b"<p>A</p>", 30.0, 60.0) is True
+    # A different key on the same stem must not see A's body.
+    assert backend.lookup("/news/b") == ("miss", None)
+    assert backend.lookup_entry("/news/b") is None
+    assert backend.lookup("/news/a") == ("fresh", b"<p>A</p>")
+    # A fenced write for B with version 0 (no entry) must succeed even
+    # though the file holds A's version-1 entry.
+    assert backend.insert_fenced("/news/b", b"<p>B</p>", 30.0, 60.0, 0) is True
+    assert backend.lookup("/news/b") == ("fresh", b"<p>B</p>")
+    # Now A must miss — B's write replaced the shared slot — and must
+    # never read B's body.
+    assert backend.lookup("/news/a") == ("miss", None)
+    assert backend.lookup_entry("/news/a") is None
+
+
+def test_key_collision_remove_keeps_other_key(tmp_path, monkeypatch):
+    backend = FileSystemCacheBackend(tmp_path)
+    monkeypatch.setattr("pynext.cache._fs_entry_name", lambda key: "collided-stem")
+    assert backend.insert("/news/a", b"<p>A</p>", 30.0, 60.0) is True
+    # Removing a different key on the same stem must not delete A's entry.
+    assert backend.remove("/news/b") is False
+    assert backend.lookup("/news/a") == ("fresh", b"<p>A</p>")
+    # Removing the owning key still works.
+    assert backend.remove("/news/a") is True
+    assert backend.lookup("/news/a") == ("miss", None)
+
+
+def test_key_collision_lease_is_per_key(tmp_path, monkeypatch):
+    backend = FileSystemCacheBackend(tmp_path)
+    monkeypatch.setattr("pynext.cache._fs_entry_name", lambda key: "collided-stem")
+    assert backend.acquire_lease("/news/a", "worker-a") == 0
+    # A different key on the same stem must not see A's lease.
+    assert backend.owns_lease("/news/b", "worker-a") is False
+    assert backend.acquire_lease("/news/b", "worker-b") == 0
+    assert backend.owns_lease("/news/b", "worker-b") is True
+    # B's lease replaced the shared slot, so A no longer holds one.
+    assert backend.owns_lease("/news/a", "worker-a") is False
+    # And B cannot release a lease it does not own.
+    assert backend.release_lease("/news/b", "worker-a") is False
+    assert backend.release_lease("/news/b", "worker-b") is True
+
+
+def _race_write(backend, key, body, observe):
+    """Run ``observe()`` while a write is paused just after publishing
+    the body (meta not yet written). Returns ``(blocked, reader, writer)``:
+    whether the observation was still blocked 0.3s after it started,
+    the observation outcome, and the writer outcome. The observation
+    runs in its own thread because, once reads are serialized with
+    writes, it legitimately blocks until the writer finishes.
+    """
+    body_written, resume = threading.Event(), threading.Event()
+    atomic = backend._atomic_write
+    writer_outcome = {}
+    reader_outcome = {}
+
+    def paused(path, data):
+        atomic(path, data)
+        if str(path).endswith(".body"):
+            body_written.set()
+            if not resume.wait(10):
+                raise RuntimeError("reader timed out")
+
+    def writer():
+        try:
+            writer_outcome["insert"] = backend.insert_fenced(key, body, 60, 0, None)
+        except BaseException as exc:  # noqa: BLE001
+            writer_outcome["error"] = repr(exc)
+
+    def reader():
+        try:
+            reader_outcome["result"] = observe()
+        except BaseException as exc:  # noqa: BLE001
+            reader_outcome["error"] = repr(exc)
+
+    backend._atomic_write = paused
+    worker = threading.Thread(target=writer)
+    worker.start()
+    try:
+        assert body_written.wait(10), "writer timed out"
+        looker = threading.Thread(target=reader)
+        looker.start()
+        time.sleep(0.3)
+        blocked = looker.is_alive()
+        resume.set()
+        worker.join(10)
+        looker.join(10)
+    finally:
+        backend._atomic_write = atomic
+    assert not worker.is_alive() and not looker.is_alive()
+    return blocked, reader_outcome, writer_outcome
+
+
+def test_lookup_during_write_waits_for_atomic_publish(tmp_path):
+    """A read landing mid-write must wait, not observe a torn entry.
+
+    P1-2: the body is published before the meta, so a lock-free read
+    between the two renames saw a body without a meta, deleted it as
+    a torn write, and the writer still reported success — the entry
+    was lost. Reads now take the same lock the writer holds, so the
+    read waits and then sees the complete new version.
+    """
+    backend = FileSystemCacheBackend(tmp_path)
+    blocked, reader, writer = _race_write(
+        backend, "/new", b"new-body", lambda: backend.lookup("/new"))
+    assert blocked, "lookup must block while the writer holds the lock"
+    assert writer.get("insert") is True
+    assert reader.get("result") == ("fresh", b"new-body")
+    assert backend.lookup("/new") == ("fresh", b"new-body")
+
+
+def test_lookup_during_colliding_write_never_serves_other_key_body(tmp_path, monkeypatch):
+    """A read racing a colliding write must never serve the other key's body.
+
+    P1-2: with two keys on one file stem, a read for Alice landing
+    after Bob's body rename but before Bob's meta rename returned
+    Bob's body as Alice's (the meta still named Alice). Reads now
+    wait for the write to finish, so Alice sees a miss once Bob's
+    meta lands — never Bob's body.
+    """
+    backend = FileSystemCacheBackend(tmp_path)
+    monkeypatch.setattr("pynext.cache._fs_entry_name", lambda key: "collided-stem")
+    assert backend.insert("/alice", b"alice-body", 60, 0) is True
+    blocked, reader, writer = _race_write(
+        backend, "/bob", b"bob-body", lambda: backend.lookup("/alice"))
+    assert blocked, "lookup must block while the writer holds the lock"
+    assert writer.get("insert") is True
+    assert reader.get("result") == ("miss", None)
+    assert backend.lookup("/alice") == ("miss", None)
+    assert backend.lookup("/bob") == ("fresh", b"bob-body")
+
+
+def test_backend_lock_is_reentrant_in_one_thread(tmp_path):
+    """A nested _locked() hold in one thread must not self-deadlock.
+
+    flock on a fresh fd would block against the outer hold from the
+    same process, so the nested case yields instead of re-taking it.
+    """
+    backend = FileSystemCacheBackend(tmp_path)
+    with backend._locked():
+        with backend._locked():
+            assert backend.insert("/page", b"x", 30.0, 60.0) is True
+    assert backend.lookup("/page") == ("fresh", b"x")
+
+
+def test_insert_lookup_fresh_stale_expired(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path)
+    assert backend.lookup("/page") == ("miss", None)
+    assert backend.lookup_entry("/page") is None
+    # Generous TTLs: the old 0.2s values were flaky on loaded CI/VM
+    # runners, where scheduling delay between insert and lookup could
+    # already push the entry past fresh (same pattern as the SQLite
+    # TTL test). Stale window is 1.0–3.0s, expired after 3.0s.
+    assert backend.insert("/page", b"<p>hi</p>", 1.0, 2.0) is True
+    assert backend.lookup("/page") == ("fresh", b"<p>hi</p>")
+    entry = backend.lookup_entry("/page")
+    assert entry.status == "fresh" and entry.version == 1
+    assert 0.0 < entry.fresh_remaining <= 1.0
+    time.sleep(1.5)
+    assert backend.lookup("/page") == ("stale", b"<p>hi</p>")
+    time.sleep(2.0)
+    assert backend.lookup("/page") == ("expired", None)
+    # An expired lookup deletes the entry files.
+    assert not (Path(backend.path) / "entries").exists() or not list(
+        (Path(backend.path) / "entries").glob("*.meta")
+    )
+
+
+def test_meta_sidecar_is_human_readable(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path)
+    assert backend.insert("/news/hello", b"<p>hi</p>", 30.0, 60.0) is True
+    meta = _meta_for(backend, "/news/hello")
+    assert meta["key"] == "/news/hello"
+    assert meta["version"] == 1
+    assert meta["fresh_for"] == 30.0 and meta["stale_for"] == 60.0
+    assert meta["generated_at"] > 0 and meta["generated_mono"] > 0
+    assert _body_for(backend, "/news/hello") == b"<p>hi</p>"
+    assert "news_hello" in next((Path(backend.path) / "entries").glob("*.meta")).name
+
+
+def test_entry_age_uses_the_surviving_clock(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path)
+    meta = {"generated_at": 1000.0, "generated_mono": 500.0}
+    # Both clocks agree: age 10.
+    assert backend._entry_age(meta, 1010.0, 510.0) == pytest.approx(10.0)
+    # Wall clock jumped forward: monotonic age wins.
+    assert backend._entry_age(meta, 2000.0, 510.0) == pytest.approx(10.0)
+    # Wall clock jumped backward: monotonic age wins.
+    assert backend._entry_age(meta, 900.0, 510.0) == pytest.approx(10.0)
+    # Monotonic clock reset (reboot): wall age wins.
+    assert backend._entry_age(meta, 1010.0, 10.0) == pytest.approx(10.0)
+
+
+def test_version_fencing(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path)
+    assert backend.insert_fenced("/page", b"v1", 30.0, 60.0, 0) is True
+    # Stale expected version: rejected, old body kept.
+    assert backend.insert_fenced("/page", b"v2", 30.0, 60.0, 0) is False
+    assert backend.lookup("/page") == ("fresh", b"v1")
+    # Correct version: accepted, version bumps.
+    assert backend.insert_fenced("/page", b"v2", 30.0, 60.0, 1) is True
+    assert backend.lookup("/page") == ("fresh", b"v2")
+    assert _meta_for(backend, "/page")["version"] == 2
+    # Unfenced insert bumps the version too.
+    assert backend.insert("/page", b"v3", 30.0, 60.0) is True
+    assert _meta_for(backend, "/page")["version"] == 3
+    # Expected version for a missing entry must be 0.
+    assert backend.insert_fenced("/other", b"x", 30.0, 60.0, 7) is False
+    assert backend.lookup("/other") == ("miss", None)
+
+
+def test_invalid_durations_and_sizes_are_rejected(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path)
+    assert backend.insert("/page", b"x", 0.0, 60.0) is False
+    assert backend.insert("/page", b"x", -1.0, 60.0) is False
+    assert backend.insert("/page", b"x", 30.0, -1.0) is False
+    assert backend.insert("/page", b"x", float("nan"), 60.0) is False
+    # Over the one-year lifetime cap (HEAD MAX_CACHE_SECONDS); the branch
+    # was written against the old 7-day cap, so 999_999s used to be over it.
+    assert backend.insert("/page", b"x", 30.0, 40_000_000.0) is False
+    assert backend.lookup("/page") == ("miss", None)
+
+
+def test_lease_excludes_other_workers_and_fences_writes(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path)
+    owner_a = "worker-a"
+    version = backend.acquire_lease("/page", owner_a)
+    assert version == 0
+    # A second worker cannot take the lease while it is live.
+    assert backend.acquire_lease("/page", "worker-b") is None
+    assert backend.owns_lease("/page", owner_a) is True
+    assert backend.owns_lease("/page", "worker-b") is False
+    # A write without the lease owner is fenced out.
+    assert backend.insert_fenced("/page", b"x", 30.0, 60.0, 0, owner="worker-b") is False
+    # The owner writes under its lease.
+    assert backend.insert_fenced("/page", b"x", 30.0, 60.0, 0, owner=owner_a) is True
+    # Only the owner can release.
+    assert backend.release_lease("/page", "worker-b") is False
+    assert backend.owns_lease("/page", owner_a) is True
+    assert backend.release_lease("/page", owner_a) is True
+    assert backend.owns_lease("/page", owner_a) is False
+    assert backend.acquire_lease("/page", "worker-b") == 1
+
+
+def test_expired_lease_can_be_taken_over(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path)
+    # Generous TTL: the old 0.1s TTL with a 0.15s sleep was flaky on
+    # loaded runners (same pattern as the TTL tests above).
+    assert backend.acquire_lease("/page", "worker-a", ttl=1.0) == 0
+    assert backend.acquire_lease("/page", "worker-b") is None
+    time.sleep(1.5)
+    assert backend.acquire_lease("/page", "worker-b") == 0
+    assert backend.owns_lease("/page", "worker-b") is True
+
+
+def test_expired_entry_survives_while_leased(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path)
+    owner = "worker-a"
+    assert backend.acquire_lease("/page", owner, ttl=30.0) == 0
+    # Generous TTLs: the old 0.1s/0.1s with a 0.25s sleep left only a
+    # 0.05s margin past expiry — flaky on loaded runners.
+    assert backend.insert_fenced("/page", b"x", 1.0, 1.0, 0, owner=owner) is True
+    time.sleep(2.5)
+    # The lease is live, so the expired entry is reported but not deleted.
+    assert backend.lookup("/page") == ("expired", None)
+    assert (Path(backend.path) / "entries" / (_fs_entry_name("/page") + ".meta")).exists()
+    assert backend.release_lease("/page", owner) is True
+    # With the lease gone, the next lookup deletes it.
+    assert backend.lookup("/page") == ("expired", None)
+    assert not (Path(backend.path) / "entries" / (_fs_entry_name("/page") + ".meta")).exists()
+
+
+def test_remove_deletes_entry_and_lease(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path)
+    assert backend.insert("/page", b"x", 30.0, 60.0) is True
+    assert backend.acquire_lease("/page", "worker-a") == 1
+    assert backend.remove("/page") is True
+    assert backend.lookup("/page") == ("miss", None)
+    assert backend.owns_lease("/page", "worker-a") is False
+    assert backend.remove("/page") is False
+
+
+def test_body_without_meta_is_a_miss_and_is_cleaned_up(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path)
+    name = _fs_entry_name("/page")
+    entries = Path(backend.path) / "entries"
+    (entries / (name + ".body")).write_bytes(b"<p>torn</p>")
+    assert backend.lookup("/page") == ("miss", None)
+    assert not (entries / (name + ".body")).exists()
+
+
+def test_corrupt_meta_is_a_miss(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path)
+    assert backend.insert("/page", b"x", 30.0, 60.0) is True
+    name = _fs_entry_name("/page")
+    (Path(backend.path) / "entries" / (name + ".meta")).write_text("{not json", encoding="utf-8")
+    assert backend.lookup("/page") == ("miss", None)
+
+
+def test_variant_generation(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path)
+    token, existed = backend.variant_generation("/news")
+    assert token and existed is False
+    token2, existed2 = backend.variant_generation("/news")
+    assert token2 == token and existed2 is True
+    token3, existed3 = backend.variant_generation("/news", invalidate=True)
+    assert token3 != token and existed3 is True
+    token4, _ = backend.variant_generation("/news")
+    assert token4 == token3
+
+
+def test_capacity_evicts_oldest_first(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path, max_entries=3)
+    for index in range(4):
+        assert backend.insert(f"/page-{index}", b"x", 30.0, 60.0) is True
+        time.sleep(0.01)
+    names = {path.name for path in (Path(backend.path) / "entries").glob("*.meta")}
+    assert len(names) == 3
+    assert (_fs_entry_name("/page-3") + ".meta") in names
+    assert (_fs_entry_name("/page-0") + ".meta") not in names
+    assert backend.lookup("/page-0") == ("miss", None)
+    assert backend.lookup("/page-3") == ("fresh", b"x")
+
+
+def test_capacity_evicts_by_bytes(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path, max_entries=100, max_bytes=10)
+    assert backend.insert("/a", b"12345", 30.0, 60.0) is True
+    assert backend.insert("/b", b"12345", 30.0, 60.0) is True
+    time.sleep(0.01)
+    assert backend.insert("/c", b"12345", 30.0, 60.0) is True
+    assert backend.lookup("/c") == ("fresh", b"12345")
+    remaining = [path.name for path in (Path(backend.path) / "entries").glob("*.meta")]
+    assert len(remaining) <= 2
+
+
+def test_capacity_never_evicts_leased_entries(tmp_path):
+    backend = FileSystemCacheBackend(tmp_path, max_entries=2)
+    assert backend.insert("/a", b"x", 30.0, 60.0) is True
+    assert backend.acquire_lease("/a", "worker-a", ttl=30.0) == 1
+    assert backend.insert("/b", b"x", 30.0, 60.0) is True
+    assert backend.insert("/c", b"x", 30.0, 60.0) is True
+    assert backend.lookup("/a") == ("fresh", b"x")
+
+
+def test_constructor_rejects_a_file_path(tmp_path):
+    target = tmp_path / "cache-file"
+    target.write_bytes(b"not a dir")
+    with pytest.raises(ValueError):
+        FileSystemCacheBackend(target)
+    with pytest.raises(ValueError):
+        FileSystemCacheBackend(tmp_path, max_entries=0)
+    with pytest.raises(ValueError):
+        FileSystemCacheBackend(tmp_path, max_bytes=0)
+
+
+def _child_hold_lease(cache_dir, ready, release):
+    from pynext.cache import FileSystemCacheBackend
+
+    backend = FileSystemCacheBackend(cache_dir)
+    assert backend.acquire_lease("/shared", "child", ttl=30.0) == 0
+    assert backend.insert_fenced("/shared", b"from-child", 30.0, 60.0, 0, owner="child") is True
+    try:
+        ready.set()
+        assert release.wait(timeout=10), "parent did not release the lease holder"
+    finally:
+        backend.release_lease("/shared", "child")
+
+
+def test_cross_process_lease_and_visibility(tmp_path):
+    ctx = mp.get_context("spawn")
+    ready, release = ctx.Event(), ctx.Event()
+    proc = ctx.Process(target=_child_hold_lease, args=(str(tmp_path), ready, release))
+    proc.start()
+    try:
+        assert ready.wait(timeout=10), "child did not acquire its lease"
+        backend = FileSystemCacheBackend(tmp_path)
+        # The child's lease blocks this process, and the child's entry
+        # is already visible here.
+        assert backend.acquire_lease("/shared", "parent") is None
+        assert backend.lookup("/shared") == ("fresh", b"from-child")
+        # A write claiming a lease this process does not hold is fenced
+        # out. (An ownerless write checks only the version, exactly like
+        # the SQLite backend; ISR generations always pass their owner.)
+        assert backend.insert_fenced("/shared", b"from-parent", 30.0, 60.0, 1, owner="parent") is False
+        assert backend.lookup("/shared") == ("fresh", b"from-child")
+        # A different key is unaffected by the child's lease.
+        assert backend.insert("/other", b"ok", 30.0, 60.0) is True
+    finally:
+        release.set()
+        proc.join(timeout=10)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=10)
+        assert proc.exitcode == 0
+
+
+async def _render_ok():
+    return Response(b"<p>ok</p>")
+
+
+def test_isr_cache_integration(tmp_path):
+    async def run():
+        cache = ISRCache(cache_backend="filesystem", cache_path=str(tmp_path))
+        try:
+            calls = []
+
+            async def render():
+                calls.append(1)
+                return Response(b"<p>ok</p>")
+
+            assert await cache.get_or_render("/page", POLICY, render) == b"<p>ok</p>"
+            assert await cache.get_or_render("/page", POLICY, render) == b"<p>ok</p>"
+            assert len(calls) == 1
+            assert await cache.invalidate("/page") is True
+            assert await cache.get_or_render("/page", POLICY, render) == b"<p>ok</p>"
+            assert len(calls) == 2
+        finally:
+            await cache.close()
+
+    asyncio.run(run())
+
+
+def test_isr_cache_reopen_after_close(tmp_path):
+    async def run():
+        cache = ISRCache(cache_backend="filesystem", cache_path=str(tmp_path))
+        try:
+            assert await cache.get_or_render("/page", POLICY, _render_ok) == b"<p>ok</p>"
+        finally:
+            await cache.close()
+        # A fresh instance on the same directory still sees the entry:
+        # it survived on disk, not just in the first process's memory.
+        cache2 = ISRCache(cache_backend="filesystem", cache_path=str(tmp_path))
+        try:
+            calls = []
+
+            async def render():
+                calls.append(1)
+                return Response(b"<p>ok</p>")
+
+            assert await cache2.get_or_render("/page", POLICY, render) == b"<p>ok</p>"
+            assert calls == []
+        finally:
+            await cache2.close()
+        # open() after close() also restores the shared store.
+        cache.open()
+        try:
+            assert cache.shared is not None
+        finally:
+            await cache.close()
+
+    asyncio.run(run())
+
+
+def test_isr_cache_requires_cache_path():
+    with pytest.raises(ValueError, match="cache_path is required"):
+        ISRCache(cache_backend="filesystem")
+    with pytest.raises(ValueError, match="Unknown cache backend"):
+        ISRCache(cache_backend="disk")

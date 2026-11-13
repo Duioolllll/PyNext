@@ -38,6 +38,9 @@ def test_discovery_uses_posix_project_relative_paths(tmp_path):
     assert manifest["routes"]["/blog/[slug]"] == {
         "entry": "app/blog/[slug]/page.py", "kind": "page",
         "layouts": ["app/layout.py", "app/blog/layout.py"],
+        # Boundary slots are part of the discovery schema even when absent.
+        # Keep exact-dict equality to catch both omitted and unexpected keys.
+        "error": None, "loading": None, "not_found": None,
     }
     assert set(manifest["sources"]) == {
         "app/blog/[slug]/page.py", "app/layout.py", "app/blog/layout.py",

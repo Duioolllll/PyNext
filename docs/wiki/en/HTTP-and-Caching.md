@@ -28,7 +28,7 @@ The built public assets, SSG output, and JS island bundles support content-deriv
 
 ## ISR boundaries
 
-The bounded ISR cache uses single-flight regeneration. The default `memory` backend is process-local; the `sqlite` and `redis` backends share entries across workers with expiring leases and fenced writes, so another worker's invalidation is observed on the next lookup while the store is available (local fallback during an outage may be stale). The SQLite backend measures entry lifetimes with a monotonic clock (a wall-clock jump can neither resurrect an expired entry nor kill a fresh one) and bounds the table to 10,000 entries / 128 MiB by default (tunable via `sqlite_max_entries` / `sqlite_max_bytes`), dropping expired rows and evicting the oldest entries on insert. Fresh anonymous cache hits can bypass Python; stale entries may be served during background regeneration. `Cookie` or `Authorization` bypass the shared cache. Invalidate through `await request.revalidate("/news/example")` or `await app.revalidate(path)`, after authenticating the API caller. `revalidate(path, type="page")` invalidates every cached entry for a dynamic route pattern such as `"/news/[slug]"` (a dynamic pattern without `type` only warns and invalidates nothing), and `revalidate(path, type="layout")` invalidates every ISR page using the layout defined at `path` (`"/"` is the root layout, so it covers all pages). `"/"` and `"/index"` are aliases.
+The bounded ISR cache uses single-flight regeneration. The default `memory` backend is process-local; the `sqlite`, `redis`, and `filesystem` backends share entries across workers with expiring leases and fenced writes, so another worker's invalidation is observed on the next lookup while the store is available (local fallback during an outage may be stale). The SQLite backend measures entry lifetimes with a monotonic clock (a wall-clock jump can neither resurrect an expired entry nor kill a fresh one) and bounds the table to 10,000 entries / 128 MiB by default (tunable via `sqlite_max_entries` / `sqlite_max_bytes`), dropping expired rows and evicting the oldest entries on insert. Fresh anonymous cache hits can bypass Python; stale entries may be served during background regeneration. `Cookie` or `Authorization` bypass the shared cache. Invalidate through `await request.revalidate("/news/example")` or `await app.revalidate(path)`, after authenticating the API caller. `revalidate(path, type="page")` invalidates every cached entry for a dynamic route pattern such as `"/news/[slug]"` (a dynamic pattern without `type` only warns and invalidates nothing), and `revalidate(path, type="layout")` invalidates every ISR page using the layout defined at `path` (`"/"` is the root layout, so it covers all pages). `"/"` and `"/index"` are aliases.
 
 
 Tag-based invalidation groups pages by the data they depend on instead of by path. Declare tags on an ISR page with `@page(render="isr", revalidate=30, stale=60, tags=("post:42", "author:7"))` (at most 64 tags per page; a tag is 1–256 characters from `[A-Za-z0-9:_-./]`). Call `await app.revalidate_tag("post:42")` to expire every entry carrying that tag at once, or `await app.revalidate_tag("post:42", expire=60)` to keep entries merely stale — served once more while a regeneration runs — for 60 seconds before they expire. Entries generated after the call are unaffected, and with the `sqlite`/`redis` backends the invalidation is stored in the shared store so other workers see it (the `memory` backend is process-local). Changing a page's tags requires a rebuild in production.
@@ -41,6 +41,46 @@ An ISR page can opt out of time-based expiry with `@page(render="isr", revalidat
 
 External systems can trigger the same invalidations over HTTP: `POST /_pynext/revalidate` with `{"paths": [...], "tags": [...], "type": "page"|"layout", "expire": 60}`. The endpoint is disabled (404) unless a secret is configured — pass `revalidate_secret=` to `create_app()` or set `PYNEXT_REVALIDATE_SECRET` — and otherwise requires `Authorization: Bearer <secret>`. Every target is validated before anything is invalidated, so a bad request changes nothing.
 
+ISR responses carry a policy-based `Cache-Control` header so a CDN in front of PyNext can serve stale while revalidating: `public, s-maxage={revalidate}` plus `stale-while-revalidate={stale}` when the page's SWR window is non-zero (a port of Next.js `getCacheControlHeader` for the two-axis `{revalidate, stale}` policy). The header is set on first-generation, fresh-hit, stale-serve and streaming ISR responses, including native fresh hits served directly from the L1 cache. Private (cookie/authorization) responses still use `private, no-store`.
+
+If a stale regeneration fails, the previous entry is retained with its fresh window clamped to 3..30 seconds and its stale window kept at at least 3 seconds (Next.js `retainPreviousCacheEntry`), so the previous body keeps serving while the next retry breathes instead of every request paying for a slow blocking render once the original stale window expires. A first-generation failure has no previous entry to retain and still surfaces as a 500.
+
+## Fetch/data cache and per-request memoization
+
+Page handlers fetch upstream data through `pynext.fetch_cached(url, fetcher, ...)`
+(or `request.app.fetch_cache.get_or_fetch(...)` from API handlers, where
+`request` is available). `fetcher` is an async callable returning a
+`FetchResult` — `pynext.urllib_fetcher` for real HTTP, or a stub in tests.
+
+- **Cache key**: `sha256(url without fragment, method, headers, body)`.
+  `Authorization`, `Cookie`, `Proxy-Authorization` and `Set-Cookie` headers
+  are excluded from the key, so a cached response is never served to a
+  different credential. The body is type-tagged (`str:`/`bytes:`/form
+  fields), so `["a", "b"]` and `["a,b"]` cannot collide.
+- **Policy** (`resolve_fetch_policy`, adapted from Next.js `patch-fetch.ts`):
+  an explicit `revalidate` (seconds, or `False` = infinite) wins;
+  `cache="force-cache"` without `revalidate` means infinite;
+  `cache="no-store"`/`"no-cache"` means never store; with no explicit
+  setting, an `Authorization`/`Cookie` header or a non-GET/HEAD method
+  means never store (auto-no-cache, disabled with `build_time=True`
+  during prerender); otherwise the caller's `default_revalidate` (a
+  page's ISR `revalidate` when known, else infinite) applies.
+  Conflicting options (`force-cache` + `revalidate=0`,
+  `no-store` + `revalidate > 0`) warn and are both dropped.
+- **Storage**: entries live in the ISR backends (memory / SQLite / Redis)
+  under separate `\0fetch:` keys. Only 2xx responses are stored, fresh
+  for `revalidate` seconds (`False` maps to the 7-day backend maximum);
+  there is no stale-while-revalidate window — an expired entry is
+  refetched synchronously. Bodies over 2 MiB are served but not stored.
+  Concurrent requests for the same key in one process share one upstream
+  fetch; `await fetch_cache.invalidate(url, ...)` removes one entry.
+- **Per-request memoization**: every request runs inside a fresh memo
+  (`pynext.memoize(key, compute)` / `memoize_sync`), so a layout and its
+  page reading the same data — or two identical DB queries in one handler
+  — compute once, with no TTL and no cross-request sharing. `fetch_cached`
+  results are memoized too, including `no-store` ones. In-request
+  invalidation (`App.revalidate` / `Request.revalidate`) clears the whole
+  memo, so a read after a mutation never sees pre-mutation data.
 ## Safety notes
 
 The native adapter can return 504 after a Python request timeout, but an already-running synchronous function may continue. Always add DB deadlines and idempotency for state-changing operations. This framework is still experimental; see [Deployment and security](Deployment-and-Security.md).

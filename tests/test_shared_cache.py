@@ -287,10 +287,13 @@ def test_shared_cache_failure_preserves_old_entry(tmp_path):
                 raise RuntimeError("generation failed")
 
             # The stale entry is served while regeneration fails, and the
-            # failed generation does not replace it.
+            # failed generation does not replace the body: the previous
+            # entry is retained as fresh for the clamped revalidate
+            # (3..30s), so the next retry breathes instead of running on
+            # every request once the original stale window expires.
             assert await cache.get_or_render("/old", POLICY, failing_render) == b"<p>old</p>"
             await _until(lambda: "/old" not in cache._inflight)
-            assert cache.shared.lookup("/old") == ("stale", b"<p>old</p>")
+            assert cache.shared.lookup("/old") == ("fresh", b"<p>old</p>")
         finally:
             await cache.close()
     asyncio.run(run())

@@ -286,6 +286,27 @@ def test_cli_accepts_boundary_limits(tmp_path, monkeypatch):
                     ("serve", app, "127.0.0.1", 3000, 1, 0, 1, 0, 30, None)]
 
 
+def test_cli_warm_isr_reaches_serve(tmp_path, monkeypatch):
+    root = tmp_path.resolve()
+    seen = []
+    app = object()
+    monkeypatch.setattr(cli, "create_app", lambda path, production, cache_backend="memory", cache_path=None,
+                        rate_limit=None, **kwargs:
+                        seen.append(("app", path, production, cache_backend, cache_path)) or app)
+
+    async def serve(received_app, host, port, max_concurrent, acquire_timeout_ms,
+                   body_capacity, body_timeout_ms, shutdown_timeout=30, max_waiting=None,
+                   warm_isr=False):
+        seen.append(("serve", received_app, host, port, warm_isr))
+
+    monkeypatch.setattr(cli, "serve", serve)
+    # C-P0-1: pin single-process; the default now takes the supervisor path.
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--dir", str(root), "--workers", "1",
+                                      "--warm-isr"])
+    cli.main()
+    assert seen[1] == ("serve", app, "127.0.0.1", 3000, True)
+
+
 def test_cli_max_waiting_reaches_serve(tmp_path, monkeypatch):
     root = tmp_path.resolve()
     seen = []
@@ -311,7 +332,9 @@ def test_cli_max_waiting_reaches_serve(tmp_path, monkeypatch):
 def test_cli_builds_and_starts_with_requested_settings(tmp_path, monkeypatch, capsys):
     root = tmp_path.resolve()
     seen = []
-    monkeypatch.setattr(cli, "write_manifest", lambda path, **kwargs: seen.append(("build", path)) or {"routes": {"/": {}}})
+    monkeypatch.setattr(cli, "write_manifest",
+                        lambda path, deployment_id=None, **kwargs: seen.append(("build", path)) or {"routes": {"/": {}},
+                                                                                          "build_id": "0" * 16})
     monkeypatch.setattr(sys, "argv", ["pynext", "build", "--dir", str(root)])
     cli.main()
     assert seen == [("build", root)]
@@ -361,7 +384,7 @@ def test_cli_shutdown_timeout_reaches_serve(tmp_path, monkeypatch):
 
 
 def test_cli_build_reports_manifest_errors_instead_of_traceback(tmp_path, monkeypatch, capsys):
-    def failing_manifest(path, **kwargs):
+    def failing_manifest(path, deployment_id=None, **kwargs):
         raise ValueError("Application sources changed during build; retry the build")
 
     monkeypatch.setattr(cli, "write_manifest", failing_manifest)
@@ -427,3 +450,44 @@ def test_cli_security_flags_reach_app(tmp_path, monkeypatch):
                                       "--ws-allowed-origin", "*"])
     with pytest.raises(SystemExit):
         cli.main()
+
+
+# --- --workers auto ---
+
+@pytest.mark.parametrize("cpus,memory_gib,expected,limited_by", [
+    (1, 16, 1, "cpus"),      # one core: one worker whatever the memory
+    (4, 16, 4, "cpus"),      # cores bind the count
+    (32, 16, 8, "cap"),      # AUTO_WORKERS_MAX caps a many-core host
+    (8, 2, 2, "memory"),     # one worker per GiB of available memory
+    (4, 0.5, 1, "memory"),   # under 1 GiB still yields one worker, not zero
+    (0, 16, 1, "cpus"),      # an unknown/zero CPU count falls back to 1
+    (16, 0, 1, "memory"),    # no available memory still yields one worker
+])
+def test_auto_workers_decision(cpus, memory_gib, expected, limited_by):
+    from pynext.supervisor import decide_auto_workers
+
+    decision = decide_auto_workers(cpu_count=cpus,
+                                   available_memory_bytes=int(memory_gib * 1024 ** 3))
+    assert decision.count == expected
+    assert decision.limited_by == limited_by
+    assert decision.cpus == max(1, cpus)
+
+
+def test_auto_workers_unknown_memory_does_not_cap(monkeypatch):
+    from pynext import supervisor
+
+    monkeypatch.setattr(supervisor, "_available_memory_bytes", lambda: None)
+    decision = supervisor.decide_auto_workers(cpu_count=4)
+    assert decision.count == 4
+    assert decision.limited_by == "cpus"
+    assert decision.available_memory_bytes is None
+    assert "available memory=unknown" in decision.describe()
+
+
+def test_auto_workers_describe_states_the_basis():
+    from pynext.supervisor import decide_auto_workers
+
+    decision = decide_auto_workers(cpu_count=4, available_memory_bytes=4 * 1024 ** 3)
+    assert decision.describe() == (
+        "auto -> 4 worker(s) (cpus=4, available memory=4.0 GiB, "
+        "limited by cpus; max 8)")

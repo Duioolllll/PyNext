@@ -16,7 +16,7 @@
 | API 413 | 요청 본문 1 MiB 초과 |
 | 부하 상황 503 | 실행·본문 슬롯 용량 및 대기열 원인 진단 |
 | 요청 504 | Python 핸들러 시간 초과; 동기 스레드가 계속 실행될 수 있음 |
-| 프로세스마다 ISR 결과 차이 | 기본 `memory` 캐시는 프로세스별입니다. 워커 간 공유에는 `--cache-backend sqlite` 또는 `redis`를 사용하세요 |
+| 프로세스마다 ISR 결과 차이 | 기본 `memory` 캐시는 프로세스별입니다. 워커 간 공유에는 `--cache-backend sqlite`, `redis` 또는 `filesystem`을 사용하세요 |
 
 ## 점검 순서
 

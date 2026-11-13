@@ -125,6 +125,10 @@ class WorkerConfig:
     # Dev-only: answer 404 (like production) for SSG paths that
     # generate_static_params would not produce, instead of merely warning.
     strict_ssg: bool = False
+    # ISR warmup (CacheSignal): each worker pre-fills its own cache in
+    # the background after listening; a shared backend dedupes the
+    # generations across workers via the cross-process lease.
+    warm_isr: bool = False
 
 
 def _heartbeat_loop(stop, heartbeat):
@@ -195,6 +199,7 @@ def _worker_main(config, ready, heartbeat, shutdown, listener):
                         shutdown_timeout=config.shutdown_timeout,
                         max_waiting=config.max_waiting,
                         allowed_hosts=config.allowed_hosts,
+                        warm_isr=config.warm_isr,
                         on_ready=lambda _address: ready.set())
         finally:
             shutdown_task.cancel()
@@ -331,6 +336,85 @@ more time spawning and watching children than serving (review #4 #5:
 --workers 100000 attempted tens of thousands of processes). The CLI
 rejects larger values at parse time; run_supervisor enforces the same
 bound for direct callers."""
+
+AUTO_WORKERS_MAX = 8
+"""Cap for ``--workers auto``: Next.js's ``getNumberOfWorkers()`` caps its
+memory-based count at 4 for builds, but a PyNext worker is a whole
+Python process serving traffic, so the auto count is capped lower than
+MAX_WORKERS — 8 is plenty for the hosts PyNext targets (a Pi 5 has 4
+cores) and keeps a mistaken auto decision from spawning dozens of
+processes. An explicit ``--workers N`` may still go up to MAX_WORKERS."""
+
+_GIB = 1024 ** 3
+
+
+def _available_memory_bytes():
+    """Available memory in bytes, or None when it cannot be determined.
+
+    Linux reads MemAvailable from /proc/meminfo — the memory a new
+    process can actually use, including reclaimable cache — which is
+    what a worker-count decision wants. Other POSIX systems fall back
+    to sysconf's free-page count. No psutil: it is a dev-only
+    dependency, and --workers auto must work on a plain install.
+    """
+    try:
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+@dataclass(frozen=True)
+class AutoWorkers:
+    """The ``--workers auto`` decision: the count and what decided it."""
+
+    count: int
+    cpus: int
+    available_memory_bytes: int | None
+    limited_by: str  # "cpus", "memory", or "cap"
+
+    def describe(self):
+        """One line stating the decision basis (logged at startup)."""
+        memory = ("unknown" if self.available_memory_bytes is None
+                  else f"{self.available_memory_bytes / _GIB:.1f} GiB")
+        return (f"auto -> {self.count} worker(s) "
+                f"(cpus={self.cpus}, available memory={memory}, "
+                f"limited by {self.limited_by}; max {AUTO_WORKERS_MAX})")
+
+
+def decide_auto_workers(*, cpu_count=None, available_memory_bytes=None):
+    """Decide the worker count for ``--workers auto``.
+
+    Borrowed from Next.js's ``getNumberOfWorkers()`` (``max(min(cpus,
+    freemem/1GB), 4)``) with the floor dropped and the cap lowered to
+    :data:`AUTO_WORKERS_MAX` for PyNext's scale: one worker per CPU
+    core, at most one per GiB of available memory, at most
+    AUTO_WORKERS_MAX, at least 1. The ``cpu_count`` /
+    ``available_memory_bytes`` parameters exist so tests can pin the
+    inputs; when omitted they are read from the machine
+    (``os.cpu_count()`` / :func:`_available_memory_bytes`). Memory the
+    OS cannot report does not cap the count.
+    """
+    cpus = cpu_count if cpu_count is not None else os.cpu_count()
+    cpus = max(1, cpus or 1)
+    memory = (available_memory_bytes if available_memory_bytes is not None
+              else _available_memory_bytes())
+    by_memory = AUTO_WORKERS_MAX if memory is None else max(1, memory // _GIB)
+    count = max(1, min(cpus, by_memory, AUTO_WORKERS_MAX))
+    if count == AUTO_WORKERS_MAX:
+        limited_by = "cap"
+    elif by_memory < cpus:
+        limited_by = "memory"
+    else:
+        limited_by = "cpus"
+    return AutoWorkers(count=count, cpus=cpus,
+                       available_memory_bytes=memory, limited_by=limited_by)
 
 
 def run_supervisor(config, *, workers):

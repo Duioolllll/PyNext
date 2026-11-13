@@ -14,6 +14,8 @@ def test_next_source_order_and_parameters():
     ["/blog/[id]", "/blog/[slug]"], ["/blog/[...id]/a"], ["/[id]/[id]"],
     ["/[[id]]"], ["/[..id]"], ["/x", "/x"],
     ["/docs/[...p]", "/docs/[[...q]]"],
+    ["/files/[...rest].json"], ["/v[...version]"], ["/files/[[...rest]].json"],
+    ["/files/[a].json", "/files/[b].json"], ["/[a][b]"],
 ])
 def test_invalid_or_ambiguous_routes(paths):
     with pytest.raises(ValueError):
@@ -38,3 +40,28 @@ def test_matches_reports_parameter_kinds():
     assert pattern == "/[a]/[...a2]"
     assert kinds == {"a": "dynamic", "a2": "catch_all"}
     assert params == {"a": ["x"], "a2": ["y", "z"]}
+
+
+def test_prefix_and_suffix_parameters():
+    router = _native.Router(["/files/[name].json", "/v[version]/api", "/files/[name].txt"])
+    assert router.matches("/files/report.json") == (
+        "/files/[name].json", {"name": ["report"]}, {"name": "dynamic"})
+    assert router.matches("/files/data.txt")[0] == "/files/[name].txt"
+    assert router.matches("/v2/api") == (
+        "/v[version]/api", {"version": ["2"]}, {"version": "dynamic"})
+    # An empty middle never matches.
+    assert router.matches("/files/.json") is None
+    assert router.matches("/v/api") is None
+    # A bare dynamic segment does not swallow the suffix.
+    router = _native.Router(["/files/[name].json", "/files/[name]"])
+    assert router.matches("/files/report.json")[0] == "/files/[name].json"
+    assert router.matches("/files/report")[0] == "/files/[name]"
+    # Affixed segments outrank a bare dynamic segment; a static segment
+    # still wins over an affixed one.
+    router = _native.Router(["/v[version]/api", "/[root]/api"])
+    assert router.matches("/v2/api")[0] == "/v[version]/api"
+    router = _native.Router(["/files/[name].json", "/files/latest.json"])
+    assert router.matches("/files/latest.json")[0] == "/files/latest.json"
+    # Affixed routes sort before bare dynamic routes.
+    router = _native.Router(["/[root]", "/v[version]/api", "/files/[name].json"])
+    assert router.ordered_routes() == ["/files/[name].json", "/v[version]/api", "/[root]"]

@@ -371,7 +371,18 @@ async function fetchPage(url, { useCache = true, signal } = {}) {
   const age = directives.map((v) => /^max-age=(\d+)$/.exec(v)).find(Boolean);
   const safe = directives.includes("public") && !directives.some((v) => /^(private|no-store|no-cache)(=|$)/.test(v)) &&
     !vary.some((v) => ["*", "cookie", "authorization"].includes(v));
-  return { html, maxAge: safe && age ? Math.min(Number(age[1]), 60) : 0 };
+  // Prefetch hint (X-PyNext-Stale-Time): seconds until the response goes
+  // stale. Static pages and fresh ISR responses carry it; it supersedes
+  // Cache-Control max-age, which is 0 for those responses because shared
+  // caches must revalidate. A malformed value is ignored. Retention still
+  // caps at 60 seconds, as before.
+  const staleHeader = response.headers.get("x-pynext-stale-time");
+  const staleTime = staleHeader !== null && /^\d+$/.test(staleHeader.trim())
+    ? Number(staleHeader.trim()) : null;
+  const maxAge = safe
+    ? (staleTime !== null ? Math.min(staleTime, 60) : (age ? Math.min(Number(age[1]), 60) : 0))
+    : 0;
+  return { html, maxAge };
 }
 
 function swapDocument(html, url) {
@@ -445,7 +456,12 @@ function prefetch(url) {
     if (prefetchCache.size >= PREFETCH_MAX_ENTRIES) {
       prefetchCache.delete(prefetchCache.keys().next().value);
     }
-    prefetchCache.set(key, { html, expires: Date.now() + maxAge * 1000 });
+    // Keep the stale time with the entry: `stale` is the seconds until
+    // this copy goes stale (the server's hint when it sent one, else the
+    // Cache-Control max-age that set the expiry). It always agrees with
+    // `expires`, so a reader can tell whether a prefetched copy is stale
+    // without re-reading the response headers.
+    prefetchCache.set(key, { html, expires: Date.now() + maxAge * 1000, stale: maxAge });
   }).catch(() => {
     // Prefetch is best-effort; the click still navigates.
   }).finally(() => prefetchInflight.delete(key));

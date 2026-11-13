@@ -11,10 +11,11 @@ import pytest
 
 from pathlib import Path
 
-from pynext import create_app, ObservabilityConfig
+from pynext import RequestInsights, create_app, ObservabilityConfig
 from pynext.observability import (
     JsonFormatter,
     MetricsCollector,
+    RequestInsights,
     _reset_otel_cache,
     begin_request_context,
     is_tracing_available,
@@ -640,3 +641,227 @@ def test_real_opentelemetry_preserves_parentage_and_handler_errors(tmp_path, mon
     finally:
         provider.shutdown()
         _reset_otel_cache()
+
+
+# -- request insights (P2-3) -------------------------------------------------
+
+def test_request_insights_disabled_is_noop():
+    insights = RequestInsights(enabled=False)
+    insights.observe(request_id="r1", method="GET", route="/", status=500,
+                     latency_ms=100.0, error_type="ValueError")
+    assert insights.snapshot() == {"enabled": False}
+
+
+def test_request_insights_records_slow_requests_over_fixed_threshold():
+    insights = RequestInsights(slow_threshold_ms=10.0)
+    insights.observe(request_id="fast", method="GET", route="/", status=200, latency_ms=1.0)
+    insights.observe(request_id="at-threshold", method="GET", route="/", status=200, latency_ms=10.0)
+    insights.observe(request_id="slow", method="GET", route="/blog/[slug]", status=200,
+                     latency_ms=25.5, python_ms=20.0, rust_ms=5.5, queue_wait_ms=0.25)
+    snap = insights.snapshot()
+    assert snap["enabled"] is True
+    assert snap["max_entries"] == 100
+    assert snap["observed"] == 3
+    assert snap["recorded"] == 2
+    assert snap["slow_threshold_ms"] == 10.0
+    assert [entry["request_id"] for entry in snap["requests"]] == ["at-threshold", "slow"]
+    entry = snap["requests"][1]
+    assert entry["method"] == "GET"
+    assert entry["route"] == "/blog/[slug]"
+    assert entry["status"] == 200
+    assert entry["latency_ms"] == 25.5
+    assert entry["python_ms"] == 20.0
+    assert entry["rust_ms"] == 5.5
+    assert entry["queue_wait_ms"] == 0.25
+    assert entry["error_type"] is None
+    assert entry["recorded_at"].endswith("Z")
+
+
+def test_request_insights_records_failures_even_when_fast():
+    insights = RequestInsights(slow_threshold_ms=1000.0)
+    insights.observe(request_id="err", method="GET", route="/error", status=500,
+                     latency_ms=1.0, error_type="ValueError")
+    insights.observe(request_id="bad", method="GET", route="/", status=400,
+                     latency_ms=1.0, error_type="BadRequest")
+    insights.observe(request_id="ok", method="GET", route="/", status=200, latency_ms=1.0)
+    snap = insights.snapshot()
+    assert snap["observed"] == 3
+    assert snap["recorded"] == 2
+    assert [entry["request_id"] for entry in snap["requests"]] == ["err", "bad"]
+    assert snap["requests"][0]["error_type"] == "ValueError"
+    assert snap["requests"][1]["status"] == 400
+
+
+def test_request_insights_dynamic_p95_threshold():
+    insights = RequestInsights()
+    for i in range(20):
+        insights.observe(request_id=f"base-{i}", method="GET", route="/",
+                         status=200, latency_ms=5.0)
+    # p95 of twenty identical 5ms samples is 5ms: another 5ms request is
+    # not slow, a 6ms one is.
+    insights.observe(request_id="normal", method="GET", route="/", status=200, latency_ms=5.0)
+    insights.observe(request_id="slow", method="GET", route="/", status=200, latency_ms=6.0)
+    snap = insights.snapshot()
+    assert snap["observed"] == 22
+    assert snap["recorded"] == 1
+    assert snap["requests"][0]["request_id"] == "slow"
+    assert snap["slow_threshold_ms"] == 5.0
+
+
+def test_request_insights_warm_up_keeps_only_failures():
+    insights = RequestInsights()
+    for i in range(5):
+        insights.observe(request_id=f"fast-{i}", method="GET", route="/",
+                         status=200, latency_ms=100.0)
+    insights.observe(request_id="err", method="GET", route="/", status=500,
+                     latency_ms=1.0, error_type="ValueError")
+    snap = insights.snapshot()
+    assert snap["observed"] == 6
+    assert snap["recorded"] == 1
+    assert snap["requests"][0]["request_id"] == "err"
+    assert snap["slow_threshold_ms"] is None  # fewer than 20 samples
+
+
+def test_request_insights_ring_buffer_is_bounded():
+    insights = RequestInsights(max_entries=3, slow_threshold_ms=0.0)
+    for i in range(5):
+        insights.observe(request_id=f"r{i}", method="GET", route="/",
+                         status=200, latency_ms=float(i))
+    snap = insights.snapshot()
+    assert snap["observed"] == 5
+    assert snap["recorded"] == 5
+    # Oldest first; the first two entries were evicted.
+    assert [entry["request_id"] for entry in snap["requests"]] == ["r2", "r3", "r4"]
+
+
+def test_request_insights_clear_resets_counters_and_window():
+    insights = RequestInsights(slow_threshold_ms=0.0)
+    insights.observe(request_id="r1", method="GET", route="/", status=200, latency_ms=1.0)
+    insights.clear()
+    snap = insights.snapshot()
+    assert snap["observed"] == 0
+    assert snap["recorded"] == 0
+    assert snap["requests"] == []
+
+
+def test_request_insights_snapshot_returns_copies():
+    insights = RequestInsights(slow_threshold_ms=0.0)
+    insights.observe(request_id="r1", method="GET", route="/", status=200, latency_ms=1.0)
+    snap = insights.snapshot()
+    snap["requests"][0]["status"] = 999
+    snap["requests"].clear()
+    assert insights.snapshot()["requests"][0]["status"] == 200
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, "10", 1.5])
+def test_request_insights_rejects_bad_max_entries(bad):
+    with pytest.raises(ValueError):
+        RequestInsights(max_entries=bad)
+
+
+@pytest.mark.parametrize("bad", [-1.0, True, "10"])
+def test_request_insights_rejects_bad_slow_threshold(bad):
+    with pytest.raises(ValueError):
+        RequestInsights(slow_threshold_ms=bad)
+
+
+def test_observability_config_request_insights_defaults():
+    config = ObservabilityConfig()
+    assert config.request_insights is None  # auto: on in debug, off in production
+    assert config.request_insights_max == 100
+    assert config.request_insights_slow_ms is None
+
+
+def test_observability_config_request_insights_from_env(monkeypatch):
+    monkeypatch.setenv("PYNEXT_REQUEST_INSIGHTS", "1")
+    monkeypatch.setenv("PYNEXT_REQUEST_INSIGHTS_MAX", "50")
+    monkeypatch.setenv("PYNEXT_REQUEST_INSIGHTS_SLOW_MS", "250")
+    config = ObservabilityConfig.from_env()
+    assert config.request_insights is True
+    assert config.request_insights_max == 50
+    assert config.request_insights_slow_ms == 250.0
+    monkeypatch.setenv("PYNEXT_REQUEST_INSIGHTS", "0")
+    assert ObservabilityConfig.from_env().request_insights is False
+    monkeypatch.setenv("PYNEXT_REQUEST_INSIGHTS", "bogus")
+    assert ObservabilityConfig.from_env().request_insights is None
+    monkeypatch.setenv("PYNEXT_REQUEST_INSIGHTS_MAX", "bogus")
+    assert ObservabilityConfig.from_env().request_insights_max == 100
+    monkeypatch.setenv("PYNEXT_REQUEST_INSIGHTS_MAX", "0")
+    assert ObservabilityConfig.from_env().request_insights_max == 1
+    monkeypatch.setenv("PYNEXT_REQUEST_INSIGHTS_SLOW_MS", "-5")
+    assert ObservabilityConfig.from_env().request_insights_slow_ms is None
+    monkeypatch.setenv("PYNEXT_REQUEST_INSIGHTS_SLOW_MS", "bogus")
+    assert ObservabilityConfig.from_env().request_insights_slow_ms is None
+
+
+def test_app_request_insights_off_by_default():
+    app = create_app(EXAMPLE)
+    assert app.request_insights.enabled is False
+    assert app.request_insights.snapshot() == {"enabled": False}
+
+
+def test_app_request_insights_on_in_debug_and_records_requests():
+    async def run():
+        app = create_app(EXAMPLE, debug=True,
+                         observability=ObservabilityConfig(request_insights_slow_ms=0.0))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            home = await client.get("/")
+            assert home.status_code == 200
+            assert (await client.get("/blog/hello")).status_code == 200
+            assert (await client.get("/missing")).status_code == 404
+            # No HTTP endpoint serves the snapshots (in-process API only).
+            assert (await client.get("/_pynext/request-insights")).status_code == 404
+        return app.request_insights.snapshot(), home.headers["x-request-id"]
+    snap, home_request_id = _run(run())
+    assert snap["enabled"] is True
+    assert snap["observed"] == 4
+    assert snap["recorded"] == 4
+    # Route labels are patterns, never raw URLs.
+    assert [entry["route"] for entry in snap["requests"]] == [
+        "/", "/blog/[slug]", "__not_found__", "__client__"]
+    assert snap["requests"][0]["request_id"] == home_request_id
+    assert snap["requests"][0]["status"] == 200
+    assert snap["requests"][2]["status"] == 404
+    assert snap["requests"][2]["error_type"] is None
+
+
+def test_app_request_insights_records_failed_request_with_error_type(tmp_path):
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "page.py").write_text(
+        'from pynext import h, page\n@page()\ndef Page(): return h("p", {}, "ok")\n'
+    )
+    error_dir = app_dir / "error"
+    error_dir.mkdir()
+    (error_dir / "route.py").write_text(
+        'from pynext import route\n@route("GET")\ndef get(): raise ValueError("expected error")\n'
+    )
+
+    async def run():
+        app = create_app(tmp_path, observability=ObservabilityConfig(
+            request_insights=True, request_insights_slow_ms=10000.0))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            assert (await client.get("/error")).status_code == 500
+            assert (await client.get("/")).status_code == 200
+        return app.request_insights.snapshot()
+    snap = _run(run())
+    assert snap["observed"] == 2
+    assert snap["recorded"] == 1
+    (entry,) = snap["requests"]
+    assert entry["route"] == "/error"
+    assert entry["status"] == 500
+    assert entry["error_type"] == "ValueError"
+
+
+def test_app_configure_observability_updates_request_insights():
+    app = create_app(EXAMPLE, debug=True)
+    assert app.request_insights.enabled is True
+    app.configure_observability(ObservabilityConfig(
+        request_insights=False, request_insights_slow_ms=5.0))
+    assert app.request_insights.enabled is False
+    assert app.request_insights.slow_threshold_ms == 5.0
+    assert app.request_insights.snapshot() == {"enabled": False}
+    app.configure_observability(ObservabilityConfig())
+    assert app.request_insights.enabled is True  # auto -> on in debug mode

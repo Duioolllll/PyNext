@@ -376,15 +376,16 @@ def test_path_headers_native_isr_cache_hit(tmp_path):
                 # rule headers must still apply to that Rust-built response.
                 # The ISR cache-control is set by an earlier dispatch step,
                 # so (like ASGI) it wins over the rule's Cache-Control —
-                # only the rule's other headers are added.
+                # only the rule's other headers are added. The value is the
+                # route's ISR policy (revalidate=30), not the old default.
                 warmed = await client.get("/blog/alpha")
                 assert warmed.status_code == 200
                 assert warmed.headers["x-blog"] == "1"
-                assert warmed.headers["cache-control"] == "public, max-age=0, must-revalidate"
+                assert warmed.headers["cache-control"] == "public, s-maxage=30, stale-while-revalidate=60"
                 cached = await native.get("/blog/alpha")
                 assert cached.status_code == 200
                 assert cached.headers["x-blog"] == "1"
-                assert cached.headers["cache-control"] == "public, max-age=0, must-revalidate"
+                assert cached.headers["cache-control"] == "public, s-maxage=30, stale-while-revalidate=60"
                 # A cache miss goes through the bridge and gets them too.
                 fresh = await native.get("/blog/beta")
                 assert fresh.status_code == 200

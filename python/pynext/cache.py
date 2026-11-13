@@ -15,23 +15,64 @@ Every shared write atomically checks both the observed entry version and
 the live lease owner. Invalidation removes the lease with the entry, so
 an old generation cannot refill the shared cache after invalidation.
 
+Concurrent shared writes for one key coalesce (Next.js ``pendingSets``,
+``cache-handlers/default.ts``): a second write waits for the first and
+reuses its fresh entry instead of issuing a duplicate write, and a read
+that arrives while a write is landing waits (bounded) and re-reads the
+shared entry instead of serving the previous version or rendering twice.
+
 Private responses are never stored in the shared cache: a response
 with ``Set-Cookie`` or ``Cache-Control: private``/``no-store`` is served
 but not written to either layer (spec section 10.2). Requests carrying
 a Cookie or Authorization header bypass the cache entirely in
 ``App.dispatch`` and never reach this module.
+
+Cache handlers (Next.js ``CacheHandler`` plugin contract, adapted):
+
+* ``CacheHandler`` is the five-method plugin contract — ``get``,
+  ``set``, ``remove``, ``get_expiration`` and ``update_tags`` — plus
+  ``refresh_tags``. A handler stores ``CacheEntry`` values
+  (``value``, ``tags``, ``stale``, ``timestamp``, ``expire``,
+  ``revalidate``) and owns eviction: the framework never deletes
+  entries except through an explicit ``remove`` (path invalidation);
+  a handler must apply its own TTL or capacity eviction, exactly as
+  Next.js requires (``cache-handlers/types.ts``).
+* The three built-in backends (``memory``, ``sqlite``, ``redis``) are
+  handlers registered by name; ``register_cache_handler`` adds more.
+  ``ISRCache(cache_handler=...)`` accepts a registered name, a
+  factory, or a handler instance, and ``create_app`` forwards it.
+* Cross-process single-flight needs more than the five methods, so
+  ``SharedCacheHandler`` extends the contract with the lease/fencing
+  operations (``acquire_lease``, ``insert_fenced``, ...) that the
+  SQLite and Redis handlers implement. A plain ``CacheHandler`` still
+  works with ``ISRCache`` — reads and writes go through it, but
+  generation is coordinated only within the process.
 """
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
 import threading
 import time
 import uuid
+from abc import ABC, abstractmethod
 from collections import OrderedDict
+from dataclasses import dataclass, field
+from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows platforms
+    msvcrt = None
 
 from . import _native
 from .components import MAX_CACHE_SECONDS, _validate_tag, _validate_tag_expire, _validate_tags
@@ -82,6 +123,14 @@ MAX_SQLITE_ENTRIES = 10_000
 #: development the floor instead extends retention (see
 #: :func:`dev_retention_policy`), so reloads still hit the cache.
 MIN_PRERENDERABLE_EXPIRE = 300.0
+# Next.js `response-cache/index.ts:retainPreviousCacheEntry` clamps the
+# retained revalidate into 3..30s and keeps expire at least revalidate+3,
+# so a failing origin is retried at most every 3s and at least every 30s.
+# In PyNext's two-axis policy that is a fresh window of 3..30s and a stale
+# window of at least 3s.
+RETAIN_MIN_REVALIDATE_SECONDS = 3.0
+RETAIN_MAX_REVALIDATE_SECONDS = 30.0
+RETAIN_MIN_STALE_SECONDS = 3.0
 _SHARED_UNAVAILABLE = object()
 _VARIANT_GENERATION_TTL = 86400
 _MAX_LOCAL_VARIANT_PATHS = 1024
@@ -214,6 +263,156 @@ def _validate_invalidation_tag(tag):
     return _validate_tag(tag)
 
 
+# Bounds for waiting on an in-flight shared write (Next.js ``pendingSets``).
+# The write itself is one backend round trip, so these only bite under lock
+# contention or a stalled backend; on timeout the caller falls back to the
+# pre-existing behaviour (serve stale / write anyway).
+PENDING_SET_WAIT_TIMEOUT = 5.0
+PENDING_SET_GET_TIMEOUT = 1.0
+
+
+class CacheSignal:
+    """Counts in-progress cache reads and reports when they settle.
+
+    An asyncio port of Next.js ``server/app-render/cache-signal.ts``.
+    ``begin_read``/``end_read`` bracket one cache read (here: one ISR
+    generation); ``cache_ready`` waits until no read is in flight,
+    giving work that can start new reads a loop turn to register first;
+    ``input_ready`` waits only until the reads already running drain.
+    Warmup uses it to know when a batch of generations has finished
+    without polling, and ``_wait_for_shared`` uses it to wake promptly
+    when local generation work settles instead of sleeping out its
+    poll interval.
+
+    A signal belongs to one event loop: the idle event is created
+    lazily on the running loop and recreated if the loop changes.
+    """
+
+    def __init__(self):
+        self._count = 0
+        self._idle = None
+        self._idle_loop = None
+        self._subscribers = None
+
+    def _sync_idle(self, *, set_idle):
+        # Keep the idle event in step with the count. begin/end_read
+        # run on a loop in practice (generation done-callbacks), but
+        # stay usable without one.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._idle is None or self._idle_loop is not loop:
+            self._idle = asyncio.Event()
+            self._idle_loop = loop
+        if set_idle:
+            self._idle.set()
+        else:
+            self._idle.clear()
+
+    def _idle_event(self):
+        loop = asyncio.get_running_loop()
+        if self._idle is None or self._idle_loop is not loop:
+            self._idle = asyncio.Event()
+            self._idle_loop = loop
+            if self._count == 0:
+                self._idle.set()
+        return self._idle
+
+    def begin_read(self):
+        self._count += 1
+        self._sync_idle(set_idle=False)
+        if self._subscribers is not None:
+            for subscriber in self._subscribers:
+                subscriber.begin_read()
+
+    def end_read(self):
+        if self._count == 0:
+            raise ValueError(
+                "CacheSignal got more end_read() calls than begin_read() calls")
+        self._count -= 1
+        if self._count == 0:
+            self._sync_idle(set_idle=True)
+        if self._subscribers is not None:
+            for subscriber in self._subscribers:
+                subscriber.end_read()
+
+    def has_pending_reads(self):
+        return self._count > 0
+
+    async def input_ready(self):
+        """Wait until the reads already running have drained.
+
+        Resolves a loop turn after the count reaches zero, so a read
+        that starts in the same turn is still observed; unlike
+        ``cache_ready`` it does not wait for further work to start new
+        reads.
+        """
+        while True:
+            if self._count == 0:
+                await asyncio.sleep(0)
+                if self._count == 0:
+                    return
+            else:
+                await self._idle_event().wait()
+
+    async def cache_ready(self):
+        """Wait until no cache read is in flight.
+
+        When the count is already zero this still waits two loop turns
+        first, so work that can start new reads gets a chance to
+        register — the asyncio equivalent of Next.js's
+        microtask/nextTick/immediate/timeout cascade. New reads that
+        start during the wait delay the resolution.
+        """
+        while True:
+            if self._count == 0:
+                await asyncio.sleep(0)
+                if self._count == 0:
+                    await asyncio.sleep(0)
+                    if self._count == 0:
+                        return
+            else:
+                await self._idle_event().wait()
+
+    async def track_read(self, awaitable):
+        """Bracket ``awaitable`` with begin/end_read and return its result."""
+        self.begin_read()
+        try:
+            return await awaitable
+        finally:
+            self.end_read()
+
+    def subscribe_to_reads(self, subscriber):
+        """Forward every read on this signal to ``subscriber``.
+
+        Returns an ``unsubscribe`` callable. Mirrors Next.js: the
+        subscriber gets one begin_read for each read already in flight,
+        and matching end_reads as they finish. Unsubscribing while reads
+        are in flight leaves those counts on the subscriber, so only
+        unsubscribe once this signal is settled.
+        """
+        if subscriber is self:
+            raise ValueError("A CacheSignal cannot subscribe to itself")
+        if self._subscribers is None:
+            self._subscribers = set()
+        self._subscribers.add(subscriber)
+        for _ in range(self._count):
+            subscriber.begin_read()
+        return lambda: self.unsubscribe_from_reads(subscriber)
+
+    def unsubscribe_from_reads(self, subscriber):
+        if self._subscribers is not None:
+            self._subscribers.discard(subscriber)
+
+# Filesystem backend defaults: entries are bounded, unlike the SQLite
+# backend, which grows without a cap (see the Next.js comparison report,
+# track C section 3.2 #11). Eviction is oldest-first.
+_FS_MAX_ENTRIES = 1024
+_FS_MAX_BYTES = 512 * 1024 * 1024
+_FS_SAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
 class CacheBusy(Exception):
     pass
 
@@ -330,6 +529,46 @@ class CacheBackend:
         pass
 
 
+def _format_seconds(value):
+    """Render a duration for a header without scientific notation."""
+    text = format(float(value), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def cache_control_header(policy):
+    """Build the SWR ``Cache-Control`` header for an ISR policy.
+
+    A port of Next.js ``server/lib/cache-control.ts:getCacheControlHeader``
+    for PyNext's two-axis policy (``revalidate`` = fresh window,
+    ``stale`` = stale-while-revalidate window): ``s-maxage`` is the fresh
+    window and ``stale-while-revalidate`` the SWR window, so a CDN in
+    front of PyNext can serve stale while revalidating. With no SWR
+    window (``stale == 0``) only ``s-maxage`` is emitted. The header uses
+    the declared ``stale`` window (as the L1 insert does); a policy with
+    an explicit ``expire`` has a wider effective window
+    (``expire - revalidate``, see :func:`policy_windows`).
+    """
+    header = f"public, s-maxage={_format_seconds(policy['revalidate'])}"
+    if policy["stale"] > 0:
+        header += f", stale-while-revalidate={_format_seconds(policy['stale'])}"
+    return header
+
+
+def _retain_durations(policy):
+    """Durations for a retained entry after a failed regeneration.
+
+    Mirrors Next.js ``retainPreviousCacheEntry``: the fresh window is the
+    policy revalidate clamped to 3..30s and the stale window is at least
+    3s, so the previous body keeps serving while retries breathe.
+    """
+    fresh = min(max(float(policy["revalidate"]), RETAIN_MIN_REVALIDATE_SECONDS),
+                RETAIN_MAX_REVALIDATE_SECONDS)
+    stale = max(float(policy["stale"]), RETAIN_MIN_STALE_SECONDS)
+    return fresh, stale
+
+
 def _valid_durations(fresh_seconds, stale_seconds):
     try:
         fresh = float(fresh_seconds)
@@ -393,7 +632,10 @@ def normalize_isr_policy(policy):
         # the longest lifetime, never stale by time (stale window 0).
         return {"revalidate": float(revalidate), "stale": float(stale),
                 "expire": float(expire)}
-    if expire <= float(revalidate):
+    # A zero stale window (``stale=0``) legitimately yields
+    # ``expire == revalidate``; any other expire at or below revalidate
+    # is malformed (inconsistent with a positive stale window).
+    if expire < float(revalidate) or (expire == float(revalidate) and float(stale) != 0.0):
         raise ValueError("expire must be greater than revalidate")
     return {"revalidate": float(revalidate), "stale": float(stale), "expire": float(expire)}
 
@@ -417,6 +659,400 @@ Must match the ``fresh_seconds > 604_800.0`` guard in
 ``MAX_CACHE_SECONDS``, so longer entries are clamped here rather
 than rejected.
 """
+
+
+# ---------------------------------------------------------------------------
+# CacheHandler plugin contract (Next.js server/lib/cache-handlers/types.ts)
+# ---------------------------------------------------------------------------
+
+_MAX_CACHE_TAGS = 64
+_MAX_CACHE_TAG_BYTES = 256
+_MAX_HANDLER_META_ENTRIES = 8192
+
+
+def _validate_tags(tags):
+    """Return ``tags`` as a tuple of strings, or ``None`` when invalid.
+
+    Tags are non-empty strings (at most 256 bytes each, at most 64 per
+    entry), matching the ``validateTags`` limits Next.js applies to
+    ``cacheTag()``/fetch tags.
+    """
+    if isinstance(tags, str) or not isinstance(tags, (tuple, list)):
+        return None
+    if len(tags) > _MAX_CACHE_TAGS:
+        return None
+    cleaned = []
+    for tag in tags:
+        if not isinstance(tag, str) or not tag or len(tag.encode("utf-8")) > _MAX_CACHE_TAG_BYTES:
+            return None
+        cleaned.append(tag)
+    if len(set(cleaned)) != len(cleaned):
+        return None
+    return tuple(cleaned)
+
+
+def _tag_status(tags, tag_times, timestamp, now, soft_tags=()):
+    """Decide how tag revalidation affects an entry created at ``timestamp``.
+
+    ``tag_times`` maps a tag to ``(stale_at, expired_at)`` wall-clock
+    seconds (either may be ``None``). A revalidation only applies when it
+    happened after the entry was created — an invalidation stamped before
+    the entry is never retroactive, as in Next.js ``areTagsExpired`` /
+    ``areTagsStale``. Returns ``"ok"``, ``"stale"`` (serve once more,
+    then replace) or ``"expired"`` (miss). Tags listed in ``soft_tags``
+    can only make an entry stale, never expired.
+    """
+    soft = set(soft_tags or ())
+    stale = False
+    for tag in tags:
+        times = tag_times.get(tag)
+        if times is None:
+            continue
+        stale_at, expired_at = times
+        if expired_at is not None and timestamp < expired_at <= now:
+            if tag not in soft:
+                return "expired"
+            stale = True
+        if stale_at is not None and timestamp < stale_at <= now:
+            stale = True
+    return "stale" if stale else "ok"
+
+
+def _validate_tag_update(tags, durations):
+    """Validate ``update_tags`` arguments. Returns ``(tags, expire)``.
+
+    ``expire`` is ``None`` for immediate expiry, else a positive finite
+    number of seconds after which the tags fully expire (until then they
+    only mark entries stale). Raises ``ValueError`` on bad input.
+    """
+    cleaned = _validate_tags(tags)
+    if cleaned is None:
+        raise ValueError("tags must be a list or tuple of up to 64 non-empty strings")
+    expire = None
+    if durations is not None:
+        if not isinstance(durations, dict) or set(durations) != {"expire"}:
+            raise ValueError("durations must be None or {'expire': seconds}")
+        try:
+            expire = float(durations["expire"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("durations['expire'] must be a positive number of seconds") from exc
+        if expire <= 0 or expire != expire or expire == float("inf"):
+            raise ValueError("durations['expire'] must be a positive number of seconds")
+    return cleaned, expire
+
+
+def _entry_durations(entry):
+    """Map a ``CacheEntry`` to ``(fresh_seconds, stale_seconds)`` for storage.
+
+    Returns ``None`` when the entry cannot be stored (oversized body,
+    invalid durations, invalid tags); the caller then returns ``False``
+    instead of raising, mirroring ``CacheBackend.insert``.
+    """
+    if not isinstance(entry.value, (bytes, bytearray)) or len(entry.value) > MAX_CACHE_BODY_BYTES:
+        return None
+    tags = _validate_tags(entry.tags)
+    if tags is None:
+        return None
+    try:
+        revalidate = float(entry.revalidate)
+        stale = float(entry.stale)
+    except (TypeError, ValueError):
+        return None
+    if not _valid_durations(revalidate, stale):
+        return None
+    if entry.expire is None:
+        return revalidate, stale
+    try:
+        expire = float(entry.expire)
+    except (TypeError, ValueError):
+        return None
+    if expire != expire or expire == float("inf") or expire < revalidate:
+        return None
+    stale_for = expire - revalidate
+    if stale_for > MAX_CACHE_SECONDS:
+        return None
+    return revalidate, stale_for
+
+
+@dataclass
+class CacheEntry:
+    """One cached value, as exchanged with a ``CacheHandler``.
+
+    This is Next.js ``CacheEntry`` (``cache-handlers/types.ts``) with one
+    PyNext addition: ``tag_state`` records the tag decision made by
+    ``get`` (``"ok"`` or ``"stale"``). Next.js overloads ``revalidate``
+    with ``-1`` for the same signal; PyNext keeps the durations intact
+    and reports the decision separately.
+
+    * ``value`` — the cached body bytes.
+    * ``tags`` — tags attached at write time (soft tags excluded).
+    * ``stale`` — seconds after ``revalidate`` during which the entry may
+      be served stale while it is regenerated (the SWR window).
+    * ``timestamp`` — creation time, wall-clock seconds (``time.time()``).
+      Handlers stamp their own write time and ignore this field on ``set``.
+    * ``expire`` — absolute hard cap, seconds after ``timestamp``; ``None``
+      means ``revalidate + stale``. Past ``expire`` the entry is never
+      served, even while a regeneration is failing.
+    * ``revalidate`` — seconds the entry stays fresh.
+    """
+
+    value: bytes
+    tags: tuple = ()
+    stale: float = 0.0
+    timestamp: float = field(default_factory=time.time)
+    expire: float | None = None
+    revalidate: float = 0.0
+    tag_state: str = "ok"
+
+    def _total(self):
+        if self.expire is not None:
+            return float(self.expire)
+        return float(self.revalidate) + float(self.stale)
+
+    def status(self, now=None):
+        """``"fresh"`` | ``"stale"`` | ``"expired"``, by age and tags."""
+        now = time.time() if now is None else now
+        age = now - self.timestamp
+        if age >= self._total():
+            return "expired"
+        if self.tag_state == "stale" or age >= float(self.revalidate):
+            return "stale"
+        return "fresh"
+
+    def fresh_remaining(self, now=None):
+        """Seconds left fresh (0 once stale); tag-stale entries are 0."""
+        if self.tag_state == "stale":
+            return 0.0
+        now = time.time() if now is None else now
+        return max(0.0, float(self.revalidate) - (now - self.timestamp))
+
+    def stale_remaining(self, now=None):
+        """Seconds left in the stale window (0 once fresh or expired)."""
+        now = time.time() if now is None else now
+        age = now - self.timestamp
+        if age < float(self.revalidate):
+            return float(self.stale)
+        return max(0.0, self._total() - age)
+
+
+class CacheHandler(ABC):
+    """Plugin contract for a cache backend (Next.js ``CacheHandler``).
+
+    Five methods, all synchronous — ``ISRCache`` calls them from a worker
+    thread. ``get``/``set`` exchange ``CacheEntry`` values; ``set``
+    returns ``False`` instead of raising when the entry cannot be stored
+    (oversized body, invalid durations), mirroring ``CacheBackend.insert``.
+    Backend failures raise :class:`SharedCacheUnavailable` so the
+    caller's failure policy decides what happens next.
+
+    Tag methods: ``update_tags`` records a revalidation instant per tag
+    (``durations=None`` expires immediately; ``{"expire": s}`` marks
+    stale now and expires after ``s`` seconds). ``get`` consults those
+    instants for the entry's tags — an expired tag is a miss, a stale tag
+    returns the entry with ``tag_state == "stale"`` — and
+    ``get_expiration`` returns the latest revalidation instant across
+    the given tags (wall-clock seconds, ``0.0`` when never revalidated).
+    ``refresh_tags`` lets a handler resync a cached tag manifest at
+    request start; handlers that read tags live (SQLite, Redis, memory)
+    leave the default no-op.
+
+    Eviction belongs to the handler: the framework never deletes entries
+    except through an explicit ``remove`` (path invalidation). A handler
+    must apply its own TTL or capacity eviction.
+    """
+
+    #: Registry name (``"memory"``, ``"sqlite"``, ``"redis"``, ...).
+    name = "custom"
+
+    @abstractmethod
+    def get(self, key, soft_tags=()):
+        """Return the entry for ``key``, or ``None`` on a miss.
+
+        ``soft_tags`` are tags whose revalidation may only make the
+        entry stale, never a miss.
+        """
+
+    @abstractmethod
+    def set(self, key, entry):
+        """Store ``entry`` under ``key``. Returns ``True`` on success."""
+
+    @abstractmethod
+    def remove(self, key):
+        """Delete the entry for ``key``. Returns ``True`` when removed."""
+
+    @abstractmethod
+    def get_expiration(self, tags):
+        """Latest revalidation instant (seconds) across ``tags``."""
+
+    @abstractmethod
+    def update_tags(self, tags, durations=None):
+        """Record a revalidation of ``tags`` (see class docstring)."""
+
+    def refresh_tags(self):
+        """Resync a cached tag manifest. No-op for live-read handlers."""
+        return None
+
+    def open(self):
+        """Reopen the handler after :meth:`close`. No-op by default."""
+        return None
+
+    def close(self):
+        """Release the handler's resources. No-op by default."""
+        return None
+
+
+class SharedCacheHandler(CacheHandler):
+    """A ``CacheHandler`` with PyNext cross-process coordination.
+
+    Next.js leaves multi-process single-flight to the remote handler;
+    PyNext's ``ISRCache`` needs leases and fenced writes to keep two
+    workers from generating the same key twice and to stop an old
+    generation refilling the cache after invalidation. Handlers that
+    subclass this (SQLite, Redis) get the full shared-cache behaviour;
+    a plain ``CacheHandler`` still works, with in-process single-flight
+    only.
+    """
+
+    @abstractmethod
+    def lookup_entry(self, key):
+        """Like ``lookup`` but returns a versioned :class:`SharedEntry`."""
+
+    @abstractmethod
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
+        """Store ``body`` only if the version/lease fences still hold.
+
+        ``tags`` are attached to the entry so a later tag revalidation
+        can retire it; ``generated_at`` / ``generated_mono`` stamp it
+        with the render *start* time instead of the insert time (see
+        :meth:`SQLiteCacheBackend.insert_fenced`). Handlers whose store
+        has no monotonic clock may ignore ``generated_mono``.
+        """
+
+    @abstractmethod
+    def acquire_lease(self, key, owner, ttl=LEASE_TTL):
+        """Take the generation lease; ``None`` when another worker holds it."""
+
+    @abstractmethod
+    def release_lease(self, key, owner):
+        """Release a lease, but only the one this worker owns."""
+
+    @abstractmethod
+    def owns_lease(self, key, owner):
+        """Whether ``owner`` still holds a live lease for ``key``."""
+
+    @abstractmethod
+    def variant_generation(self, key, *, invalidate=False):
+        """Get or replace a path generation atomically across workers."""
+
+    def lookup(self, key):
+        """``CacheBackend``-compatible read: ``(status, body)``.
+
+        Kept so code written against ``ISRCache.shared`` (a backend)
+        keeps working when the shared store is a handler instead.
+        """
+        entry = self.lookup_entry(key)
+        if entry is None:
+            return ("miss", None)
+        return (entry.status, entry.body)
+
+    def insert(self, key, body, fresh_seconds, stale_seconds):
+        """``CacheBackend``-compatible unfenced write."""
+        return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None)
+
+
+class _TagManifest:
+    """Process-local tag revalidation instants (``_tag_status`` storage).
+
+    Shared by the memory handler and by ``ISRCache`` when no shared
+    handler is configured. Thread-safe.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._tags = {}
+
+    def update(self, tags, durations=None):
+        cleaned, expire = _validate_tag_update(tags, durations)
+        now = time.time()
+        with self._lock:
+            for tag in cleaned:
+                if expire is None:
+                    self._tags[tag] = (None, now)
+                else:
+                    self._tags[tag] = (now, now + expire)
+        return None
+
+    def times(self, tags):
+        cleaned = _validate_tags(tags)
+        if cleaned is None:
+            raise ValueError("tags must be a list or tuple of up to 64 non-empty strings")
+        with self._lock:
+            return {tag: self._tags.get(tag, (None, None)) for tag in cleaned}
+
+    def expiration(self, tags):
+        cleaned = _validate_tags(tags)
+        if cleaned is None:
+            raise ValueError("tags must be a list or tuple of up to 64 non-empty strings")
+        with self._lock:
+            instants = [self._tags[tag][0] if self._tags[tag][0] is not None
+                        else self._tags[tag][1]
+                        for tag in cleaned if tag in self._tags]
+        return max(instants) if instants else 0.0
+
+
+def _shared_entry_from_cache_entry(entry, now=None):
+    """Convert a handler ``CacheEntry`` to the versioned ``SharedEntry``.
+
+    Plain handlers have no entry versions, so the version is ``0`` and
+    the write is unfenced.
+    """
+    now = time.time() if now is None else now
+    status = entry.status(now)
+    if status == "expired":
+        return SharedEntry("expired", None, 0, 0.0, 0.0)
+    return SharedEntry(status, entry.value, 0,
+                       entry.fresh_remaining(now), entry.stale_remaining(now))
+
+
+def _validate_cache_handler(handler):
+    """Raise ``TypeError`` unless ``handler`` implements the contract."""
+    for method in ("get", "set", "remove", "get_expiration", "update_tags"):
+        if not callable(getattr(handler, method, None)):
+            raise TypeError(f"cache_handler must implement {method}(...)")
+    return handler
+
+
+_CACHE_HANDLER_FACTORIES = {}
+
+
+def register_cache_handler(name, factory, *, override=False):
+    """Register a cache handler factory under ``name``.
+
+    ``factory`` is called as ``factory(cache_path=None, cache_url=None)``
+    and must return a :class:`CacheHandler`. Registering an existing name
+    without ``override=True`` raises ``ValueError``. Built-ins
+    (``memory``, ``sqlite``, ``redis``) can be replaced with
+    ``override=True``.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError("cache handler name must be a non-empty string")
+    if not callable(factory):
+        raise TypeError("cache handler factory must be callable")
+    if name in _CACHE_HANDLER_FACTORIES and not override:
+        raise ValueError(f"Cache handler {name!r} is already registered")
+    _CACHE_HANDLER_FACTORIES[name] = factory
+    return factory
+
+
+def get_cache_handler_factory(name):
+    """Return the factory registered under ``name`` (``KeyError`` if none)."""
+    return _CACHE_HANDLER_FACTORIES[name]
+
+
+def list_cache_handlers():
+    """Names of all registered cache handlers, sorted."""
+    return tuple(sorted(_CACHE_HANDLER_FACTORIES))
 
 
 class MemoryCacheBackend(CacheBackend):
@@ -463,17 +1099,445 @@ class MemoryCacheBackend(CacheBackend):
                            expired_at if expired_at is not None else old_expired)
 
 
+class MemoryCacheHandler(CacheHandler):
+    """Process-local handler backed by the Rust ``PageCache``.
+
+    Entry durations and tags live in a side table because the Rust
+    store only keeps the body and its fresh/stale windows; an entry
+    whose metadata is missing (never written through :meth:`set`) is
+    treated as a miss rather than served with guessed durations.
+    """
+
+    name = "memory"
+
+    def __init__(self, store=None):
+        self._store = store if store is not None else _native.PageCache()
+        self._lock = threading.RLock()
+        self._meta = OrderedDict()  # key -> (timestamp, revalidate, stale, expire, tags)
+        self._tags = _TagManifest()
+
+    @property
+    def store(self):
+        return self._store
+
+    def _prune_meta(self, key):
+        self._meta.pop(key, None)
+
+    def get(self, key, soft_tags=()):
+        status, body = self._store.lookup(key)
+        now = time.time()
+        with self._lock:
+            if status in ("miss", "expired") or body is None:
+                self._prune_meta(key)
+                return None
+            meta = self._meta.get(key)
+            if meta is None:
+                return None
+            timestamp, revalidate, stale, expire, tags = meta
+            tag_state = _tag_status(tags, self._tags.times(tags) if tags else {},
+                                    timestamp, now, soft_tags)
+            if tag_state == "expired":
+                # A miss for this read only: the entry stays stored, so a
+                # later read with the tag as soft can still serve it stale.
+                return None
+            return CacheEntry(value=body, tags=tags, stale=stale, timestamp=timestamp,
+                              expire=expire, revalidate=revalidate, tag_state=tag_state)
+
+    def set(self, key, entry):
+        durations = _entry_durations(entry)
+        if durations is None or len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES:
+            return False
+        revalidate, stale_for = durations
+        if not self._store.insert(key, bytes(entry.value), revalidate, stale_for):
+            return False
+        with self._lock:
+            self._meta[key] = (time.time(), revalidate, stale_for,
+                               entry.expire if entry.expire is not None else revalidate + stale_for,
+                               _validate_tags(entry.tags) or ())
+            self._meta.move_to_end(key)
+            while len(self._meta) > _MAX_HANDLER_META_ENTRIES:
+                self._meta.popitem(last=False)
+        return True
+
+    def remove(self, key):
+        with self._lock:
+            self._prune_meta(key)
+        return self._store.remove(key)
+
+    def get_expiration(self, tags):
+        return self._tags.expiration(tags)
+
+    def update_tags(self, tags, durations=None):
+        return self._tags.update(tags, durations)
+
+
+class SQLiteCacheHandler(SharedCacheHandler):
+    """SQLite-backed shared handler.
+
+    The body, leases and generations live in :class:`SQLiteCacheBackend`;
+    entry metadata (timestamp, durations, tags) and tag revalidation
+    instants live in two extra tables in the same file
+    (``handler_meta`` / ``handler_tags``), so tags are shared across
+    processes exactly like entries. ``get`` returns ``None`` when the
+    entry has no metadata (never written through :meth:`set`), mirroring
+    :class:`MemoryCacheHandler`.
+    """
+
+    name = "sqlite"
+
+    def __init__(self, cache_path=None, cache_url=None):
+        if cache_path is None:
+            raise ValueError("cache_path is required for the sqlite cache handler")
+        self._path = os.fspath(cache_path)
+        self._lock = threading.RLock()
+        self._closed = False
+        self._open_backend()
+
+    def _open_backend(self):
+        self.backend = SQLiteCacheBackend(self._path)
+        self._meta_conn = sqlite3.connect(self._path, timeout=10.0, check_same_thread=False)
+        self._meta_conn.execute("PRAGMA busy_timeout=10000")
+        self._meta_conn.executescript(
+            "CREATE TABLE IF NOT EXISTS handler_meta ("
+            "  key TEXT PRIMARY KEY, timestamp REAL NOT NULL,"
+            "  revalidate REAL NOT NULL, stale REAL NOT NULL,"
+            "  expire REAL NOT NULL, tags TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS handler_tags ("
+            "  tag TEXT PRIMARY KEY, stale_at REAL, expired_at REAL);"
+        )
+        self._meta_conn.commit()
+        self._closed = False
+
+    # -- CacheHandler contract -------------------------------------------
+    def get(self, key, soft_tags=()):
+        entry = self.backend.lookup_entry(key)
+        now = time.time()
+        if entry is None or entry.status == "expired":
+            self._drop_meta(key)
+            return None
+        meta = self._read_meta(key)
+        if meta is None:
+            return None
+        timestamp, revalidate, stale, expire, tags = meta
+        tag_state = _tag_status(tags, self._tag_times(tags) if tags else {},
+                                timestamp, now, soft_tags)
+        if tag_state == "expired":
+            # A miss for this read only: the entry stays stored, so a
+            # later read with the tag as soft can still serve it stale.
+            return None
+        return CacheEntry(value=entry.body, tags=tags, stale=stale, timestamp=timestamp,
+                          expire=expire, revalidate=revalidate, tag_state=tag_state)
+
+    def set(self, key, entry):
+        durations = _entry_durations(entry)
+        if durations is None or len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES:
+            return False
+        revalidate, stale_for = durations
+        if not self.backend.insert_fenced(key, bytes(entry.value), revalidate, stale_for, None):
+            return False
+        expire = entry.expire if entry.expire is not None else revalidate + stale_for
+        self._write_meta(key, time.time(), revalidate, stale_for, expire,
+                         _validate_tags(entry.tags) or ())
+        return True
+
+    def remove(self, key):
+        removed = self.backend.remove(key)
+        return self._drop_meta(key) or removed
+
+    def get_expiration(self, tags):
+        cleaned = _validate_tags(tags)
+        if cleaned is None:
+            raise ValueError("tags must be a list or tuple of up to 64 non-empty strings")
+        with self._lock:
+            instants = []
+            for tag in cleaned:
+                row = self._meta_conn.execute(
+                    "SELECT stale_at, expired_at FROM handler_tags WHERE tag = ?", (tag,)
+                ).fetchone()
+                if row is not None:
+                    instants.append(row[0] if row[0] is not None else row[1])
+        return max(instants) if instants else 0.0
+
+    def update_tags(self, tags, durations=None):
+        cleaned, expire = _validate_tag_update(tags, durations)
+        now = time.time()
+        with self._lock:
+            for tag in cleaned:
+                if expire is None:
+                    self._meta_conn.execute(
+                        "INSERT INTO handler_tags (tag, stale_at, expired_at) VALUES (?, NULL, ?)"
+                        " ON CONFLICT(tag) DO UPDATE SET stale_at=NULL, expired_at=excluded.expired_at",
+                        (tag, now))
+                else:
+                    self._meta_conn.execute(
+                        "INSERT INTO handler_tags (tag, stale_at, expired_at) VALUES (?, ?, ?)"
+                        " ON CONFLICT(tag) DO UPDATE SET stale_at=excluded.stale_at,"
+                        " expired_at=excluded.expired_at",
+                        (tag, now, now + expire))
+            self._meta_conn.commit()
+        return None
+
+    # -- SharedCacheHandler coordination (delegated to the backend) ------
+    def lookup_entry(self, key):
+        return self.backend.lookup_entry(key)
+
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
+        return self.backend.insert_fenced(key, body, fresh_seconds, stale_seconds,
+                                          expected_version, owner, tags, generated_at,
+                                          generated_mono)
+
+    def acquire_lease(self, key, owner, ttl=LEASE_TTL):
+        return self.backend.acquire_lease(key, owner, ttl)
+
+    def release_lease(self, key, owner):
+        return self.backend.release_lease(key, owner)
+
+    def owns_lease(self, key, owner):
+        return self.backend.owns_lease(key, owner)
+
+    def variant_generation(self, key, *, invalidate=False):
+        return self.backend.variant_generation(key, invalidate=invalidate)
+
+    # -- lifecycle --------------------------------------------------------
+    def open(self):
+        with self._lock:
+            if self._closed:
+                self._open_backend()
+        return None
+
+    def close(self):
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                try:
+                    self.backend.close()
+                except Exception:
+                    pass
+                try:
+                    self._meta_conn.close()
+                except sqlite3.Error:
+                    pass
+        return None
+
+    # -- metadata / tag storage ------------------------------------------
+    def _read_meta(self, key):
+        with self._lock:
+            row = self._meta_conn.execute(
+                "SELECT timestamp, revalidate, stale, expire, tags FROM handler_meta"
+                " WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None
+        timestamp, revalidate, stale, expire, tags_json = row
+        try:
+            tags = tuple(json.loads(tags_json))
+        except (TypeError, ValueError):
+            return None
+        return timestamp, revalidate, stale, expire, tags
+
+    def _write_meta(self, key, timestamp, revalidate, stale, expire, tags):
+        with self._lock:
+            self._meta_conn.execute(
+                "INSERT INTO handler_meta (key, timestamp, revalidate, stale, expire, tags)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET timestamp=excluded.timestamp,"
+                " revalidate=excluded.revalidate, stale=excluded.stale,"
+                " expire=excluded.expire, tags=excluded.tags",
+                (key, timestamp, revalidate, stale, expire, json.dumps(list(tags))))
+            self._meta_conn.commit()
+
+    def _drop_meta(self, key):
+        with self._lock:
+            deleted = self._meta_conn.execute(
+                "DELETE FROM handler_meta WHERE key = ?", (key,)).rowcount
+            self._meta_conn.commit()
+            return deleted > 0
+
+    def _tag_times(self, tags):
+        with self._lock:
+            times = {}
+            for tag in tags:
+                row = self._meta_conn.execute(
+                    "SELECT stale_at, expired_at FROM handler_tags WHERE tag = ?", (tag,)
+                ).fetchone()
+                times[tag] = (row[0], row[1]) if row is not None else (None, None)
+            return times
+
+
+class RedisCacheHandler(SharedCacheHandler):
+    """Redis-backed shared handler.
+
+    The body, leases and generations live in :class:`RedisCacheBackend`;
+    entry metadata lives in a ``:meta`` hash next to the entry key and
+    tag revalidation instants in ``pynext:isr:tag:<sha256>`` hashes, so
+    both are shared across processes. Tag rows expire after
+    ``MAX_CACHE_SECONDS`` (entries cannot outlive that), meta rows
+    expire with their entry.
+    """
+
+    name = "redis"
+
+    def __init__(self, cache_url=None, cache_path=None, url=None):
+        from .redis_cache import RedisCacheBackend
+        resolved = cache_url or url or os.environ.get("PYNEXT_REDIS_URL")
+        self.backend = RedisCacheBackend(resolved)
+        self._lock = threading.RLock()
+
+    @property
+    def client(self):
+        return self.backend.client
+
+    @staticmethod
+    def _meta_key(key):
+        from .redis_cache import RedisCacheBackend
+        entry_key, _lease_key = RedisCacheBackend._keys(key)
+        return entry_key[: -len(":entry")] + ":meta"
+
+    @staticmethod
+    def _tag_key(tag):
+        return "pynext:isr:tag:" + hashlib.sha256(tag.encode("utf-8")).hexdigest()
+
+    # -- CacheHandler contract -------------------------------------------
+    def get(self, key, soft_tags=()):
+        entry = self.backend.lookup_entry(key)
+        now = time.time()
+        if entry is None or entry.status == "expired":
+            self._drop_meta(key)
+            return None
+        meta = self._read_meta(key)
+        if meta is None:
+            return None
+        timestamp, revalidate, stale, expire, tags = meta
+        tag_state = _tag_status(tags, self._tag_times(tags) if tags else {},
+                                timestamp, now, soft_tags)
+        if tag_state == "expired":
+            # A miss for this read only: the entry stays stored, so a
+            # later read with the tag as soft can still serve it stale.
+            return None
+        return CacheEntry(value=entry.body, tags=tags, stale=stale, timestamp=timestamp,
+                          expire=expire, revalidate=revalidate, tag_state=tag_state)
+
+    def set(self, key, entry):
+        durations = _entry_durations(entry)
+        if durations is None or len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES:
+            return False
+        revalidate, stale_for = durations
+        if not self.backend.insert_fenced(key, bytes(entry.value), revalidate, stale_for, None):
+            return False
+        expire = entry.expire if entry.expire is not None else revalidate + stale_for
+        self._write_meta(key, time.time(), revalidate, stale_for, expire,
+                         _validate_tags(entry.tags) or ())
+        return True
+
+    def remove(self, key):
+        removed = self.backend.remove(key)
+        return self._drop_meta(key) or removed
+
+    def get_expiration(self, tags):
+        cleaned = _validate_tags(tags)
+        if cleaned is None:
+            raise ValueError("tags must be a list or tuple of up to 64 non-empty strings")
+        instants = []
+        for tag in cleaned:
+            row = self.client.hmget(self._tag_key(tag), "stale_at", "expired_at")
+            stale_at, expired_at = row[0], row[1]
+            if stale_at is not None or expired_at is not None:
+                instants.append(float(stale_at) if stale_at is not None else float(expired_at))
+        return max(instants) if instants else 0.0
+
+    def update_tags(self, tags, durations=None):
+        cleaned, expire = _validate_tag_update(tags, durations)
+        now = time.time()
+        for tag in cleaned:
+            key = self._tag_key(tag)
+            if expire is None:
+                self.client.hset(key, mapping={"expired_at": repr(now)})
+                self.client.hdel(key, "stale_at")
+            else:
+                self.client.hset(key, mapping={"stale_at": repr(now),
+                                               "expired_at": repr(now + expire)})
+            self.client.pexpire(key, math.ceil(MAX_CACHE_SECONDS * 1000))
+        return None
+
+    # -- SharedCacheHandler coordination (delegated to the backend) ------
+    def lookup_entry(self, key):
+        return self.backend.lookup_entry(key)
+
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
+        return self.backend.insert_fenced(key, body, fresh_seconds, stale_seconds,
+                                          expected_version, owner, tags, generated_at,
+                                          generated_mono)
+
+    def acquire_lease(self, key, owner, ttl=LEASE_TTL):
+        return self.backend.acquire_lease(key, owner, ttl)
+
+    def release_lease(self, key, owner):
+        return self.backend.release_lease(key, owner)
+
+    def owns_lease(self, key, owner):
+        return self.backend.owns_lease(key, owner)
+
+    def variant_generation(self, key, *, invalidate=False):
+        return self.backend.variant_generation(key, invalidate=invalidate)
+
+    # -- lifecycle --------------------------------------------------------
+    def open(self):
+        # redis-py reopens its pool on demand after close().
+        return None
+
+    def close(self):
+        self.backend.close()
+        return None
+
+    # -- metadata / tag storage ------------------------------------------
+    def _read_meta(self, key):
+        row = self.client.hmget(self._meta_key(key), "timestamp", "revalidate",
+                                "stale", "expire", "tags")
+        if row[0] is None:
+            return None
+        try:
+            return (float(row[0]), float(row[1]), float(row[2]), float(row[3]),
+                    tuple(json.loads(row[4].decode("utf-8"))))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _write_meta(self, key, timestamp, revalidate, stale, expire, tags):
+        meta_key = self._meta_key(key)
+        self.client.hset(meta_key, mapping={
+            "timestamp": repr(timestamp), "revalidate": repr(revalidate),
+            "stale": repr(stale), "expire": repr(expire),
+            "tags": json.dumps(list(tags))})
+        self.client.pexpire(meta_key, math.ceil(
+            (revalidate + stale + LEASE_TTL) * 1000))
+
+    def _drop_meta(self, key):
+        return bool(self.client.delete(self._meta_key(key)))
+
+    def _tag_times(self, tags):
+        times = {}
+        for tag in tags:
+            row = self.client.hmget(self._tag_key(tag), "stale_at", "expired_at")
+            stale_at = float(row[0]) if row[0] is not None else None
+            expired_at = float(row[1]) if row[1] is not None else None
+            times[tag] = (stale_at, expired_at)
+        return times
+
+
 class SharedEntry:
     """One shared-cache row as observed by a lookup."""
 
-    __slots__ = ("status", "body", "version", "fresh_remaining", "stale_remaining")
+    __slots__ = ("status", "body", "version", "fresh_remaining", "stale_remaining", "timestamp")
 
-    def __init__(self, status, body, version, fresh_remaining, stale_remaining):
+    def __init__(self, status, body, version, fresh_remaining, stale_remaining, timestamp=None):
         self.status = status
         self.body = body
         self.version = version
         self.fresh_remaining = fresh_remaining
         self.stale_remaining = stale_remaining
+        # Creation time (wall-clock seconds) when the backend knows it;
+        # None when it does not (Redis reports it via the handler meta).
+        self.timestamp = timestamp
 
 
 class SQLiteCacheBackend(CacheBackend):
@@ -1135,6 +2199,712 @@ class SQLiteCacheBackend(CacheBackend):
                 pass
 
 
+def _fs_entry_name(key):
+    """Map a cache key to a safe, human-readable file stem.
+
+    The stem keeps a sanitized slice of the key so entries are
+    recognizable in a directory listing, plus a 64-bit hash suffix so
+    two keys that sanitize identically never collide. Only
+    ``[A-Za-z0-9._-]`` survives, so the stem can never escape its
+    directory.
+    """
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    slug = _FS_SAFE_CHARS.sub("_", key).strip("._").strip()
+    # Keep the tail: ISR keys are namespaced with a build id up front,
+    # and the path at the end is the part a human recognizes.
+    slug = re.sub(r"_+", "_", slug)[-48:].strip("_")
+    return f"{slug}-{digest[:16]}" if slug else digest[:16]
+
+
+def _fs_monotonic_age(generated_mono, now_mono):
+    age = now_mono - generated_mono
+    return age if age >= 0.0 else None
+
+
+def _fs_wall_age(generated_at, now):
+    age = now - generated_at
+    return age if age >= 0.0 else None
+
+
+class FileSystemCacheBackend(CacheBackend):
+    """A cross-process cache backend on plain files (Next.js
+    ``FileSystemCache``-style, ``server/lib/incremental-cache/
+    file-system-cache.ts``).
+
+    Layout inside ``path``::
+
+        entries/<stem>.body   raw response body
+        entries/<stem>.meta   JSON sidecar: key, version, generated_at
+                              (wall-clock seconds), generated_mono
+                              (monotonic seconds), fresh_for, stale_for
+        leases/<stem>.lease   JSON: owner, expires_at (wall), expires_mono
+        variants/<stem>.variant  JSON: token, expires_at (wall)
+        tags/<stem>.tag       JSON: tag, stale_at, expired_at (shared tag manifest)
+        .lock                 cross-process mutation lock
+
+    The ``.meta`` sidecar is the publish marker, mirroring Next.js's
+    ``.html``/``.body`` + ``.meta`` structure: the body is written first
+    (temp file + atomic rename) and the meta last, so a reader never
+    sees a half-written entry. When the meta is missing or corrupt the
+    entry is a miss, and a body without a meta falls back to nothing —
+    unlike Next.js, which falls back to the file mtime, because PyNext
+    needs the durations and version that only the meta carries.
+
+    The file stem is ``{slug}-{digest[:16]}`` (a 64-bit digest prefix),
+    so two keys can in principle map to the same stem. Every keyed
+    read, write, lease, and removal therefore verifies the stored
+    ``key`` against the requested one: a meta, lease, or variant naming
+    another key is treated as absent, so a collision can never serve,
+    fence, or delete another path's body — it only costs a re-render.
+    Leases and variants store the key for the same reason.
+
+    Age is the smaller of the monotonic and wall-clock ages, ignoring
+    any negative candidate. A wall-clock jump forward is masked by the
+    monotonic age, a jump backward is masked by the wall age, and after
+    a reboot (monotonic clock reset) the wall age is the surviving
+    candidate. Lease liveness requires *both* clocks to say live, so a
+    pre-reboot lease cannot outlive its wall expiry either.
+
+    Mutations (fenced writes, leases, removals, variant generations)
+    take one global lock: an in-process ``RLock`` plus an ``flock``/
+    ``msvcrt`` byte lock on ``.lock``, released automatically if a
+    worker dies. Entry reads take the same lock: a rename is atomic
+    per file, but the body+meta pair is not — a lock-free read could
+    observe a body whose meta has not landed yet (and delete it as a
+    torn write), or read a body that a concurrent colliding write
+    already replaced while the meta still names the old key. Holding
+    the lock across the whole read makes publication atomic: a read
+    sees the old complete version or the new complete version, never
+    a half-published pair. Version checks fence every write, exactly
+    like the SQLite backend. Entries are bounded (``max_entries`` /
+    ``max_bytes``, oldest-first eviction on insert); leased entries
+    are never evicted.
+    """
+
+    def __init__(self, path, *, max_entries=_FS_MAX_ENTRIES, max_bytes=_FS_MAX_BYTES):
+        path = os.fspath(path)
+        if os.path.isfile(path):
+            raise ValueError(f"Filesystem cache path is a file: {path}")
+        self.path = os.path.abspath(path)
+        self.max_entries = int(max_entries)
+        self.max_bytes = int(max_bytes)
+        if self.max_entries <= 0 or self.max_bytes <= 0:
+            raise ValueError("Filesystem cache limits must be positive")
+        self._entries_dir = os.path.join(self.path, "entries")
+        self._leases_dir = os.path.join(self.path, "leases")
+        self._variants_dir = os.path.join(self.path, "variants")
+        self._tags_dir = os.path.join(self.path, "tags")
+        self._lock_path = os.path.join(self.path, ".lock")
+        self._lock = threading.RLock()
+        self._lock_depth = threading.local()
+        try:
+            os.makedirs(self._entries_dir, exist_ok=True)
+            os.makedirs(self._leases_dir, exist_ok=True)
+            os.makedirs(self._variants_dir, exist_ok=True)
+            os.makedirs(self._tags_dir, exist_ok=True)
+            with open(self._lock_path, "ab"):
+                pass
+        except OSError as exc:
+            raise ValueError(f"Cannot create filesystem cache at {path}: {exc}") from exc
+
+    # -- paths ---------------------------------------------------------
+
+    def _body_path(self, name):
+        return os.path.join(self._entries_dir, name + ".body")
+
+    def _meta_path(self, name):
+        return os.path.join(self._entries_dir, name + ".meta")
+
+    def _lease_path(self, name):
+        return os.path.join(self._leases_dir, name + ".lease")
+
+    def _variant_path(self, name):
+        return os.path.join(self._variants_dir, name + ".variant")
+
+    def _tag_path(self, name):
+        return os.path.join(self._tags_dir, name + ".tag")
+
+    # -- locking -------------------------------------------------------
+
+    @contextmanager
+    def _locked(self):
+        """Serialize mutations in-process and cross-process.
+
+        Re-entrant within one thread: a nested hold just yields,
+        because the outer hold already excludes other threads and
+        processes. (``flock`` on a fresh fd would self-deadlock if
+        re-acquired, so the nested case must skip the flock, not
+        re-take it.)
+        """
+        depth = getattr(self._lock_depth, "depth", 0)
+        if depth > 0:
+            yield
+            return
+        with self._lock:
+            handle = open(self._lock_path, "a+b")
+            try:
+                handle.seek(0)
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                elif msvcrt is not None:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                self._lock_depth.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._lock_depth.depth = depth
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    elif msvcrt is not None:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            finally:
+                handle.close()
+
+    # -- atomic file helpers -------------------------------------------
+
+    @staticmethod
+    def _fsync_dir(directory):
+        try:
+            fd = os.open(directory, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def _atomic_write(self, path, data):
+        """Write ``data`` via a temp file + atomic rename, fsynced."""
+        directory = os.path.dirname(path)
+        tmp = os.path.join(directory, f".{os.path.basename(path)}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+        try:
+            with open(tmp, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        self._fsync_dir(directory)
+
+    def _remove_quietly(self, *paths):
+        for path in paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    # -- entry reads ---------------------------------------------------
+
+    def _read_meta(self, name):
+        try:
+            with open(self._meta_path(name), "rb") as handle:
+                meta = json.loads(handle.read().decode("utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(meta, dict):
+            return None
+        try:
+            tags = meta.get("tags", ())
+            if not isinstance(tags, list) or not all(isinstance(item, str) for item in tags):
+                raise ValueError("bad tags")
+            return {
+                "key": meta["key"],
+                "version": int(meta["version"]),
+                "generated_at": float(meta["generated_at"]),
+                "generated_mono": float(meta["generated_mono"]),
+                "fresh_for": float(meta["fresh_for"]),
+                "stale_for": float(meta["stale_for"]),
+                "tags": tuple(tags),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _read_meta_for_key(self, name, key):
+        """Read the meta for ``name``, but only when it belongs to ``key``.
+
+        The file stem is ``{slug}-{digest[:16]}`` (64-bit digest), so two
+        different keys can map to the same stem. The stored ``key`` is the
+        tie-breaker: a meta naming another key is treated as no entry at
+        all, so a collision can never serve — or fence, or delete —
+        another path's body. Returns None when the meta is missing,
+        corrupt, or names a different key.
+        """
+        meta = self._read_meta(name)
+        if meta is not None and meta["key"] != key:
+            return None
+        return meta
+
+    def _entry_age(self, meta, now, now_mono):
+        """Dual-clock age; see the class docstring for the rationale."""
+        candidates = [
+            age for age in (
+                _fs_monotonic_age(meta["generated_mono"], now_mono),
+                _fs_wall_age(meta["generated_at"], now),
+            )
+            if age is not None
+        ]
+        return min(candidates) if candidates else 0.0
+
+    def _read_entry(self, key, now, now_mono):
+        """Read one entry atomically with respect to writers.
+
+        The whole read runs under the same lock ``insert_fenced``
+        holds while publishing body+meta, so a concurrent read can
+        never observe the half-published pair (body written, meta
+        not yet): it sees the old complete version or the new
+        complete version. Without this, a read landing between the
+        two renames deletes the fresh body as a torn write (and the
+        writer still reports success), or — on a file-stem
+        collision — serves the other key's freshly written body
+        under the old key's meta.
+        """
+        with self._locked():
+            return self._read_entry_locked(key, now, now_mono)
+
+    def _read_entry_locked(self, key, now, now_mono):
+        name = _fs_entry_name(key)
+        raw_meta = self._read_meta(name)
+        if raw_meta is None:
+            body_path = self._body_path(name)
+            if os.path.exists(body_path):
+                # A body without a readable meta is a torn or corrupt
+                # write: drop it so it can never be served.
+                self._remove_quietly(body_path)
+            return None
+        if raw_meta["key"] != key:
+            # The file holds a different key's entry (file-name
+            # collision). Never serve it — and never delete it either,
+            # it belongs to the other key. A miss makes the caller
+            # re-render and store under its own key.
+            return None
+        meta = raw_meta
+        age = self._entry_age(meta, now, now_mono)
+        fresh_for = meta["fresh_for"]
+        stale_for = meta["stale_for"]
+        if age >= fresh_for + stale_for:
+            lease = self._read_lease(name, now, now_mono, key)
+            if lease is not None:
+                return SharedEntry("expired", None, meta["version"], 0.0, 0.0)
+            # Delete only the exact expired version seen. This read
+            # holds the lock, so no concurrent writer can replace
+            # the entry between the re-check and the delete; the
+            # version+generated_at match is the fence against a
+            # replacement that landed before this read started. The
+            # key-aware read also fences against a concurrent write
+            # for a colliding key.
+            current = self._read_meta_for_key(name, key)
+            if current is not None and current["version"] == meta["version"] \
+                    and current["generated_at"] == meta["generated_at"]:
+                self._remove_quietly(self._body_path(name), self._meta_path(name))
+            return SharedEntry("expired", None, meta["version"], 0.0, 0.0)
+        try:
+            with open(self._body_path(name), "rb") as handle:
+                body = handle.read()
+        except FileNotFoundError:
+            return None
+        if age < fresh_for:
+            status, fresh_left, stale_left = "fresh", fresh_for - age, stale_for
+        else:
+            status, fresh_left, stale_left = "stale", 0.0, fresh_for + stale_for - age
+        # Tag invalidation is judged by the render-start time, like the
+        # SQLite backend: a generation that started before the invalidation
+        # but landed after it is stale/expired, never fresh. A tag-expired
+        # entry is a miss but stays stored (a later read may still serve
+        # it stale); only age expiry deletes.
+        tags = meta.get("tags", ())
+        if tags:
+            tag_state = _tag_status(tags, self._tag_times(tags), meta["generated_at"], now)
+            if tag_state == "expired":
+                return SharedEntry("expired", None, meta["version"], 0.0, 0.0)
+            if tag_state == "stale":
+                status, fresh_left, stale_left = "stale", 0.0, fresh_for + stale_for - age
+        return SharedEntry(status, body, meta["version"], fresh_left, stale_left)
+
+    def lookup(self, key):
+        try:
+            entry = self._read_entry(key, time.time(), time.monotonic())
+        except OSError:
+            log.warning("Filesystem cache lookup failed for %s", key, exc_info=True)
+            return ("miss", None)
+        if entry is None:
+            return ("miss", None)
+        return (entry.status, entry.body)
+
+    def lookup_entry(self, key):
+        """Like ``lookup`` but also returns the entry version and the
+        remaining fresh/stale windows, which callers need for fencing and
+        for repopulating the process-local cache."""
+        try:
+            return self._read_entry(key, time.time(), time.monotonic())
+        except OSError as exc:
+            raise SharedCacheUnavailable("Filesystem cache lookup failed") from exc
+
+    # -- leases ----------------------------------------------------------
+
+    def _read_lease(self, name, now, now_mono, key=None):
+        """Read a live lease, optionally only when it names ``key``.
+
+        Like entries, leases live in a file named by the key stem, so a
+        file-name collision could let one key see another's lease. When
+        ``key`` is given, a lease naming a different key is treated as
+        no lease. Callers that only need "is anything leased here"
+        (capacity eviction) pass no key.
+        """
+        try:
+            with open(self._lease_path(name), "rb") as handle:
+                lease = json.loads(handle.read().decode("utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(lease, dict):
+            return None
+        try:
+            owner = lease["owner"]
+            expires_at = float(lease["expires_at"])
+            expires_mono = float(lease["expires_mono"])
+            version = int(lease["version"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if key is not None and lease.get("key") is not None and lease["key"] != key:
+            return None
+        # Live only while both clocks agree: a wall jump or a reboot
+        # (monotonic reset) on its own cannot resurrect a dead lease.
+        if now < expires_at and now_mono < expires_mono:
+            return {"owner": owner, "version": version}
+        return None
+
+    def acquire_lease(self, key, owner, ttl=LEASE_TTL):
+        """Take the cross-process generation lease for ``key``.
+
+        Returns the entry version observed at acquisition (``0`` when no
+        entry exists) for fencing the later write, or ``None`` when another
+        worker already holds a live lease. An expired lease may be taken
+        over, so a crashed worker cannot block regeneration forever.
+        """
+        name = _fs_entry_name(key)
+        with self._locked():
+            try:
+                now = time.time()
+                now_mono = time.monotonic()
+                if self._read_lease(name, now, now_mono, key) is not None:
+                    return None
+                meta = self._read_meta_for_key(name, key)
+                version = meta["version"] if meta is not None else 0
+                lease = {
+                    "key": key,
+                    "owner": owner,
+                    "expires_at": now + ttl,
+                    "expires_mono": now_mono + ttl,
+                    "version": version,
+                }
+                self._atomic_write(
+                    self._lease_path(name),
+                    json.dumps(lease, sort_keys=True).encode("utf-8"),
+                )
+                return version
+            except OSError as exc:
+                raise SharedCacheUnavailable("Filesystem cache lease failed") from exc
+
+    def release_lease(self, key, owner):
+        """Release a lease, but only the one this worker owns."""
+        name = _fs_entry_name(key)
+        with self._locked():
+            try:
+                lease = self._read_lease(name, time.time(), time.monotonic(), key)
+                if lease is not None and lease["owner"] == owner:
+                    self._remove_quietly(self._lease_path(name))
+                    return True
+                # An expired lease file is already dead; remove it only
+                # when it names this owner, so a successor's lease is
+                # never clobbered. The key must match too, so a
+                # colliding key cannot release another key's lease.
+                try:
+                    with open(self._lease_path(name), "rb") as handle:
+                        raw = json.loads(handle.read().decode("utf-8"))
+                    if isinstance(raw, dict) and raw.get("owner") == owner \
+                            and (raw.get("key") is None or raw.get("key") == key):
+                        self._remove_quietly(self._lease_path(name))
+                        return True
+                except (FileNotFoundError, OSError, ValueError, UnicodeDecodeError):
+                    pass
+                return False
+            except OSError:
+                log.warning("Filesystem cache lease release failed for %s", key, exc_info=True)
+                return False
+
+    def owns_lease(self, key, owner):
+        try:
+            lease = self._read_lease(
+                _fs_entry_name(key), time.time(), time.monotonic(), key)
+        except OSError as exc:
+            raise SharedCacheUnavailable("Filesystem cache lease lookup failed") from exc
+        return lease is not None and lease["owner"] == owner
+
+    # -- writes ----------------------------------------------------------
+
+    def insert(self, key, body, fresh_seconds, stale_seconds, tags=()):
+        return self.insert_fenced(key, body, fresh_seconds, stale_seconds, None, tags=tags)
+
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
+        """Store ``body`` only if the entry version still equals
+        ``expected_version`` (``0`` when no entry existed, ``None`` for an
+        unfenced write). When an owner is given, its lease must still be live
+        in the same lock hold. Returns False when either fence has moved.
+
+        ``generated_at`` / ``generated_mono`` stamp the entry with the
+        render *start* time instead of the insert time (same role as in
+        :meth:`SQLiteCacheBackend.insert_fenced`): a generation that
+        started before a tag invalidation but stored after it is judged
+        by when its content was produced. ``tags`` are stored in the meta
+        sidecar so other workers can judge them on lookup.
+        """
+        if len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES or len(body) > MAX_CACHE_BODY_BYTES:
+            return False
+        if not _valid_durations(fresh_seconds, stale_seconds):
+            return False
+        try:
+            tags = _validate_entry_tags(tags)
+        except ValueError:
+            return False
+        name = _fs_entry_name(key)
+        with self._locked():
+            try:
+                now = time.time()
+                now_mono = time.monotonic()
+                gen_at = generated_at if generated_at is not None else now
+                gen_mono = generated_mono if generated_mono is not None else now_mono
+                if owner is not None:
+                    lease = self._read_lease(name, now, now_mono, key)
+                    if lease is None or lease["owner"] != owner:
+                        return False
+                # A meta naming another key is treated as no entry:
+                # the write starts fresh (version 1) instead of
+                # inheriting — or fencing on — another key's version.
+                meta = self._read_meta_for_key(name, key)
+                if expected_version is None:
+                    version = (meta["version"] + 1) if meta is not None else 1
+                elif meta is None:
+                    if expected_version != 0:
+                        return False
+                    version = 1
+                elif meta["version"] != expected_version:
+                    return False
+                else:
+                    version = meta["version"] + 1
+                new_meta = {
+                    "key": key,
+                    "version": version,
+                    "generated_at": gen_at,
+                    "generated_mono": gen_mono,
+                    "fresh_for": float(fresh_seconds),
+                    "stale_for": float(stale_seconds),
+                    "tags": list(tags),
+                }
+                # Body first, meta last: the meta is the publish marker.
+                self._atomic_write(self._body_path(name), bytes(body))
+                self._atomic_write(
+                    self._meta_path(name),
+                    json.dumps(new_meta, sort_keys=True).encode("utf-8"),
+                )
+                self._enforce_capacity(except_name=name)
+                return True
+            except OSError:
+                log.warning("Filesystem cache insert failed for %s", key, exc_info=True)
+                return False
+
+    def _enforce_capacity(self, *, except_name):
+        """Evict oldest-first until the entry count and total body bytes
+        are back under the caps. Best-effort: a scan failure only loses
+        eviction, never the write that just landed. Leased entries and
+        the entry just written are never evicted."""
+        try:
+            now = time.time()
+            now_mono = time.monotonic()
+            entries = []
+            total_bytes = 0
+            for filename in os.listdir(self._entries_dir):
+                if not filename.endswith(".meta"):
+                    continue
+                name = filename[:-len(".meta")]
+                meta = self._read_meta(name)
+                if meta is None:
+                    continue
+                try:
+                    size = os.path.getsize(self._body_path(name))
+                except OSError:
+                    continue
+                total_bytes += size
+                entries.append((self._entry_age(meta, now, now_mono), name))
+            if len(entries) <= self.max_entries and total_bytes <= self.max_bytes:
+                return
+            entries.sort(key=lambda item: -item[0])  # oldest first
+            remaining = len(entries)
+            for _age, name in list(entries):
+                if remaining <= self.max_entries and total_bytes <= self.max_bytes:
+                    break
+                if name == except_name:
+                    continue
+                if self._read_lease(name, now, now_mono) is not None:
+                    continue
+                try:
+                    size = os.path.getsize(self._body_path(name))
+                except OSError:
+                    size = 0
+                self._remove_quietly(self._body_path(name), self._meta_path(name))
+                remaining -= 1
+                total_bytes -= size
+        except OSError:
+            log.debug("Filesystem cache capacity scan failed", exc_info=True)
+
+    def remove(self, key):
+        name = _fs_entry_name(key)
+        with self._locked():
+            # Never delete another key's entry: a file-name collision
+            # must not let one key's invalidation wipe another path.
+            # When the meta names a different key, leave everything
+            # (entry and lease) alone.
+            meta = self._read_meta(name)
+            if meta is not None and meta["key"] != key:
+                return False
+            removed = False
+            for path in (self._body_path(name), self._meta_path(name), self._lease_path(name)):
+                try:
+                    os.unlink(path)
+                    removed = True
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    log.warning("Filesystem cache remove failed for %s", key, exc_info=True)
+                    return False
+            return removed
+
+    def variant_generation(self, key, *, invalidate=False):
+        """Get or replace a path generation atomically across workers."""
+        name = _fs_entry_name(key)
+        with self._locked():
+            try:
+                now = time.time()
+                token = None
+                existed = False
+                try:
+                    with open(self._variant_path(name), "rb") as handle:
+                        raw = json.loads(handle.read().decode("utf-8"))
+                    # A variant naming another key is a file-name
+                    # collision, not this key's generation.
+                    if isinstance(raw, dict) and float(raw["expires_at"]) > now \
+                            and (raw.get("key") is None or raw.get("key") == key):
+                        token = raw["token"]
+                        existed = True
+                except (FileNotFoundError, OSError, ValueError, UnicodeDecodeError, KeyError, TypeError):
+                    token = None
+                if token is None or invalidate:
+                    token = uuid.uuid4().hex
+                    self._atomic_write(
+                        self._variant_path(name),
+                        json.dumps(
+                            {"key": key, "token": token, "expires_at": now + _VARIANT_GENERATION_TTL},
+                            sort_keys=True,
+                        ).encode("utf-8"),
+                    )
+                return token, existed
+            except OSError as exc:
+                raise SharedCacheUnavailable("Filesystem cache generation failed") from exc
+
+    # -- tags (shared tag manifest, one JSON file per tag) --------------
+    # These mirror the tag-manifest contract the other shared stores
+    # provide (SQLite/Redis handlers implement the same three methods):
+    # ``_read_entry`` re-judges tagged entries by the manifest, and
+    # ``ISRCache.revalidate_tag`` records invalidations here so other
+    # workers observe them on their next lookup.
+
+    def _tag_times(self, tags):
+        """Return ``{tag: (stale_at, expired_at)}`` in wall-clock seconds.
+
+        A missing tag maps to ``(None, None)``. A tag file naming a
+        different tag is a file-name collision, not this tag's record.
+        """
+        times = {}
+        for tag in tags:
+            try:
+                with open(self._tag_path(_fs_entry_name(tag)), "rb") as handle:
+                    row = json.loads(handle.read().decode("utf-8"))
+                if not isinstance(row, dict) or row.get("tag") != tag:
+                    times[tag] = (None, None)
+                else:
+                    times[tag] = (float(row["stale_at"]), float(row["expired_at"]))
+            except (FileNotFoundError, OSError, ValueError, UnicodeDecodeError,
+                    KeyError, TypeError):
+                times[tag] = (None, None)
+        return times
+
+    def get_tag_times(self, tags):
+        """Return ``{tag: (stale_at, expired_at)}`` in wall-clock seconds.
+
+        A missing tag maps to ``(None, None)``.
+        """
+        return self._tag_times(tags)
+
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation in the shared manifest.
+
+        ``expire=None`` marks entries carrying the tag expired
+        immediately; ``expire`` seconds keeps them merely stale until
+        that delay passes. Entries generated after this call are
+        unaffected. Returns True when the record was stored.
+        """
+        tag = _validate_tag(tag)
+        expire = _validate_tag_expire(expire)
+        name = _fs_entry_name(tag)
+        with self._locked():
+            try:
+                now = time.time()
+                stale_at = now
+                expired_at = now if expire is None else now + expire
+                self._atomic_write(
+                    self._tag_path(name),
+                    json.dumps({"tag": tag, "stale_at": stale_at, "expired_at": expired_at},
+                               sort_keys=True).encode("utf-8"),
+                )
+                # A manifest row can only affect entries generated before
+                # its expired_at, and no entry lives longer than
+                # fresh+stale (2 * MAX_CACHE_SECONDS), so older rows are
+                # dead weight. Prune them opportunistically.
+                cutoff = now - 2 * MAX_CACHE_SECONDS
+                try:
+                    filenames = os.listdir(self._tags_dir)
+                except OSError:
+                    filenames = []
+                for filename in filenames:
+                    if not filename.endswith(".tag"):
+                        continue
+                    try:
+                        with open(os.path.join(self._tags_dir, filename), "rb") as handle:
+                            row = json.loads(handle.read().decode("utf-8"))
+                        if float(row["expired_at"]) < cutoff:
+                            self._remove_quietly(os.path.join(self._tags_dir, filename))
+                    except (OSError, ValueError, UnicodeDecodeError, KeyError, TypeError):
+                        continue
+                return True
+            except OSError:
+                log.warning("Filesystem cache tag invalidation failed for %s", tag, exc_info=True)
+                return False
+
+    def close(self):
+        # No connection to close; files are opened per operation.
+        pass
+
+
 def _is_storable(response):
     """A response with Set-Cookie or Cache-Control: private/no-store must
     never land in a cache shared between users (spec section 10.2)."""
@@ -1149,13 +2919,226 @@ def _is_storable(response):
     return True
 
 
+class _PlainHandlerSharedAdapter(SharedCacheHandler):
+    """Give a plain :class:`CacheHandler` the shared-cache operations.
+
+    Leases, versions and generations live in process-local tables, so
+    generation is coordinated only within this process — exactly the
+    limit the module docstring promises for plain handlers. Entry
+    reads/writes go through the wrapped handler's ``get``/``set``.
+    """
+
+    name = "custom"
+
+    def __init__(self, handler):
+        self.handler = _validate_cache_handler(handler)
+        self.name = getattr(handler, "name", "custom")
+        self._lock = threading.RLock()
+        self._versions = {}      # key -> int
+        self._leases = {}        # key -> (owner, expires_at)
+        self._generations = {}   # key -> (token, expires_at)
+        # Local entry metadata (key -> (tags, generated_at, generated_mono)):
+        # the wrapped handler's ``set`` takes a CacheEntry, whose
+        # ``tags``/``timestamp`` fields carry the tags and the render-start
+        # time — but handlers are free to re-stamp the write time (the
+        # built-in memory handler and the test dict handler both do), so
+        # the render-start instant is also kept here. ``lookup_entry``
+        # judges the entry by it, mirroring the SQLite backend's
+        # ``generated_at`` tag check. ``generated_mono`` has no CacheEntry
+        # field and no wall-clock consumer here; it is recorded for
+        # parity with the shared backends.
+        self._entry_meta = {}
+        # Mirror of the tag revalidation instants recorded through this
+        # adapter (same semantics as :class:`_TagManifest`): the handler
+        # classifies by its own write time, so the mirror lets
+        # ``lookup_entry`` re-judge by the render-start time instead.
+        self._tags = _TagManifest()
+
+    # -- CacheHandler contract (delegated) -------------------------------
+    def get(self, key, soft_tags=()):
+        return self.handler.get(key, soft_tags)
+
+    def set(self, key, entry):
+        return self.handler.set(key, entry)
+
+    def remove(self, key):
+        with self._lock:
+            self._versions.pop(key, None)
+            self._leases.pop(key, None)
+            self._entry_meta.pop(key, None)
+        return self.handler.remove(key)
+
+    def get_expiration(self, tags):
+        return self.handler.get_expiration(tags)
+
+    def update_tags(self, tags, durations=None):
+        result = self.handler.update_tags(tags, durations)
+        # Mirror the invalidation locally so lookup_entry can judge
+        # entries by their render-start time (see _entry_meta).
+        self._tags.update(tags, durations)
+        return result
+
+    def _tag_times(self, tags):
+        """Tag invalidation instants from the local mirror (see :meth:`update_tags`).
+
+        The wrapped handler keeps its own tag store, but the adapter
+        judges entries by the render-start time, so the mirror — not
+        the handler — is the authority here. Satisfies the abstract
+        ``SharedCacheHandler._tag_times`` the adapter must implement.
+        """
+        return self._tags.times(tags)
+
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation through the wrapped handler and the local mirror."""
+        tag = _validate_tag(tag)
+        expire = _validate_tag_expire(expire)
+        durations = {"expire": expire} if expire is not None else None
+        self.handler.update_tags([tag], durations)
+        self._tags.update([tag], durations)
+        return True
+
+    def refresh_tags(self):
+        return self.handler.refresh_tags()
+
+    def open(self):
+        return self.handler.open()
+
+    def close(self):
+        return self.handler.close()
+
+    # -- SharedCacheHandler coordination (process-local) -----------------
+    def lookup_entry(self, key):
+        entry = self.handler.get(key)
+        if entry is None:
+            return None
+        with self._lock:
+            version = self._versions.get(key, 0)
+            meta = self._entry_meta.get(key)
+        if meta is None:
+            shared = _shared_entry_from_cache_entry(entry)
+            shared.version = version
+            return shared
+        # Re-judge by the render-start time: the handler classified the
+        # entry by its own write time, so a generation that started
+        # before a tag invalidation but landed after it would look fresh
+        # to the handler. The local tag check can only demote (fresh ->
+        # stale/expired), never promote — an entry the handler already
+        # calls stale or expired stays that way.
+        tags, generated_at, _generated_mono = meta
+        now = time.time()
+        tag_state = _tag_status(tags, self._tags.times(tags) if tags else {},
+                                generated_at, now)
+        if tag_state == "expired":
+            return SharedEntry("expired", None, version, 0.0, 0.0)
+        if tag_state == "stale" or entry.tag_state == "stale":
+            tag_state = "stale"
+        else:
+            tag_state = entry.tag_state
+        corrected = CacheEntry(value=entry.value, tags=entry.tags, stale=entry.stale,
+                               timestamp=generated_at, expire=entry.expire,
+                               revalidate=entry.revalidate, tag_state=tag_state)
+        shared = _shared_entry_from_cache_entry(corrected)
+        shared.version = version
+        return shared
+
+    def insert_fenced(self, key, body, fresh_seconds, stale_seconds, expected_version, owner=None,
+                      tags=(), generated_at=None, generated_mono=None):
+        """Store ``body`` only if the version/lease fences still hold.
+
+        Tags and the render-start time travel in the :class:`CacheEntry`
+        handed to the wrapped handler (``tags`` / ``timestamp``), and
+        are also recorded in :attr:`_entry_meta`: handlers may re-stamp
+        the write time on ``set``, so the local record is what
+        :meth:`lookup_entry` judges freshness and tag staleness by —
+        the same role ``generated_at`` plays in
+        :meth:`SQLiteCacheBackend.insert_fenced`.
+        """
+        if len(key.encode("utf-8")) > MAX_CACHE_KEY_BYTES or len(body) > MAX_CACHE_BODY_BYTES:
+            return False
+        if not _valid_durations(fresh_seconds, stale_seconds):
+            return False
+        try:
+            tags = _validate_entry_tags(tags)
+        except ValueError:
+            return False
+        now = time.time()
+        gen_at = generated_at if generated_at is not None else now
+        gen_mono = generated_mono if generated_mono is not None else time.monotonic()
+        with self._lock:
+            now_mono = time.monotonic()
+            if owner is not None:
+                lease = self._leases.get(key)
+                if lease is None or lease[0] != owner or lease[1] <= now_mono:
+                    return False
+            version = self._versions.get(key, 0)
+            if expected_version is not None and version != expected_version:
+                return False
+            entry = CacheEntry(value=bytes(body), tags=tags, revalidate=float(fresh_seconds),
+                               stale=float(stale_seconds), timestamp=gen_at)
+            if not self.handler.set(key, entry):
+                return False
+            self._versions[key] = version + 1
+            self._entry_meta[key] = (tags, gen_at, gen_mono)
+            return True
+
+    def acquire_lease(self, key, owner, ttl=LEASE_TTL):
+        with self._lock:
+            now = time.monotonic()
+            lease = self._leases.get(key)
+            if lease is not None and lease[1] > now:
+                return None
+            self._leases[key] = (owner, now + ttl)
+            return self._versions.get(key, 0)
+
+    def release_lease(self, key, owner):
+        with self._lock:
+            lease = self._leases.get(key)
+            if lease is not None and lease[0] == owner:
+                del self._leases[key]
+                return True
+            return False
+
+    def owns_lease(self, key, owner):
+        with self._lock:
+            lease = self._leases.get(key)
+            return lease is not None and lease[0] == owner and lease[1] > time.monotonic()
+
+    def variant_generation(self, key, *, invalidate=False):
+        with self._lock:
+            now = time.monotonic()
+            current = self._generations.get(key)
+            if current is not None and current[1] > now and not invalidate:
+                return current[0], True
+            token = uuid.uuid4().hex
+            self._generations[key] = (token, now + _VARIANT_GENERATION_TTL)
+            return token, current is not None
+
+
+def _memory_handler_factory(cache_path=None, cache_url=None):
+    return MemoryCacheHandler()
+
+
+def _sqlite_handler_factory(cache_path=None, cache_url=None):
+    return SQLiteCacheHandler(cache_path=cache_path)
+
+
+def _redis_handler_factory(cache_path=None, cache_url=None):
+    return RedisCacheHandler(cache_url=cache_url)
+
+
+register_cache_handler("memory", _memory_handler_factory)
+register_cache_handler("sqlite", _sqlite_handler_factory)
+register_cache_handler("redis", _redis_handler_factory)
+
+
 class ISRCache:
     def __init__(self, cache_backend="memory", cache_path=None, namespace="", cache_url=None,
-                 failure_policy=None, sqlite_max_entries=None, sqlite_max_bytes=None):
+                 failure_policy=None, sqlite_max_entries=None, sqlite_max_bytes=None, cache_handler=None,
+                 health=None, metrics=None):
         """Create an ISR cache.
 
         ``failure_policy`` (roadmap item B4) decides what happens when
-        the shared backend (``sqlite``/``redis``) is unavailable: the
+        the shared backend (``sqlite``/``filesystem``/``redis``) is unavailable: the
         default ``"fail_open"`` falls back to the process-local cache
         and renders locally, while ``"fail_closed"`` raises
         :class:`SharedCacheUnavailable` so the caller can answer 503
@@ -1168,10 +3151,105 @@ class ISRCache:
         backend's capacity caps (``None`` selects the backend defaults,
         currently 10,000 entries / 128 MiB); they are ignored for the
         other backends.
+
+        ``cache_handler`` selects the cache store through the
+        :class:`CacheHandler` plugin contract instead of the
+        ``cache_backend`` name: a registered name (``"memory"``,
+        ``"sqlite"``, ``"redis"`` or a custom one), a factory called
+        as ``factory(cache_path=None, cache_url=None)``, or a handler
+        instance. A :class:`SharedCacheHandler` is used directly for
+        cross-process coordination; a plain :class:`CacheHandler` is
+        wrapped so reads/writes go through it while generation is
+        coordinated only within this process. When ``cache_handler``
+        is given, ``cache_backend`` is ignored.
+
+        ``health`` is an optional :class:`observability.BackendHealth`
+        that the read/decision path reports to whenever it actually
+        touches the shared backend (success or failure), so ``/readyz``
+        can reflect backend health from last-seen state without
+        probing. Best-effort writes do not report.
+
+        ``metrics`` is an optional :class:`observability.MetricsCollector`
+        that counts failure-policy activations (``"refused"`` under
+        ``fail_closed``, ``"degraded"`` under ``fail_open``).
         """
-        if cache_backend not in ("memory", "sqlite", "redis"):
-            raise ValueError(
-                f"Unknown cache backend {cache_backend!r}: expected 'memory', 'sqlite' or 'redis'"
+        self.handler = None
+        self._shared_builder = None
+        if cache_handler is not None:
+            factory = None
+            instance = None
+            if isinstance(cache_handler, str):
+                try:
+                    factory = get_cache_handler_factory(cache_handler)
+                except KeyError as exc:
+                    raise ValueError(
+                        f"Unknown cache handler {cache_handler!r}: expected one of "
+                        f"{', '.join(list_cache_handlers())}") from exc
+            elif isinstance(cache_handler, CacheHandler):
+                instance = cache_handler
+            elif callable(cache_handler):
+                factory = cache_handler
+            else:
+                raise TypeError(
+                    "cache_handler must be a registered name, a factory, or a CacheHandler")
+
+            def _build_shared():
+                handler = (factory(cache_path=cache_path, cache_url=cache_url)
+                           if factory is not None else instance)
+                return self._wrap_handler(handler)
+
+            self._shared_builder = _build_shared
+            self.shared = _build_shared()
+            self._sync_handler()
+            self.backend_name = getattr(self.handler, "name", "custom") or "custom"
+            self._cache_path = cache_path
+            self._cache_url = cache_url
+            self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_OPEN)
+            # Same reporting hooks as the cache_backend path below: the
+            # shared store is touched here too, so _report_backend and
+            # _report_degraded (and the warmup CacheSignal) must exist.
+            self._health = health
+            self._metrics = metrics
+            self.signal = CacheSignal()
+            # The process-local store stays the native fast path in both modes:
+            # the Axum server reads it directly for fresh hits.
+            self.store = _native.PageCache()
+            self._inflight = {}
+            self._task_leases = {}
+            self._tasks = set()
+            # C-2 retention: ``_retained`` maps a key to its last-known-good
+            # ``(body, retained_at)`` — the previous entry a failed
+            # regeneration falls back to, even after the backends have
+            # dropped the expired entry itself. ``_regen_failures`` maps a
+            # key to ``{"failures", "next_retry_at", "last_error"}`` for the
+            # retry backoff. Both are process-local (same as the
+            # cache_backend path below). Without these, the cache_handler
+            # path returned early and get_or_render failed with
+            # AttributeError on ``_regen_failures``.
+            self._retained = OrderedDict()
+            self._retained_bytes = 0
+            self._regen_failures = {}
+            # In-flight shared writes, keyed by cache key (Next.js ``pendingSets``):
+            # a second write for the same key waits on the event instead of
+            # issuing a duplicate write, and a read waits (bounded) and re-reads
+            # the shared entry once the write lands.
+            self._pending_sets = {}
+            self._variant_paths = OrderedDict()
+            # Tag invalidation state (same as the cache_backend path below):
+            # ``_key_tags`` / ``_key_generated_at`` record which tags each
+            # cached key carries and when its current entry was generated,
+            # so a tag invalidation can retire in-flight generations and
+            # reclassify process-local hits without consulting the backend.
+            self._tag_manifest = {}
+            self._key_tags = OrderedDict()
+            self._key_generated_at = OrderedDict()
+            self._cached_paths = OrderedDict()
+            self._loop = None
+            self._closed = False
+            self.namespace = namespace
+            return
+        if cache_backend not in ("memory", "sqlite", "redis", "filesystem"):            raise ValueError(
+                "Unknown cache backend {!r}: expected 'memory', 'sqlite', 'redis' or 'filesystem'".format(cache_backend)
             )
         self.backend_name = cache_backend
         self._cache_path = cache_path
@@ -1185,6 +3263,8 @@ class ISRCache:
             self._cache_path = path
         self._cache_url = (cache_url or os.environ.get("PYNEXT_REDIS_URL")) if cache_backend == "redis" else None
         self.failure_policy = normalize_failure_policy(failure_policy, default=FAIL_OPEN)
+        self._health = health
+        self._metrics = metrics
         # The process-local store stays the native fast path in both modes:
         # the Axum server reads it directly for fresh hits.
         self.store = _native.PageCache()
@@ -1194,6 +3274,10 @@ class ISRCache:
                 raise ValueError("cache_path is required when cache_backend is 'sqlite'")
             self.shared = SQLiteCacheBackend(
                 self._cache_path, max_entries=sqlite_max_entries, max_bytes=sqlite_max_bytes)
+        elif cache_backend == "filesystem":
+            if cache_path is None:
+                raise ValueError("cache_path is required when cache_backend is 'filesystem'")
+            self.shared = FileSystemCacheBackend(self._cache_path)
         elif cache_backend == "redis":
             from .redis_cache import RedisCacheBackend
             self.shared = RedisCacheBackend(self._cache_url)
@@ -1211,6 +3295,16 @@ class ISRCache:
         self._retained = OrderedDict()
         self._retained_bytes = 0
         self._regen_failures = {}
+        # In-flight shared writes, keyed by cache key (Next.js ``pendingSets``):
+        # a second write for the same key waits on the event instead of
+        # issuing a duplicate write, and a read waits (bounded) and re-reads
+        # the shared entry once the write lands.
+        self._pending_sets = {}
+        # CacheSignal (Next.js cache-signal.ts): counts in-flight
+        # generations so warmup and cross-worker waits can tell when
+        # cache reads have settled without polling. Every task added by
+        # _register brackets one read; see its done callback.
+        self.signal = CacheSignal()
         self._variant_paths = OrderedDict()
         # Tag invalidation state. ``_tag_manifest`` is the process-local
         # copy of the tag manifest (authoritative for the memory backend;
@@ -1227,13 +3321,37 @@ class ISRCache:
         self._closed = False
         self.namespace = namespace
 
+    @staticmethod
+    def _wrap_handler(handler):
+        """Validate ``handler`` and adapt it to the shared-cache role."""
+        _validate_cache_handler(handler)
+        handler.open()
+        if isinstance(handler, SharedCacheHandler):
+            return handler
+        return _PlainHandlerSharedAdapter(handler)
+
+    def _sync_handler(self):
+        """Point ``self.handler`` at the handler behind ``self.shared``."""
+        if isinstance(self.shared, _PlainHandlerSharedAdapter):
+            self.handler = self.shared.handler
+        else:
+            self.handler = self.shared
+
     def open(self):
         # A previous shutdown or failed app startup closes the shared store.
         # Reopening must restore it rather than silently falling back to L1.
+        if self._shared_builder is not None:
+            if self.shared is None:
+                self.shared = self._shared_builder()
+                self._sync_handler()
+            self._closed = False
+            return
         if self.shared is None and self.backend_name == "sqlite":
             self.shared = SQLiteCacheBackend(
                 self._cache_path, max_entries=self._sqlite_max_entries,
                 max_bytes=self._sqlite_max_bytes)
+        elif self.shared is None and self.backend_name == "filesystem":
+            self.shared = FileSystemCacheBackend(self._cache_path)
         elif self.shared is None and self.backend_name == "redis":
             from .redis_cache import RedisCacheBackend
             self.shared = RedisCacheBackend(self._cache_url)
@@ -1279,6 +3397,9 @@ class ISRCache:
         self._retained.clear()
         self._retained_bytes = 0
         self._regen_failures.clear()
+        for event in self._pending_sets.values():
+            event.set()
+        self._pending_sets.clear()
         self._variant_paths.clear()
         self._key_tags.clear()
         self._key_generated_at.clear()
@@ -1299,6 +3420,17 @@ class ISRCache:
             raise RuntimeError("An ISR app instance must use a single event loop")
         return loop
 
+    def _report_backend(self, healthy):
+        """Record a shared-backend touch for ``/readyz`` (no-op without one)."""
+        if self._health is not None and self.shared is not None:
+            self._health.report("isr-cache", healthy=healthy, policy=self.failure_policy)
+
+    def _report_degraded(self):
+        """Count one failure-policy activation (refused vs degraded)."""
+        if self._metrics is not None and self.shared is not None:
+            outcome = "refused" if self.failure_policy == FAIL_CLOSED else "degraded"
+            self._metrics.observe_degraded("isr-cache", self.failure_policy, outcome)
+
     async def _shared_entry(self, key):
         """Return an entry, a miss, or a distinct backend-failure sentinel.
 
@@ -1307,12 +3439,16 @@ class ISRCache:
         sentinel, so the request fails rather than falling back.
         """
         try:
-            return await asyncio.to_thread(self.shared.lookup_entry, self.namespace + key)
+            entry = await asyncio.to_thread(self.shared.lookup_entry, self.namespace + key)
         except Exception as exc:
+            self._report_backend(False)
+            self._report_degraded()
             if self.failure_policy == FAIL_CLOSED:
                 raise SharedCacheUnavailable("Shared cache lookup failed") from exc
             log.warning("Shared cache lookup failed for %s", key, exc_info=True)
             return _SHARED_UNAVAILABLE
+        self._report_backend(True)
+        return entry
 
     async def _shared_store(self, key, body, policy, expected_version, owner, tags=(),
                             generated_at=None, generated_mono=None):
@@ -1342,12 +3478,16 @@ class ISRCache:
 
     async def _shared_acquire(self, key, owner):
         try:
-            return await asyncio.to_thread(self.shared.acquire_lease, self.namespace + key, owner)
+            acquired = await asyncio.to_thread(self.shared.acquire_lease, self.namespace + key, owner)
         except Exception as exc:
+            self._report_backend(False)
+            self._report_degraded()
             if self.failure_policy == FAIL_CLOSED:
                 raise SharedCacheUnavailable("Shared cache lease failed") from exc
             log.warning("Shared cache lease failed for %s", key, exc_info=True)
             return _SHARED_UNAVAILABLE
+        self._report_backend(True)
+        return acquired
 
     async def _shared_release(self, key, owner):
         # Best-effort in both policies: leases expire on their own, and
@@ -1359,14 +3499,18 @@ class ISRCache:
 
     async def _shared_remove(self, key):
         try:
-            return await asyncio.to_thread(self.shared.remove, self.namespace + key)
+            removed = await asyncio.to_thread(self.shared.remove, self.namespace + key)
         except Exception as exc:
+            self._report_backend(False)
+            self._report_degraded()
             if self.failure_policy == FAIL_CLOSED:
                 # An explicit invalidation must not report success when
                 # the shared store never saw it.
                 raise SharedCacheUnavailable("Shared cache invalidation failed") from exc
             log.warning("Shared cache remove failed for %s", key, exc_info=True)
             return False
+        self._report_backend(True)
+        return removed
 
 
     def _store_insert(self, key, body, fresh_seconds, stale_seconds):
@@ -1639,6 +3783,90 @@ class ISRCache:
                 log.warning("Shared cache tag invalidation failed for %s", tag, exc_info=True)
         return evicted
 
+    async def _wait_pending_set(self, key, timeout):
+        """Wait for the in-flight shared write for ``key`` to finish.
+
+        Returns True when the write completed within ``timeout`` (whether
+        it stored a body or not), False on timeout or when no write was
+        pending.
+        """
+        event = self._pending_sets.get(key)
+        if event is None:
+            return False
+        try:
+            await asyncio.wait_for(event.wait(), timeout)
+            return True
+        except TimeoutError:
+            return False
+
+    def _finish_pending_set(self, key, event):
+        # Resolve waiters first, then drop the registration — but only
+        # when it is still ours, so a newer set for the same key is never
+        # unregistered by an older one finishing (the Next.js ``finally``
+        # deletes blindly).
+        event.set()
+        if self._pending_sets.get(key) is event:
+            del self._pending_sets[key]
+
+    async def _await_pending_set(self, key):
+        """If a shared write for ``key`` is in flight, wait for it (bounded)
+        and re-read the shared entry.
+
+        Returns the re-read entry, or None when no write was pending, the
+        wait timed out, or the backend failed — the caller then keeps its
+        previous entry and falls back to the pre-existing path.
+        """
+        if key not in self._pending_sets:
+            return None
+        if not await self._wait_pending_set(key, timeout=PENDING_SET_GET_TIMEOUT):
+            return None
+        entry = await self._shared_entry(key)
+        if entry is _SHARED_UNAVAILABLE:
+            return None
+        return entry
+
+    async def _store_shared(self, key, body, policy, expected_version, owner, tags=(),
+                            generated_at=None, generated_mono=None):
+        """Store ``body`` in the shared backend, coalescing concurrent sets
+        for the same key (Next.js ``pendingSets``).
+
+        Returns ``(stored, coalesced)``. When another set for ``key`` is
+        already in flight, this waits for it (bounded) and re-reads the
+        shared entry: if it is fresh the earlier set already stored a
+        usable body, so this write is skipped and the local cache is
+        populated from the shared entry instead (``coalesced=True``). When
+        no set is in flight this registers one before writing and resolves
+        it in a ``finally``, so a concurrent ``get`` waits for the write
+        instead of reading the previous version. A failed or fenced-out
+        write resolves its waiters just the same — a pending set must never
+        block readers forever.
+        """
+        deadline = time.monotonic() + PENDING_SET_WAIT_TIMEOUT
+        while True:
+            pending = self._pending_sets.get(key)
+            if pending is None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not await self._wait_pending_set(key, timeout=remaining):
+                break
+            entry = await self._shared_entry(key)
+            if entry is _SHARED_UNAVAILABLE:
+                break
+            if entry is not None and entry.status == "fresh":
+                self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                return True, True
+            # The earlier set finished without leaving a fresh entry
+            # (failed, fenced out, or private); loop and register our own
+            # set — another set may have started while we re-read.
+        event = asyncio.Event()
+        self._pending_sets[key] = event
+        try:
+            return await self._shared_store(key, body, policy, expected_version, owner, tags,
+                                          generated_at=generated_at,
+                                          generated_mono=generated_mono), False
+        finally:
+            self._finish_pending_set(key, event)
+
     async def invalidate(self, key):
         """Remove ``key`` from the local cache and, when configured, the shared store.
 
@@ -1733,9 +3961,12 @@ class ISRCache:
             try:
                 token, existed = await asyncio.to_thread(
                     self.shared.variant_generation, self.namespace + path, invalidate=invalidate)
+                self._report_backend(True)
                 self._remember_variant_generation(path, token)
                 return token, existed or had_local
             except Exception as exc:
+                self._report_backend(False)
+                self._report_degraded()
                 if self.failure_policy == FAIL_CLOSED:
                     raise SharedCacheUnavailable("Shared cache generation failed") from exc
                 log.warning("Shared cache generation failed for %s", path, exc_info=True)
@@ -1750,12 +3981,14 @@ class ISRCache:
         self._inflight[key] = task
         self._task_leases[task] = owner
         self._tasks.add(task)
+        self.signal.begin_read()
 
         def completed(finished):
             self._tasks.discard(finished)
             self._task_leases.pop(finished, None)
             if self._inflight.get(key) is finished:
                 self._inflight.pop(key, None)
+            self.signal.end_read()
             if not finished.cancelled():
                 error = finished.exception()
                 if error is not None and not isinstance(error, (SignalError, ISRRenderStatusError)):
@@ -1767,11 +4000,21 @@ class ISRCache:
         task.add_done_callback(completed)
         return task
 
-    async def _wait_for_shared(self, key, timeout):
+    async def _wait_for_shared(self, key, timeout, signal=None):
         """Wait for another worker's first generation to land in the shared
         cache. Returns the fresh body, or None on timeout. If the other
         worker's lease expires while we wait, take the lease and report
-        the observed version so the caller becomes the generator."""
+        the observed version so the caller becomes the generator.
+
+        ``signal`` (a :class:`CacheSignal`, normally this cache's own)
+        lets the poll wake early: while local cache reads are in flight
+        the wait ends as soon as they settle instead of sleeping out
+        the poll interval, so a waiter re-checks the shared entry the
+        moment a warmup or generation finishes. The poll interval stays
+        ``LEASE_WAIT_INTERVAL`` as the worst-case cadence, and the loop
+        re-checks the entry on every wake, so correctness never depends
+        on the signal.
+        """
         deadline = time.monotonic() + timeout
         owner = f"{os.getpid()}:{uuid.uuid4().hex}"
         while True:
@@ -1787,7 +4030,13 @@ class ISRCache:
                 return ("unavailable", None)
             if version is not None:
                 return ("lease", (version, owner))
-            await asyncio.sleep(LEASE_WAIT_INTERVAL)
+            if signal is not None and signal.has_pending_reads():
+                try:
+                    await asyncio.wait_for(signal.cache_ready(), LEASE_WAIT_INTERVAL)
+                except TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(LEASE_WAIT_INTERVAL)
 
     def _remember_key_generated(self, key, generated_at=None):
         # ``generated_at`` is the render *start* time when the caller
@@ -1846,19 +4095,127 @@ class ISRCache:
                 status, body = "miss", None
             elif tag_status == "stale":
                 status = "stale"
+            elif key in self._regen_failures and self._regen_backoff_remaining(key) <= 0:
+                # A retained entry re-stored after a failed regeneration
+                # is fresh for the backoff window, but once the backoff
+                # has elapsed the next request must retry instead of
+                # serving the retained copy as fresh. Demote it so the
+                # stale path (which consults the backoff) triggers the
+                # retry; while the backoff is still active the entry
+                # keeps serving as fresh above.
+                status = "stale"
         if status == "fresh" and self.shared is None:
             return body
         if self.shared is None:
             return await self._get_or_render_local(key, policy, render, status, body, tags)
         return await self._get_or_render_shared(key, policy, render, status, body, tags)
 
-    async def _generate(self, key, policy, render, lease=None, tags=()):
+    async def warmup(self, entries, *, timeout=None):
+        """Pre-fill the cache for ``entries`` without failing the caller.
+
+        ``entries`` is an iterable of ``(key, policy, render)`` triples,
+        the same shape :meth:`get_or_render` takes. Entries already
+        fresh in the local cache are skipped (and duplicates after the
+        first); the rest render concurrently through the normal
+        single-flight path, so a warmup never duplicates a generation a
+        request already started, and at most ``MAX_INFLIGHT``
+        generations run at once.
+
+        Completion is detected with :attr:`signal` — the warmup returns
+        once the in-flight generation count reaches zero instead of
+        polling. A per-entry failure is logged and counted, never
+        raised: warmup is best-effort, and the entry is simply rendered
+        on its first real request instead.
+
+        Returns ``{"requested", "warmed", "skipped", "failed",
+        "pending", "timed_out", "failures"}``; ``failures`` maps keys to
+        ``"ErrorType: message"``. With ``timeout``, entries still
+        running when the wait expires are reported as ``pending`` and
+        keep generating in the background.
+        """
+        if self._closed:
+            raise CacheBusy("ISR cache is shutting down")
+        self._check_loop()
+        outcomes = {}
+        seen = set()
+        requested = 0
+        skipped = 0
+        tasks = []
+        semaphore = asyncio.Semaphore(MAX_INFLIGHT)
+        for key, policy, render in entries:
+            if key in seen:
+                skipped += 1
+                continue
+            seen.add(key)
+            requested += 1
+            status, _ = self.store.lookup(key)
+            if status == "fresh":
+                skipped += 1
+                continue
+            tasks.append(asyncio.ensure_future(
+                self._warm_one(key, policy, render, outcomes, semaphore)))
+        timed_out = False
+        try:
+            async with asyncio.timeout(timeout):
+                await self.signal.cache_ready()
+                if tasks:
+                    await asyncio.gather(*tasks)
+        except TimeoutError:
+            timed_out = True
+            # gather() above already cancels the still-running warmups
+            # when the timeout fires mid-gather; cancel any that were
+            # still only queued behind cache_ready() and let each record
+            # "pending" before it stops. The underlying generations are
+            # shielded and keep running, so a timed-out entry still
+            # lands in the cache.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        warmed = sum(1 for outcome in outcomes.values() if outcome == "warmed")
+        pending = sum(1 for outcome in outcomes.values() if outcome == "pending")
+        failures = {key: outcome[1] for key, outcome in outcomes.items()
+                    if isinstance(outcome, tuple)}
+        result = {"requested": requested, "warmed": warmed, "skipped": skipped,
+                  "failed": len(failures), "pending": pending,
+                  "timed_out": timed_out, "failures": failures}
+        for key, error in failures.items():
+            log.warning("ISR warmup failed for %s: %s", key, error)
+        if timed_out:
+            log.warning("ISR warmup timed out after %ss with %d entries still pending",
+                        timeout, pending)
+        return result
+
+    async def _warm_one(self, key, policy, render, outcomes, semaphore):
+        """Render one warmup entry and record its outcome."""
+        try:
+            async with semaphore:
+                await self.get_or_render(key, policy, render)
+        except asyncio.CancelledError:
+            # The warmup wait expired (or the caller went away). The
+            # generation itself is shielded and keeps running, so this
+            # entry is pending, not failed.
+            outcomes[key] = "pending"
+            raise
+        except Exception as exc:
+            outcomes[key] = ("failed", f"{type(exc).__name__}: {exc}")
+        else:
+            outcomes[key] = "warmed"
+    async def _generate(self, key, policy, render, lease=None, tags=(), previous_body=None):
         """Render once and store the result, fenced by the lease version.
 
         ``lease`` is ``(expected_version, owner)`` for a shared-cache
         generation that holds the cross-process lease. A fallback without a
         lease is stored only locally. A fenced-out generation still serves
         its own caller, but cannot replace either cache layer.
+
+        When ``previous_body`` is given (a stale entry was being
+        regenerated) and the render fails, the previous body is retained
+        with tightened durations (Next.js ``retainPreviousCacheEntry``):
+        it keeps serving while the next retry breathes 3..30s instead of
+        the entry expiring on its original schedule and every request
+        paying for a slow blocking render.
         """
         owner = lease[1] if lease is not None else None
         expected_version = lease[0] if lease is not None else None
@@ -1911,16 +4268,19 @@ class ISRCache:
                 if self._inflight.get(key) is asyncio.current_task():
                     if _is_storable(response):
                         shared_stored = True
+                        coalesced = False
                         if self.shared is not None and owner is not None:
-                            shared_stored = await self._shared_store(
+                            shared_stored, coalesced = await self._store_shared(
                                 key, response.body, policy, expected_version, owner, tags,
                                 generated_at=started_at, generated_mono=started_mono)
                             if not shared_stored:
                                 log.warning("Shared ISR insert for %s failed or was fenced out;"
                                             " page was served but not cached", key)
-                        # Do not populate L1 after a shared write was rejected
-                        # or after this app invalidated the running task.
-                        if shared_stored and self._inflight.get(key) is asyncio.current_task():
+                        # Do not populate L1 after a shared write was rejected,
+                        # after this app invalidated the running task, or when a
+                        # concurrent set already stored a fresh body (its body
+                        # is in L1 already).
+                        if shared_stored and not coalesced and self._inflight.get(key) is asyncio.current_task():
                             if self._store_insert(key, response.body, policy["revalidate"], policy["stale"]):
                                 self._remember_key_generated(key, started_at)
                             else:
@@ -1941,6 +4301,22 @@ class ISRCache:
             # entry; record it so the next retry backs off instead of
             # hammering the origin on every request.
             self._record_regen_failure(key, exc)
+            if previous_body is not None and self._inflight.get(key) is asyncio.current_task():
+                fresh, stale = _retain_durations(policy)
+                shared_stored = True
+                if self.shared is not None and owner is not None:
+                    shared_stored = await self._shared_store(
+                        key, previous_body, {"revalidate": fresh, "stale": stale},
+                        expected_version, owner, tags)
+                    if not shared_stored:
+                        log.warning("Shared ISR retain for %s failed or was fenced out;"
+                                    " previous entry was not extended", key)
+                if shared_stored:
+                    if not self._store_insert(key, previous_body, fresh, stale):
+                        log.warning("ISR cache retain failed for %s; previous entry was not extended", key)
+                log.warning("ISR regeneration failed for %s; retaining previous entry"
+                            " (fresh %.0fs, stale %.0fs) before the next retry",
+                            key, fresh, stale)
             raise
         finally:
             if owner is not None and self.shared is not None:
@@ -1957,7 +4333,8 @@ class ISRCache:
                 task = self._inflight.get(key)
                 if task is None and len(self._tasks) < MAX_INFLIGHT:
                     task = self._register(key, asyncio.create_task(
-                        self._generate(key, policy, render, tags=tags), context=contextvars.Context()))
+                        self._generate(key, policy, render, tags=tags, previous_body=body),
+                        context=contextvars.Context()))
             return body
         # Expired or miss: the backends have already dropped the entry,
         # so the retained previous value (if any) is the fallback. While
@@ -1986,7 +4363,12 @@ class ISRCache:
             # retained previous body (C-2).
             raise
         except Exception:
-            if previous is not None:
+            # Only the first consecutive failure serves the retained
+            # value. A retained window from a prior failure has already
+            # expired by the time this path runs again, so a repeat
+            # failure surfaces instead of masking the outage forever.
+            failures = self._regen_failures.get(key, {}).get("failures", 0)
+            if previous is not None and failures <= 1:
                 return previous
             raise
 
@@ -2001,6 +4383,16 @@ class ISRCache:
             # still validates each hit against the authoritative store.
             self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
             return entry.body
+        # A shared write for this key may be landing right now (Next.js
+        # ``pendingSets``): wait for it to finish (bounded) and re-read, so
+        # this request serves the new body instead of the previous version
+        # or a duplicate render.
+        refreshed = await self._await_pending_set(key)
+        if refreshed is not None:
+            entry = refreshed
+            if entry.status == "fresh":
+                self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                return entry.body
         task = self._inflight.get(key)
         if task is not None:
             owner = self._task_leases.get(task)
@@ -2042,7 +4434,8 @@ class ISRCache:
                     return await self._get_or_render_local(key, policy, render, "stale", entry.body, tags)
                 if version is not None:
                     task = self._register(key, asyncio.create_task(
-                        self._generate(key, policy, render, lease=(version, owner), tags=tags),
+                        self._generate(key, policy, render, lease=(version, owner), tags=tags,
+                                       previous_body=entry.body),
                         context=contextvars.Context()), owner)
                 return entry.body
             # First generation (or expired): become the generator if the
@@ -2056,7 +4449,7 @@ class ISRCache:
                     self._generate(key, policy, render, lease=(version, owner), tags=tags),
                     context=contextvars.Context()), owner)
             else:
-                outcome, payload = await self._wait_for_shared(key, GENERATION_TIMEOUT)
+                outcome, payload = await self._wait_for_shared(key, GENERATION_TIMEOUT, self.signal)
                 if outcome == "fresh":
                     entry = payload
                     self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
@@ -2097,8 +4490,13 @@ class ISRCache:
             raise
         except Exception:
             # C-2: a failed (re)generation serves the retained previous
-            # value instead of erroring, when one exists.
+            # value instead of erroring, when one exists — but only on
+            # the first consecutive failure. A retained window from a
+            # prior failure has already expired by the time this path
+            # runs again, so a repeat failure surfaces instead of
+            # masking the outage.
             previous = await self._retained_body(key, tags)
-            if previous is not None:
+            failures = self._regen_failures.get(key, {}).get("failures", 0)
+            if previous is not None and failures <= 1:
                 return previous
             raise

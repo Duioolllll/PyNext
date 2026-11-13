@@ -32,36 +32,51 @@ from .admission import DecisionGate, DecisionUnavailable
 from .assets import read_public_artifacts, read_public_sources
 from .auth import authorization_policy, check_authorization
 from .cache import (MAX_CACHE_SECONDS, CacheBusy, ISRCache, SharedCacheUnavailable,
-                    dev_retention_policy, validate_cache_tag)
-from .client import compile_client, read_client_artifacts
-from .components import (_isr_policy, _isr_query_keys, _node, _partial_isr_policy, _validate_tags,
-                        bind_islands, reduce_segment_config)
+                    cache_control_header, dev_retention_policy, validate_cache_tag)
+from .client import PREFIX, compile_client, read_client_artifacts
+from .components import (_isr_policy, _isr_query_keys, _node, _partial_isr_policy, _ssg_fallback,
+                        _validate_tags, bind_islands, reduce_segment_config)
 from .env import load_env
-from .build import _materialize, discover, load_manifest
+from .build import (MAX_STATIC_PAGE_BYTES, MAX_STREAMED_STATIC_BYTES, MAX_STREAMED_STATIC_SECONDS,
+                    _materialize, discover, load_manifest)
 from .config import DEFAULT_CONFIG
 from .dynamic import (DYNAMIC_MODES, MAX_DYNAMIC_ACCESSES, format_dynamic_accesses,
                       suppress_dynamic_tracking, track_prerender)
-from .errors import SignalError, digest_for_error, error_count
+from .errors import NotFoundError, SignalError, digest_for_error, error_count
 from .http import (SAFE_METHODS, BadRequest, JSONResponse, Request, RequestCancelled, Response, SecurityConfig,
-                   StreamingResponse, WebSocket, WebSocketDisconnect, apply_cors_headers,
-                   apply_path_headers, apply_security_headers, compile_path_headers,
+                   StreamingResponse, WebSocket, WebSocketDisconnect, apply_build_headers, apply_cors_headers,
+                   apply_path_headers, apply_security_headers, compile_path_headers, PathHeaderRule,
                    cors_preflight_response, csrf_token_response, filter_internal_headers, new_csp_nonce, sanitize_response_headers,
                    validate_csrf, validate_request_framing)
+from .build import _config_error, _short_repr
+from .fetch_cache import FetchCache, fetch_cache_scope
+from .request_memo import clear_request_memo, ensure_request_memo, request_memo_scope
+from .matcher import compile_header_rules, compile_middleware_entries
+from .middleware import MAX_MIDDLEWARE_REWRITES, MiddlewareResult, ScopedMiddleware
+from .custom_routes import compile_custom_routes
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
-from .middleware import ScopedMiddleware
 from .observability import (
+    BackendHealth,
+    DedupedErrorLogger,
     MetricsCollector,
     ObservabilityConfig,
+    RequestInsights,
     begin_request_context,
+    classify_request_error,
     configure_logging,
     get_request_id,
+    middleware_actor_var,
+    middleware_outcome_var,
+    middleware_rewrote_path_var,
     queue_wait_var,
+    rate_limit_outcome_var,
     render_ms_var,
     route_var,
     span,
 )
 from .proxy import ProxyTrust
-from .ratelimit import _is_exempt_path, rate_limited_response
+from .ratelimit import RateLimitUnavailable, _is_exempt_path, rate_limited_response
+from .routing import normalize_base_path, preprocess_pathname, validate_trailing_slash
 from .sessions import SessionMiddleware, SQLiteSessionStore, WS_PREFLIGHT_STATE_KEY
 from .sync_dispatch import (
     CALL_ASYNC,
@@ -89,6 +104,19 @@ ASGI_BODY_TIMEOUT_SECS = DEFAULT_CONFIG.body_timeout_ms / 1000.0
 ASGI_BODY_MIN_RATE_BYTES_PER_SEC = DEFAULT_CONFIG.body_min_rate_bytes_per_sec
 ASGI_BODY_MIN_RATE_GRACE_SECS = 2.0
 ASGI_BODY_MIN_RATE_CHECK_INTERVAL_SECS = 0.25
+# Prefetch hint (P2-5, Next.js `staleTimes`): `X-PyNext-Stale-Time` states,
+# in whole seconds, how long a prefetched response may be reused before it
+# must be treated as stale. The value is min(page stale time, layout stale
+# times); a layout without a declared stale time puts no constraint on it.
+# Static pages never change until a rebuild, so they carry the Next.js
+# `staleTimes.static` default of 300 seconds; the client runtime still
+# caps prefetch retention at 60 seconds. ISR pages carry their remaining
+# fresh window (a fresh hit) or `revalidate` (a newly generated entry).
+# Stale-served, private, and dynamic responses carry no hint, so a client
+# never retains a copy that is already stale or user-specific.
+PREFETCH_STALE_TIME_HEADER = b"x-pynext-stale-time"
+SSG_PREFETCH_STALE_SECONDS = 300
+MAX_PREFETCH_STALE_SECONDS = 604_800
 
 # Development error page (P1-3): how much of a traceback the dev page keeps.
 # The tail is kept so the frames nearest the failure survive; anything cut
@@ -290,9 +318,17 @@ def _load(root, relative, namespace):
 def _check_signature(fn, allowed, label):
     for p in inspect.signature(fn).parameters.values():
         if p.kind in (p.POSITIONAL_ONLY, p.VAR_POSITIONAL, p.VAR_KEYWORD):
-            raise ValueError(f"{label} must use named parameters from {sorted(allowed)}")
+            raise ValueError(_config_error(
+                f"{label} must use named parameters from {sorted(allowed)}",
+                [("parameter", p.name)],
+                [f"Change {p.name!r} to a named parameter",
+                 f"Remove {p.name!r} or give it a default value"]))
         if p.name not in allowed and p.default is p.empty:
-            raise ValueError(f"Unsupported required parameter {p.name!r} in {label}")
+            raise ValueError(_config_error(
+                f"Unsupported required parameter {p.name!r} in {label}",
+                [("allowed", sorted(allowed))],
+                [f"Remove the {p.name!r} parameter from {label}",
+                 f"Give {p.name!r} a default value to make it optional"]))
 
 
 async def _invoke(fn, _app=None, **values):
@@ -322,31 +358,148 @@ async def _invoke(fn, _app=None, **values):
 
 
 _MAX_ISR_STREAM_BYTES = 8 * 1024 * 1024
+# HTML comment a streamed page ends with when rendering fails after the
+# headers were already sent. The status can no longer change to 500, so
+# the marker is the client's only signal that the document is truncated.
+_STREAM_ERROR_MARKER = b"<!-- pynext-stream-error -->"
+
+
+def _partition_header_rules(rules):
+    """Split ``headers`` between the two per-path header systems.
+
+    Returns ``(path_items, matcher_items)``: a ``(source, headers)``
+    tuple is compiled by BOTH systems — the matcher rules apply first
+    in ASGI dispatch (first matching rule wins per header) while the
+    native-aware :class:`pynext.http.PathHeaders` copy serves the
+    native fast path and responses that bypass dispatch, and
+    :func:`pynext.http.apply_path_headers` never overwrites a header
+    the matcher already set, so the two copies agree. Dict rules go to
+    the matcher only (``PathHeaders`` cannot take them) and
+    ``PathHeaderRule`` objects go to ``PathHeaders`` only (the matcher
+    cannot take them). A non-iterable ``rules`` value is passed through
+    untouched so :func:`compile_path_headers` raises its usual error
+    for it. A tuple source the route-pattern grammar rejects (a ``*``
+    glob) fails startup in :func:`compile_path_headers`, even though
+    the matcher would accept it.
+    """
+    if rules is None:
+        return [], []
+    if isinstance(rules, (str, bytes)):
+        return rules, []
+    try:
+        items = list(rules)
+    except TypeError:
+        return rules, []
+    path_items, matcher_items = [], []
+    for item in items:
+        if isinstance(item, dict):
+            matcher_items.append(item)
+        elif isinstance(item, PathHeaderRule):
+            path_items.append(item)
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            # Compiled by both systems (see the docstring).
+            path_items.append(item)
+            matcher_items.append(item)
+        else:
+            path_items.append(item)
+    return path_items, matcher_items
+
+
+def _accepts_html(request):
+    """True when the request's Accept header lists text/html.
+
+    Error/not-found pages are HTML, so route misses only render them for
+    clients that accept HTML; curl-style requests without an Accept header
+    (and API-style ``*/*``) keep the plain-text body.
+    """
+    if request is None:
+        return False
+    for key, value in request.headers:
+        if key.lower() != b"accept":
+            continue
+        for part in value.decode("latin-1").split(","):
+            if part.strip().split(";")[0].strip().lower() == "text/html":
+                return True
+    return False
 
 
 class _ISRStreamFeed:
-    """One bounded stream tap for the request that starts regeneration."""
+    """Tee point for a single ISR render: one producer, two consumers.
+
+    The render in :meth:`App._render_isr_cached` runs once. Its chunks go
+    to two consumers at the same time:
+
+    1. the ISR cache body (the ``bytearray`` accumulated in ``render()``),
+    2. the initiating client's response stream (``feed.chunks()``).
+
+    This is PyNext's equivalent of Next.js ``ReactServerResult.tee()`` /
+    ``ReplayableNodeStream``: a single render fanned out instead of rendered
+    twice. The feed owns the fan-out, so the two consumers can never drift
+    apart — both see the same chunks in the same order, and the cache body
+    is exactly the body that was streamed.
+
+    State machine (``_state``), enforced with :class:`RuntimeError`:
+
+    ``idle -> begun -> finished | failed``
+
+    * ``begin()`` moves ``idle`` to ``begun`` and resolves ``ready``; a
+      second ``begin()`` (or one after a terminal state) raises.
+    * ``send()`` is only valid while ``begun``; before ``begin()`` or after
+      ``finish()``/``fail()`` it raises.
+    * ``finish()``/``fail()`` are terminal; calling them twice raises,
+      except that a second ``fail()`` is a no-op because the first error is
+      already queued for the consumer.
+    * ``chunks()`` may be called only once (``consumed`` flag) — a feed
+      that has already been consumed cannot be replayed, mirroring
+      Next.js ``assertChunks``.
+    * ``detach()`` is separate from the state machine and always allowed:
+      it means "the consumer is gone". After detaching, ``begin()``/
+      ``send()``/``finish()``/``fail()`` silently drop their work so the
+      producer can keep generating for the cache even when the initiating
+      client has disconnected.
+    """
 
     def __init__(self):
         self.ready = asyncio.get_running_loop().create_future()
         self._queue = asyncio.Queue(maxsize=4)
         self._attached = True
+        self._state = "idle"
+        self.consumed = False
 
     def begin(self):
-        if self._attached and not self.ready.done():
+        if not self._attached:
+            return
+        if self._state != "idle":
+            raise RuntimeError(f"ISR stream feed cannot begin() while {self._state}")
+        self._state = "begun"
+        if not self.ready.done():
             self.ready.set_result(None)
 
     async def send(self, chunk):
-        if self._attached:
-            await self._queue.put(("chunk", chunk))
-
-    async def finish(self):
-        if self._attached:
-            await self._queue.put(("end", None))
-
-    def fail(self, error):
         if not self._attached:
             return
+        if self._state == "idle":
+            raise RuntimeError("ISR stream feed send() before begin()")
+        if self._state in ("finished", "failed"):
+            raise RuntimeError(f"ISR stream feed send() after {self._state}()")
+        await self._queue.put(("chunk", chunk))
+
+    async def finish(self):
+        if not self._attached:
+            return
+        if self._state == "idle":
+            raise RuntimeError("ISR stream feed finish() before begin()")
+        if self._state in ("finished", "failed"):
+            raise RuntimeError(f"ISR stream feed finish() after {self._state}()")
+        self._state = "finished"
+        await self._queue.put(("end", None))
+
+    def fail(self, error):
+        if not self._attached or self._state == "failed":
+            return
+        if self._state == "finished":
+            raise RuntimeError("ISR stream feed fail() after finish()")
+        self._state = "failed"
         while not self._queue.empty():
             self._queue.get_nowait()
         self._queue.put_nowait(("error", error))
@@ -356,13 +509,24 @@ class _ISRStreamFeed:
         while not self._queue.empty():
             self._queue.get_nowait()
 
-    async def chunks(self):
+    def chunks(self):
+        """Return the consumer side of the tee (callable only once)."""
+        if self.consumed:
+            raise RuntimeError("ISR stream feed has already been consumed")
+        self.consumed = True
+        return self._iterate()
+
+    async def _iterate(self):
         try:
             while True:
                 kind, value = await self._queue.get()
                 if kind == "end":
                     return
                 if kind == "error":
+                    # Signal the truncated stream before aborting it, so a
+                    # client that already received the 200 headers and the
+                    # first chunks can tell the document is incomplete.
+                    yield _STREAM_ERROR_MARKER
                     if isinstance(value, Exception):
                         raise value
                     raise RuntimeError("ISR stream interrupted")
@@ -371,11 +535,90 @@ class _ISRStreamFeed:
             self.detach()
 
 
+class _PreludeReplay:
+    """Replay the one item :func:`process_prelude` peeked, then the source.
+
+    The caller still sees the whole stream: the buffered first item comes
+    out first, and every later item is pulled from the source iterator on
+    demand. ``aclose`` closes the source, so a response that is never
+    consumed (HEAD, early disconnect) still releases the page generator.
+    """
+
+    def __init__(self, iterator, first):
+        self._iterator = iterator
+        self._first = first
+        self._pending = True
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._pending:
+            self._pending = False
+            return self._first
+        return await anext(self._iterator)
+
+    async def aclose(self):
+        close = getattr(self._iterator, "aclose", None)
+        if close is not None:
+            await close()
+
+
+class _EmptyPrelude:
+    """An async iterable that ends immediately (the source was empty)."""
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+    async def aclose(self):
+        return None
+
+
+async def process_prelude(chunks):
+    """Peek at the first item of ``chunks`` without consuming the stream.
+
+    Mirrors Next.js ``processPrelude`` (``packages/next/src/server/
+    app-render/app-render-prerender-utils.ts``): pull one item to learn
+    whether the stream is empty, then hand back an async iterable that
+    replays the buffered item first, so the caller still sees the whole
+    stream. Only one item is ever buffered.
+
+    Returns ``(prelude, is_empty)``: ``prelude`` is the replaying async
+    iterable and ``is_empty`` is True when the source produced no items
+    at all. An exception raised while pulling the first item propagates
+    to the caller — the inspection happens before headers are sent, so
+    the failure still surfaces as a 500 instead of a truncated 200.
+    """
+    iterator = aiter(chunks)
+    try:
+        first = await anext(iterator)
+    except StopAsyncIteration:
+        return _EmptyPrelude(), True
+    return _PreludeReplay(iterator, first), False
+
+
+# The client runtime <script> tag that bind_islands() appends to every
+# rendered document. It is framework boilerplate, not page content, so
+# emptiness checks ignore it: without this, a page that yields nothing
+# inside an empty shell would still "have content" (the script tag alone)
+# and the empty-document guard could never fire.
+_CLIENT_RUNTIME_SCRIPT = re.compile(
+    r'<script type="module" src="' + re.escape(PREFIX) + r'[^"]*\.js"[^>]*></script>')
+
+
+def _strip_client_runtime(html):
+    """Remove client runtime boilerplate so emptiness checks see content."""
+    return _CLIENT_RUNTIME_SCRIPT.sub("", html)
+
+
 class _ISRStreamingResponse(StreamingResponse):
-    def __init__(self, feed):
+    def __init__(self, feed, cache_control):
         self._feed = feed
         super().__init__(feed.chunks(), media_type="text/html; charset=utf-8", headers=[
-            (b"cache-control", b"public, max-age=0, must-revalidate"),
+            (b"cache-control", cache_control),
             (b"vary", b"Cookie, Authorization"),
         ])
 
@@ -811,16 +1054,25 @@ def check_get_idempotency(app):
     return findings
 
 
+def _middleware_name(middleware):
+    """Short, bounded label for a middleware callable (app code, never user input)."""
+    name = getattr(middleware, "__qualname__", None) or getattr(middleware, "__name__", None)
+    if isinstance(name, str) and name:
+        return name
+    return type(middleware).__name__
+
+
 class App:
     def __init__(self, root, manifest, *, production=False, security=None,
                  cache_backend=DEFAULT_CONFIG.cache_backend,
                  cache_path=None, observability=None, rate_limit=None, middleware=None, debug=False,
-                 resources=None, cache_url=None, cache_failure_policy=None,
+                 resources=None, cache_url=None, cache_failure_policy=None, cache_handler=None,
                  websocket_max_message=DEFAULT_CONFIG.websocket_max_message, hot_reload=False,
                  trusted_proxies=None, sync_workers=32, sync_wait_timeout=ASGI_DECISION_TIMEOUT,
                  sync_queue_limit=None, render_workers=None, session_workers=None,
                  strict_ssg=False, headers=None,
-                 revalidate_secret=None,
+                 revalidate_secret=None, base_path="", trailing_slash="redirect", reuse_client=None,
+                 custom_routes=None,
                  body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms,
                  handler_timeout_ms=DEFAULT_CONFIG.handler_timeout_ms,
                  response_timeout_ms=DEFAULT_CONFIG.response_timeout_ms):
@@ -884,6 +1136,16 @@ class App:
                 not isinstance(revalidate_secret, str) or not revalidate_secret):
             raise ValueError("revalidate_secret must be a non-empty string")
         self.revalidate_secret = revalidate_secret
+        # Path preprocessing (REPORT.md §2.3 P2, track A §2.8): the base
+        # path is stripped before route matching and re-added by
+        # url_for(); the trailing-slash policy names the 308 behaviour
+        # that used to be hardcoded in _dispatch. Both are validated
+        # here so a bad deployment fails at startup.
+        self.base_path = normalize_base_path(base_path)
+        self.trailing_slash = validate_trailing_slash(trailing_slash)
+        # Custom routes (redirects / rewrites / headers) are compiled
+        # here so a bad rule fails startup instead of failing per request.
+        self.custom_routes = compile_custom_routes(custom_routes)
         if not isinstance(debug, bool):
             raise TypeError("debug must be a bool")
         if not isinstance(strict_ssg, bool):
@@ -916,9 +1178,33 @@ class App:
         # Per-path response headers (Next.js headers() equivalent): compiled
         # and validated here, so a bad rule fails at startup. See
         # http.compile_path_headers for the accepted shapes.
-        self.path_headers = compile_path_headers(headers)
+        # `headers` feeds two per-path header systems: (source, headers)
+        # tuples are compiled by both — the matcher rules for first-wins
+        # ordering in ASGI dispatch, PathHeaders for the native fast path
+        # and responses that bypass dispatch — while dict rules go to the
+        # matcher only and PathHeaderRule objects to PathHeaders only
+        # (see _partition_header_rules). A dict rule cannot break
+        # PathHeaders startup validation and a PathHeaderRule cannot
+        # break the matcher.
+        _path_header_items, _matcher_header_items = _partition_header_rules(headers)
+        self.path_headers = compile_path_headers(_path_header_items)
         self.observability_config = observability or ObservabilityConfig.from_env()
         self.metrics = MetricsCollector(enabled=self.observability_config.metrics)
+        # Request insights are a separate, debug-only ring buffer (P2-3):
+        # on in development by default, off in production, overridable
+        # with ObservabilityConfig(request_insights=...) / PYNEXT_REQUEST_INSIGHTS.
+        insights_enabled = (self.observability_config.request_insights
+                            if self.observability_config.request_insights is not None
+                            else debug)
+        self.request_insights = RequestInsights(
+            enabled=insights_enabled,
+            max_entries=self.observability_config.request_insights_max,
+            slow_threshold_ms=self.observability_config.request_insights_slow_ms,
+        )
+        # Last-seen shared-backend health, for /readyz (no probing: the
+        # backends report here when they are actually touched).
+        self.backend_health = BackendHealth(ttl_s=self.observability_config.backend_health_ttl_s)
+        self._error_log_dedup = DedupedErrorLogger(window_s=self.observability_config.log_dedup_window_s)
         configure_logging(self.observability_config)
         # Per-process token-bucket limiter (spec §11, finding #49). None
         # disables it. The Axum adapter reads the same attribute in
@@ -947,21 +1233,35 @@ class App:
                     raise TypeError("resources.py must export a RESOURCES dict")
             self._initialize(root, manifest, production=production,
                              cache_backend=cache_backend, cache_path=cache_path, cache_url=cache_url,
-                             cache_failure_policy=cache_failure_policy)
+                             cache_failure_policy=cache_failure_policy, cache_handler=cache_handler,
+                             reuse_client=reuse_client)
             configured = ()
+            configured_headers = ()
             if "middleware.py" in manifest["sources"]:
                 configured = getattr(self._module("middleware.py"), "MIDDLEWARE", None)
                 if not isinstance(configured, (list, tuple)):
                     raise TypeError("middleware.py must export a MIDDLEWARE list or tuple")
+                configured_headers = getattr(self._module("middleware.py"), "HEADERS", ())
+                if not isinstance(configured_headers, (list, tuple)):
+                    raise TypeError("middleware.py must export a HEADERS list or tuple")
             if middleware is None:
                 middleware = ()
             if not isinstance(middleware, (list, tuple)):
                 raise TypeError("middleware must be a list or tuple")
-            self.middleware = tuple(configured) + tuple(middleware)
-            for item in self.middleware:
-                if not (inspect.iscoroutinefunction(item) or
-                        inspect.iscoroutinefunction(getattr(item, "__call__", None))):
-                    raise TypeError("middleware entries must be async callables")
+            # Middleware scopes and per-path header rules are compiled
+            # once here, at startup (Next.js compiles matchers and custom
+            # headers at build time): an invalid matcher, condition or
+            # header raises here, so app creation — and therefore server
+            # startup — fails instead of the rule silently never firing.
+            # compile_middleware_entries also unwraps ScopedMiddleware;
+            # self.middleware stays the plain callables (a scoped entry
+            # keeps its Scope in the parallel middleware_scopes tuple).
+            compiled_middleware = compile_middleware_entries(
+                tuple(configured) + tuple(middleware))
+            self.middleware = tuple(fn for fn, _scope in compiled_middleware)
+            self.middleware_scopes = tuple(scope for _fn, scope in compiled_middleware)
+            self.header_rules = compile_header_rules(
+                tuple(configured_headers) + tuple(_matcher_header_items))
             if security.csrf_enabled is None:
                 # Auto CSRF: a session middleware means the app keeps
                 # server-side state, so every state-changing API route is
@@ -1333,14 +1633,34 @@ class App:
         """Apply a new observability config to this app (logging + metrics)."""
         self.observability_config = config
         self.metrics.enabled = config.metrics
+        self.request_insights.enabled = (
+            config.request_insights if config.request_insights is not None else self.debug)
+        self.request_insights.slow_threshold_ms = config.request_insights_slow_ms
+        self.backend_health.set_ttl(config.backend_health_ttl_s)
+        self._error_log_dedup.set_window(config.log_dedup_window_s)
         configure_logging(config)
         return self
 
     def _initialize(self, root, manifest, *, production=False, cache_backend="memory", cache_path=None,
-                    cache_url=None, cache_failure_policy=None):
+                    cache_url=None, cache_failure_policy=None, cache_handler=None, reuse_client=None):
+        # ``reuse_client`` is a build-internal (manifest, assets) pair from an
+        # earlier compile: the generate-only build stage reuses those bundles
+        # instead of running esbuild again. It is ignored in production,
+        # where the bundles always come from the manifest.
         self.root = Path(root).resolve()
         self.manifest = manifest
         self.production = production
+        # Build identity for skew protection: the build ID names this
+        # build's sources, the deployment ID names its deployment.
+        # Both are None for a development manifest (discover() output)
+        # and for manifests built before build IDs existed; responses
+        # then simply carry no build headers.
+        self.build_id = manifest.get("build_id")
+        self.deployment_id = manifest.get("deployment_id")
+        if self.build_id is not None and not isinstance(self.build_id, str):
+            raise ValueError("Invalid build_id in manifest; rebuild the application")
+        if self.deployment_id is not None and not isinstance(self.deployment_id, str):
+            raise ValueError("Invalid deployment_id in manifest; rebuild the application")
         self.router = _native.Router(list(manifest["routes"]))
         self.entries = {}
         # Authorization policies snapshotted at registration (S-P1-33):
@@ -1366,32 +1686,67 @@ class App:
         self.isr_queries = {}
         self.isr_tags = {}
         self.entry_layouts = {}
+        self.ssg_fallback = {}
+        self.isr_generators = {}
+        self.isr_static_paths = {}
+        self._ssg_fallback_tasks = {}
+        self._isr_warmup_task = None
+        # Per-path prefetch stale-time hints for static pages, handed to the
+        # native server so its fast path can emit the same header Python
+        # dispatch emits (empty outside production: no static pages exist).
+        self.prefetch_stale_times = {}
         if cache_backend == "sqlite" and cache_path is None:
             cache_path = self.root / ".pynext" / "isr-cache.sqlite3"
+        if cache_backend == "filesystem" and cache_path is None:
+            cache_path = self.root / ".pynext" / "isr-cache"
         build_id = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"),
                                              ensure_ascii=True).encode("ascii")).hexdigest()
         self.isr = ISRCache(cache_backend=cache_backend, cache_path=cache_path,
-                            namespace=(build_id + ":") if cache_backend in {"sqlite", "redis"} else "",
-                            cache_url=cache_url, failure_policy=cache_failure_policy)
+                            namespace=(build_id + ":") if cache_backend in {"sqlite", "redis", "filesystem"}
+                            or cache_handler is not None else "",
+                            cache_url=cache_url, failure_policy=cache_failure_policy,
+                            cache_handler=cache_handler,
+                            health=self.backend_health, metrics=self.metrics)
+        # Fetch/data cache over the same backends (track C P1-1); page
+        # handlers reach it as ``request.app.fetch_cache`` or via
+        # ``pynext.fetch_cache`` helpers, and the request memo
+        # (track C P1-2) is installed per request in dispatch().
+        self.fetch_cache = FetchCache(self.isr)
         self.static_generators = {}
         self.static_pages = {}
         self.public_assets = {}
         self.client_assets = {}
         self.client_manifest = {}
+        self.client_report = None
         for pattern, spec in manifest["routes"].items():
             module = self._module(spec["entry"])
             if spec["kind"] == "page":
                 fn = getattr(module, "Page", None)
                 if not callable(fn) or not getattr(fn, "__pynext_page__", False):
-                    raise ValueError(f"{spec['entry']} must export a @page() Page function")
+                    raise ValueError(_config_error(
+                        f"{spec['entry']} must export a @page() Page function",
+                        [("route", pattern)],
+                        [f"Add a @page() decorated Page function to {spec['entry']}"]))
                 _check_signature(fn, {"request", "params", "query"}, spec["entry"])
                 mode = getattr(fn, "__pynext_render__", "ssr")
                 if mode not in {"ssr", "ssg", "isr"}:
-                    raise ValueError(f"Unsupported render mode in {spec['entry']}")
+                    raise ValueError(_config_error(
+                        f"Unsupported render mode {mode!r} in {spec['entry']}",
+                        [("route", pattern)],
+                        ["Change @page(render=...) to 'ssr', 'ssg', or 'isr' in "
+                         f"{spec['entry']}"]))
                 if mode in {"ssg", "isr"} and "request" in inspect.signature(fn).parameters:
-                    raise ValueError(f"{mode.upper()} page {spec['entry']} cannot accept request")
+                    raise ValueError(_config_error(
+                        f"{mode.upper()} page {spec['entry']} cannot accept request",
+                        [("route", pattern)],
+                        [f"Remove the request parameter from Page in {spec['entry']}",
+                         "SSG and ISR pages are rendered without a request"]))
                 if mode in {"ssg", "isr"} and getattr(fn, "__pynext_auth__", False):
-                    raise ValueError(f"{mode.upper()} page {spec['entry']} cannot require authentication")
+                    raise ValueError(_config_error(
+                        f"{mode.upper()} page {spec['entry']} cannot require authentication",
+                        [("route", pattern)],
+                        [f"Remove @require_auth from Page in {spec['entry']}",
+                         "Change render to 'ssr' if the page needs authentication"]))
                 self.render_modes[pattern] = mode
                 # The manifest records paths with the OS separator, so on
                 # Windows ``spec["layouts"]`` holds ``app\\blog\\layout.py``.
@@ -1405,42 +1760,91 @@ class App:
                 for relative in layout_relatives:
                     layout_fn = getattr(self._module(relative), "Layout", None)
                     if not callable(layout_fn) or not getattr(layout_fn, "__pynext_layout__", False):
-                        raise ValueError(f"{relative} must export a @layout Layout function")
+                        raise ValueError(_config_error(
+                            f"{relative} must export a @layout Layout function",
+                            [("route", pattern)],
+                            [f"Add a @layout decorated Layout function to {relative}"]))
                     _check_signature(layout_fn, {"children"}, relative)
                     if "children" not in inspect.signature(layout_fn).parameters:
-                        raise ValueError(f"{relative} must accept children")
+                        raise ValueError(_config_error(
+                            f"{relative} must accept children",
+                            [("route", pattern)],
+                            [f"Add a children parameter to Layout in {relative}"]))
                     layouts.append(layout_fn)
+                    # A hand-set __pynext_stale__ (or a @layout(stale=...)
+                    # value that escaped policy validation) is checked here
+                    # so the prefetch hint can never exceed the cap.
+                    stale = getattr(layout_fn, "__pynext_stale__", None)
+                    if stale is not None and (
+                            not isinstance(stale, (int, float)) or isinstance(stale, bool)
+                            or stale != stale or stale < 0 or stale > MAX_PREFETCH_STALE_SECONDS):
+                        raise ValueError(_config_error(
+                            f"Invalid layout stale time in {relative}",
+                            [("route", pattern), ("got", _short_repr(stale))],
+                            [f"Pass stale as a finite number of seconds between 0 and "
+                             f"{MAX_PREFETCH_STALE_SECONDS} to @layout in {relative}"]))
                     raw_layout_policy = getattr(layout_fn, "__pynext_layout_policy__", None)
                     if raw_layout_policy is not None:
                         if not isinstance(raw_layout_policy, dict) or set(raw_layout_policy) != {"revalidate", "stale", "expire"}:
-                            raise ValueError(f"Invalid layout policy in {relative}")
+                            raise ValueError(_config_error(
+                                f"Invalid layout policy in {relative}",
+                                [("route", pattern), ("got", _short_repr(raw_layout_policy))],
+                                ["Use @layout(revalidate=<positive seconds or None>, "
+                                 "stale=<non-negative seconds or None>, "
+                                 "expire=<positive seconds or None>) in " + relative]))
                         try:
                             layout_policy = _partial_isr_policy(raw_layout_policy["revalidate"],
                                                                 raw_layout_policy["stale"],
                                                                 raw_layout_policy["expire"])
                         except ValueError as exc:
-                            raise ValueError(f"Invalid layout policy in {relative}: {exc}") from exc
+                            raise ValueError(_config_error(
+                                f"Invalid layout policy in {relative}: {exc}",
+                                [("route", pattern), ("got", _short_repr(raw_layout_policy))],
+                                ["Use @layout(revalidate=<positive seconds or None>, "
+                                 "stale=<non-negative seconds or None>, "
+                                 "expire=<positive seconds or None>) in " + relative])) from exc
                         if (layout_policy["revalidate"] is not None or layout_policy["stale"] is not None
                                 or layout_policy["expire"] is not None):
                             layout_policies.append((relative, layout_policy))
                 dynamic = getattr(fn, "__pynext_dynamic__", "auto")
                 if dynamic not in DYNAMIC_MODES:
-                    raise ValueError(f"Unsupported dynamic mode in {spec['entry']}")
+                    raise ValueError(_config_error(
+                        f"Unsupported dynamic mode in {spec['entry']}",
+                        [("route", pattern), ("got", repr(dynamic))],
+                        ["Set dynamic='auto', 'force-dynamic', or 'error' in " + spec["entry"]]))
                 if mode == "ssr" and dynamic != "auto":
-                    raise ValueError(f"SSR page {spec['entry']} cannot set dynamic={dynamic!r}")
+                    raise ValueError(_config_error(
+                        f"SSR page {spec['entry']} cannot set dynamic={dynamic!r}",
+                        [("route", pattern)],
+                        ["Remove the dynamic= argument in " + spec["entry"],
+                         "Change the page to render='ssg' if it should be static"]))
                 if dynamic == "force-dynamic" and mode != "ssg":
-                    raise ValueError(f"Only SSG pages can use dynamic='force-dynamic' in {spec['entry']}")
+                    raise ValueError(_config_error(
+                        f"Only SSG pages can use dynamic='force-dynamic' in {spec['entry']}",
+                        [("route", pattern)],
+                        ["Change the page to render='ssg' in " + spec["entry"],
+                         "Remove dynamic='force-dynamic' from " + spec["entry"]]))
                 self.dynamic_modes[pattern] = dynamic
                 if mode == "isr":
                     raw_policy = getattr(fn, "__pynext_cache_policy__", None)
                     if not isinstance(raw_policy, dict) or set(raw_policy) != {"revalidate", "stale", "expire"}:
-                        raise ValueError(f"Invalid ISR policy in {spec['entry']}")
+                        raise ValueError(_config_error(
+                            f"Invalid ISR policy in {spec['entry']}",
+                            [("route", pattern), ("got", _short_repr(raw_policy))],
+                            ["Use @page(render='isr', revalidate=<positive seconds>, "
+                             "stale=<non-negative seconds>, expire=<positive seconds or None>) "
+                             "in " + spec["entry"]]))
                     try:
                         page_policy = _partial_isr_policy(raw_policy["revalidate"],
                                                           raw_policy["stale"],
                                                           raw_policy["expire"])
                     except ValueError as exc:
-                        raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
+                        raise ValueError(_config_error(
+                            f"Invalid ISR policy in {spec['entry']}: {exc}",
+                            [("route", pattern), ("got", _short_repr(raw_policy))],
+                            ["Use @page(render='isr', revalidate=<positive seconds>, "
+                             "stale=<non-negative seconds>, expire=<positive seconds or None>) "
+                             "in " + spec["entry"]])) from exc
                     if layout_policies:
                         self.layout_policies[pattern] = [
                             {"source": source, "revalidate": policy["revalidate"],
@@ -1464,8 +1868,12 @@ class App:
                                 key, page_value, entry, key, winner_value,
                                 winner_source, pattern, key)
                     if effective["revalidate"] is None:
-                        raise ValueError(
-                            f"ISR page {spec['entry']} must set revalidate or inherit it from a layout")
+                        raise ValueError(_config_error(
+                            f"ISR page {spec['entry']} must set revalidate or inherit it from a layout",
+                            [("route", pattern)],
+                            ["Set revalidate=<positive seconds> in @page(render='isr', ...) in "
+                             + spec["entry"],
+                             "Set revalidate on an ancestor @layout in " + spec["entry"]]))
                     if effective["revalidate"] is False:
                         # On-demand-only ISR: never regenerates on a timer,
                         # only explicit revalidate()/revalidate_tag() does.
@@ -1475,7 +1883,12 @@ class App:
                         try:
                             policy = _isr_policy(False, stale, None)
                         except ValueError as exc:
-                            raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
+                            raise ValueError(_config_error(
+                                f"Invalid ISR policy in {spec['entry']}: {exc}",
+                                [("route", pattern), ("got", _short_repr(effective))],
+                                ["Use @page(render='isr', revalidate=<positive seconds>, "
+                                 "stale=<non-negative seconds>, expire=<positive seconds or None>) "
+                                 "in " + spec["entry"]])) from exc
                     else:
                         # Reconcile stale/expire: they are two spellings of the
                         # same window. A set expire is the hard cap and wins;
@@ -1487,18 +1900,51 @@ class App:
                             stale = expire - revalidate
                         else:
                             stale = 60.0 if effective["stale"] is None else effective["stale"]
-                            expire = revalidate + stale
+                            # Pass expire=None so _isr_policy derives
+                            # expire = revalidate + stale itself: a zero
+                            # stale window (stale=0) legitimately yields
+                            # expire == revalidate, which _isr_policy only
+                            # rejects for an explicitly given expire.
+                            expire = None
                         try:
                             policy = _isr_policy(revalidate, stale, expire)
                         except ValueError as exc:
-                            raise ValueError(f"Invalid ISR policy in {spec['entry']}: {exc}") from exc
+                            raise ValueError(_config_error(
+                                f"Invalid ISR policy in {spec['entry']}: {exc}",
+                                [("route", pattern), ("got", _short_repr(effective))],
+                                ["Use @page(render='isr', revalidate=<positive seconds>, "
+                                 "stale=<non-negative seconds>, expire=<positive seconds or None>) "
+                                 "in " + spec["entry"]])) from exc
                     self.isr_policies[pattern] = policy
-                    if getattr(module, "generate_static_params", None) is not None:
-                        raise ValueError(f"ISR page {spec['entry']} cannot export generate_static_params yet")
+                    # ISR pages may export generate_static_params: the
+                    # listed paths are warmed into the cache at startup
+                    # (see warmup_isr) instead of waiting for a first
+                    # request. The generator rules mirror SSG: a dynamic
+                    # route may export one, a static route may not.
+                    isr_dynamic = any("[" in segment for segment in pattern.split("/"))
+                    generator = getattr(module, "generate_static_params", None)
+                    if isr_dynamic and generator is not None and (
+                            not callable(generator) or inspect.signature(generator).parameters):
+                        raise ValueError(_config_error(
+                            f"Dynamic ISR page {spec['entry']} must export generate_static_params() with no arguments",
+                            [("route", pattern)],
+                            [f"Define generate_static_params() with no arguments in {spec['entry']}"]))
+                    if not isr_dynamic and generator is not None:
+                        raise ValueError(_config_error(
+                            f"Static ISR page {spec['entry']} cannot export generate_static_params",
+                            [("route", pattern)],
+                            [f"Remove generate_static_params from {spec['entry']}",
+                             "Make the route dynamic by adding a [param] segment to its directory name"]))
+                    self.isr_generators[pattern] = generator
                     try:
                         query_keys = _isr_query_keys(getattr(fn, "__pynext_cache_query__", ()))
                     except ValueError as exc:
-                        raise ValueError(f"Invalid ISR query keys in {spec['entry']}: {exc}") from exc
+                        raise ValueError(_config_error(
+                            f"Invalid ISR query keys in {spec['entry']}: {exc}",
+                            [("route", pattern),
+                             ("got", _short_repr(getattr(fn, "__pynext_cache_query__", ())))],
+                            ["Pass query_keys as a list of up to 16 unique names matching "
+                             "[A-Za-z][A-Za-z0-9_-]{0,63}"])) from exc
                     self.isr_queries[pattern] = query_keys
                     try:
                         # Lists, not tuples: the manifest round-trips
@@ -1506,7 +1952,12 @@ class App:
                         self.isr_tags[pattern] = list(_validate_tags(
                             getattr(fn, "__pynext_cache_tags__", ())))
                     except ValueError as exc:
-                        raise ValueError(f"Invalid ISR tags in {spec['entry']}: {exc}") from exc
+                        raise ValueError(_config_error(
+                            f"Invalid ISR tags in {spec['entry']}: {exc}",
+                            [("route", pattern),
+                             ("got", _short_repr(getattr(fn, "__pynext_cache_tags__", ())))],
+                            ["Pass tags as a list of up to 16 unique names matching "
+                             "[A-Za-z][A-Za-z0-9_-]{0,63}"])) from exc
                     # Layout tags: an ISR page also carries one tag per
                     # ancestor layout (scopes recorded in entry_layouts),
                     # so invalidating a layout tag evicts the whole
@@ -1516,18 +1967,41 @@ class App:
                 else:
                     query_keys = []
                 if "query" in inspect.signature(fn).parameters and not query_keys:
-                    raise ValueError(f"Page {spec['entry']} needs ISR query_keys to accept query")
+                    raise ValueError(_config_error(
+                        f"Page {spec['entry']} needs ISR query_keys to accept query",
+                        [("route", pattern)],
+                        [f"Add query_keys=(...) to @page(render='isr', ...) in {spec['entry']}",
+                         f"Remove the query parameter from Page in {spec['entry']}"]))
                 if mode == "ssg":
-                    is_dynamic = any(segment.startswith("[") for segment in pattern.split("/"))
+                    fallback = getattr(fn, "__pynext_ssg_fallback__", None)
+                    try:
+                        fallback = _ssg_fallback(
+                            (fallback or {}).get("fallback", "not_found"),
+                            (fallback or {}).get("dynamic_params", True))
+                    except ValueError as exc:
+                        raise ValueError(_config_error(
+                            f"Invalid SSG fallback in {spec['entry']}: {exc}",
+                            [("route", pattern), ("got", _short_repr(fallback))],
+                            ["Pass fallback='not_found', 'blocking', or 'static' to "
+                             "@page(render='ssg', ...) in " + spec["entry"]])) from exc
+                    self.ssg_fallback[pattern] = fallback
+                    is_dynamic = any("[" in segment for segment in pattern.split("/"))
                     generator = getattr(module, "generate_static_params", None)
                     if dynamic == "force-dynamic":
                         # Served dynamically in production, so no generator
                         # is needed and any exported one is ignored at build.
                         pass
                     elif is_dynamic and (not callable(generator) or inspect.signature(generator).parameters):
-                        raise ValueError(f"Dynamic SSG page {spec['entry']} must export generate_static_params() with no arguments")
+                        raise ValueError(_config_error(
+                            f"Dynamic SSG page {spec['entry']} must export generate_static_params() with no arguments",
+                            [("route", pattern)],
+                            [f"Define generate_static_params() with no arguments in {spec['entry']}"]))
                     elif not is_dynamic and generator is not None:
-                        raise ValueError(f"Static SSG page {spec['entry']} cannot export generate_static_params")
+                        raise ValueError(_config_error(
+                            f"Static SSG page {spec['entry']} cannot export generate_static_params",
+                            [("route", pattern)],
+                            [f"Remove generate_static_params from {spec['entry']}",
+                             "Make the route dynamic by adding a [param] segment to its directory name"]))
                     self.static_generators[pattern] = generator
                 # Optional request parameters pass signature validation and
                 # receive the current request through _invoke. Never share
@@ -1559,16 +2033,28 @@ class App:
                     method = getattr(fn, "__pynext_method__", None)
                     if method and fn.__module__ == module.__name__:
                         if method in handlers:
-                            raise ValueError(f"Duplicate {method} handler in {spec['entry']}")
+                            raise ValueError(_config_error(
+                                f"Duplicate {method} handler in {spec['entry']}",
+                                [("route", pattern)],
+                                [f"Keep only one @route({method!r}) handler in {spec['entry']}",
+                                 "Remove the duplicate handler function"]))
                         _check_signature(fn, {"request", "params"}, spec["entry"])
                         handlers[method] = fn
                     if getattr(fn, "__pynext_websocket__", False) and fn.__module__ == module.__name__:
                         if ws_handler is not None:
-                            raise ValueError(f"Duplicate WebSocket handler in {spec['entry']}")
+                            raise ValueError(_config_error(
+                                f"Duplicate WebSocket handler in {spec['entry']}",
+                                [("route", pattern)],
+                                [f"Keep only one @websocket handler in {spec['entry']}",
+                                 "Remove the duplicate handler function"]))
                         _check_signature(fn, {"websocket", "params"}, spec["entry"])
                         ws_handler = fn
                 if not handlers and ws_handler is None:
-                    raise ValueError(f"{spec['entry']} has no @route handlers")
+                    raise ValueError(_config_error(
+                        f"{spec['entry']} has no @route handlers",
+                        [("route", pattern)],
+                        [f"Add at least one @route('GET') handler to {spec['entry']}",
+                         f"Add a @websocket handler to {spec['entry']} to serve WebSocket connections"]))
                 if ws_handler is not None:
                     self.websocket_entries[pattern] = ws_handler
                     self.websocket_auth[pattern] = authorization_policy(ws_handler)
@@ -1580,28 +2066,103 @@ class App:
                     cache_call_kind(handler_fn)
                 if ws_handler is not None:
                     cache_call_kind(ws_handler)
+        # Segment error boundaries (REPORT §2.1 #15): one ErrorPage /
+        # NotFoundPage / LoadingPage per route, resolved to the nearest
+        # boundary file at build time. Validated eagerly so a typo fails
+        # startup, not the first failing request.
+        self.error_boundaries = {}
+        self.not_found_boundaries = {}
+        self.loading_boundaries = {}
+        for pattern, spec in manifest["routes"].items():
+            if spec["kind"] != "page":
+                continue
+            self.error_boundaries[pattern] = self._load_boundary(
+                spec.get("error"), "ErrorPage", {"error", "request", "params"})
+            self.not_found_boundaries[pattern] = self._load_boundary(
+                spec.get("not_found"), "NotFoundPage", {"request", "params"})
+            self.loading_boundaries[pattern] = self._load_boundary(
+                spec.get("loading"), "LoadingPage", {"request", "params"})
+        self.global_error_boundary = self._load_boundary(
+            manifest.get("error"), "ErrorPage", {"error", "request", "params"})
+        self.global_not_found_boundary = self._load_boundary(
+            manifest.get("not_found"), "NotFoundPage", {"request", "params"})
         if production:
             from .build import read_static_pages
             if manifest.get("render_modes") != self.render_modes:
-                raise ValueError("Render modes changed since build; run `pynext build` again")
+                raise ValueError(_config_error(
+                    "Render modes changed since build",
+                    [("manifest", ".pynext/manifest.json")],
+                    ["Run `pynext build` again"]))
             if manifest.get("isr_policies") != self.isr_policies:
-                raise ValueError("ISR policies changed since build; run `pynext build` again")
+                raise ValueError(_config_error(
+                    "ISR policies changed since build",
+                    [("manifest", ".pynext/manifest.json")],
+                    ["Run `pynext build` again"]))
             if manifest.get("layout_policies") != self.layout_policies:
-                raise ValueError("Layout policies changed since build; run `pynext build` again")
+                raise ValueError(_config_error(
+                    "Layout policies changed since build",
+                    [("manifest", ".pynext/manifest.json")],
+                    ["Run `pynext build` again"]))
             if manifest.get("isr_queries") != self.isr_queries:
-                raise ValueError("ISR query keys changed since build; run `pynext build` again")
+                raise ValueError(_config_error(
+                    "ISR query keys changed since build",
+                    [("manifest", ".pynext/manifest.json")],
+                    ["Run `pynext build` again"]))
             if manifest.get("dynamic_modes") != self.dynamic_modes:
-                raise ValueError("Dynamic modes changed since build; run `pynext build` again")
+                raise ValueError(_config_error(
+                    "Dynamic modes changed since build",
+                    [("manifest", ".pynext/manifest.json")],
+                    ["Run `pynext build` again"]))
             if manifest.get("isr_tags") != self.isr_tags:
-                raise ValueError("ISR tags changed since build; run `pynext build` again")
+                raise ValueError(_config_error(
+                    "ISR tags changed since build",
+                    [("manifest", ".pynext/manifest.json")],
+                    ["Run `pynext build` again"]))
+            if manifest.get("ssg_fallback") != self.ssg_fallback:
+                raise ValueError(_config_error(
+                    "SSG fallback modes changed since build",
+                    [("manifest", ".pynext/manifest.json")],
+                    ["Run `pynext build` again"]))
+            isr_static_paths = manifest.get("isr_static_paths")
+            if (not isinstance(isr_static_paths, dict) or
+                    any(not isinstance(paths, list) or
+                        any(not isinstance(path, str) for path in paths)
+                        for paths in isr_static_paths.values()) or
+                    set(isr_static_paths) - {p for p, g in self.isr_generators.items() if g is not None}):
+                raise ValueError(_config_error(
+                    "Invalid ISR static paths in manifest",
+                    [("manifest", ".pynext/manifest.json")],
+                    ["Run `pynext build` again"]))
+            self.isr_static_paths = isr_static_paths
             self.client_manifest, self.client_assets = read_client_artifacts(self.root, manifest)
+            self.client_report = None
             self.static_pages = read_static_pages(self.root, manifest, self.router)
             self.public_assets = read_public_artifacts(self.root, manifest)
-            if set(self.static_pages).intersection(self.public_assets):
-                raise ValueError("A public file conflicts with a generated page; rebuild the application")
+            # Static pages are served by the native fast path without
+            # Python dispatch, so precompute their prefetch hints here.
+            for path in self.static_pages:
+                match = self.router.matches(path)
+                if match is None:
+                    continue
+                seconds = self.prefetch_stale_seconds(match[0], SSG_PREFETCH_STALE_SECONDS)
+                if seconds is not None:
+                    self.prefetch_stale_times[path] = seconds
+            conflicting = set(self.static_pages).intersection(self.public_assets)
+            if conflicting:
+                path = sorted(conflicting)[0]
+                raise ValueError(_config_error(
+                    f"A public file conflicts with a generated page: {path}",
+                    [("public file", f"public{path}"), ("generated page", path)],
+                    ["Rename or move the public file so its URL does not match the generated page",
+                     "Rebuild the application after changing generate_static_params"]))
         else:
             self.public_assets = read_public_sources(self.root, manifest["public_sources"])
-            self.client_manifest, self.client_assets = compile_client(self.root, manifest["client_sources"])
+            if reuse_client is not None:
+                self.client_manifest, self.client_assets = reuse_client
+                self.client_report = None
+            else:
+                self.client_manifest, self.client_assets, self.client_report = compile_client(
+                    self.root, manifest["client_sources"])
         assets = {**self.static_pages, **self.client_assets,
                   **{path: body for path, (body, _) in self.public_assets.items()}}
         self.asset_etags = {path: f'"{hashlib.sha256(body).hexdigest()}"' for path, body in assets.items()}
@@ -1649,6 +2210,130 @@ class App:
         if key not in self.modules:
             self.modules[key] = _load(self.root, path, self._namespace)
         return self.modules[key]
+
+    def _load_boundary(self, relative, export, allowed):
+        """Load one boundary export (``ErrorPage``/``NotFoundPage``/``LoadingPage``).
+
+        Returns the callable, or None when the route has no such boundary.
+        A boundary file that fails to export its function is a startup
+        error: silently ignoring it would turn a typo into a missing
+        fallback on the first failing request.
+        """
+        if not relative:
+            return None
+        fn = getattr(self._module(relative), export, None)
+        if not callable(fn):
+            raise ValueError(f"{relative} must export a {export} function")
+        _check_signature(fn, allowed, relative)
+        return fn
+
+    async def _render_boundary(self, fn, *, request, params, layouts, error=None, status=500):
+        """Render one boundary function to a Response, or None if it fails.
+
+        The boundary is tried with the route layouts first, so a failing
+        page still renders inside the site shell, then bare when a layout
+        itself is what failed. The status is decided by the caller: a
+        boundary returns an ``h()`` tree and can never change the status.
+        """
+        tree = None
+        for attempt_layouts in (layouts, ()):
+            try:
+                tree = await _invoke(fn, error=error, request=request, params=params)
+                if not isinstance(tree, dict):
+                    raise TypeError(
+                        f"Boundary must return a render node dict, got {type(tree).__name__}")
+                for layout_fn in reversed(attempt_layouts):
+                    tree = await _invoke(layout_fn, children=tree, request=request)
+                    if not isinstance(tree, dict):
+                        raise TypeError(
+                            "Layout must return a render node dict, "
+                            f"got {type(tree).__name__}")
+                break
+            except Exception:
+                tree = None
+        if tree is None:
+            log.exception("Error boundary failed to render")
+            return None
+        try:
+            tree = bind_islands(tree, self.client_manifest, dev_id=self._dev_id)
+            payload = json.dumps(tree, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            nonce = new_csp_nonce() if self.security.csp_nonce_enabled else None
+            html = await asyncio.to_thread(_native.render, payload, nonce)
+        except Exception:
+            log.exception("Error boundary failed to render")
+            return None
+        if isinstance(tree, dict) and tree.get("tag", "").lower() == "html":
+            html = "<!DOCTYPE html>" + html
+        return Response(html, status=status, media_type="text/html; charset=utf-8", csp_nonce=nonce)
+
+    async def _error_page_response(self, request, pattern, params, exc):
+        """Nearest segment error boundary for a failed page render.
+
+        Falls back to the global ``app/error.py`` boundary when the nearest
+        one fails, and to the plain 500 page when no boundary renders.
+        The status stays 500 either way.
+        """
+        fn = self.error_boundaries.get(pattern) if pattern else None
+        layouts = self.entries[pattern][1] if pattern and pattern in self.entries else ()
+        if fn is not None:
+            response = await self._render_boundary(
+                fn, request=request, params=params, layouts=layouts, error=exc, status=500)
+            if response is not None:
+                return response
+        if self.global_error_boundary is not None and self.global_error_boundary is not fn:
+            response = await self._render_boundary(
+                self.global_error_boundary, request=request, params=params, layouts=(),
+                error=exc, status=500)
+            if response is not None:
+                return response
+        # No boundary rendered: the plain 500 is the last resort. Log the
+        # failure and record the error metric like dispatch_and_send does
+        # for uncaught errors, so a 500 always has exactly one error log
+        # line carrying its digest (see
+        # test_errors.py::test_500_body_carries_request_id_and_digest).
+        digest, _count = digest_for_error(exc)
+        self.metrics.observe_error(pattern or "__unmatched__", type(exc).__name__, digest)
+        log.exception("Request failed", extra={"error_digest": digest})
+        return self.error_response(exc, digest=digest)
+
+    async def _not_found_page_response(self, request, pattern, params):
+        """Nearest segment not-found boundary, else the global one, else plain 404.
+
+        The status stays 404 either way. Used both for route misses and
+        for pages that raise :class:`NotFoundError`.
+        """
+        fn = self.not_found_boundaries.get(pattern) if pattern else None
+        layouts = self.entries[pattern][1] if pattern and pattern in self.entries else ()
+        if fn is not None:
+            response = await self._render_boundary(
+                fn, request=request, params=params, layouts=layouts, status=404)
+            if response is not None:
+                return response
+        if self.global_not_found_boundary is not None and self.global_not_found_boundary is not fn:
+            response = await self._render_boundary(
+                self.global_not_found_boundary, request=request, params=params, layouts=(),
+                status=404)
+            if response is not None:
+                return response
+        return Response("Not Found", status=404)
+
+    def log_request_error(self, exc):
+        """Log one request failure at the transport boundary.
+
+        Well-known transport noise (client disconnects, cancellations)
+        logs once at INFO with the error type and route only — never the
+        exception message, which can carry request data. Real failures
+        log in full, deduped by callsite (exception class + innermost
+        user-code frame + route pattern) so one broken page cannot flood
+        the log.
+        """
+        route = route_var.get()
+        if classify_request_error(exc) == "known":
+            log.info("Request failed (known error)", extra={
+                "error_type": type(exc).__name__, "route": route,
+            })
+            return
+        self._error_log_dedup.log_exception(exc, route=route)
 
     def error_response(self, exc, digest=None):
         """Render a 500 for an unexpected failure.
@@ -1787,6 +2472,48 @@ class App:
             await self.isr.close(executor=self._ensure_exit_executor())
             raise
         self._started = True
+        if self.production:
+            # ISR warmup is best-effort and must never delay readiness:
+            # it runs in the background while requests take the normal
+            # ISR path (miss -> synchronous generation) for paths that
+            # have not been warmed yet.
+            self._isr_warmup_task = asyncio.create_task(self.warmup_isr())
+
+    async def warmup_isr(self):
+        """Pre-generate ISR ``generate_static_params`` paths into the cache.
+
+        Best-effort: one path failing (slow data source, render error,
+        shared-store outage) is logged and skipped; it never fails
+        startup, and the path still renders on demand at request time.
+        Returns ``(warmed, failed)`` counts. Only runs in production:
+        development renders ISR pages on request.
+        """
+        warmed = 0
+        failed = 0
+        for pattern, paths in self.isr_static_paths.items():
+            for path in paths:
+                try:
+                    match = self.router.matches(path)
+                    if match is None or match[0] != pattern:
+                        raise ValueError(f"Warmed ISR path {path} does not match {pattern}")
+                    params = {k: v if f"[...{k}]" in pattern else v[0] for k, v in match[1].items()}
+                    cache_key = await self._isr_cache_key(pattern, path, {})
+                    response = await self._render_isr_cached(pattern, params, {}, cache_key)
+                    if isinstance(response, StreamingResponse):
+                        try:
+                            while await response._next_chunk() is not None:
+                                pass
+                        finally:
+                            await response.aclose()
+                    warmed += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    failed += 1
+                    log.warning("ISR warmup failed for %s", path, exc_info=True)
+        if warmed or failed:
+            log.info("ISR warmup finished: %d warmed, %d failed", warmed, failed)
+        return warmed, failed
 
     async def shutdown(self):
         """Close resources in reverse order even when one shutdown fails."""
@@ -1797,6 +2524,15 @@ class App:
     async def _shutdown_locked(self):
         error = None
         self._draining = True
+        if self._isr_warmup_task is not None:
+            task, self._isr_warmup_task = self._isr_warmup_task, None
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("ISR warmup failed during shutdown")
         for resource in reversed(self._resources_started):
             try:
                 await resource.shutdown()
@@ -1938,12 +2674,19 @@ class App:
         Next.js ``revalidatePath``. ``"/"`` and ``"/index"`` are aliases.
         Returns True when at least one entry (or query-variant generation)
         was invalidated.
+
+        A base-path-prefixed path is accepted and stripped first, so
+        operators can pass the public URL; the trailing-slash rule
+        still applies to the app-relative path.
         """
         if type is not None and type not in ("page", "layout"):
             raise ValueError("revalidate type must be 'page' or 'layout'")
         if not isinstance(path, str):
             raise TypeError("ISR path must be a string")
         path = _decode_path(path)
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash="redirect")
+        if path is None:
+            raise ValueError("Path does not match an ISR page")
         if path != "/" and path.endswith("/"):
             raise ValueError("ISR path must not have a trailing slash")
         if _is_dynamic_pattern(path):
@@ -2023,6 +2766,10 @@ class App:
         if type == "layout":
             return await self.isr.invalidate_tag(_layout_tag(path)) > 0
         match = self.router.matches(path)
+        # In-request invalidation clears the request memo (track C P1-2):
+        # a later read in this same request must see the post-mutation
+        # data, not the pre-mutation memo.
+        clear_request_memo()
         if self.isr_queries.get(match[0]):
             _, existed = await self.isr.variant_generation(path, invalidate=True)
             return existed
@@ -2275,6 +3022,48 @@ class App:
         self.isr_policy_overrides.clear()
         return count
 
+    async def warm_isr_cache(self, *, timeout=None):
+        """Pre-fill the ISR cache for statically addressable ISR routes.
+
+        Warms every ISR pattern without dynamic segments or query keys —
+        those are the routes whose cache key is just the path, so they
+        can be rendered without request input. Dynamic ISR routes need
+        ``generate_static_params`` (not yet supported for ISR) and
+        query-variant routes need concrete query values, so both are
+        skipped and reported under ``skipped_routes``. Best-effort:
+        per-page failures are logged and counted, never raised — a
+        failed entry is simply rendered on its first real request.
+        Returns the :meth:`ISRCache.warmup` summary plus
+        ``skipped_routes`` (``{"dynamic": [...], "query": [...]}``).
+        """
+        entries = []
+        skipped_routes = {"dynamic": [], "query": []}
+        for pattern, policy in self.isr_policies.items():
+            if "[" in pattern:
+                skipped_routes["dynamic"].append(pattern)
+                continue
+            if self.isr_queries.get(pattern):
+                skipped_routes["query"].append(pattern)
+                continue
+
+            async def render(pattern=pattern):
+                return await self._render_isr_response(pattern, {}, {})
+
+            entries.append((pattern, policy, render))
+        result = await self.isr.warmup(entries, timeout=timeout)
+        result["skipped_routes"] = skipped_routes
+        self.metrics.observe_warmup(result)
+        if skipped_routes["dynamic"]:
+            log.info("ISR warmup skipped dynamic routes "
+                     "(generate_static_params is not supported for ISR yet): %s",
+                     ", ".join(sorted(skipped_routes["dynamic"])))
+        if skipped_routes["query"]:
+            log.info("ISR warmup skipped query-variant routes: %s",
+                     ", ".join(sorted(skipped_routes["query"])))
+        log.info("ISR warmup finished: %(warmed)d warmed, %(skipped)d skipped, "
+                 "%(failed)d failed, %(pending)d pending", result)
+        return result
+
     async def _render_stream_chunk(self, node):
         """Serialize one streamed UI node to HTML on a worker thread."""
         bound = bind_islands(_node(node), self.client_manifest, include_runtime=False)
@@ -2294,12 +3083,18 @@ class App:
         Either case returns None and the caller renders every layout on
         each request. Otherwise, returns the cached entry dict.
 
-        ``request`` is threaded through to the layout invocations so a
-        sync layout runs under the sync-worker limit (``_invoke_sync``)
-        exactly as it did before shell caching; without it the layout
-        would run on a bare worker thread, bypassing the limit and its
-        tracking counter. Prerenders pass None and keep the old bypass,
-        as they did before caching existed.
+        The layout shell is rendered once with a marker in place of the page
+        children, then split into a prefix and a suffix around the marker.
+        The prefix is sent first, each page chunk is serialized and sent as
+        it arrives, and the suffix closes the document. Layouts must render
+        their children exactly once; anything else fails before headers are
+        sent. Before the response is built, the page stream is inspected
+        with :func:`process_prelude`: a page that yields nothing inside an
+        empty shell would otherwise go out as a document holding only the
+        client runtime script tag, so that case fails here instead, while
+        headers can still become a 500. SSG consumes the stream during the
+        build. ISR streams its first generation while retaining a bounded
+        copy for the cache.
         """
         if self._layout_shell_dynamic.get(pattern, False):
             return None
@@ -2374,18 +3169,33 @@ class App:
             entry["prefix"], entry["suffix"] = prefix, suffix
             return prefix, suffix
 
-    async def _streaming_page_response(self, pattern, chunks, layouts, tracker=None, request=None):
+    async def _streaming_page_response(self, pattern, chunks, layouts, tracker=None, request=None, params=None,
+                                       loading=None):
         """Wrap an async iterable of UI nodes in a StreamingResponse.
 
         The layout shell is rendered once per route and cached; the
         cached prefix is sent first, each page chunk is serialized and
         sent as it arrives, and the cached suffix closes the document.
+
+        When the segment defines a ``loading.py`` boundary, its node is
+        rendered and sent as the first chunk, before the page generator's
+        first chunk arrives, so a slow page still paints a placeholder
+        inside the shell. The response is tagged ``_pynext_loading_index``
+        with that chunk's position, so body-building consumers (SSG build,
+        ISR cache) can skip it instead of baking the placeholder into the
+        stored page.
+
         Layouts accepting ``request`` or opting out with
         ``@layout(dynamic=True)`` are rendered on every request. Layouts
         must render their children exactly once; anything else fails
-        before headers are sent. SSG consumes the stream during the build.
-        ISR streams its first generation while retaining a bounded copy
-        for the cache.
+        before headers are sent. When the shell is empty, the page stream
+        is inspected with :func:`process_prelude` before the response is
+        built: a page that yields nothing inside an empty shell fails here
+        instead of going out as a document holding only the client runtime
+        script tag, while headers can still become a 500. A non-empty shell
+        streams first with no inspection. SSG consumes the stream during
+        the build. ISR streams its first generation while retaining a
+        bounded copy for the cache.
 
         When ``tracker`` is given, the stream owns it: ``page_stream()``
         exits it when the body is fully consumed or the stream is closed,
@@ -2412,25 +3222,121 @@ class App:
             prefix, suffix = await self._render_shell_split(pattern, shell, marker)
         else:
             prefix, suffix = await self._layout_shell_html(pattern, entry)
+        loading_html = None
+        if loading is not None:
+            node = await _invoke(loading, request=request, params=params)
+            if not isinstance(node, dict):
+                raise TypeError(
+                    f"LoadingPage for {pattern} must return a render node dict, "
+                    f"got {type(node).__name__}"
+                )
+            loading_html = await self._render_stream_chunk(node)
+
+        # processPrelude-style inspection: look at the first page chunk
+        # without consuming the stream — but only when the shell is
+        # empty. The error only fires for an empty page inside an empty
+        # shell, so a non-empty shell needs no inspection; inspecting
+        # first would also hold the shell back while the page's first
+        # chunk is still cooking, breaking shell-first streaming (a
+        # gated page's gate is only released once the shell arrives).
+        # The runtime tag is boilerplate, not content, so it is stripped
+        # before the emptiness test. A non-empty shell is still a
+        # legitimate (if content-free) page.
+        stream = chunks
+        if not _strip_client_runtime(prefix) and not _strip_client_runtime(suffix):
+            prelude, prelude_is_empty = await process_prelude(chunks)
+            if prelude_is_empty:
+                raise ValueError(
+                    f"Streaming page {pattern} rendered an empty document: "
+                    "the page produced no content and the layout shell is empty"
+                )
+            stream = prelude
 
         async def page_stream():
+            suffix_sent = False
             try:
                 if prefix:
                     yield prefix
-                async for node in chunks:
+                if loading_html:
+                    yield loading_html
+                async for node in stream:
                     html = await self._render_stream_chunk(node)
                     if html:
                         yield html
                 if suffix:
+                    suffix_sent = True
                     yield suffix
+            except BaseException as exc:
+                # A disconnect or cancellation must not yield into a dying
+                # generator; anything else is a render failure after the
+                # headers were sent, so close the document with the error
+                # marker (the status can no longer become 500) and re-raise
+                # so the build fails and the ISR generation is not cached.
+                if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+                    raise
+                if not suffix_sent:
+                    yield _STREAM_ERROR_MARKER.decode("ascii") + suffix
+                raise
             finally:
-                close = getattr(chunks, "aclose", None)
+                close = getattr(stream, "aclose", None)
                 if close is not None:
                     await close()
                 if tracker is not None:
                     tracker.__exit__(None, None, None)
 
-        return StreamingResponse(page_stream(), media_type="text/html; charset=utf-8")
+        response = StreamingResponse(page_stream(), media_type="text/html; charset=utf-8")
+        if loading_html:
+            # Chunks arrive as [prefix?, loading, ...]; the loading chunk
+            # is index 1 when a shell prefix was sent, else 0. Body-building
+            # consumers (SSG build, ISR cache) use this to drop it instead
+            # of baking the placeholder into the stored page.
+            response._pynext_loading_index = 1 if prefix else 0
+        return response
+
+    async def _isr_cache_key(self, pattern, path, query):
+        """Cache key for an ISR path, including the query-variant dimension.
+
+        Paths without ``query_keys`` use the bare path, exactly as the
+        native server's fresh-hit lookup does; paths with query keys mix
+        in the variant generation and a hash of the selected query, so
+        warmup and request handling compute the same key.
+        """
+        if not self.isr_queries[pattern]:
+            return path
+        generation, _ = await self.isr.variant_generation(path)
+        encoded = json.dumps(query, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        return ("\0isr:" + hashlib.sha256(path.encode("utf-8")).hexdigest() + ":" +
+                generation + ":" + hashlib.sha256(encoded).hexdigest())
+
+    def _layout_stale_seconds(self, pattern):
+        """Minimum declared stale time over the route's layouts, or None.
+
+        Layouts declare it with ``@layout(stale=<seconds>)``; a layout
+        without one puts no constraint on the prefetch hint.
+        """
+        _, layouts = self.entries[pattern]
+        declared = [getattr(layout_fn, "__pynext_stale__", None) for layout_fn in layouts]
+        declared = [value for value in declared if value is not None]
+        return min(declared) if declared else None
+
+    def prefetch_stale_seconds(self, pattern, page_seconds):
+        """Prefetch stale-time hint for ``pattern``, in whole seconds.
+
+        ``page_seconds`` is the page's own stale time (SSG: the static
+        default; ISR: remaining fresh window or ``revalidate`` for a newly
+        generated entry). The hint is min(page, layout stale times) —
+        the Next.js `getDynamicStaleTime` rule, min over segments. Returns
+        ``None`` when there is no hint (no page stale time, or the minimum
+        floors to zero, i.e. "already stale, do not retain").
+        """
+        if page_seconds is None:
+            return None
+        candidates = [float(page_seconds)]
+        layout_stale = self._layout_stale_seconds(pattern)
+        if layout_stale is not None:
+            candidates.append(float(layout_stale))
+        seconds = int(min(candidates))
+        return seconds if 1 <= seconds <= MAX_PREFETCH_STALE_SECONDS else None
 
     def _page_query(self, pattern, request):
         keys = self.isr_queries.get(pattern, ())
@@ -2443,7 +3349,52 @@ class App:
             raise BadRequest("ISR query values are too large")
         return selected
 
+    async def _render_isr_response(self, pattern, params, query, *, feed=None):
+        """Render an ISR page to a plain Response, consuming streams fully.
+
+        When ``feed`` is given, each chunk is also sent to the feed as
+        it arrives (the live-request path); warmup passes no feed and
+        just needs the finished body for the cache.
+        """
+        response = await self.render_page(pattern, None, params, csp_nonce=False, query=query)
+        if not isinstance(response, StreamingResponse):
+            return response
+        if feed is not None:
+            feed.begin()
+        body = bytearray()
+        try:
+            # The loading placeholder is for the live client only; feed
+            # it through but keep it out of the cached body, the same
+            # rule _render_isr_cached applies below.
+            index = 0
+            loading_index = getattr(response, "_pynext_loading_index", None)
+            while (chunk := await response._next_chunk()) is not None:
+                if index == loading_index:
+                    index += 1
+                    if feed is not None:
+                        await feed.send(chunk)
+                    continue
+                index += 1
+                if len(body) + len(chunk) > _MAX_ISR_STREAM_BYTES:
+                    raise ValueError("Streamed ISR page exceeds the size limit")
+                body.extend(chunk)
+                if feed is not None:
+                    await feed.send(chunk)
+            if feed is not None:
+                await feed.finish()
+            return Response(bytes(body), status=response.status, headers=response.headers)
+        except BaseException as exc:
+            if feed is not None:
+                feed.fail(exc)
+            raise
+        finally:
+            await response.aclose()
+
     async def _render_isr_cached(self, pattern, params, query, key, policy=None, tags=None):
+        # Tee: one render feeds two consumers — the ISR cache body (``body``
+        # in render()) and the initiating client's response stream (the
+        # feed). See _ISRStreamFeed: the feed owns the fan-out, so the
+        # cached body is exactly the body that was streamed.
         feed = _ISRStreamFeed()
 
         async def render():
@@ -2453,7 +3404,16 @@ class App:
             feed.begin()
             body = bytearray()
             try:
+                # The loading placeholder is for the live client only; feed
+                # it through but keep it out of the cached body.
+                index = 0
+                loading_index = getattr(response, "_pynext_loading_index", None)
                 while (chunk := await response._next_chunk()) is not None:
+                    if index == loading_index:
+                        index += 1
+                        await feed.send(chunk)
+                        continue
+                    index += 1
                     if len(body) + len(chunk) > _MAX_ISR_STREAM_BYTES:
                         raise ValueError("Streamed ISR page exceeds the size limit")
                     body.extend(chunk)
@@ -2485,12 +3445,112 @@ class App:
             if task.done():
                 feed.detach()
                 return task.result()
-            return _ISRStreamingResponse(feed)
+            return _ISRStreamingResponse(feed, cache_control_header(self.isr_policies[pattern]).encode("ascii"))
         except BaseException:
             # Do not cancel a shared generation when the initiating client
             # disconnects; other requests can still use its eventual result.
             feed.detach()
             raise
+
+    async def _generate_ssg_page(self, pattern, path, params):
+        """Render one ungenerated SSG page and store it in the runtime overlay.
+
+        The body is capped like a build-time static page, so a runaway
+        fallback generation cannot grow memory without bound. The overlay
+        lives only in this process (and is not written back to the build
+        manifest): the native server keeps the static-pages snapshot it
+        received at start, so later native requests still fall through to
+        Python dispatch, which serves the generated body from here.
+        """
+        response = await self.render_page(pattern, None, params)
+        if isinstance(response, StreamingResponse):
+            body = bytearray()
+            try:
+                async with asyncio.timeout(MAX_STREAMED_STATIC_SECONDS):
+                    while (chunk := await response._next_chunk()) is not None:
+                        if len(body) + len(chunk) > MAX_STREAMED_STATIC_BYTES:
+                            raise ValueError(f"Generated SSG page for {path} exceeds the size limit")
+                        body.extend(chunk)
+            except asyncio.TimeoutError as exc:
+                raise ValueError(
+                    f"Generated SSG page for {path} exceeded the time limit "
+                    f"({MAX_STREAMED_STATIC_SECONDS}s)") from exc
+            finally:
+                await response.aclose()
+            body = bytes(body)
+        else:
+            if len(response.body) > MAX_STATIC_PAGE_BYTES:
+                raise ValueError(f"Generated SSG page for {path} exceeds the size limit")
+            body = response.body
+        self.static_pages[path] = body
+        self.asset_etags[path] = f'"{hashlib.sha256(body).hexdigest()}"'
+        return body
+
+    async def _render_ssg_blocking(self, pattern, path, params, request):
+        """Fallback ``blocking``: generate on first request, then serve statically.
+
+        Concurrent requests for the same path share one generation
+        (single-flight); a failed generation is dropped from the task
+        table so the next request retries instead of caching the error.
+        """
+        task = self._ssg_fallback_tasks.get(path)
+        if task is None:
+            task = asyncio.create_task(self._generate_ssg_page(pattern, path, params))
+            self._ssg_fallback_tasks[path] = task
+            task.add_done_callback(lambda done: self._ssg_fallback_tasks.pop(path, None))
+        body = await task
+        return asset_response(request, body, "text/html; charset=utf-8",
+                              self.asset_etags[path], cache_control=b"public, max-age=0, must-revalidate",
+                              extra_headers=[(b"vary", b"Cookie, Authorization")])
+
+    async def _render_ssg_prerender(self, pattern, path, params):
+        """Fallback ``prerender``: stream the layout shell first, then the page.
+
+        The shell prefix flushes before the page function finishes, so
+        the first byte is fast; the generated page streams in behind it
+        in the same document. The stream is tee'd: once it is fully
+        delivered, the generated page joins the runtime static overlay
+        (see :meth:`_generate_ssg_page`) so later requests serve it
+        without rendering. A client that disconnects early stores
+        nothing.
+        """
+        fn, layouts = self.entries[pattern]
+
+        async def chunks():
+            if inspect.isasyncgenfunction(fn):
+                kwargs = {key: value for key, value in (("params", params),)
+                          if key in inspect.signature(fn).parameters}
+                async for node in fn(**kwargs):
+                    yield node
+            else:
+                yield await _invoke(fn, params=params)
+
+        response = await self._streaming_page_response(pattern, chunks(), layouts)
+        original = response._iterator
+        buffer = bytearray()
+        completed = False
+
+        async def tee():
+            nonlocal completed
+            try:
+                async for chunk in original:
+                    data = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
+                    if len(buffer) + len(data) > MAX_STATIC_PAGE_BYTES:
+                        raise ValueError(f"Generated SSG page for {path} exceeds the size limit")
+                    buffer.extend(data)
+                    yield chunk
+                completed = True
+            finally:
+                close = getattr(original, "aclose", None)
+                if close is not None:
+                    await close()
+            if completed:
+                body = bytes(buffer)
+                self.static_pages[path] = body
+                self.asset_etags[path] = f'"{hashlib.sha256(body).hexdigest()}"'
+
+        response._iterator = aiter(tee())
+        return response
 
     async def render_page(self, pattern, request, params, *, csp_nonce=True, query=None):
         """Render one page, tracking dynamic accesses for SSG/ISR pages.
@@ -2502,6 +3562,21 @@ class App:
         ``force-dynamic`` SSG pages render untracked: they are dynamic by
         design, so tracking them would only produce false warnings.
         """
+        # ISR generation runs in a fresh task context where the dispatch
+        # memo/scope is not visible; give this render its own memo so a
+        # layout and its page still share one fetch/DB read (track C
+        # P1-2), and install the fetch cache so page functions can call
+        # fetch_cached() (track C P1-1). When a scope already exists
+        # (SSR/API path) these are no-ops for the same instances.
+        ensure_request_memo()
+        with fetch_cache_scope(self.fetch_cache):
+            return await self._render_page_tracked(pattern, request, params,
+                                                 csp_nonce=csp_nonce, query=query)
+
+    async def _render_page_tracked(self, pattern, request, params, *, csp_nonce=True, query=None):
+        # HEAD's render_page body, moved here unchanged: it looks the
+        # page up, installs the prerender tracker, and delegates the
+        # actual rendering to _render_page_inner (7-arg version).
         fn, layouts = self.entries[pattern]
         if query is None:
             query = self._page_query(pattern, request)
@@ -2541,8 +3616,9 @@ class App:
         else:
             result = await _invoke(fn, request=request, params=params, query=query)
         if hasattr(result, "__aiter__"):
-            return await self._streaming_page_response(pattern, result, layouts, tracker=tracker,
-                                                       request=request)
+            return await self._streaming_page_response(
+                pattern, result, layouts, tracker=tracker, request=request, params=params,
+                loading=self.loading_boundaries.get(pattern))
         tree = result
         if not isinstance(tree, dict):
             raise TypeError(f"Page {pattern} must return a render node dict, got {type(tree).__name__}")
@@ -2588,33 +3664,224 @@ class App:
         ``terminal`` is the final step (the HTTP dispatcher, or the
         WebSocket pre-flight sentinel): it only runs when every middleware
         called ``call_next``. A middleware that returns its own response
-        short-circuits the chain, and that response is the result.
+        short-circuits the chain, and that response is the result. A
+        scoped middleware (see :func:`pynext.matcher.scoped_middleware`)
+        whose scope does not match this request is skipped — the chain
+        continues past it as if it were not registered.
+
+        Middleware results are the four standard outcomes (see
+        :mod:`pynext.middleware`): ``next`` (``call_next`` with the
+        request unchanged), ``rewrite`` (``call_next`` with a request
+        whose path or query string differs), ``redirect`` (a 3xx response
+        with a ``Location`` header) and ``response`` (any other response
+        of the middleware's own making). ``redirect`` and ``response``
+        short-circuit the chain: ``terminal`` never runs. A middleware
+        may state its outcome implicitly — return a plain ``Response``,
+        or call ``call_next`` with a rewritten request — or explicitly
+        by returning a :class:`pynext.middleware.MiddlewareResult`;
+        both spellings follow the same rules below.
+
+        Rewrite rules: a rewritten path is validated with the same
+        ``_decode_path`` the transports use at the edge (encoded
+        separators, malformed escapes, ``//``, backslashes and dot
+        segments are rejected, and the stored path is the decoded one),
+        then routing, authorization and CSRF are re-evaluated against
+        the rewritten request by ``_dispatch``. Rate limiting is *not*
+        re-evaluated: it is decided once, before middleware runs, on
+        the original path. At most ``MAX_MIDDLEWARE_REWRITES`` rewrites
+        run per request; the next one fails closed with
+        ``RuntimeError`` (a 500 for HTTP, a 503 for a WebSocket
+        pre-flight). ``call_next`` may still be called only once per
+        middleware, and a middleware that called it must return its
+        result (a plain ``Response``), not a ``MiddlewareResult``.
+
+        The chain outcome is recorded for observability (P2-2, §3.3 #18):
+        ``continued`` when the chain reached the terminal, ``short_circuited``
+        when a middleware answered on its own, ``error`` when a middleware
+        raised or violated the chain contract. The outcome, the acting
+        middleware's name and whether the terminal saw a different path
+        (a rewrite) go into request contextvars so the access log line
+        and the ``pynext.request`` span carry them, and the outcome is
+        counted in ``pynext_middleware_total``. ``continued`` is about
+        the chain, not the handler: a handler failure behind the terminal
+        still counts as ``continued`` (the 500 in the log is the handler's
+        failure), and a middleware that recovers from a downstream failure
+        and answers on its own short-circuits.
         """
+
+        rewrites = 0
+        original_path = request.path
+        outcome = {"value": None, "actor": None, "rewrote_path": False}
+        terminal_reached = False
+
+        def record():
+            value = outcome["value"] or "error"
+            middleware_outcome_var.set(value)
+            middleware_actor_var.set(outcome["actor"])
+            middleware_rewrote_path_var.set(outcome["rewrote_path"] or None)
+            self.metrics.observe_middleware(value)
+
+        def _validated_rewrite(next_request):
+            path = next_request.path
+            if not isinstance(path, str) or "?" in path or "#" in path:
+                raise ValueError("Invalid middleware rewrite path")
+            try:
+                normalized = _decode_path(path, path.encode("utf-8"))
+            except (ValueError, UnicodeError) as exc:
+                raise ValueError("Invalid middleware rewrite path") from exc
+            # The encoded path must follow the rewrite: _dispatch matches
+            # on raw_path when present, so a stale raw_path would route
+            # the rewritten request to the original URL.
+            encoded = quote(normalized, safe="/!$&'()*+,;=:@-._~")
+            return dataclasses.replace(next_request, path=normalized, raw_path=encoded, params={})
+
+        async def _continue(index, current, next_request):
+            nonlocal rewrites
+            if not isinstance(next_request, Request):
+                raise TypeError("call_next requires a Request")
+            if (next_request.path != current.path
+                    or next_request.query_string != current.query_string):
+                rewrites += 1
+                if rewrites > MAX_MIDDLEWARE_REWRITES:
+                    raise RuntimeError("middleware rewrite limit exceeded")
+                next_request = _validated_rewrite(next_request)
+            return await invoke(index + 1, next_request)
+
+        async def terminal_wrapper(current):
+            nonlocal terminal_reached
+            terminal_reached = True
+            if current.path != original_path:
+                outcome["rewrote_path"] = True
+            response = await terminal(current)
+            outcome["value"] = "continued"
+            return response
+
         async def invoke(index, current):
             if not isinstance(current, Request):
                 raise TypeError("call_next requires a Request")
             if index == len(self.middleware):
-                return await terminal(current)
+                return await terminal_wrapper(current)
+            scope = self.middleware_scopes[index]
+            if scope is not None and not scope.matches_request(current):
+                return await invoke(index + 1, current)
             called = False
+            downstream_raised = False
 
             async def call_next(next_request):
-                nonlocal called
+                nonlocal called, downstream_raised
                 if called:
                     raise RuntimeError("call_next may be called only once")
+                if not isinstance(next_request, Request):
+                    raise TypeError("call_next requires a Request")
                 called = True
-                return await invoke(index + 1, next_request)
+                try:
+                    return await _continue(index, current, next_request)
+                except BaseException:
+                    # The failure came from deeper in the chain (or the
+                    # terminal): the frame that owns it records the
+                    # outcome, not this one.
+                    downstream_raised = True
+                    raise
 
-            result = await self.middleware[index](current, call_next)
+            try:
+                result = await self.middleware[index](current, call_next)
+            except Exception:
+                if not downstream_raised:
+                    # This middleware itself raised (after the terminal
+                    # returned, or without calling it): its own error,
+                    # even if the terminal already ran.
+                    outcome["value"] = "error"
+                    outcome["actor"] = _middleware_name(self.middleware[index])
+                raise
+            if isinstance(result, MiddlewareResult):
+                if called:
+                    raise RuntimeError(
+                        "middleware must not return a MiddlewareResult after calling call_next")
+                if result.kind in ("next", "rewrite"):
+                    return await _continue(index, current, result.request)
+                if outcome["value"] is None:
+                    outcome["value"] = "short_circuited"
+                    outcome["actor"] = _middleware_name(self.middleware[index])
+                return result.response
             if not isinstance(result, Response):
-                raise TypeError("middleware must return a Response")
+                # Returning a non-Response is this middleware's own
+                # contract violation, even when the terminal already ran.
+                outcome["value"] = "error"
+                outcome["actor"] = _middleware_name(self.middleware[index])
+                raise TypeError("middleware must return a Response or a MiddlewareResult")
+            if outcome["value"] is None:
+                outcome["value"] = "short_circuited"
+                outcome["actor"] = _middleware_name(self.middleware[index])
             return result
 
-        return await invoke(0, request)
+        try:
+            response = await invoke(0, request)
+        except BaseException:
+            if outcome["value"] is None and terminal_reached:
+                # The chain reached the terminal and the failure came from
+                # behind it (the handler): the chain continued; the 500
+                # in the request log is the handler's failure.
+                outcome["value"] = "continued"
+            if outcome["value"] is not None:
+                record()
+            # Otherwise a middleware raised before the terminal ran and
+            # the owning frame already recorded the ``error`` outcome;
+            # a bare failure with no outcome (cancellation) records
+            # nothing.
+            raise
+        # A ``return`` inside the ``try`` would skip an ``else`` clause,
+        # so the success outcome is recorded here, after the ``try``.
+        record()
+        return response
+
+    def _apply_path_headers(self, request, response):
+        """Apply the compiled per-path header rules to ``response``.
+
+        Rules are checked in order and the first matching rule wins per
+        header name; a header the handler (or an earlier rule) already
+        set is never overwritten. The exception is
+        ``content-security-policy``: ``Response`` always adds a default
+        policy on construction, so a rule that sets CSP replaces that
+        default and marks it explicit (a CSP a handler set explicitly
+        still wins over a rule). Health probes bypass this — they return
+        before dispatch — and responses that bypass dispatch entirely
+        (rate-limit 429, 400, 500 error pages) get no path headers.
+        """
+        if not self.header_rules:
+            return response
+        present = {key for key, _value in response.headers}
+        for rule in self.header_rules:
+            if not rule.matches_request(request):
+                continue
+            for key, value in rule.headers:
+                if key in present:
+                    if (key == b"content-security-policy"
+                            and not getattr(response, "_csp_explicit", False)):
+                        index = next(i for i, (k, _v) in enumerate(response.headers)
+                                     if k == key)
+                        response.headers[index] = (key, value)
+                        response._csp_explicit = True
+                    continue
+                response.headers.append((key, value))
+                present.add(key)
+                if key == b"content-security-policy":
+                    response._csp_explicit = True
+        return response
 
     async def dispatch(self, request):
-        """Return a response. Exceptions are converted at the transport boundary."""
+        """Return a response. Exceptions are converted at the transport boundary.
+
+        Every request runs inside a fresh request memo (track C P1-2):
+        duplicate fetches/DB reads in one request compute once. It also
+        installs this app's fetch cache (track C P1-1) so page functions
+        can call ``fetch_cached()`` without a ``request`` argument.
+        """
+        with request_memo_scope(), fetch_cache_scope(self.fetch_cache):
+            return await self._dispatch_with_memo(request)
+
+    async def _dispatch_with_memo(self, request):
         try:
-            return await self._dispatch_response(request)
+            response = await self._dispatch_response(request)
         except _SyncHandlerBusy:
             response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
             apply_path_headers(response, request.path, path_headers=self.path_headers)
@@ -2622,7 +3889,6 @@ class App:
             apply_security_headers(response, config=self.security, production=self.production)
             if request.method == "HEAD":
                 response.body = b""
-            return response
         except RequestCancelled:
             if request.cancelled:
                 # A cooperative worker may observe the signal before its
@@ -2633,6 +3899,47 @@ class App:
         except asyncio.CancelledError:
             request._cancel_event.set()
             raise
+        # Skew protection: every dispatched response (pages, API, static
+        # assets, HTML) carries the build and deployment IDs, so a client
+        # holding an old page can tell it is talking to a newer deploy.
+        # The native transport serves static assets itself, so it applies
+        # the same headers from ServerState (see server.start_native);
+        # bridge responses pass through here and are not re-tagged there.
+        apply_build_headers(response, build_id=self.build_id, deployment_id=self.deployment_id)
+        return response
+
+    async def _guarded_page_render(self, request, pattern, params, render):
+        """Render a page, answering failures with its segment boundary.
+
+        ``render`` is a no-argument callable returning the page response
+        (or raising). A page failure renders the nearest ``error.py`` with
+        status 500; :class:`NotFoundError` renders the nearest
+        ``not-found.py`` with status 404. Framework signals (bad request,
+        sync-worker exhaustion, cancellation, cache infrastructure,
+        generation timeout) propagate untouched so their existing
+        handling still applies.
+        """
+        try:
+            return await render()
+        except NotFoundError as exc:
+            # Record the error metric like _dispatch_timed does for
+            # signals that escape dispatch: this handler converts the
+            # signal to a boundary response here, so it never reaches
+            # there (see test_errors.py::test_signals_answer_without_error_log).
+            # The digest is the signal's well-known label digest, not the
+            # computed error digest used for real 500s.
+            self.metrics.observe_error(pattern or "__unmatched__", type(exc).__name__, exc.label_digest)
+            return await self._not_found_page_response(request, pattern, params)
+        except SignalError:
+            # Other signals (forbidden, unauthorized, redirect) propagate
+            # so dispatch converts them to their responses without an
+            # error log; only NotFoundError renders a boundary here.
+            raise
+        except (BadRequest, _SyncHandlerBusy, RequestCancelled, CacheBusy,
+                SharedCacheUnavailable, TimeoutError):
+            raise
+        except Exception as exc:
+            return await self._error_page_response(request, pattern, params, exc)
 
     async def _dispatch_response(self, request):
         # Health probes are reserved framework paths (B6): they bypass
@@ -2642,19 +3949,47 @@ class App:
         # rate limiting and static serving for these paths; see
         # server.start_native and crates/pynext-native/src/lib.rs.
         # /healthz is liveness (the process answers at all); /readyz is
-        # readiness (startup finished and not draining).
-        if request.path in ("/healthz", "/readyz"):
-            route_var.set("__health__")
+        # readiness (startup finished, not draining, and no fail_closed
+        # backend is currently down); /metrics serves Prometheus text
+        # when the metrics endpoint is enabled, and is an ordinary path
+        # otherwise (an app route may serve it, or it 404s).
+        if request.path == "/metrics" and not self.observability_config.metrics_endpoint:
+            pass
+        elif request.path in ("/healthz", "/readyz", "/metrics"):
             if request.method not in {"GET", "HEAD"}:
                 response = Response("Method Not Allowed", status=405,
                                     headers=[(b"allow", b"GET, HEAD")])
             elif request.path == "/healthz":
+                route_var.set("__health__")
                 body = b"" if request.method == "HEAD" else b"ok"
                 response = Response(body, media_type="text/plain; charset=utf-8")
+            elif request.path == "/metrics":
+                route_var.set("__metrics__")
+                body = b"" if request.method == "HEAD" else self.metrics.prometheus_text().encode("utf-8")
+                response = Response(body, media_type="text/plain; version=0.0.4; charset=utf-8")
             elif self.is_ready:
-                body = b"" if request.method == "HEAD" else b"ready"
-                response = Response(body, media_type="text/plain; charset=utf-8")
+                route_var.set("__health__")
+                # Backend health is last-seen state only: a fail_closed
+                # backend that is currently down makes the process unready
+                # so the load balancer stops sending traffic, while a
+                # fail_open backend only degrades the answer.
+                unhealthy = self.backend_health.unhealthy_fail_closed()
+                if unhealthy:
+                    detail = ", ".join(unhealthy)
+                    body = b"" if request.method == "HEAD" else f"not ready (unhealthy: {detail})".encode("ascii")
+                    response = Response(body, status=503, media_type="text/plain; charset=utf-8",
+                                    headers=[(b"retry-after", b"1")])
+                else:
+                    degraded = self.backend_health.degraded()
+                    if degraded:
+                        detail = ", ".join(degraded)
+                        body = b"" if request.method == "HEAD" else f"ready (degraded: {detail})".encode("ascii")
+                        response = Response(body, media_type="text/plain; charset=utf-8")
+                    else:
+                        body = b"" if request.method == "HEAD" else b"ready"
+                        response = Response(body, media_type="text/plain; charset=utf-8")
             else:
+                route_var.set("__health__")
                 response = Response(b"" if request.method == "HEAD" else b"not ready", status=503,
                                     media_type="text/plain; charset=utf-8",
                                     headers=[(b"retry-after", b"1")])
@@ -2670,10 +4005,12 @@ class App:
                 return await self._dispatch(current)
 
             response = await self._dispatch_timed(request, lambda: self._run_middleware(request, terminal))
+            self._apply_path_headers(request, response)
             if preflight is None:
                 apply_cors_headers(request, response, config=self.security)
             apply_path_headers(response, request.path, path_headers=self.path_headers)
             apply_security_headers(response, config=self.security, production=self.production)
+            self.custom_routes.apply_to_response(response, request.path)
             if request.method == "HEAD":
                 if isinstance(response, StreamingResponse):
                     await response.aclose()
@@ -2681,13 +4018,17 @@ class App:
                 response.body = b""
             return response
         if preflight is not None:
+            self._apply_path_headers(request, preflight)
             apply_path_headers(preflight, request.path, path_headers=self.path_headers)
             apply_security_headers(preflight, config=self.security, production=self.production)
+            self.custom_routes.apply_to_response(preflight, request.path)
             return preflight
         response = await self._dispatch_timed(request)
+        self._apply_path_headers(request, response)
         apply_cors_headers(request, response, config=self.security)
         apply_path_headers(response, request.path, path_headers=self.path_headers)
         apply_security_headers(response, config=self.security, production=self.production)
+        self.custom_routes.apply_to_response(response, request.path)
         return response
 
     async def _dispatch_timed(self, request, handler=None):
@@ -2699,6 +4040,7 @@ class App:
         """
         started = time.monotonic()
         status, response = 500, None
+        error_type = None
         tracing = self.observability_config.tracing
         with span("pynext.request", {"http.method": request.method},
                   enabled=tracing) as request_span:
@@ -2725,9 +4067,11 @@ class App:
                 status = 400
                 self.metrics.observe_error(route_var.get() or "__unmatched__",
                                            type(exc).__name__)
+                error_type = "BadRequest"
                 raise
             except _SyncHandlerBusy:
                 status = 503
+                error_type = "_SyncHandlerBusy"
                 raise
             except (asyncio.CancelledError, RequestCancelled) as exc:
                 if isinstance(exc, asyncio.CancelledError) or request.cancelled:
@@ -2739,12 +4083,28 @@ class App:
                 digest, _count = digest_for_error(exc)
                 self.metrics.observe_error(route_var.get() or "__unmatched__",
                                            type(exc).__name__, digest)
+                error_type = type(exc).__name__
                 raise
             finally:
                 request_span.set_attribute("http.status_code", status)
                 latency_ms = (time.monotonic() - started) * 1000
                 route = route_var.get() or "__unmatched__"
                 request_span.set_attribute("http.route", route)
+                # Middleware/security decisions for this request (P2-2):
+                # the chain outcome and the admission decision, when one
+                # ran. Both are bounded outcome words, never raw URLs.
+                middleware_outcome = middleware_outcome_var.get()
+                middleware_actor = middleware_actor_var.get()
+                middleware_rewrote = middleware_rewrote_path_var.get()
+                rate_limit_outcome = rate_limit_outcome_var.get()
+                if middleware_outcome is not None:
+                    request_span.set_attribute("middleware.outcome", middleware_outcome)
+                if middleware_actor is not None:
+                    request_span.set_attribute("middleware.actor", middleware_actor)
+                if middleware_rewrote:
+                    request_span.set_attribute("middleware.rewrote_path", True)
+                if rate_limit_outcome is not None:
+                    request_span.set_attribute("rate_limit.outcome", rate_limit_outcome)
                 rust_ms = render_ms_var.get() or 0.0
                 queue_wait_ms = queue_wait_var.get()
                 response_bytes = (len(response.body) if response is not None
@@ -2754,6 +4114,12 @@ class App:
                     response_bytes=response_bytes, queue_wait_ms=queue_wait_ms,
                     python_ms=max(0.0, latency_ms - rust_ms), rust_ms=rust_ms or None,
                 )
+                self.request_insights.observe(
+                    request_id=get_request_id(), method=request.method, route=route,
+                    status=status, latency_ms=latency_ms,
+                    python_ms=max(0.0, latency_ms - rust_ms), rust_ms=rust_ms or None,
+                    queue_wait_ms=queue_wait_ms, error_type=error_type,
+                )
                 log.info("request", extra={
                     "method": request.method, "route": route, "status": status,
                     "latency_ms": round(latency_ms, 3),
@@ -2761,17 +4127,66 @@ class App:
                     "queue_wait_ms": round(queue_wait_ms, 3) if queue_wait_ms is not None else None,
                     "python_ms": round(max(0.0, latency_ms - rust_ms), 3),
                     "rust_ms": round(rust_ms, 3) if rust_ms else None,
+                    "middleware": middleware_outcome,
+                    "middleware_actor": middleware_actor,
+                    "middleware_rewrote_path": middleware_rewrote,
+                    "rate_limit": rate_limit_outcome,
                 })
 
-    async def _dispatch(self, request):
+    async def _dispatch(self, request, _rewritten=False):
         """Return a response. Streaming pages return a StreamingResponse."""
         path = request.path
+        # Custom routes, Next.js resolve-routes order: redirect ->
+        # rewrite.beforeFiles -> file/route check -> afterFiles ->
+        # fallback. The file/route check is the public-asset and
+        # router matching below; afterFiles/fallback run at the
+        # route miss at the end of this method. Only one rewrite
+        # applies per request (``_rewritten``), so rewrites cannot
+        # chain or loop.
+        if self.custom_routes and not _rewritten:
+            redirect = self.custom_routes.match_redirect(path)
+            if redirect is not None:
+                status, location = redirect
+                route_var.set("__redirect__")
+                target = location.encode("ascii")
+                if "?" not in location and request.query_string:
+                    if any(c < 32 or c == 127 for c in request.query_string):
+                        return Response("Bad Request", status=400)
+                    target += b"?" + request.query_string
+                return Response("", status=status, headers=[(b"location", target)])
+            rewritten = self.custom_routes.match_rewrite(path, "beforeFiles")
+            if rewritten is not None:
+                route_var.set("__rewrite__")
+                path = rewritten
+                request = Request(request.method, rewritten, request.query_string, request.headers,
+                                  request.body, {}, self, request.state, request._cancel_event)
         # Matching runs on the per-segment decoded form (Next.js
         # decodePathParams): static segments compare decoded, while an
         # encoded delimiter stays one segment. The encoded path is kept
         # for the trailing-slash redirect so the encoding is preserved.
         encoded_path = request.raw_path or request.path
         match_path = _normalize_path_for_matching(encoded_path)
+        # Path preprocessing (track A §2.8): strip the base path before
+        # matching, then apply the trailing-slash policy. Everything
+        # below — route matching, `/_pynext/` assets, public files,
+        # SSG/ISR lookups — sees the app-relative path. A path outside
+        # the base path is a plain 404.
+        raw_path = path
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
+        if path is None:
+            route_var.set("__not_found__")
+            return Response("Not Found", status=404)
+        # The match form follows the stripped path: the base prefix is
+        # whole segments, so strip the same prefix from the normalized
+        # form (the boundary check above already settled it), and
+        # mirror the trailing-slash policy so "ignore" does not redirect.
+        if self.base_path and match_path != "/":
+            if match_path == self.base_path:
+                match_path = "/"
+            elif match_path.startswith(self.base_path + "/"):
+                match_path = match_path[len(self.base_path):]
+        if self.trailing_slash == "ignore" and match_path != "/" and match_path.endswith("/"):
+            match_path = match_path.rstrip("/") or "/"
         if self.hot_reload and path == "/_pynext/dev/client":
             route_var.set("__dev__")
             if request.method not in {"GET", "HEAD"}:
@@ -2880,7 +4295,18 @@ class App:
                                   extra_headers=[(b"x-content-type-options", b"nosniff")])
         match = self.router.matches(match_path)
         if match is None:
+            if self.custom_routes and not _rewritten:
+                for phase in ("afterFiles", "fallback"):
+                    rewritten = self.custom_routes.match_rewrite(path, phase)
+                    if rewritten is not None:
+                        route_var.set("__rewrite__")
+                        rewritten_request = Request(
+                            request.method, rewritten, request.query_string, request.headers,
+                            request.body, {}, self, request.state, request._cancel_event)
+                        return await self._dispatch(rewritten_request, _rewritten=True)
             route_var.set("__not_found__")
+            if _accepts_html(request):
+                return await self._not_found_page_response(request, None, {})
             return Response("Not Found", status=404)
         pattern, raw_params, kinds = match
         route_var.set(pattern)
@@ -2895,7 +4321,15 @@ class App:
         if (self.production and self.render_modes.get(pattern) == "ssg"
                 and self.dynamic_modes.get(pattern) != "force-dynamic"
                 and path not in self.static_pages):
-            return Response("Not Found", status=404)
+            # Only "not_found" (and dynamic_params=False, which forces it)
+            # rejects an ungenerated path outright. "blocking" and
+            # "prerender" fall through to the method checks below and are
+            # generated in the page branch.
+            fallback = self.ssg_fallback.get(pattern) or {"fallback": "not_found", "dynamic_params": True}
+            if fallback["fallback"] == "not_found" or not fallback["dynamic_params"]:
+                if _accepts_html(request):
+                    return await self._not_found_page_response(request, pattern, params)
+                return Response("Not Found", status=404)
         if (not self.production and self.render_modes.get(pattern) == "ssg"
                 and self.dynamic_modes.get(pattern) != "force-dynamic"):
             # Dev/prod consistency (§3.2 #4): development renders SSG pages
@@ -2936,14 +4370,26 @@ class App:
         if spec["kind"] == "page":
             if (self.production and self.render_modes[pattern] == "ssg"
                     and self.dynamic_modes.get(pattern) != "force-dynamic"):
-                response = asset_response(request, self.static_pages[path], "text/html; charset=utf-8",
-                                          self.asset_etags[path], cache_control=b"public, max-age=0, must-revalidate",
-                                          extra_headers=[(b"vary", b"Cookie, Authorization")])
+                if path in self.static_pages:
+                    extra_headers = [(b"vary", b"Cookie, Authorization")]
+                    stale_seconds = self.prefetch_stale_seconds(pattern, SSG_PREFETCH_STALE_SECONDS)
+                    if stale_seconds is not None:
+                        extra_headers.append((PREFETCH_STALE_TIME_HEADER,
+                                              str(stale_seconds).encode("ascii")))
+                    response = asset_response(request, self.static_pages[path], "text/html; charset=utf-8",
+                                              self.asset_etags[path], cache_control=b"public, max-age=0, must-revalidate",
+                                              extra_headers=extra_headers)
+                elif self.ssg_fallback[pattern]["fallback"] == "blocking":
+                    response = await self._render_ssg_blocking(pattern, path, params, request)
+                else:
+                    response = await self._render_ssg_prerender(pattern, path, params)
             elif self.render_modes[pattern] == "isr" and (self.production or self.debug):
                 query = self._page_query(pattern, request)
                 private = any(name.lower() in {b"authorization", b"cookie"} for name, _ in request.headers)
                 if private:
-                    response = await self.render_page(pattern, None, params, query=query)
+                    response = await self._guarded_page_render(
+                        request, pattern, params,
+                        lambda: self.render_page(pattern, None, params, query=query))
                     response.headers.extend([
                         (b"cache-control", b"private, no-store"),
                         (b"vary", b"Cookie, Authorization"),
@@ -2952,23 +4398,12 @@ class App:
                     # Classify the outcome before rendering: a fresh entry is
                     # a hit, a stale entry is served while one regeneration
                     # runs in the background, a miss renders synchronously.
-                    # The cache key is the routing-normalized path, not
-                    # the fully decoded one: "/files/a%2Fb" and
-                    # "/files/a/b" are different routes (different
-                    # patterns and params) and must not share an entry.
-                    # The normalized form is also what revalidate() sees
-                    # for an encoded URL, so invalidation still matches.
-                    cache_key = match_path
-                    if self.isr_queries[pattern]:
-                        try:
-                            generation, _ = await self.isr.variant_generation(match_path)
-                        except SharedCacheUnavailable:
-                            self.metrics.observe_regeneration("failure")
-                            return Response("Service Unavailable", status=503,
-                                            headers=[(b"retry-after", b"1")])
-                        encoded = json.dumps(query, ensure_ascii=True, separators=(",", ":")).encode("ascii")
-                        cache_key = ("\0isr:" + hashlib.sha256(match_path.encode("utf-8")).hexdigest() + ":" +
-                                     generation + ":" + hashlib.sha256(encoded).hexdigest())
+                    try:
+                        cache_key = await self._isr_cache_key(pattern, match_path, query)
+                    except SharedCacheUnavailable:
+                        self.metrics.observe_regeneration("failure")
+                        return Response("Service Unavailable", status=503,
+                                        headers=[(b"retry-after", b"1")])
                     cache_before, retained_body = self.isr.store.lookup(cache_key)
                     self.metrics.observe_cache(cache_before)
                     policy = self.get_isr_policy(pattern)
@@ -2978,6 +4413,13 @@ class App:
                         # reload hits the cache. Production keeps the
                         # declared policy.
                         policy = dev_retention_policy(policy)
+                    # Remaining fresh window of the entry being served, for
+                    # the prefetch hint. Only a fresh hit has one; a miss
+                    # or expired entry is newly generated (its fresh window
+                    # is `revalidate`), and a stale entry gets no hint at
+                    # all — it is already stale.
+                    fresh_remaining = (self.isr.store.fresh_remaining(cache_key)
+                                       if cache_before == "fresh" else None)
                     try:
                         # Implicit path tags stay on the decoded path:
                         # the tag charset (letters, digits, "_", ".",
@@ -2988,7 +4430,9 @@ class App:
                         # because the key itself is the normalized path.
                         tags = (tuple(self.isr_tags.get(pattern, ())) +
                                 tuple(_implicit_path_tags(path)))
-                        body = await self._render_isr_cached(pattern, params, query, cache_key, policy, tags)
+                        body = await self._guarded_page_render(
+                            request, pattern, params,
+                            lambda: self._render_isr_cached(pattern, params, query, cache_key, policy, tags))
                     except CacheBusy:
                         self.metrics.observe_cache("busy")
                         self.metrics.observe_regeneration("failure")
@@ -3020,18 +4464,43 @@ class App:
                     except TimeoutError:
                         self.metrics.observe_regeneration("failure")
                         return Response("Gateway Timeout", status=504)
-                    if cache_before == "miss":
-                        self.metrics.observe_regeneration("started" if isinstance(body, StreamingResponse)
-                                                          else "success")
-                    elif cache_before == "stale":
-                        self.metrics.observe_regeneration("started")
-                    response = body if isinstance(body, StreamingResponse) else Response(
-                        body, media_type="text/html; charset=utf-8", headers=[
-                            (b"cache-control", b"public, max-age=0, must-revalidate"),
-                            (b"vary", b"Cookie, Authorization"),
-                        ])
+                    boundary_response = False
+                    if isinstance(body, StreamingResponse):
+                        if cache_before in ("miss", "stale"):
+                            self.metrics.observe_regeneration("started")
+                        response = body
+                    elif isinstance(body, Response):
+                        # A segment boundary answered instead of the cache:
+                        # serve it as-is, never cache it, and count the
+                        # generation as failed.
+                        self.metrics.observe_regeneration("failure")
+                        response = body
+                        boundary_response = True
+                    else:
+                        if cache_before == "miss":
+                            self.metrics.observe_regeneration("success")
+                        elif cache_before == "stale":
+                            self.metrics.observe_regeneration("started")
+                        response = Response(
+                            body, media_type="text/html; charset=utf-8", headers=[
+                                (b"cache-control", cache_control_header(self.isr_policies[pattern]).encode("ascii")),
+                                (b"vary", b"Cookie, Authorization"),
+                            ])
+                    if not boundary_response:
+                        if cache_before == "fresh":
+                            page_seconds = fresh_remaining
+                        elif cache_before in {"miss", "expired"}:
+                            page_seconds = self.isr_policies[pattern]["revalidate"]
+                        else:
+                            page_seconds = None
+                        stale_seconds = self.prefetch_stale_seconds(pattern, page_seconds)
+                        if stale_seconds is not None:
+                            response.headers.append((PREFETCH_STALE_TIME_HEADER,
+                                                     str(stale_seconds).encode("ascii")))
             else:
-                response = await self.render_page(pattern, request, params)
+                response = await self._guarded_page_render(
+                    request, pattern, params,
+                    lambda: self.render_page(pattern, request, params))
         else:
             method = "GET" if request.method == "HEAD" and "HEAD" not in entry else request.method
             if (method not in SAFE_METHODS
@@ -3066,6 +4535,25 @@ class App:
         return {path: list(getattr(handler, "__pynext_websocket_protocols__", ()))
                 for path, handler in self.websocket_entries.items()}
 
+    def _report_rate_limit(self, limiter, *, refused=False):
+        """Report a shared (Redis) limiter decision to ``/readyz`` health.
+
+        In-process limiters have no shared backend and are skipped. Under
+        ``fail_closed`` an outage raises before returning, so the caller
+        reports it with ``refused=True``; under ``fail_open`` the outage
+        is absorbed inside ``allow()``, and the limiter's
+        ``last_unavailable_at`` marker is what reveals it.
+        """
+        policy = getattr(limiter, "failure_policy", None)
+        if policy is None:
+            return
+        if refused or getattr(limiter, "last_unavailable_at", None) is not None:
+            self.backend_health.report("rate-limit", healthy=False, policy=policy)
+            self.metrics.observe_degraded(
+                "rate-limit", policy, "refused" if refused else "admitted")
+        else:
+            self.backend_health.report("rate-limit", healthy=True, policy=policy)
+
     async def _rate_limit_denied(self, scope, path):
         """One bounded admission check for both ASGI HTTP and WebSocket."""
         limiter = self.rate_limit
@@ -3076,17 +4564,25 @@ class App:
         headers = tuple(scope.get("headers", ()))
 
         def decide():
+            # Returns the decision plus its outcome word. ``decide`` runs
+            # in an executor thread on a copied context, so the outcome
+            # is returned (not recorded here) and observed by the caller.
             if _is_exempt_path(limiter, path):
-                return True, None
+                return True, None, "exempt"
             key = limiter.key_for(client_ip, headers)
-            allowed, retry_after = limiter.allow(key)
+            try:
+                allowed, retry_after = limiter.allow(key)
+            except RateLimitUnavailable:
+                self._report_rate_limit(limiter, refused=True)
+                raise
+            self._report_rate_limit(limiter)
             if type(allowed) is not bool or (retry_after is not None and (
                     not isinstance(retry_after, int) or not 0 <= retry_after <= 2**64 - 1)):
                 raise ValueError("Invalid rate-limit decision")
-            return allowed, retry_after
+            return allowed, retry_after, ("allowed" if allowed else "denied")
 
         try:
-            allowed, retry_after = await self._asgi_admission.check(decide)
+            allowed, retry_after, outcome = await self._asgi_admission.check(decide)
         except DecisionUnavailable:
             # H-2: no decision could be produced — the decision gate was
             # full or its deadline expired while the loop was saturated.
@@ -3101,8 +4597,18 @@ class App:
             # limiter's failure_policy): fail closed, as before.
             # Counted under the admission stage (C-P1-7), distinct from
             # the Rust slot-wait 503s, which never reach this gate.
+            # Match native admission: callback failures and overload fail
+            # closed regardless of a backend's own failure-policy choice.
             self.metrics.observe_stage_timeout("admission")
+            self.metrics.observe_rate_limit("error")
+            rate_limit_outcome_var.set("error")
             return Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
+        # One observation per decision (P2-2): a denied request never
+        # reaches dispatch, so this counter is its only record — and an
+        # exempt 404 shows up here next to the 404 in the request
+        # counters, the shape a B-1 style bypass takes.
+        self.metrics.observe_rate_limit(outcome)
+        rate_limit_outcome_var.set(outcome)
         return None if allowed else rate_limited_response(max(1, retry_after or 1))
 
     async def _websocket_rate_limit_denied(self, scope, path):
@@ -3162,15 +4668,31 @@ class App:
         response; perform login and session changes through ordinary HTTP
         endpoints before connecting.
         """
+        # Same path preprocessing as _dispatch: the pre-flight matches
+        # the app-relative path, so a prefixed upgrade finds its route.
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
+        if path is None:
+            return Response("Not Found", status=404)
         # Match on the per-segment decoded form (Next.js
         # decodePathParams) so the pre-flight checks the same route the
         # handler will run; when no encoded path is available (native
         # transport, where Rust already decoded it) the decoded path
-        # normalizes to the same form.
+        # normalizes to the same form. When the encoded path is
+        # available the match form still carries the base prefix, so
+        # strip it (the boundary check above already settled it) and
+        # mirror the trailing-slash policy.
         try:
             match_path = _normalize_path_for_matching(raw_path or path)
         except BadRequest:
             return Response("Bad Request", status=400)
+        if raw_path:
+            if self.base_path and match_path != "/":
+                if match_path == self.base_path:
+                    match_path = "/"
+                elif match_path.startswith(self.base_path + "/"):
+                    match_path = match_path[len(self.base_path):]
+            if self.trailing_slash == "ignore" and match_path != "/" and match_path.endswith("/"):
+                match_path = match_path.rstrip("/") or "/"
         match = self.router.matches(match_path)
         if match is None:
             return Response("Not Found", status=404)
@@ -3196,11 +4718,22 @@ class App:
             response = await (self._run_middleware(request, terminal) if self.middleware
                               else terminal(request))
         except Exception:
-            log.exception("WebSocket authorization failed")
+            log.exception("WebSocket authorization failed", extra={
+                "middleware": middleware_outcome_var.get(),
+                "middleware_actor": middleware_actor_var.get(),
+            })
             return Response("Service Unavailable", status=503)
         if not terminal_reached:
             # A middleware answered the upgrade itself: its response is
-            # the denial (for example 403 from an auth middleware).
+            # the denial (for example 403 from an auth middleware). The
+            # chain outcome is already counted by _run_middleware; the
+            # denial itself is logged here because the pre-flight has no
+            # access log line (§3.3 #18).
+            log.info("websocket authorization denied by middleware", extra={
+                "middleware": middleware_outcome_var.get() or "short_circuited",
+                "middleware_actor": middleware_actor_var.get(),
+                "status": response.status,
+            })
             return response
         # S-P1-33: enforce from the policy snapshotted at registration
         # for this pattern, as HTTP dispatch does.
@@ -3223,6 +4756,17 @@ class App:
         # before any rate-limit charge (B-1 / review #7). Matching on
         # the normalized form would hide the '?' and let the handshake
         # reach the rate limiter instead.
+        # Same path preprocessing as _dispatch: a prefixed handshake
+        # matches the app-relative path; outside the base path the
+        # upgrade is refused like an unknown route. The raw path is
+        # kept for _authorize_websocket below, which preprocesses it
+        # itself — passing the stripped path twice would 404.
+        raw_path = path
+        path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
+        if path is None:
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        match = self.router.matches(path)
         match = self.router.matches(path)
         handler = None
         params = {}
@@ -3290,7 +4834,7 @@ class App:
         # Authorization runs before the handshake completes: a denied
         # upgrade is refused with a close instead of an accept, so the
         # handler never runs and no data is sent.
-        denied = await self._authorize_websocket(path, scope.get("query_string", b""),
+        denied = await self._authorize_websocket(raw_path, scope.get("query_string", b""),
                                                  scope.get("headers", []), raw_path=encoded_path)
         if denied is not None:
             await send({"type": "websocket.close", "code": 1008})
@@ -3460,7 +5004,8 @@ class App:
             response = Response("Bad Request", status=400)
         else:
             # Liveness/readiness remain available when decision slots are full.
-            denied = (None if match_path in ("/healthz", "/readyz") else
+            denied = (None if match_path in ("/healthz", "/readyz") or
+                      (match_path == "/metrics" and self.observability_config.metrics_endpoint) else
                       await self._rate_limit_denied(scope, match_path))
             if denied is not None:
                 if scope["method"].upper() == "HEAD":
@@ -3537,12 +5082,13 @@ class App:
                                           raw_path=encoded_path)
                         break
             except BadRequest as exc:
-                log.info("Bad request: %s", exc)
+                # Log the type only: the message can carry request data.
+                log.info("Bad request", extra={"error_type": type(exc).__name__})
                 response = Response("Bad Request", status=400)
             except Exception as exc:
                 digest, _count = digest_for_error(exc)
                 self.metrics.observe_error("__unmatched__", type(exc).__name__, digest)
-                log.exception("Request failed", extra={"error_digest": digest})
+                self.log_request_error(exc)
                 response = self.error_response(exc, digest=digest)
         if request is not None:
             # Trust-resolved client identity (A6, pynext.proxy): the peer
@@ -3575,11 +5121,11 @@ class App:
                     if request_id and not any(k == b"x-request-id" for k, _ in result.headers):
                         result.headers.append((b"x-request-id", request_id.encode("ascii")))
                 except BadRequest as exc:
-                    log.info("Bad request: %s", exc)
+                    log.info("Bad request", extra={"error_type": type(exc).__name__})
                     result = Response("Bad Request", status=400)
                 except Exception as exc:
                     digest, _count = digest_for_error(exc)
-                    log.exception("Request failed", extra={"error_digest": digest})
+                    self.log_request_error(exc)
                     result = self.error_response(exc, digest=digest)
                     request_id = get_request_id()
                     if request_id and not any(k == b"x-request-id" for k, _ in result.headers):
@@ -3617,12 +5163,12 @@ class App:
 def create_app(root=".", *, production=False, security=None, cache_backend=DEFAULT_CONFIG.cache_backend,
                cache_path=None,
                observability=None, rate_limit=None, middleware=None, debug=False, resources=None, cache_url=None,
-               cache_failure_policy=None, websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
+               cache_failure_policy=None, cache_handler=None, websocket_max_message=DEFAULT_CONFIG.websocket_max_message,
                hot_reload=False,
                trusted_proxies=None, sync_workers=32, sync_wait_timeout=ASGI_DECISION_TIMEOUT,
                sync_queue_limit=None, render_workers=None, session_workers=None,
                strict_ssg=False, headers=None,
-               revalidate_secret=None,
+               revalidate_secret=None, base_path="", trailing_slash="redirect", custom_routes=None,
                body_timeout_ms=DEFAULT_CONFIG.body_timeout_ms,
                handler_timeout_ms=DEFAULT_CONFIG.handler_timeout_ms,
                response_timeout_ms=DEFAULT_CONFIG.response_timeout_ms):
@@ -3643,4 +5189,5 @@ def create_app(root=".", *, production=False, security=None, cache_backend=DEFAU
                strict_ssg=strict_ssg,
                headers=headers, revalidate_secret=revalidate_secret,
                body_timeout_ms=body_timeout_ms, handler_timeout_ms=handler_timeout_ms,
-               response_timeout_ms=response_timeout_ms)
+               response_timeout_ms=response_timeout_ms, cache_handler=cache_handler,
+               base_path=base_path, trailing_slash=trailing_slash, custom_routes=custom_routes)

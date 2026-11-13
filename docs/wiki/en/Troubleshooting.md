@@ -16,7 +16,7 @@
 | API returns 413 | Request body exceeds 1 MiB |
 | 503 overload | Adjust execution/body capacity after identifying the load; do not disable safeguards |
 | 504 timeout | Python handler exceeded deadline; synchronous thread may still run |
-| ISR differs between processes | The default `memory` cache is process-local; use `--cache-backend sqlite` or `redis` to share entries across workers |
+| ISR differs between processes | The default `memory` cache is process-local; use `--cache-backend sqlite`, `redis`, or `filesystem` to share entries across workers |
 
 ## Debug checklist
 

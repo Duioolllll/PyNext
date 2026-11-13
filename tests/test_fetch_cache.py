@@ -492,3 +492,559 @@ def test_apply_fetch_revalidate():
         apply_fetch_revalidate(-1, 60)
     with pytest.raises(ValueError):
         apply_fetch_revalidate(60.0, -1)
+
+
+# ---------------------------------------------------------------------------
+# Storage + request-memo layer (track C P1-1/P1-2, this commit):
+# FetchCache over the ISR backends, resolve_fetch_policy, and the
+# per-request memo. (The suite's module-level URL is FETCH_URL here
+# so it does not overwrite the policy suite's URL above.)
+# ---------------------------------------------------------------------------
+"""Fetch/data cache + per-request memoization (track C P1-1/P1-2)."""
+import asyncio
+import contextvars
+import logging
+
+import httpx
+import pytest
+
+from pynext import (FetchCache, FetchResult, create_app, fetch_cache_key,
+                    fetch_cached, get_fetch_cache, memoize, memoize_sync,
+                    resolve_fetch_policy)
+from pynext.cache import ISRCache
+from pynext.request_memo import (RequestMemo, clear_request_memo, current_memo,
+                                 ensure_request_memo, request_memo_scope)
+
+FETCH_URL = "https://api.example.test/posts/42"
+
+
+# --- cache keys -----------------------------------------------------------
+
+def test_fetch_cache_key_is_stable_and_method_sensitive():
+    key = fetch_cache_key(FETCH_URL)
+    assert key == fetch_cache_key(FETCH_URL)
+    assert key == fetch_cache_key(FETCH_URL + "#fragment")
+    assert key != fetch_cache_key(FETCH_URL, method="POST")
+    assert len(key) == 64
+
+
+def test_fetch_cache_key_distinguishes_credentials_and_ignores_tracing_headers():
+    """P1-1 regression: credential headers are part of the key, so two
+    fetches with different credentials never share one entry. Only
+    distributed tracing headers are excluded (Next.js
+    ``FETCH_CACHE_KEY_EXCLUDED_HEADERS``)."""
+    base = fetch_cache_key(FETCH_URL, headers=[("Accept", "application/json")])
+    # Different credentials -> different keys (no cross-user serving).
+    assert base != fetch_cache_key(
+        FETCH_URL, headers=[("Accept", "application/json"),
+                      ("Authorization", "Bearer x")])
+    assert base != fetch_cache_key(
+        FETCH_URL, headers=[("Accept", "application/json"),
+                      ("Cookie", "s=1")])
+    assert fetch_cache_key(
+        FETCH_URL, headers=[("Authorization", "Bearer alice")]) != fetch_cache_key(
+        FETCH_URL, headers=[("Authorization", "Bearer bob")])
+    assert fetch_cache_key(
+        FETCH_URL, headers=[("Cookie", "s=alice")]) != fetch_cache_key(
+        FETCH_URL, headers=[("Cookie", "s=bob")])
+    # Same credential -> same key (header order and case do not matter).
+    assert fetch_cache_key(
+        FETCH_URL, headers=[("X-B", "2"), ("Accept", "application/json"), ("X-A", "1"),
+                      ("Authorization", "Bearer x")]) == fetch_cache_key(
+        FETCH_URL, headers=[("authorization", "Bearer x"), ("X-A", "1"),
+                      ("X-B", "2"), ("Accept", "application/json")])
+    # Tracing headers still do not change the key.
+    assert base == fetch_cache_key(
+        FETCH_URL, headers=[("Accept", "application/json"),
+                      ("traceparent", "00-abc-def-01")])
+    assert base == fetch_cache_key(
+        FETCH_URL, headers=[("Accept", "application/json"),
+                      ("TraceState", "vendor=1")])
+    # ...but a different non-credential header value does change the key.
+    assert base != fetch_cache_key(
+        FETCH_URL, headers=[("Accept", "text/html")])
+
+
+def test_fetch_cache_key_tags_body_types_so_similar_bodies_differ():
+    assert fetch_cache_key(FETCH_URL, method="POST", body="a,b") != fetch_cache_key(
+        FETCH_URL, method="POST", body=b"a,b")
+    # ["a", "b"] vs ["a,b"] must not collide (form-field tagging).
+    assert fetch_cache_key(FETCH_URL, method="POST", body={"f": ["a", "b"]}) != fetch_cache_key(
+        FETCH_URL, method="POST", body={"f": ["a,b"]})
+    assert fetch_cache_key(FETCH_URL, method="POST", body={"b": "1", "a": "2"}) == fetch_cache_key(
+        FETCH_URL, method="POST", body={"a": "2", "b": "1"})
+    with pytest.raises(ValueError):
+        fetch_cache_key("")
+    with pytest.raises(TypeError):
+        fetch_cache_key(FETCH_URL, method="POST", body=object())
+
+
+# --- policy decision table -------------------------------------------------
+
+def test_policy_explicit_revalidate_wins():
+    assert resolve_fetch_policy(revalidate=60).revalidate == 60
+    assert resolve_fetch_policy(revalidate=False).revalidate is False
+    assert resolve_fetch_policy(revalidate=0) == resolve_fetch_policy(cache="no-store")
+    assert resolve_fetch_policy(revalidate=0).cached is False
+    # False (infinite) is not zero.
+    assert resolve_fetch_policy(revalidate=False).cached is True
+
+
+def test_policy_force_cache_without_revalidate_is_infinite():
+    policy = resolve_fetch_policy(cache="force-cache")
+    assert policy.revalidate is False and policy.cached is True
+
+
+def test_policy_infinite_fresh_seconds_is_clamped_to_the_native_l1_cap():
+    """P1-3 regression: an infinite policy resolves to a fresh window
+    the native L1 PageCache accepts (7 days), not the 1-year
+    ``MAX_CACHE_SECONDS`` the native ``insert`` rejects with
+    ``ValueError: Invalid cache durations``. A finite revalidate
+    longer than the cap is clamped the same way."""
+    for policy in (resolve_fetch_policy(),
+                   resolve_fetch_policy(cache="force-cache"),
+                   resolve_fetch_policy(revalidate=False)):
+        assert policy.revalidate is False
+        assert policy.fresh_seconds == 604_800.0
+    assert resolve_fetch_policy(revalidate=2_592_000).fresh_seconds == 604_800.0
+    # Shorter windows are untouched.
+    assert resolve_fetch_policy(revalidate=60).fresh_seconds == 60.0
+
+
+def test_policy_no_store_is_zero():
+    for cache in ("no-store", "no-cache"):
+        policy = resolve_fetch_policy(cache=cache)
+        assert policy.revalidate == 0 and policy.cached is False
+
+
+def test_policy_conflicts_warn_and_drop_both(caplog):
+    with caplog.at_level(logging.WARNING, logger="pynext"):
+        policy = resolve_fetch_policy(cache="force-cache", revalidate=0)
+    assert "Conflicting fetch cache options" in caplog.text
+    # Both dropped: falls through to the default (infinite here).
+    assert policy.revalidate is False
+    with caplog.at_level(logging.WARNING, logger="pynext"):
+        policy = resolve_fetch_policy(cache="no-store", revalidate=30)
+    assert "Conflicting fetch cache options" in caplog.text
+    assert policy.revalidate is False
+
+
+def test_policy_auto_no_cache_on_auth_or_non_get():
+    assert resolve_fetch_policy(
+        headers=[("Authorization", "Bearer x")]).revalidate == 0
+    assert resolve_fetch_policy(
+        headers=[("Cookie", "s=1")]).revalidate == 0
+    assert resolve_fetch_policy(method="POST").revalidate == 0
+    # Build-time prerender disables auto-no-cache (Next.js patch-fetch).
+    assert resolve_fetch_policy(
+        headers=[("Authorization", "Bearer x")], build_time=True).cached is True
+    assert resolve_fetch_policy(method="POST", build_time=True).cached is True
+
+
+def test_policy_default_follows_default_revalidate():
+    assert resolve_fetch_policy().revalidate is False
+    assert resolve_fetch_policy(default_revalidate=120).revalidate == 120
+    assert resolve_fetch_policy(default_revalidate=False).revalidate is False
+    with pytest.raises(ValueError):
+        resolve_fetch_policy(revalidate=-1)
+    with pytest.raises(ValueError):
+        resolve_fetch_policy(revalidate=True)
+    with pytest.raises(ValueError):
+        resolve_fetch_policy(cache="only-cache")
+
+
+# --- request memo ----------------------------------------------------------
+
+def test_request_memo_scope_isolation_and_clear():
+    with request_memo_scope() as memo:
+        assert current_memo() is memo
+        memo.set("k", 1)
+        assert memo.get("k") == 1
+        assert memoize_sync("s", lambda: 7) == 7
+        assert memo.get("s") == 7
+        memo.invalidate("k")
+        assert memo.get("k") is None
+        clear_request_memo()
+        assert len(memo) == 0
+    assert current_memo() is None
+
+
+def test_request_memo_get_or_compute_dedups_concurrent_calls():
+    async def run():
+        memo = RequestMemo()
+        calls = []
+
+        async def compute():
+            calls.append(1)
+            await asyncio.sleep(0.05)
+            return "v"
+
+        results = await asyncio.gather(
+            *(memo.get_or_compute("k", compute) for _ in range(5)))
+        assert results == ["v"] * 5
+        assert len(calls) == 1
+
+        # A failed computation is not cached: the next call recomputes.
+        attempts = []
+
+        async def flaky():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("boom")
+            return "ok"
+
+        with pytest.raises(RuntimeError):
+            await memo.get_or_compute("f", flaky)
+        assert await memo.get_or_compute("f", flaky) == "ok"
+        assert len(attempts) == 2
+
+    asyncio.run(run())
+
+
+def test_ensure_request_memo_is_per_context():
+    """An ISR generation task runs in a fresh context: it gets its own
+    memo instead of the request's (and vice versa)."""
+    async def run():
+        with request_memo_scope() as outer:
+            outer.set("k", "outer")
+            seen = {}
+
+            async def in_fresh_context():
+                memo = ensure_request_memo()
+                seen["memo"] = memo
+                seen["value"] = memo.get("k")
+
+            await asyncio.create_task(in_fresh_context(), context=contextvars.Context())
+            assert seen["memo"] is not outer
+            assert seen["value"] is None
+            assert outer.get("k") == "outer"
+
+    asyncio.run(run())
+
+
+def test_memoize_outside_a_scope_creates_one_for_the_context():
+    async def run():
+        calls = []
+
+        async def compute():
+            calls.append(1)
+            return 42
+
+        assert await memoize(("db", 1), compute) == 42
+        assert await memoize(("db", 1), compute) == 42
+        assert len(calls) == 1
+
+    asyncio.run(run())
+
+
+# --- fetch cache over ISR backends ------------------------------------------
+
+class _CountingFetcher:
+    def __init__(self, status=200, body=b'{"ok":true}'):
+        self.calls = 0
+        self.status = status
+        self.body = body
+
+    async def __call__(self, url, *, method="GET", headers=(), body=None, **_kwargs):
+        self.calls += 1
+        return FetchResult(self.status, (("content-type", "application/json"),), self.body)
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_fetch_cache_stores_and_serves_without_refetching():
+    async def run():
+        cache = ISRCache()
+        try:
+            fetch = FetchCache(cache)
+            fetcher = _CountingFetcher()
+            # A fresh memo scope per "request": the second scope must be
+            # served from the persistent cache, not the request memo.
+            with request_memo_scope():
+                first = await fetch.get_or_fetch(FETCH_URL, fetcher, revalidate=60)
+            assert fetcher.calls == 1
+            with request_memo_scope():
+                second = await fetch.get_or_fetch(FETCH_URL, fetcher, revalidate=60)
+            assert first.body == b'{"ok":true}' and first.status == 200
+            assert second == first
+            assert fetcher.calls == 1
+        finally:
+            await cache.close()
+
+    _run(run())
+
+
+def test_fetch_cache_does_not_serve_one_users_authorised_response_to_another():
+    """P1-1 regression: with an explicit ``revalidate``, Alice's cached
+    response must not be served to Bob. Different credentials get
+    different keys, so Bob's request misses and fetches upstream."""
+
+    class _TokenFetcher:
+        def __init__(self):
+            self.calls = 0
+
+        async def __call__(self, url, *, method="GET", headers=(), body=None, **_kwargs):
+            self.calls += 1
+            pairs = headers.items() if hasattr(headers, "items") else headers
+            token = dict((k.lower(), v) for k, v in pairs).get("authorization", "?")
+            return FetchResult(200, (), f"data-for-{token}".encode())
+
+    async def run():
+        cache = ISRCache()
+        try:
+            fetch = FetchCache(cache)
+            fetcher = _TokenFetcher()
+            with request_memo_scope():
+                alice = await fetch.get_or_fetch(
+                    FETCH_URL, fetcher, revalidate=60,
+                    headers={"Authorization": "Bearer alice"})
+            assert alice.body == b"data-for-Bearer alice"
+            assert fetcher.calls == 1
+            with request_memo_scope():
+                bob = await fetch.get_or_fetch(
+                    FETCH_URL, fetcher, revalidate=60,
+                    headers={"Authorization": "Bearer bob"})
+            assert bob.body == b"data-for-Bearer bob"
+            assert fetcher.calls == 2
+        finally:
+            await cache.close()
+
+    _run(run())
+
+
+def test_fetch_cache_infinite_policy_stores_without_value_error():
+    """P1-3 regression: the default, force-cache and revalidate=False
+    policies (all infinite) store through the native L1 without
+    ``ValueError: Invalid cache durations`` and serve the second
+    request from the cache."""
+    async def run():
+        for kwargs in ({}, {"cache": "force-cache"}, {"revalidate": False}):
+            cache = ISRCache()
+            try:
+                fetch = FetchCache(cache)
+                fetcher = _CountingFetcher()
+                with request_memo_scope():
+                    first = await fetch.get_or_fetch(FETCH_URL, fetcher, **kwargs)
+                assert first.status == 200
+                assert fetcher.calls == 1
+                with request_memo_scope():
+                    second = await fetch.get_or_fetch(FETCH_URL, fetcher, **kwargs)
+                assert second == first
+                assert fetcher.calls == 1
+            finally:
+                await cache.close()
+
+    _run(run())
+
+
+def test_fetch_cache_dedups_concurrent_requests():
+    async def run():
+        cache = ISRCache()
+        try:
+            fetch = FetchCache(cache)
+            fetcher = _CountingFetcher()
+
+            async def slow(url, **kwargs):
+                await asyncio.sleep(0.05)
+                return await fetcher(url, **kwargs)
+
+            results = await asyncio.gather(
+                *(fetch.get_or_fetch(FETCH_URL, slow, revalidate=60) for _ in range(4)))
+            assert all(r.body == b'{"ok":true}' for r in results)
+            assert fetcher.calls == 1
+        finally:
+            await cache.close()
+
+    _run(run())
+
+
+def test_fetch_cache_expires_and_refetches():
+    async def run():
+        cache = ISRCache()
+        try:
+            fetch = FetchCache(cache)
+            fetcher = _CountingFetcher()
+            with request_memo_scope():
+                await fetch.get_or_fetch(FETCH_URL, fetcher, revalidate=0.2)
+            assert fetcher.calls == 1
+            await asyncio.sleep(0.3)
+            # A fresh memo scope (a new request) must not see the old
+            # memo, so the expired entry is refetched.
+            with request_memo_scope():
+                await fetch.get_or_fetch(FETCH_URL, fetcher, revalidate=0.2)
+            assert fetcher.calls == 2
+        finally:
+            await cache.close()
+
+    _run(run())
+
+
+def test_fetch_cache_never_stores_non_2xx_but_still_memoizes():
+    async def run():
+        cache = ISRCache()
+        try:
+            fetch = FetchCache(cache)
+            fetcher = _CountingFetcher(status=500, body=b"err")
+            with request_memo_scope():
+                first = await fetch.get_or_fetch(FETCH_URL, fetcher, revalidate=60)
+                second = await fetch.get_or_fetch(FETCH_URL, fetcher, revalidate=60)
+            assert first.status == 500 and second.status == 500
+            assert fetcher.calls == 1  # memoized within the request
+            await fetch.get_or_fetch(FETCH_URL, fetcher, revalidate=60)
+            assert fetcher.calls == 2  # not persisted: refetched
+        finally:
+            await cache.close()
+
+    _run(run())
+
+
+def test_fetch_cache_no_store_never_persists_but_memoizes_in_request():
+    async def run():
+        cache = ISRCache()
+        try:
+            fetch = FetchCache(cache)
+            fetcher = _CountingFetcher()
+            with request_memo_scope():
+                await fetch.get_or_fetch(FETCH_URL, fetcher, cache="no-store")
+                await fetch.get_or_fetch(FETCH_URL, fetcher, cache="no-store")
+            assert fetcher.calls == 1
+            await fetch.get_or_fetch(FETCH_URL, fetcher, cache="no-store")
+            assert fetcher.calls == 2
+        finally:
+            await cache.close()
+
+    _run(run())
+
+
+def test_fetch_cache_invalidate_removes_persistent_and_memo_entries():
+    async def run():
+        cache = ISRCache()
+        try:
+            fetch = FetchCache(cache)
+            fetcher = _CountingFetcher()
+            with request_memo_scope():
+                await fetch.get_or_fetch(FETCH_URL, fetcher, revalidate=60)
+                assert await fetch.invalidate(FETCH_URL) is True
+                await fetch.get_or_fetch(FETCH_URL, fetcher, revalidate=60)
+                assert await fetch.invalidate(FETCH_URL) is True
+            assert fetcher.calls == 2
+            assert await fetch.invalidate(FETCH_URL) is False
+        finally:
+            await cache.close()
+
+    _run(run())
+
+
+def test_fetch_cache_shared_sqlite_backend_survives_new_instance(tmp_path):
+    async def run():
+        path = tmp_path / "fetch.sqlite3"
+        cache = ISRCache(cache_backend="sqlite", cache_path=path)
+        try:
+            fetch = FetchCache(cache)
+            fetcher = _CountingFetcher()
+            with request_memo_scope():
+                await fetch.get_or_fetch(FETCH_URL, fetcher, revalidate=60)
+            assert fetcher.calls == 1
+        finally:
+            await cache.close()
+        cache2 = ISRCache(cache_backend="sqlite", cache_path=path)
+        try:
+            fetch2 = FetchCache(cache2)
+            fetcher2 = _CountingFetcher()
+            with request_memo_scope():
+                result = await fetch2.get_or_fetch(FETCH_URL, fetcher2, revalidate=60)
+            assert result.body == b'{"ok":true}'
+            assert fetcher2.calls == 0
+        finally:
+            await cache2.close()
+
+    _run(run())
+
+
+def test_fetch_cached_requires_a_request_context():
+    async def run():
+        assert get_fetch_cache() is None
+        with pytest.raises(RuntimeError, match="no fetch cache installed"):
+            await fetch_cached(FETCH_URL, _CountingFetcher())
+
+    _run(run())
+
+
+# --- app integration ---------------------------------------------------------
+
+def _write_project(root):
+    app_dir = root / "app"
+    (app_dir / "api" / "memo").mkdir(parents=True)
+    (app_dir / "api" / "memo" / "route.py").write_text(
+        "from pynext import JSONResponse, memoize, route\n"
+        "calls = 0\n"
+        "@route('GET')\n"
+        "async def handler():\n"
+        "    global calls\n"
+        "    async def compute():\n"
+        "        global calls\n"
+        "        calls += 1\n"
+        "        return calls\n"
+        "    first = await memoize(('db', 1), compute)\n"
+        "    second = await memoize(('db', 1), compute)\n"
+        "    return JSONResponse({'first': first, 'second': second, 'calls': calls})\n"
+    )
+    (app_dir / "page.py").write_text(
+        "from pynext import FetchResult, fetch_cached, h, page\n"
+        "calls = 0\n"
+        "async def fetcher(url, **kwargs):\n"
+        "    global calls\n"
+        "    calls += 1\n"
+        "    return FetchResult(200, (), b'upstream-data')\n"
+        "@page()\n"
+        "async def Page():\n"
+        "    first = await fetch_cached('https://api.example.test/data', fetcher, revalidate=60)\n"
+        "    second = await fetch_cached('https://api.example.test/data', fetcher, revalidate=60)\n"
+        "    return h('main', {}, f\"{first.body.decode()}|{second.body.decode()}|calls={calls}\")\n"
+    )
+    (app_dir / "layout.py").write_text(
+        "from pynext import FetchResult, fetch_cached, h, layout\n"
+        "async def _layout_fetcher(url, **kwargs):\n"
+        "    return FetchResult(200, (), b'upstream-data')\n"
+        "@layout\n"
+        "async def Layout(children):\n"
+        "    result = await fetch_cached('https://api.example.test/data', _layout_fetcher, revalidate=60)\n"
+        "    return h('div', {}, result.body.decode(), children)\n"
+    )
+
+
+def test_app_memoize_dedups_within_a_request_and_resets_between(tmp_path):
+    _write_project(tmp_path)
+    app = create_app(tmp_path)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = await client.get("/api/memo")
+            assert first.json() == {"first": 1, "second": 1, "calls": 1}
+            second = await client.get("/api/memo")
+            assert second.json() == {"first": 2, "second": 2, "calls": 2}
+
+    _run(run())
+
+
+def test_app_fetch_cached_shared_by_layout_and_page_and_persisted(tmp_path):
+    _write_project(tmp_path)
+    app = create_app(tmp_path)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = await client.get("/")
+            assert first.status_code == 200
+            assert "upstream-data|upstream-data|calls=1" in first.text
+            second = await client.get("/")
+            assert second.status_code == 200
+            # The layout's fetcher and the page's fetcher both ran once
+            # on the first request only; the second request hit the
+            # persistent fetch cache (and the per-request memo).
+            assert "upstream-data|upstream-data|calls=1" in second.text
+
+    _run(run())

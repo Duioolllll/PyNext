@@ -24,6 +24,10 @@ uv run pynext start --dir examples/basic
 
 `pynext dev --dir examples/basic` 不经构建直接运行源码，并在 `app/`、`islands/`、`public/` 或 `pynext.config.py` 变化时在同一端口重启服务器。`pynext start` 使用构建 manifest；受跟踪的源码发生变化后必须重新构建。不使用 island 的应用不需要 Node 和 esbuild。以上说明通过仓库源码安装，并不表示项目已发布到 PyPI。
 
+### 构建模式
+
+普通的 `pynext build` 会同时执行 island 打包编译与静态页面生成两个阶段。`pynext build --only-islands` 仅编译 island，`pynext build --only-static` 仅使用此前编译结果生成静态页面。构建不完整时 `pynext start` 会指出缺失的阶段并拒绝启动。`pynext build --static-only` 会把 SSG 页面、public 资源和 island 包以普通文件形式导出到 `.pynext/export`（可用 `--export-dir` 更改），无需 PyNext 服务器即可用 `python -m http.server` 提供服务。含动态 SSR、ISR 或 API 路由的应用会被拒绝。详情请参阅英文手册。
+
 开发监视器使用原生文件通知和文件哈希，必要时回退到轮询。修改 JS/TS island 会重新构建并替换受影响的模块，无需刷新整个页面；旧清理函数会执行，该 island 的状态可能重置。修改其他源码会重启服务器并刷新打开的页面。错误修改保留上一个正常版本。`--port 0` 分配的端口在重启后保持不变。
 
 ## 项目结构和路由
@@ -172,7 +176,7 @@ async def stream():
 
 `route.py` 可以在 HTTP 处理函数之外再导出一个 `@websocket` 处理函数。处理函数接收一个 `WebSocket`，在收发消息之前必须调用 `await websocket.accept()`。支持文本和二进制消息往返；对方断开连接时 `receive()` 会抛出 `WebSocketDisconnect`，因此每个连接的清理工作应放在 `finally` 块中。
 
-开发版本在 ASGI 和 Axum 接受连接前检查 `Origin`，默认只允许同源。通过向 `create_app(..., security=...)` 传入 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`，或重复指定 `--ws-allowed-origin https://client.example`，可以添加 HTTP(S) 来源。来源须包含协议及非默认端口；不接受 `*` 和 `null`。不发送 `Origin` 的现有非浏览器客户端必须通过 `websocket_allow_missing_origin=True` 或 `--ws-allow-missing-origin` 显式允许。已发布的 0.1.0 不包含此检查。客户端可以伪造或省略 `Origin`。在握手完成之前，升级请求还会经过全局中间件链（包括会话中间件）和处理函数的 `@require_auth`/`@require_permission` 策略（ASGI 和 Axum 均适用）；被拒绝的升级会在 101 响应之前被拦截（ASGI 和 Axum 均返回 HTTP 403，拒绝会被记录到日志），处理函数不会执行。应用仍须负责建立身份（例如登录路由设置 `session["user_id"]`），会话之外的凭证方式（如令牌）须在中间件中验证。使用代理时，只通过 `--trusted-proxy` 指定实际的代理，并配置代理覆盖客户端提供的转发头。
+开发版本在 ASGI 和 Axum 接受连接前检查 `Origin`，默认只允许同源。通过向 `create_app(..., security=...)` 传入 `SecurityConfig(websocket_allowed_origins=("https://client.example",))`，或重复指定 `--ws-allowed-origin https://client.example`，可以添加 HTTP(S) 来源。来源须包含协议及非默认端口；不接受 `null`。也支持通配符模式：`*` 匹配一个 DNS 标签（`https://*.example.com`），`**` 仅在最左侧标签时匹配一个或多个前导标签（`https://**.example.com`）；`https://*.com` 这类匹配整个域的模式会被拒绝。不发送 `Origin` 的现有非浏览器客户端必须通过 `websocket_allow_missing_origin=True` 或 `--ws-allow-missing-origin` 显式允许。已发布的 0.1.0 不包含此检查。客户端可以伪造或省略 `Origin`。在握手完成之前，升级请求还会经过全局中间件链（包括会话中间件）和处理函数的 `@require_auth`/`@require_permission` 策略（ASGI 和 Axum 均适用）；被拒绝的升级会在 101 响应之前被拦截（ASGI 和 Axum 均返回 HTTP 403，拒绝会被记录到日志），处理函数不会执行。应用仍须负责建立身份（例如登录路由设置 `session["user_id"]`），会话之外的凭证方式（如令牌）须在中间件中验证。使用代理时，只通过 `--trusted-proxy` 指定实际的代理，并配置代理覆盖客户端提供的转发头。
 
 为了让 PyNext 在 ASGI 下识别可信代理，服务器须在 `scope["client"]` 中保留原始对端地址。如果由 PyNext 解释转发头，请关闭 ASGI 服务器提前处理代理头的功能（Uvicorn 使用 `--no-proxy-headers`）。
 
@@ -284,6 +288,8 @@ uv run --extra dev uvicorn --app-dir examples/basic asgi:app
 指标在内存中收集，默认开启。`app.metrics.snapshot()` 返回按路由模式统计的请求数与状态码、按路由统计的延迟 p50/p95/p99、Python 执行队列长度与等待时间、Python 执行时间与 Rust 渲染时间对比、ISR 缓存 hit/miss/stale 与再生成成功/失败/已开始、Worker 启动/超时/不可用、响应大小与 island 包大小。`app.metrics.prometheus_text()` 以 Prometheus 文本格式暴露相同的计数器。延迟样本按路由上限为 2048 个。Rust 不经过 Python 直接提供的全新 ISR 命中不会计入此处；仅统计到达 Python 分发的 ISR 结果。
 
 OpenTelemetry 追踪默认关闭且为可选项：安装 `opentelemetry-api`（以及自选的 SDK/导出器），并用 `--tracing` 或 `PYNEXT_TRACING=1` 启用。启用后会创建 `pynext.request` 与 `pynext.render` span，并传播传入的 W3C `traceparent`/`tracestate` 上下文。未安装相关包时，追踪为 no-op，不会破坏任何功能。
+
+构建遥测仅在本地记录一个事件 `build_failed`：当 `pynext build` 失败时，构建阶段（`discover`、`render` 或 `write` 之一）与构建耗时会被追加到 `.pynext/telemetry.jsonl`（仅保留最近 100 条）。事件中不包含项目名、路径、错误信息或用户代码，也不会向任何外部发送数据。设置 `PYNEXT_TELEMETRY_DISABLED=1` 可关闭本地记录。
 
 可通过 CLI 标志 `--structured-logs` / `--no-structured-logs`、`--metrics` / `--no-metrics`、`--tracing` / `--no-tracing`，环境变量 `PYNEXT_STRUCTURED_LOGS`、`PYNEXT_METRICS`、`PYNEXT_TRACING`、`PYNEXT_LOG_LEVEL`，或在代码中向 `create_app(..., observability=ObservabilityConfig(...))` 传入配置来进行设置。
 

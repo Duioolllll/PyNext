@@ -601,3 +601,496 @@ def decide_fetch_cache(*, cache=None, revalidate=None, fetch_cache_mode=None,
         dynamic=dynamic,
         route_revalidate=propagated_route,
     )
+
+
+# ---------------------------------------------------------------------------
+# Storage layer (track C P1-1): persistent fetch cache over the ISR
+# backends, request-memo integration, and the stdlib fetcher. This
+# lives in the same module as the policy layer above; the two layers
+# keep separate key/policy helpers (``fetch_cache_key`` /
+# ``resolve_fetch_policy`` here vs ``generate_fetch_cache_key`` /
+# ``decide_fetch_cache`` above) because they were built on different
+# branches — unifying them is a follow-up, not this rebase.
+# ---------------------------------------------------------------------------
+import asyncio
+import base64
+import binascii
+import contextvars
+import hashlib
+import json
+import logging
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from contextlib import contextmanager
+from dataclasses import dataclass
+
+from .cache import (
+    MAX_CACHE_BODY_BYTES,
+    ISRCache,
+    SharedCacheUnavailable,
+    _MAX_L1_SECONDS,
+)
+from .failure_policy import FAIL_CLOSED
+from .request_memo import ensure_request_memo
+
+__all__ = [
+    # Storage layer (this commit's track C P1-1).
+    "FetchCache",
+    "FetchPolicy",
+    "FetchResult",
+    "fetch_cache_key",
+    "fetch_cache_scope",
+    "fetch_cached",
+    "get_fetch_cache",
+    "resolve_fetch_policy",
+    "urllib_fetcher",
+    # Policy layer (HEAD: key rules + decision table).
+    "FETCH_CACHE_KEY_EXCLUDED_HEADERS",
+    "FETCH_CACHE_KEY_PREFIX",
+    "FETCH_CACHE_MODES",
+    "FETCH_CACHE_NAMESPACE",
+    "FETCH_CACHE_OPTIONS",
+    "FetchCacheDecision",
+    "apply_fetch_revalidate",
+    "decide_fetch_cache",
+    "fetch_cache_store_key",
+    "generate_fetch_cache_key",
+    "generate_simple_fetch_cache_key",
+]
+
+log = logging.getLogger("pynext")
+
+# The fetch cache for the request/render in progress. Installed by
+# App.dispatch for the whole request and by App.render_page for renders
+# that run in a fresh task context (ISR generation), so page functions —
+# which cannot take a ``request`` argument — can still call
+# fetch_cached() without holding an App reference.
+_fetch_cache_var = contextvars.ContextVar("pynext_fetch_cache", default=None)
+
+
+@contextmanager
+def fetch_cache_scope(cache):
+    """Install ``cache`` as the current fetch cache; reset it on exit."""
+    token = _fetch_cache_var.set(cache)
+    try:
+        yield cache
+    finally:
+        _fetch_cache_var.reset(token)
+
+
+def get_fetch_cache():
+    """Return the current fetch cache, or ``None`` outside a request."""
+    return _fetch_cache_var.get()
+
+
+async def fetch_cached(url, fetcher, **kwargs):
+    """Fetch ``url`` through the current request's fetch cache.
+
+    Same arguments as :meth:`FetchCache.get_or_fetch`. Raises
+    :class:`RuntimeError` outside a request/render (no cache installed).
+    """
+    cache = _fetch_cache_var.get()
+    if cache is None:
+        raise RuntimeError("fetch_cached() requires a request context (no fetch cache installed)")
+    return await cache.get_or_fetch(url, fetcher, **kwargs)
+
+_FETCH_PREFIX = "\0fetch:"
+# Headers excluded from the storage-layer fetch key. Only distributed
+# tracing headers: they must not affect caching or deduplication
+# (Next.js ``FETCH_CACHE_KEY_EXCLUDED_HEADERS``). Credential headers
+# (``Authorization`` / ``Cookie`` / ``Proxy-Authorization``) are
+# intentionally NOT here — two fetches with different credentials
+# must not share one entry (P1-1).
+_EXCLUDED_HEADERS = frozenset({"traceparent", "tracestate"})
+_METHOD_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    """One fetched response: status, headers and body bytes."""
+
+    status: int
+    headers: tuple = ()
+    body: bytes = b""
+
+
+@dataclass(frozen=True)
+class FetchPolicy:
+    """Resolved fetch caching policy.
+
+    ``revalidate`` is seconds (``0`` = never store, ``False`` =
+    infinite). ``cached`` is False exactly when ``revalidate == 0``.
+    """
+
+    revalidate: float | bool = False
+    cached: bool = True
+
+    @property
+    def fresh_seconds(self):
+        """``revalidate`` mapped onto what the backends can store.
+
+        The native L1 PageCache rejects any window over
+        ``_MAX_L1_SECONDS`` (7 days) with ``ValueError: Invalid cache
+        durations``, so an infinite policy — and any finite revalidate
+        longer than the cap — is clamped to the cap instead of
+        rejected (same rule as ``ISRCache`` in :mod:`pynext.cache`).
+        """
+        if self.revalidate is False:
+            return _MAX_L1_SECONDS
+        return min(float(self.revalidate), _MAX_L1_SECONDS)
+
+
+def _is_zero(value):
+    """True for a numeric zero revalidate — but not for ``False``,
+    which means infinite (``False == 0`` in Python)."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and value == 0)
+
+
+def _coerce_headers(headers):
+    if headers is None:
+        return []
+    if hasattr(headers, "items"):
+        headers = headers.items()
+    coerced = []
+    for name, value in headers:
+        if isinstance(name, (bytes, bytearray)):
+            name = bytes(name).decode("latin-1")
+        if isinstance(value, (bytes, bytearray)):
+            value = bytes(value).decode("latin-1")
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise TypeError("fetch headers must be str or bytes pairs")
+        coerced.append((name.strip().lower(), value.strip()))
+    return coerced
+
+
+def _validate_method(method):
+    if not isinstance(method, str) or not _METHOD_TOKEN.fullmatch(method):
+        raise ValueError(f"Invalid fetch method: {method!r}")
+    return method.upper()
+
+
+def _encode_body(body):
+    """Tag a body by type so ``["a", "b"]`` and ``["a,b"]`` cannot
+    collide (Next.js ``generateCacheKey`` does the same)."""
+    if body is None:
+        return ["none"]
+    if isinstance(body, str):
+        data = body.encode("utf-8")
+        return ["str", len(data), hashlib.sha256(data).hexdigest()]
+    if isinstance(body, (bytes, bytearray, memoryview)):
+        data = bytes(body)
+        return ["bytes", len(data), hashlib.sha256(data).hexdigest()]
+    if isinstance(body, dict):
+        fields = []
+        for key in sorted(body, key=str):
+            value = body[key]
+            values = value if isinstance(value, (list, tuple)) else [value]
+            fields.append([str(key), [_encode_body(item) for item in values]])
+        return ["form", fields]
+    raise TypeError(f"Unsupported fetch body type: {type(body).__name__}")
+
+
+def fetch_cache_key(url, *, method="GET", headers=(), body=None):
+    """Return the hex cache key for one fetch.
+
+    The key hashes ``[url (fragment stripped), method, headers, body]``.
+    Credential headers (``Authorization``, ``Cookie``,
+    ``Proxy-Authorization``) are part of the key: a cached response
+    must never be served to a different credential, so two fetches
+    with different credentials get different keys. Only distributed
+    tracing headers (``traceparent`` / ``tracestate``) are excluded,
+    matching Next.js ``FETCH_CACHE_KEY_EXCLUDED_HEADERS``. Header
+    order does not matter; the body is type-tagged (see
+    :func:`_encode_body`).
+    """
+    if not isinstance(url, str) or not url:
+        raise ValueError("fetch URL must be a non-empty string")
+    method = _validate_method(method)
+    url = url.split("#", 1)[0]
+    kept = sorted(
+        (name, value) for name, value in _coerce_headers(headers)
+        if name not in _EXCLUDED_HEADERS
+    )
+    canonical = json.dumps(
+        ["fetch-v1", method, url, kept, _encode_body(body)],
+        ensure_ascii=True, separators=(",", ":"), sort_keys=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_fetch_revalidate(value, *, source="revalidate"):
+    if value is False:
+        return False
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{source} must be a non-negative number or False")
+    if value != value or value < 0 or value == float("inf"):
+        raise ValueError(f"{source} must be a non-negative number or False")
+    return value
+
+
+def resolve_fetch_policy(*, cache=None, revalidate=_UNSET, method="GET",
+                         headers=(), default_revalidate=None, build_time=False):
+    """Resolve caching for one fetch from the decision table.
+
+    ``cache`` is ``"force-cache"``, ``"no-store"`` or ``"no-cache"``;
+    ``revalidate`` is seconds or ``False`` (infinite). Conflicting
+    explicit options warn and are both dropped. ``default_revalidate``
+    is the fallback when nothing is explicit (a page's ISR
+    ``revalidate`` when the caller knows it, else infinite).
+    """
+    if cache is not None and cache not in {"force-cache", "no-store", "no-cache"}:
+        raise ValueError(f"Unknown fetch cache mode: {cache!r}")
+    explicit_revalidate = revalidate is not _UNSET
+    if explicit_revalidate:
+        revalidate = _validate_fetch_revalidate(revalidate)
+    if default_revalidate is not None:
+        default_revalidate = _validate_fetch_revalidate(
+            default_revalidate, source="default_revalidate")
+    conflict = (
+        (cache == "force-cache" and _is_zero(revalidate))
+        or (cache in {"no-store", "no-cache"} and revalidate is not _UNSET
+            and (revalidate is False or revalidate > 0))
+    )
+    if conflict:
+        log.warning("Conflicting fetch cache options cache=%r revalidate=%r; ignoring both",
+                    cache, revalidate)
+        cache, revalidate, explicit_revalidate = None, _UNSET, False
+    if explicit_revalidate:
+        return FetchPolicy(revalidate, cached=not _is_zero(revalidate))
+    if cache == "force-cache":
+        return FetchPolicy(False, True)
+    if cache in {"no-store", "no-cache"}:
+        return FetchPolicy(0, False)
+    method = _validate_method(method)
+    names = {name for name, _ in _coerce_headers(headers)}
+    if not build_time and (names & {"authorization", "cookie"}
+                           or method not in {"GET", "HEAD"}):
+        return FetchPolicy(0, False)
+    fallback = False if default_revalidate is None else default_revalidate
+    return FetchPolicy(fallback, True)
+
+
+def _serialize(result):
+    payload = {
+        "status": result.status,
+        "headers": [[name, value] for name, value in result.headers],
+        "body": base64.b64encode(result.body).decode("ascii"),
+    }
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
+def _deserialize(data):
+    try:
+        payload = json.loads(data.decode("ascii"))
+        status = payload["status"]
+        headers = tuple((str(k), str(v)) for k, v in payload["headers"])
+        body = base64.b64decode(payload["body"], validate=True)
+    except (ValueError, KeyError, TypeError, binascii.Error, UnicodeError) as exc:
+        raise ValueError("Corrupt fetch cache entry") from exc
+    if not isinstance(status, int) or not 100 <= status <= 599:
+        raise ValueError("Corrupt fetch cache entry")
+    return FetchResult(status, headers, body)
+
+
+async def urllib_fetcher(url, *, method="GET", headers=(), body=None, timeout=10.0):
+    """Fetch ``url`` with the stdlib and return a :class:`FetchResult`.
+
+    Only ``http``/``https`` URLs are allowed. HTTP error statuses are
+    returned as results, not raised; transport errors propagate.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"urllib_fetcher only supports http(s) URLs: {url!r}")
+    if isinstance(body, dict):
+        data = urllib.parse.urlencode(body, doseq=True).encode("ascii")
+    elif isinstance(body, str):
+        data = body.encode("utf-8")
+    elif body is None:
+        data = None
+    else:
+        data = bytes(body)
+
+    def _do():
+        request = urllib.request.Request(url, data=data, method=method)
+        for name, value in _coerce_headers(headers):
+            request.add_header(name, value)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return FetchResult(response.status,
+                                   tuple((k.lower(), v) for k, v in response.headers.items()),
+                                   response.read())
+        except urllib.error.HTTPError as exc:
+            return FetchResult(exc.code,
+                               tuple((k.lower(), v) for k, v in exc.headers.items()),
+                               exc.read())
+
+    return await asyncio.to_thread(_do)
+
+
+class FetchCache:
+    """Persistent fetch cache over an :class:`ISRCache`.
+
+    ``isr_cache`` supplies the backends (memory / SQLite / Redis); fetch
+    entries live under ``\\0fetch:`` keys so they never collide with page
+    entries. The same request memo as :mod:`pynext.request_memo` dedups
+    repeated fetches inside one request, including ``no-store`` ones.
+    """
+
+    def __init__(self, isr_cache):
+        if not isinstance(isr_cache, ISRCache):
+            raise TypeError("FetchCache requires an ISRCache")
+        self._isr = isr_cache
+        self._inflight = {}
+        self._tasks = set()
+
+    def _storage_key(self, key):
+        return self._isr.namespace + _FETCH_PREFIX + key
+
+    def _memo_key(self, key):
+        return ("pynext.fetch", key)
+
+    async def _shared_lookup(self, key):
+        """Return a fresh shared entry body, ``None`` on miss/expired,
+        or the shared-unavailable sentinel path (``None`` under
+        fail_open, raise under fail_closed)."""
+        shared = self._isr.shared
+        if shared is None:
+            return None
+        try:
+            entry = await asyncio.to_thread(shared.lookup_entry, self._storage_key(key))
+        except Exception as exc:
+            if self._isr.failure_policy == FAIL_CLOSED:
+                raise SharedCacheUnavailable("Shared fetch cache lookup failed") from exc
+            log.warning("Shared fetch cache lookup failed for %s", key, exc_info=True)
+            return None
+        if entry is not None and entry.status == "fresh":
+            return entry.body
+        return None
+
+    async def _shared_store(self, key, data, fresh_seconds):
+        shared = self._isr.shared
+        if shared is None:
+            return
+        try:
+            await asyncio.to_thread(
+                shared.insert_fenced, self._storage_key(key), data,
+                float(fresh_seconds), 0.0, None)
+        except Exception:
+            log.warning("Shared fetch cache insert failed for %s", key, exc_info=True)
+
+    async def _shared_remove(self, key):
+        shared = self._isr.shared
+        if shared is None:
+            return False
+        try:
+            return await asyncio.to_thread(shared.remove, self._storage_key(key))
+        except Exception:
+            log.warning("Shared fetch cache remove failed for %s", key, exc_info=True)
+            return False
+
+    async def _fetch_once(self, key, url, fetcher, fetcher_kwargs, policy):
+        memo = ensure_request_memo()
+        cached = memo.get(self._memo_key(key))
+        if cached is not None:
+            return cached
+        if policy.cached:
+            storage_key = self._storage_key(key)
+            status, body = self._isr.store.lookup(storage_key)
+            if status == "fresh":
+                try:
+                    result = _deserialize(body)
+                except ValueError:
+                    result = None
+                if result is not None:
+                    memo.set(self._memo_key(key), result)
+                    return result
+            shared_body = await self._shared_lookup(key)
+            if shared_body is not None:
+                try:
+                    result = _deserialize(shared_body)
+                except ValueError:
+                    result = None
+                if result is not None:
+                    self._isr.store.insert(storage_key, shared_body,
+                                           policy.fresh_seconds, 0.0)
+                    memo.set(self._memo_key(key), result)
+                    return result
+        result = await fetcher(url, **fetcher_kwargs)
+        if not isinstance(result, FetchResult):
+            raise TypeError("fetcher must return a FetchResult")
+        if policy.cached and 200 <= result.status <= 299:
+            data = _serialize(result)
+            if len(data) <= MAX_CACHE_BODY_BYTES:
+                storage_key = self._storage_key(key)
+                self._isr.store.insert(storage_key, data, policy.fresh_seconds, 0.0)
+                await self._shared_store(key, data, policy.fresh_seconds)
+            else:
+                log.warning("Fetch cache entry for %s exceeds the %d-byte cap; served but not cached",
+                            key, MAX_CACHE_BODY_BYTES)
+        memo.set(self._memo_key(key), result)
+        return result
+
+    async def get_or_fetch(self, url, fetcher, *, method="GET", headers=(),
+                           body=None, cache=None, revalidate=_UNSET,
+                           default_revalidate=None, build_time=False, **fetcher_kwargs):
+        """Fetch ``url`` (via async ``fetcher(url, ...)``), cached per
+        the resolved policy.
+
+        ``fetcher`` is an async callable returning a
+        :class:`FetchResult` — pass :func:`urllib_fetcher` for real
+        HTTP, or a stub in tests. Extra keyword arguments are passed
+        through to the fetcher (e.g. ``timeout=`` for
+        :func:`urllib_fetcher`). Concurrent calls for the same key in
+        this process share one upstream fetch.
+        """
+        key = fetch_cache_key(url, method=method, headers=headers, body=body)
+        policy = resolve_fetch_policy(cache=cache, revalidate=revalidate, method=method,
+                                      headers=headers, default_revalidate=default_revalidate,
+                                      build_time=build_time)
+        memo = ensure_request_memo()
+        cached = memo.get(self._memo_key(key))
+        if cached is not None:
+            return cached
+        task = self._inflight.get(key)
+        if task is None:
+            fetcher_kwargs = {k: v for k, v in fetcher_kwargs.items()
+                              if k not in {"method", "headers", "body"}}
+            task = asyncio.ensure_future(
+                self._fetch_once(key, url, fetcher,
+                                 {"method": method, "headers": headers, "body": body,
+                                  **fetcher_kwargs},
+                                 policy))
+            self._inflight[key] = task
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+            def _done(finished):
+                if self._inflight.get(key) is finished:
+                    self._inflight.pop(key, None)
+                if not finished.cancelled() and finished.exception() is not None:
+                    log.warning("Fetch failed for %s", url, exc_info=finished.exception())
+
+            task.add_done_callback(_done)
+        try:
+            return await asyncio.shield(task)
+        except BaseException:
+            # Only retire the slot when the shared fetch itself finished;
+            # a cancelled waiter must not orphan a still-running fetch.
+            if task.done() and self._inflight.get(key) is task:
+                self._inflight.pop(key, None)
+            raise
+
+    async def invalidate(self, url, *, method="GET", headers=(), body=None):
+        """Remove one fetch entry (persistent + request memo).
+
+        Returns True when a persistent entry or a memo entry was removed.
+        """
+        key = fetch_cache_key(url, method=method, headers=headers, body=body)
+        memo = ensure_request_memo()
+        removed_memo = memo.invalidate(self._memo_key(key))
+        removed_local = self._isr.store.remove(self._storage_key(key))
+        removed_shared = await self._shared_remove(key)
+        return bool(removed_memo or removed_local or removed_shared)
