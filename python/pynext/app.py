@@ -1679,6 +1679,10 @@ class App:
         # Per-pattern dynamic accesses recorded during SSG/ISR prerenders
         # (see _merge_dynamic_accesses); written to the build manifest.
         self.dynamic_accesses = {}
+        # Per-pattern accesses dropped by the 32-access cap (A1-L4):
+        # the cap counts, not just the stored entries, so a page that
+        # reads the clock in a loop does not silently lose the overflow.
+        self.dynamic_accesses_dropped = {}
         self._dev_static_paths = {}
         self.isr_policies = {}
         self.layout_policies = {}
@@ -2861,7 +2865,23 @@ class App:
         on every request (or a regenerating ISR page) warns once per
         expression instead of once per render. The report is written to
         the build manifest as ``dynamic_accesses``.
+
+        Accesses dropped by the 32-access cap (``state.dropped``, A1-L4)
+        are accumulated per pattern into ``dynamic_accesses_dropped`` and
+        written to the manifest as ``dynamic_accesses_dropped``, with a
+        warning the first time a pattern drops any — the stored entries
+        alone would otherwise hide how much was lost.
         """
+        if not state.accesses and not state.dropped:
+            return
+        if state.dropped:
+            total = self.dynamic_accesses_dropped.get(pattern, 0) + state.dropped
+            self.dynamic_accesses_dropped[pattern] = total
+            if total == state.dropped:
+                log.warning(
+                    "Static page %s dropped %d dynamic access(es) beyond the "
+                    "%d-access cap; only the first %d are recorded",
+                    pattern, state.dropped, MAX_DYNAMIC_ACCESSES, MAX_DYNAMIC_ACCESSES)
         if not state.accesses:
             return
         known = self.dynamic_accesses.setdefault(pattern, [])

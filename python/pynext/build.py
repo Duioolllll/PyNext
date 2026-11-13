@@ -888,6 +888,10 @@ def _write_manifest(root, deployment_id, lock_timeout, selected, tracker,
         # later at runtime are not part of the build manifest.
         manifest["dynamic_accesses"] = {pattern: accesses for pattern, accesses in app.dynamic_accesses.items()
                                         if accesses}
+        # Accesses dropped by the 32-access cap (A1-L4): the stored
+        # entries alone would hide how much was lost.
+        manifest["dynamic_accesses_dropped"] = {pattern: count for pattern, count in app.dynamic_accesses_dropped.items()
+                                                if count}
         manifest["isr_tags"] = app.isr_tags
         # Only the file names and the public-variable keys are recorded, never
         # values: secrets stay out of the manifest, and the public keys show
@@ -1013,6 +1017,8 @@ def _finish_manifest(root, manifest, app, rendered, *, previous=None, deployment
     # of the build manifest.
     manifest["dynamic_accesses"] = {pattern: accesses for pattern, accesses in app.dynamic_accesses.items()
                                     if accesses}
+    manifest["dynamic_accesses_dropped"] = {pattern: count for pattern, count in app.dynamic_accesses_dropped.items()
+                                            if count}
     manifest["isr_static_paths"] = asyncio.run(_enumerate_isr_static_paths(app))
     if rendered is None:
         if previous is not None:

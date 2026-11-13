@@ -474,3 +474,25 @@ def test_tracked_datetime_returns_original_class_in_other_thread():
         thread.join()
     assert results["now_type"] is dt.datetime
     assert results["today_type"] is dt.date
+
+
+def test_dropped_accesses_are_counted_in_manifest_and_logged(tmp_path, caplog):
+    """A1-L4: accesses beyond the 32-access cap are counted per pattern
+    in the manifest (dynamic_accesses_dropped) and warned about, instead
+    of silently disappearing."""
+    write_page(tmp_path, (
+        "from pynext import h, page\n"
+        "import time\n"
+        "@page(render=\"ssg\")\n"
+        "async def Page():\n"
+        "    for _ in range(40):\n"
+        "        time.time()\n"
+        "    return h(\"p\", {}, \"x\")\n"
+    ))
+    with caplog.at_level(logging.WARNING, logger="pynext"):
+        manifest = write_manifest(tmp_path)
+    accesses = manifest["dynamic_accesses"]["/"]
+    assert len(accesses) == 32
+    assert manifest["dynamic_accesses_dropped"] == {"/": 8}
+    assert "dropped 8 dynamic access" in caplog.text
+    assert "32-access cap" in caplog.text
