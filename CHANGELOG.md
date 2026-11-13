@@ -2,7 +2,7 @@
 
 All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstructed from preserved development source distributions when those releases were prepared; they are not claims that the tags were published at those earlier development times. The later malformed-query/JSON fix and timeout documentation/test were backported to the reconstructed snapshots.
 
-## Unreleased
+## 0.1.3 (2026-11-13)
 
 - Route discovery stores project-relative entry, layout, and source paths with `/` separators on every platform, keeping manifest paths and route diagnostics consistent on Windows.
 - Session lifetime (S-P1-9): sessions are now bounded twice — an idle timeout (`idle_timeout`, default `max_age`) refreshed while the user is active (rolling re-save at most every `touch_interval` seconds, default 300), and an absolute lifetime (`absolute_max_age`, default 7 days) measured from creation that rotation does not extend. Either deadline turns the next request anonymous and deletes the server entry best-effort. Built-in stores persist `created_at`/`last_seen` and `load` returns a `SessionRecord` (a `(data, csrf, version)` tuple with those timestamps); third-party stores returning a plain 3-tuple get no enforcement.
@@ -116,7 +116,7 @@ All versions below are experimental. The v0.1.0–v0.3.0 snapshots were reconstr
   `docs/WHEEL_RELEASE.md`. CI still does not upload anything to PyPI;
   publishing stays a manual maintainer step.
 
-The current release is **0.1.2** (top section). The `v0.7.0a1` section below is a release plan superseded by the 0.1.0 decision; its items were merged to `main` and are included in 0.1.0. The `v0.1.0` section at the bottom is the early reconstructed snapshot, not the current release.
+The current release is **0.1.3** (top section). The `v0.7.0a1` section below is a release plan superseded by the 0.1.0 decision; its items were merged to `main` and are included in 0.1.0. The `v0.1.0` section at the bottom is the early reconstructed snapshot, not the current release.
 
 ## 0.1.0
 
