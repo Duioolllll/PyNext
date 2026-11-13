@@ -301,3 +301,16 @@ def test_info_tolerates_unknown_render_mode(tmp_path):
     info = collect_info(tmp_path)
     assert info["manifest"]["routes"] == {"total": 1, "ssg": 0, "isr": 0, "ssr": 1, "api": 0}
     assert "1 SSR" in format_info(info)
+
+
+def test_info_tolerates_build_report_missing_keys(tmp_path):
+    # A-3: a build-report.json with only the version key must not crash
+    # `pynext info` with KeyError on the missing static_pages/routes.
+    from pynext.info import collect_info, format_info
+    report_dir = tmp_path / ".pynext"
+    report_dir.mkdir()
+    (report_dir / "build-report.json").write_text(
+        json.dumps({"version": 1, "duration_seconds": 1.0}), encoding="utf-8")
+    info = collect_info(tmp_path)
+    out = format_info(info)
+    assert "Build report: present" in out

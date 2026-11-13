@@ -151,9 +151,12 @@ def format_info(info, *, doctor=False):
         manifest_line = "absent — run `pynext build` first"
     report = info["build_report"]
     if report is not None:
-        pages = report["static_pages"]
-        report_line = (f"present ({report['duration_seconds']}s, "
-                       f"{pages['rendered']} rendered / {pages['reused']} reused static pages)")
+        # A hand-edited or truncated report may lack keys; diagnostics
+        # should still print instead of raising KeyError.
+        pages = report.get("static_pages") or {}
+        report_line = (f"present ({report.get('duration_seconds', '?')}s, "
+                       f"{pages.get('rendered', '?')} rendered / {pages.get('reused', '?')} "
+                       f"reused static pages)")
     else:
         report_line = "absent — run `pynext build`"
     lines = [
