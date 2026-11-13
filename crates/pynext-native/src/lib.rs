@@ -2940,9 +2940,11 @@ impl IdleClock {
 
     fn mark_idle(&self) {
         // Saturating: a guard must never drive the count below zero.
-        let _ = self.busy.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
-            Some(count.saturating_sub(1))
-        });
+        let _ = self
+            .busy
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
+                Some(count.saturating_sub(1))
+            });
     }
 
     fn is_busy(&self) -> bool {
