@@ -371,6 +371,13 @@ def _record_call(expression):
     ``logging`` (which reads the clock for every record) or framework code
     does not. The call chain is user code -> wrapper -> this function, so
     the user frame is two hops up.
+
+    ``exec()``/``eval()`` code runs in a ``"<string>"`` frame with no real
+    file (A1-L2): the walk skips those frames to reach the user frame that
+    ran the exec, so a clock read inside dynamically executed code is
+    recorded against the exec call site. Only ``"<string>"`` frames are
+    skipped — a standard-library frame in between still stops the walk,
+    so ``logging`` reading the clock never counts.
     """
     state = _active_state()
     if state is None:
@@ -379,6 +386,8 @@ def _record_call(expression):
     try:
         wrapper_frame = frame.f_back if frame is not None else None
         caller = wrapper_frame.f_back if wrapper_frame is not None else None
+        while caller is not None and caller.f_code.co_filename == "<string>":
+            caller = caller.f_back
         if caller is None or not _is_user_file(caller.f_code.co_filename):
             return
     finally:

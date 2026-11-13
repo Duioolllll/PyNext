@@ -409,3 +409,28 @@ def test_prerender_context_covers_executor_work():
         with ThreadPoolExecutor(max_workers=1) as pool:
             pool.submit(ctx.run, lambda: time.time() > 0).result()
     assert [a.expression for a in state.accesses] == ["time.time()"]
+
+
+def test_exec_and_eval_clock_reads_are_tracked():
+    """A1-L2: a clock read inside exec()/eval() code is recorded against
+    the exec/eval call site, not silently missed."""
+    with track_prerender("/unit", "auto") as state:
+        exec("time.time()")
+        eval("time.time()")
+    assert [a.expression for a in state.accesses] == ["time.time()", "time.time()"]
+    # The location is the real file that ran the exec, not "<string>".
+    for access in state.accesses:
+        assert "test_dynamic_tracking.py" in access.location
+        assert "<string>" not in access.location
+
+
+def test_stdlib_clock_read_still_not_tracked():
+    """A1-L2 guard: walking past "<string>" frames must not turn a
+    standard-library clock read into a dynamic access — logging reading
+    the clock for a record still does not count."""
+    import logging
+
+    logger = logging.getLogger("pynext-test-a1l2")
+    with track_prerender("/unit", "auto") as state:
+        logger.info("a log line during a prerender")
+    assert state.accesses == []
