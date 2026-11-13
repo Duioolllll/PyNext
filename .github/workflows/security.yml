@@ -2,10 +2,16 @@ name: Supply chain and container checks
 
 on:
   push:
+    branches: [main]
   pull_request:
   schedule:
     - cron: "23 5 * * 1"
   workflow_dispatch:
+
+# Do not run duplicate security scans for superseded commits on a PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
