@@ -308,6 +308,13 @@ class SecurityConfig:
             raise ValueError("csrf_cookie_samesite must be Lax, Strict or None")
         if not isinstance(self.csrf_cookie_secure, bool):
             raise TypeError("csrf_cookie_secure must be a bool")
+        # A1-L8: SameSite=None requires Secure (RFC 6265bis) — browsers
+        # reject the cookie otherwise and CSRF protection silently breaks.
+        # The session cookie already enforces this (sessions.py); the CSRF
+        # cookie config must too, instead of relying on `pynext check`.
+        if self.csrf_cookie_samesite == "None" and not self.csrf_cookie_secure:
+            raise ValueError("csrf_cookie_samesite='None' requires csrf_cookie_secure=True: "
+                             "browsers reject SameSite=None cookies without Secure")
         if isinstance(self.csrf_cookie_max_age, bool) or not isinstance(self.csrf_cookie_max_age, int) \
                 or not 0 < self.csrf_cookie_max_age <= 2_592_000:
             raise ValueError("csrf_cookie_max_age must be an integer from 1 to 2592000")
