@@ -425,3 +425,65 @@ def test_http2_prior_knowledge_preface_gets_settings_frame(tmp_path):
             await app.isr.close()
 
     asyncio.run(run())
+
+
+def test_native_body_timeout_zero_disables_timeout(tmp_path):
+    # R5-M1: body_timeout_ms=0 must mean "no timeout" on the native
+    # path, like the ASGI path (body_timeout_ms / 1000 or None) and the
+    # other native timeouts. Before the fix, a body arriving after the
+    # headers was answered 408 immediately.
+    route = tmp_path / "app" / "input"
+    route.mkdir(parents=True)
+    (route / "route.py").write_text(
+        'from pynext import JSONResponse, route\n'
+        '@route("POST")\ndef post(): return JSONResponse({"ok": True})\n',
+        encoding="utf-8")
+
+    async def run():
+        app = create_app(tmp_path)
+        server = start_native(app, asyncio.get_running_loop(), port=0,
+                              body_timeout_ms=0, body_min_rate_bytes_per_sec=0)
+        host, port = server.address.rsplit(":", 1)
+        try:
+            reader, writer = await asyncio.open_connection(host, int(port))
+            try:
+                writer.write(b"POST /input HTTP/1.1\r\nHost: localhost\r\n"
+                             b"Content-Length: 100\r\n\r\n")
+                await writer.drain()
+                # The body arrives well after the headers; with the
+                # timeout disabled the request must still succeed.
+                await asyncio.sleep(0.3)
+                writer.write(b"x" * 100)
+                await writer.drain()
+                first_line = await asyncio.wait_for(reader.readline(), timeout=5)
+                assert first_line.startswith(b"HTTP/1.1 200 "), first_line
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        finally:
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())
+
+
+def test_native_server_rejects_inverted_acquire_timeout_max(tmp_path):
+    # R5-L1: NativeServer must reject acquire_timeout_max_ms below
+    # acquire_timeout_ms like the Python validation does, instead of
+    # panicking later in effective_acquire_timeout (Duration::clamp
+    # with min > max).
+    import pytest
+    from pynext import _native
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "page.py").write_text(
+        'from pynext import Response, page\n'
+        '@page(render="ssr")\ndef Page(): return Response("ok")\n',
+        encoding="utf-8")
+    app = create_app(tmp_path)
+    try:
+        with pytest.raises(ValueError,
+                           match="acquire_timeout_max_ms must be at least acquire_timeout_ms"):
+            _native.NativeServer(
+                lambda *args: None, "127.0.0.1", 0, {}, {}, {}, app.isr.store, {},
+                acquire_timeout_ms=1000, acquire_timeout_max_ms=500)
+    finally:
+        asyncio.run(app.isr.close())

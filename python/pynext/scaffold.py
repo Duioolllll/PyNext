@@ -7,6 +7,9 @@ _GITIGNORE = """\
 .pynext/
 __pycache__/
 *.pyc
+.env*
+*.pem
+*.key
 """
 
 _BASIC_PAGE = '''from pynext import h, page

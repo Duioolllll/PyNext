@@ -346,3 +346,29 @@ def test_cli_build_error_still_reports_without_traceback(monkeypatch, tmp_path, 
         cli.main()
     assert error.value.code == 2
     assert "Island sources changed" in capsys.readouterr().err
+
+
+def test_cli_build_prints_built_routes_once(monkeypatch, tmp_path, capsys):
+    # A-4: a full build printed "Built N routes" twice (once in the
+    # mode branch, once unconditionally after it).
+    make_app(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["pynext", "build", "--dir", str(tmp_path)])
+    cli.main()
+    out = capsys.readouterr().out
+    assert out.count("Built 1 routes") == 1
+
+
+def test_cli_stage_builds_show_no_stale_summary(monkeypatch, tmp_path, capsys):
+    # A-4: --only-islands/--only-static printed "Built N routes" and
+    # the previous build's summary even though the stage build wrote
+    # no build report and rendered nothing.
+    make_app(tmp_path)
+    write_manifest(tmp_path)  # full build: writes a build report
+    for flag, line in (("--only-islands", "Compiled 0 island bundles"),
+                       ("--only-static", "Generated 1 static pages")):
+        monkeypatch.setattr(sys, "argv", ["pynext", "build", "--dir", str(tmp_path), flag])
+        cli.main()
+        out = capsys.readouterr().out
+        assert line in out
+        assert "Built" not in out
+        assert "Static pages:" not in out

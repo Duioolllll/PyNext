@@ -669,7 +669,7 @@ def _build_parser():
                                  type=_bounded(1, MAX_CONCURRENT, "--max-concurrent-per-ip"),
                                  default=None,
                                  help="execution slots one client IP may hold at once (1-1000000; "
-                                      "default 16, a quarter of the 64-slot pool, so one IP cannot "
+                                      "default 16, one eighth of the 128-slot pool, so one IP cannot "
                                       "take every slot with slow requests)")
             command.add_argument("--header-read-timeout-ms",
                                  type=_bounded(0, MAX_TIMEOUT_MS, "--header-read-timeout-ms"),
@@ -912,8 +912,12 @@ def main():
                 parser.error(str(exc))
             print(f"Exported {summary['pages']} static pages to {summary['output']}")
             print(f"Serve with: python -m http.server --directory {summary['output']}")
-        print(f"Built {len(manifest['routes'])} routes in {root / '.pynext'}")
-        _print_build_summary(root, analyze=args.analyze)
+        # The mode branch above already printed the per-mode line
+        # ("Built"/"Compiled"/"Generated"). Stage builds write no build
+        # report, so their summary would be the previous build's
+        # numbers; only print the summary for builds that wrote one.
+        if not (args.only_islands or args.only_static):
+            _print_build_summary(root, analyze=args.analyze)
         if args.standalone:
             output = Path(args.standalone_dir) if args.standalone_dir else root / ".pynext" / "standalone"
             try:
