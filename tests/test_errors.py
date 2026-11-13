@@ -96,6 +96,13 @@ def test_redirect_rejects_bad_input():
         RedirectError("/bad\nlocation")
     with pytest.raises(ValueError):
         RedirectError("/caf\u00e9")
+    # A1-L5: every C0 control character and DEL is rejected at
+    # construction, not just CR/LF — to_response() puts the location in
+    # a Location header, and the HTTP layer refuses control characters.
+    for bad in ("/bad\x00location", "/bad\tlocation", "/bad\x7flocation",
+                "/bad\rlocation", "/bad\x01location", "/bad\x1blocation"):
+        with pytest.raises(ValueError, match="control characters"):
+            RedirectError(bad)
     for status in (301, 302, 303, 307, 308):
         assert RedirectError("/x", status=status).status == status
 

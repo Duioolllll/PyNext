@@ -139,8 +139,13 @@ class RedirectError(SignalError):
     def __init__(self, location, status=307, replace=False):
         if not isinstance(location, str) or not location:
             raise ValueError("redirect location must be a non-empty string")
-        if any(c in location for c in "\r\n"):
-            raise ValueError("redirect location must not contain CR or LF")
+        # A1-L5: reject every C0 control character and DEL here, not just
+        # CR/LF. to_response() encodes the location into a Location header,
+        # and the HTTP layer refuses control characters there — so a
+        # location carrying \x00, \t or \x7f used to fail at response time
+        # instead of at construction time.
+        if any(ord(c) < 32 or ord(c) == 127 for c in location):
+            raise ValueError("redirect location must not contain control characters")
         try:
             location.encode("ascii")
         except UnicodeEncodeError as exc:
