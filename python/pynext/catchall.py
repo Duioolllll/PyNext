@@ -22,12 +22,26 @@ Concretely, at build time (``build.write_manifest``) this module:
   (``dynamic_only``);
 - verifies the enumeration is complete: every enumerated path must match at
   least one route, and the most-specific matching route — computed here
-  independently of the Rust trie, from the segment specificity ordering of
-  Next.js ``sortable-routes.ts`` (static 0, dynamic 1, catch-all 2,
-  optional catch-all 3, shorter wins on a tie) — must be the path's owning
+  independently of the Rust trie, from the segment specificity ordering
+  (static 0, affixed dynamic 1, plain dynamic 2, catch-all 3,
+  optional catch-all 4, shorter wins on a tie) — must be the path's owning
   pattern (``verify_static_enumeration``). A disagreement means the
   enumeration and the router disagree about who owns a path, so the build
   fails instead of rendering the page under the wrong route.
+
+The specificity ordering deliberately departs from Next.js
+``sortable-routes.ts`` (static 0, dynamic 1, catch-all 2, optional 3):
+Next.js has no affixed segments, but PyNext does (``v[version]``,
+``[name].json``), and the Rust trie ranks them between static and plain
+dynamic (``static > affixed > dynamic``). Using the Next.js tiers here
+made affixed routes lose to — or tie with — plain dynamic routes, so
+valid apps failed the build. Affixed segments that both match one path
+are ordered by their ``(prefix, suffix)`` pair, matching the trie's
+``BTreeMap<(prefix, suffix)>`` iteration order, so the winner here is
+the winner at runtime; only affixed segments with the same
+``(prefix, suffix)`` (e.g. ``[a].json`` vs ``[b].json``) are truly
+ambiguous — the trie stores them under one key and cannot distinguish
+them either.
 
 Only page routes take part: API routes (``route.py``) do not participate in
 static enumeration, and the router's own self-check in ``_render_static_pages``
@@ -45,10 +59,11 @@ __all__ = ["CatchAllReport", "normalize_catch_all_routes", "verify_static_enumer
 # the normalization can be tested without building an app.
 _SEGMENT_RE = re.compile(r"([^[]*)\[(\[)?(\.\.\.)?([A-Za-z0-9_-]+)\](\]?)(.*)")
 
-# Segment specificity, mirroring Next.js sortable-routes.ts
-# getSegmentSpecificity(): static 0, dynamic 1, catch-all 2, optional
-# catch-all 3.
-_SPECIFICITY = {"static": 0, "dynamic": 1, "catch_all": 2, "optional": 3}
+# Segment specificity (A1-M3): static 0, affixed dynamic 1, plain dynamic 2,
+# catch-all 3, optional catch-all 4. This departs from Next.js
+# sortable-routes.ts (which has no affixed tier) to match the Rust trie,
+# where affixed segments rank between static and plain dynamic.
+_SPECIFICITY = {"static": 0, "affixed": 1, "dynamic": 2, "catch_all": 3, "optional": 4}
 
 
 def _parse_segment(segment):
@@ -112,8 +127,46 @@ def _segment_kinds(pattern):
 
 
 def _specificity(parsed):
-    """Specificity tuple for one pattern, for most-specific-first ordering."""
-    return tuple(_SPECIFICITY[kind] for kind, *_ in parsed)
+    """Specificity tuple for one pattern, for most-specific-first ordering.
+
+    An affixed dynamic segment (``v[version]``, ``[name].json``) is more
+    specific than a plain dynamic segment (A1-M3).
+    """
+    result = []
+    for kind, _name, prefix, suffix in parsed:
+        if kind == "dynamic" and (prefix or suffix):
+            result.append(_SPECIFICITY["affixed"])
+        else:
+            result.append(_SPECIFICITY[kind])
+    return tuple(result)
+
+
+def _affixed_key(parsed):
+    """The ``(prefix, suffix)`` pair of every segment, in order.
+
+    Used to break ties between affixed segments the way the Rust trie
+    does: its affixed children live in a ``BTreeMap<(prefix, suffix)>``,
+    so the lexicographically smaller pair is tried first. Non-affixed
+    segments contribute ``("", "")``.
+    """
+    return tuple((prefix, suffix) for _kind, _name, prefix, suffix in parsed)
+
+
+def _sort_key(parsed, pattern):
+    """Full ordering key for matching patterns, most specific first."""
+    return (_specificity(parsed), len(parsed), _affixed_key(parsed), pattern)
+
+
+def _ambiguity_key(parsed):
+    """The part of the ordering that the router can distinguish.
+
+    Two patterns tied on this key are indistinguishable at runtime
+    (same segment kinds, same length, same affixed pairs), so the
+    enumeration cannot name a winner. The pattern string itself is
+    excluded: two patterns that differ only in parameter names
+    (``[a].json`` vs ``[b].json``) are still ambiguous.
+    """
+    return (_specificity(parsed), len(parsed), _affixed_key(parsed))
 
 
 def _is_catch_all(parsed):
@@ -158,15 +211,17 @@ def _matches(parsed, path_segments):
 def _matching_patterns(parsed_patterns, path):
     """All patterns matching a concrete path, most specific first.
 
-    Ordering follows Next.js sortable-routes.ts: segment specificity
-    (static < dynamic < catch-all < optional catch-all), compared segment
-    by segment, with the shorter pattern winning when one is a prefix of
-    the other. Returns a list of (pattern, parsed) pairs.
+    Ordering: segment specificity (static < affixed dynamic < plain
+    dynamic < catch-all < optional catch-all), compared segment by
+    segment, with the shorter pattern winning when one is a prefix of
+    the other, affixed segments ordered by their (prefix, suffix) pair
+    (the Rust trie's order), and the pattern string as the final
+    tie-break. Returns a list of (pattern, parsed) pairs.
     """
     segments = _split(path)
     matched = [(pattern, parsed) for pattern, parsed in parsed_patterns
                if _matches(parsed, segments)]
-    matched.sort(key=lambda item: (_specificity(item[1]), len(item[1]), item[0]))
+    matched.sort(key=lambda item: _sort_key(item[1], item[0]))
     return matched
 
 
@@ -224,7 +279,7 @@ def normalize_catch_all_routes(patterns, static_paths):
     # Most specific first: segment specificity, then shorter pattern —
     # the same ordering _matching_patterns uses, so the report lists
     # covering catch-alls in runtime priority order.
-    catch_alls.sort(key=lambda item: (_specificity(item[1]), len(item[1]), item[0]))
+    catch_alls.sort(key=lambda item: _sort_key(item[1], item[0]))
 
     coverage = {}
     shadowed = {}
@@ -269,7 +324,7 @@ def verify_static_enumeration(patterns, static_paths):
             raise ValueError(
                 f"Static path {path} is owned by {owner} but the most specific "
                 f"matching route is {winner}")
-        if len(matched) > 1 and _specificity(matched[0][1]) == _specificity(matched[1][1]):
+        if len(matched) > 1 and _ambiguity_key(matched[0][1]) == _ambiguity_key(matched[1][1]):
             raise ValueError(
                 f"Static path {path} is ambiguously matched by {matched[0][0]} "
                 f"and {matched[1][0]}")
