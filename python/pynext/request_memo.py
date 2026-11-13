@@ -21,6 +21,10 @@ Rules (mirroring ``IncrementalCache.get`` bypassing the RDC after
 
 * Values are cached for the request only; there is no TTL and no
   cross-request sharing. Use :mod:`pynext.fetch_cache` for that.
+  Entries are bounded (``RequestMemo.MAX_ENTRIES``, 1024, oldest
+  evicted first) so a memo that outlives its request — e.g. one created
+  by :func:`memoize` outside a request scope — cannot grow without
+  bound (A6-L5).
 * Concurrent ``get_or_compute`` calls for the same key share one
   in-flight computation (``asyncio.shield`` so one canceller cannot kill
   the shared compute). A failed computation is *not* cached: the entry
@@ -56,12 +60,26 @@ _request_memo_var = contextvars.ContextVar("pynext_request_memo", default=None)
 class RequestMemo:
     """One request's memo table: values plus in-flight computations."""
 
+    #: Maximum memoized values (A6-L5). A memo created outside a request
+    #: scope (see :func:`ensure_request_memo`) is never reset, so without
+    #: a bound its entries would accumulate forever; past the bound the
+    #: oldest value is dropped first. Request-scoped memos die with the
+    #: request long before this matters.
+    MAX_ENTRIES = 1024
+
     def __init__(self):
         self._values = {}
         self._inflight = {}
         # Bumped by clear(): completions from an older generation must
         # not store their value back into the memo (P2-3).
         self._generation = 0
+
+    def _store(self, key, value):
+        """Store ``value`` under ``key``, evicting oldest first past the bound."""
+        if key not in self._values:
+            while len(self._values) >= self.MAX_ENTRIES:
+                self._values.pop(next(iter(self._values)))
+        self._values[key] = value
 
     def __contains__(self, key):
         return key in self._values or key in self._inflight
@@ -83,7 +101,7 @@ class RequestMemo:
         computation leaves the generation alone, so unrelated in-flight
         computations still store normally.
         """
-        self._values[key] = value
+        self._store(key, value)
         if self._inflight.pop(key, None) is not None:
             self._generation += 1
 
@@ -143,7 +161,7 @@ class RequestMemo:
             if self._inflight.get(key) is task:
                 self._inflight.pop(key, None)
             return value
-        self._values[key] = value
+        self._store(key, value)
         self._inflight.pop(key, None)
         return value
 
@@ -152,7 +170,7 @@ class RequestMemo:
         if key in self._values:
             return self._values[key]
         value = compute()
-        self._values[key] = value
+        self._store(key, value)
         return value
 
 
