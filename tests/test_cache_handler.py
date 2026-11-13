@@ -297,6 +297,113 @@ def test_isr_cache_with_named_sqlite_handler(tmp_path):
     _run(run())
 
 
+# ---------------------------------------------------------------------------
+# A-1: SharedCacheHandler tag invalidation (revalidate_tag / get_tag_times)
+# ---------------------------------------------------------------------------
+
+def test_sqlite_handler_revalidate_tag_and_get_tag_times(tmp_path):
+    """A-1: the sqlite handler records tag invalidations where both its
+    read paths consult them — the shared manifest (lookup_entry) and
+    the handler tag table (get, for entries written via set)."""
+    path = str(tmp_path / "cache.sqlite3")
+    first = SQLiteCacheHandler(cache_path=path)
+    second = SQLiteCacheHandler(cache_path=path)
+    try:
+        assert first.set("/b", CacheEntry(value=b"world", tags=("x",), revalidate=60, stale=5))
+        assert second.get("/b").value == b"world"
+        assert first.revalidate_tag("x") is True
+        stale_at, expired_at = second.get_tag_times(["x"])["x"]
+        assert stale_at is not None and expired_at is not None
+        assert second.get("/b") is None  # mirror: set-written entry retired
+        assert second.get_tag_times(["never"])["never"] == (None, None)
+        # Deferred invalidation demotes to stale instead of expiring.
+        assert first.set("/c", CacheEntry(value=b"later", tags=("y",), revalidate=3600, stale=60))
+        assert first.revalidate_tag("y", expire=3600) is True
+        stale_at, expired_at = second.get_tag_times(["y"])["y"]
+        assert expired_at > stale_at
+        got = second.get("/c")
+        assert got is not None and got.tag_state == "stale"
+    finally:
+        first.close()
+        second.close()
+
+
+def test_isr_cache_sqlite_handler_cross_worker_tag_invalidation(tmp_path):
+    """A-1: revalidate_tag on the sqlite handler path must reach the
+    other worker — before the fix the call returned False (the handler
+    had no revalidate_tag) and worker 2 kept serving the entry fresh."""
+    path = str(tmp_path / "isr.sqlite3")
+    calls = 0
+
+    async def render():
+        nonlocal calls
+        calls += 1
+        return Response(b"<p>tagged</p>")
+
+    async def run():
+        c1 = ISRCache(cache_handler="sqlite", cache_path=path)
+        c2 = ISRCache(cache_handler="sqlite", cache_path=path)
+        try:
+            policy = {"revalidate": 3600.0, "stale": 3600.0}
+            assert await c1.get_or_render("/page", policy, render, tags=("t1",)) == b"<p>tagged</p>"
+            assert calls == 1
+            entry = await c2._shared_entry("/page")
+            assert entry is not None and entry.status == "fresh"
+            assert await c1.revalidate_tag("t1") is True
+            entry = await c2._shared_entry("/page")
+            assert entry is not None and entry.status == "expired"
+            assert await c2.get_or_render("/page", policy, render, tags=("t1",)) == b"<p>tagged</p>"
+            assert calls == 2
+        finally:
+            await c1.close()
+            await c2.close()
+
+    _run(run())
+
+
+def test_isr_cache_sqlite_handler_retained_body_voided_cross_worker(tmp_path):
+    """A-1 (related): a cross-worker tag invalidation must void the
+    other worker's retained previous body — before the fix
+    _retained_body swallowed the missing get_tag_times and the stale
+    body could resurrect."""
+    path = str(tmp_path / "isr.sqlite3")
+
+    async def render():
+        return Response(b"<p>kept</p>")
+
+    async def run():
+        c1 = ISRCache(cache_handler="sqlite", cache_path=path)
+        c2 = ISRCache(cache_handler="sqlite", cache_path=path)
+        try:
+            policy = {"revalidate": 3600.0, "stale": 3600.0}
+            assert await c2.get_or_render("/page", policy, render, tags=("t1",)) == b"<p>kept</p>"
+            assert await c2._retained_body("/page", ("t1",)) == b"<p>kept</p>"
+            assert await c1.revalidate_tag("t1") is True
+            assert await c2._retained_body("/page", ("t1",)) is None
+        finally:
+            await c1.close()
+            await c2.close()
+
+    _run(run())
+
+
+def test_isr_cache_memory_handler_revalidate_tag_get_tag_times():
+    """A-1 (related): the plain-handler adapter must expose
+    get_tag_times — before the fix _retained_body swallowed the
+    missing method and skipped the retention check entirely."""
+    async def run():
+        cache = ISRCache(cache_handler="memory")
+        try:
+            assert await cache.revalidate_tag("t1") is True
+            stale_at, expired_at = cache.shared.get_tag_times(["t1"])["t1"]
+            assert stale_at is None and expired_at is not None
+            assert cache.shared.get_tag_times(["never"])["never"] == (None, None)
+        finally:
+            await cache.close()
+
+    _run(run())
+
+
 def test_isr_cache_with_custom_plain_handler_instance():
     handler = _DictHandler()
     calls = 0

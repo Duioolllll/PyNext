@@ -945,6 +945,27 @@ class SharedCacheHandler(CacheHandler):
     def variant_generation(self, key, *, invalidate=False):
         """Get or replace a path generation atomically across workers."""
 
+    @abstractmethod
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation in the shared manifest.
+
+        ``expire=None`` marks entries carrying the tag expired
+        immediately; ``expire`` seconds keeps them merely stale until
+        that delay passes. Entries generated after this call are
+        unaffected. Returns True when the record was stored, so other
+        workers see it on their next lookup. Backends without a shared
+        store may keep the record process-local.
+        """
+
+    @abstractmethod
+    def get_tag_times(self, tags):
+        """Return ``{tag: (stale_at, expired_at)}`` in wall-clock seconds.
+
+        A missing tag maps to ``(None, None)``. ``ISRCache`` consults
+        this to keep a retained previous body from resurrecting after a
+        cross-worker invalidation.
+        """
+
     def lookup(self, key):
         """``CacheBackend``-compatible read: ``(status, body)``.
 
@@ -1277,6 +1298,33 @@ class SQLiteCacheHandler(SharedCacheHandler):
             self._meta_conn.commit()
         return None
 
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation in the shared manifest (A-1).
+
+        The backend's ``tags`` table is what cross-worker lookups
+        consult (``lookup_entry``), so the shared record goes there.
+        The handler's own ``get`` judges entries against
+        ``handler_tags``, so the same invalidation is mirrored there
+        too — same instant, same semantics as :meth:`update_tags`.
+        The mirror is best-effort: the shared record is what other
+        workers see, and a failed mirror only affects entries written
+        through :meth:`set` (which carry no backend tags).
+        """
+        tag = _validate_tag(tag)
+        expire = _validate_tag_expire(expire)
+        recorded = self.backend.revalidate_tag(tag, expire)
+        if recorded:
+            try:
+                durations = {"expire": expire} if expire is not None else None
+                self.update_tags([tag], durations)
+            except Exception:
+                log.warning("SQLite handler tag mirror failed for %s", tag, exc_info=True)
+        return recorded
+
+    def get_tag_times(self, tags):
+        """Tag invalidation instants from the shared manifest (A-1)."""
+        return self.backend.get_tag_times(tags)
+
     # -- SharedCacheHandler coordination (delegated to the backend) ------
     def lookup_entry(self, key):
         return self.backend.lookup_entry(key)
@@ -1369,10 +1417,15 @@ class RedisCacheHandler(SharedCacheHandler):
 
     The body, leases and generations live in :class:`RedisCacheBackend`;
     entry metadata lives in a ``:meta`` hash next to the entry key and
-    tag revalidation instants in ``pynext:isr:tag:<sha256>`` hashes, so
-    both are shared across processes. Tag rows expire after
-    ``MAX_CACHE_SECONDS`` (entries cannot outlive that), meta rows
-    expire with their entry.
+    tag revalidation instants in ``pynext:isr:tag:<sha256>`` strings
+    (``"stale_ms,expired_ms"``, the same encoding
+    :class:`RedisCacheBackend` uses), so both are shared across
+    processes. Tag rows expire after ``MAX_CACHE_SECONDS`` (entries
+    cannot outlive that), meta rows expire with their entry.
+
+    The tag encoding is deliberately the backend's string format, not
+    a hash: handler and backend share the tag key, so two encodings
+    would collide with WRONGTYPE when the APIs are mixed (A-4).
     """
 
     name = "redis"
@@ -1437,27 +1490,49 @@ class RedisCacheHandler(SharedCacheHandler):
         cleaned = _validate_tags(tags)
         if cleaned is None:
             raise ValueError("tags must be a list or tuple of up to 64 non-empty strings")
+        values = self.client.mget([self._tag_key(tag) for tag in cleaned])
         instants = []
-        for tag in cleaned:
-            row = self.client.hmget(self._tag_key(tag), "stale_at", "expired_at")
-            stale_at, expired_at = row[0], row[1]
-            if stale_at is not None or expired_at is not None:
-                instants.append(float(stale_at) if stale_at is not None else float(expired_at))
+        for value in values:
+            if not value:
+                continue
+            try:
+                stale_at, _expired_at = (
+                    int(part) for part in value.decode("ascii").split(",", 1))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            instants.append(stale_at / 1000)
         return max(instants) if instants else 0.0
 
     def update_tags(self, tags, durations=None):
+        # Tag records share the backend's "stale_ms,expired_ms" string
+        # encoding (see RedisCacheBackend.revalidate_tag): handler and
+        # backend read and write the same key, so the encodings must
+        # match or a mixed read raises WRONGTYPE (A-4).
         cleaned, expire = _validate_tag_update(tags, durations)
-        now = time.time()
+        now_ms = math.ceil(time.time() * 1000)
+        ttl_ms = (math.ceil(expire * 1000) if expire is not None else 0) \
+            + math.ceil(MAX_CACHE_SECONDS * 1000) + math.ceil(LEASE_TTL * 1000)
         for tag in cleaned:
-            key = self._tag_key(tag)
-            if expire is None:
-                self.client.hset(key, mapping={"expired_at": repr(now)})
-                self.client.hdel(key, "stale_at")
-            else:
-                self.client.hset(key, mapping={"stale_at": repr(now),
-                                               "expired_at": repr(now + expire)})
-            self.client.pexpire(key, math.ceil(MAX_CACHE_SECONDS * 1000))
+            stale_at = now_ms
+            expired_at = now_ms if expire is None else now_ms + math.ceil(expire * 1000)
+            self.client.set(self._tag_key(tag),
+                            f"{stale_at},{expired_at}".encode("ascii"), px=ttl_ms)
         return None
+
+    def revalidate_tag(self, tag, expire=None):
+        """Record a tag invalidation through the shared backend (A-1).
+
+        The backend's string tag record is what both the shared lookup
+        path (``lookup_entry``) and this handler's ``get`` consult —
+        A-4 unified the encodings — so a single backend write covers
+        both. Raises :class:`SharedCacheUnavailable` when Redis is
+        unreachable, like the other backend-delegated calls.
+        """
+        return self.backend.revalidate_tag(tag, expire)
+
+    def get_tag_times(self, tags):
+        """Tag invalidation instants from the shared manifest (A-1)."""
+        return self.backend.get_tag_times(tags)
 
     # -- SharedCacheHandler coordination (delegated to the backend) ------
     def lookup_entry(self, key):
@@ -1515,12 +1590,22 @@ class RedisCacheHandler(SharedCacheHandler):
         return bool(self.client.delete(self._meta_key(key)))
 
     def _tag_times(self, tags):
+        # Same "stale_ms,expired_ms" string encoding as the backend
+        # (see update_tags): a missing or unparseable record maps to
+        # (None, None), mirroring RedisCacheBackend.get_tag_times.
+        values = self.client.mget([self._tag_key(tag) for tag in tags])
         times = {}
-        for tag in tags:
-            row = self.client.hmget(self._tag_key(tag), "stale_at", "expired_at")
-            stale_at = float(row[0]) if row[0] is not None else None
-            expired_at = float(row[1]) if row[1] is not None else None
-            times[tag] = (stale_at, expired_at)
+        for tag, value in zip(tags, values):
+            if not value:
+                times[tag] = (None, None)
+                continue
+            try:
+                stale_at, expired_at = (
+                    int(part) for part in value.decode("ascii").split(",", 1))
+            except (ValueError, UnicodeDecodeError):
+                times[tag] = (None, None)
+                continue
+            times[tag] = (stale_at / 1000, expired_at / 1000)
         return times
 
 
@@ -2997,6 +3082,16 @@ class _PlainHandlerSharedAdapter(SharedCacheHandler):
         self._tags.update([tag], durations)
         return True
 
+    def get_tag_times(self, tags):
+        """Tag invalidation instants from the local mirror (A-1).
+
+        The wrapped handler keeps its own tag store, but the adapter
+        judges entries by the render-start time, so the mirror — not
+        the handler — is the authority here, exactly like
+        :meth:`_tag_times`.
+        """
+        return self._tags.times(tags)
+
     def refresh_tags(self):
         return self.handler.refresh_tags()
 
@@ -3853,7 +3948,11 @@ class ISRCache:
             if entry is _SHARED_UNAVAILABLE:
                 break
             if entry is not None and entry.status == "fresh":
-                self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                # Populate L1 from the shared entry — via _store_insert so
+                # the body is also remembered as this worker's retained
+                # last-known-good value (C-2), like the normal fresh-hit
+                # path (A-2).
+                self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
                 return True, True
             # The earlier set finished without leaving a fresh entry
             # (failed, fenced out, or private); loop and register our own
@@ -4391,7 +4490,9 @@ class ISRCache:
         if refreshed is not None:
             entry = refreshed
             if entry.status == "fresh":
-                self.store.insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
+                # Via _store_insert so the coalesced body is also retained
+                # (C-2), like the fresh-hit path just above (A-2).
+                self._store_insert(key, entry.body, entry.fresh_remaining, entry.stale_remaining)
                 return entry.body
         task = self._inflight.get(key)
         if task is not None:
