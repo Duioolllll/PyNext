@@ -204,7 +204,7 @@ def test_info_without_manifest(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["pynext", "info", "--dir", str(tmp_path)])
     cli.main()
     out = capsys.readouterr().out
-    assert "PyNext 0.1.2" in out
+    assert "PyNext 0.1.3" in out
     assert "Python 3" in out
     assert "Native extension: loaded" in out
     assert "esbuild: not found (no islands, not needed)" in out

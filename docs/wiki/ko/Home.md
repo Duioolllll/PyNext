@@ -1,8 +1,8 @@
 # PyNext 공식 위키
 
-**PyNext 0.1.2 — 실험적인 Python + Rust 풀스택 웹 프레임워크**
+**PyNext 0.1.3 — 실험적인 Python + Rust 풀스택 웹 프레임워크**
 
-[English](../en/Home.md) · [GitHub 저장소](https://github.com/Duioolllll/PyNext) · [릴리스](https://github.com/Duioolllll/PyNext/releases/tag/v0.1.2) · [라이선스](../../../LICENSE)
+[English](../en/Home.md) · [GitHub 저장소](https://github.com/Duioolllll/PyNext) · [릴리스](https://github.com/Duioolllll/PyNext/releases/tag/v0.1.3) · [라이선스](../../../LICENSE)
 
 PyNext는 Next.js의 파일 기반 개발 경험에서 영감을 받아, **Python 페이지·API**와 **Rust 라우터·HTML 렌더러·Axum/Tokio HTTP 엔진**을 결합한 독립적인 실험 프로젝트입니다. **Next.js, React 또는 React Server Components 호환 구현이 아닙니다.**
 

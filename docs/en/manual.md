@@ -2,7 +2,7 @@
 
 [한국어](../ko/manual.md) · [日本語](../ja/manual.md) · [简体中文](../zh-CN/manual.md)
 
-This manual describes the code in this checkout, corresponding to the experimental **0.1.2** version. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
+This manual describes the code in this checkout, corresponding to the experimental **0.1.3** version. PyNext is an experimental Python + Rust full-stack framework. It is not compatible with Next.js, React, or React Server Components. Do not expose this prototype directly to the public internet or run untrusted applications with it. See the [version history](../../CHANGELOG.md) and [future work](../PRODUCTION_ROADMAP.md).
 
 > Canonical source: this English manual is the single source of truth for PyNext documentation. The Korean, Japanese, and Simplified Chinese manuals are translations of it; if they disagree, this manual wins. The capability list is generated from code — see [FEATURES](../FEATURES.md).
 
