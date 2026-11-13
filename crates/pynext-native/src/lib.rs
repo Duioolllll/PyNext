@@ -3490,6 +3490,17 @@ impl NativeServer {
                 "max_concurrent_per_ip is outside the supported range",
             ));
         }
+        // The adaptive acquire timeout clamps the EWMA to [base, max];
+        // a ceiling below the base would panic there (Duration::clamp
+        // requires min <= max), so reject it here like the Python
+        // validation does instead of panicking on a queued request.
+        if let Some(max) = acquire_timeout_max_ms {
+            if max < acquire_timeout_ms {
+                return Err(PyValueError::new_err(
+                    "acquire_timeout_max_ms must be at least acquire_timeout_ms",
+                ));
+            }
+        }
         // S-P1-11: the fast-path budget defaults to 4x the execution
         // slots — generous for cheap static responses, but still a cap
         // instead of the bare connection limit. An explicit 0 would shed

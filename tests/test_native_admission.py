@@ -464,3 +464,26 @@ def test_native_body_timeout_zero_disables_timeout(tmp_path):
             await asyncio.to_thread(server.stop)
             await app.isr.close()
     asyncio.run(run())
+
+
+def test_native_server_rejects_inverted_acquire_timeout_max(tmp_path):
+    # R5-L1: NativeServer must reject acquire_timeout_max_ms below
+    # acquire_timeout_ms like the Python validation does, instead of
+    # panicking later in effective_acquire_timeout (Duration::clamp
+    # with min > max).
+    import pytest
+    from pynext import _native
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "page.py").write_text(
+        'from pynext import Response, page\n'
+        '@page(render="ssr")\ndef Page(): return Response("ok")\n',
+        encoding="utf-8")
+    app = create_app(tmp_path)
+    try:
+        with pytest.raises(ValueError,
+                           match="acquire_timeout_max_ms must be at least acquire_timeout_ms"):
+            _native.NativeServer(
+                lambda *args: None, "127.0.0.1", 0, {}, {}, {}, app.isr.store, {},
+                acquire_timeout_ms=1000, acquire_timeout_max_ms=500)
+    finally:
+        asyncio.run(app.isr.close())
