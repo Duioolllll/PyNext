@@ -78,7 +78,11 @@ def manifest_info(root):
             if isinstance(spec, dict) and spec.get("kind") == "route":
                 counts["api"] += 1
             else:
-                counts[modes.get(pattern, "ssr")] += 1
+                # A stale or hand-edited manifest may carry a render
+                # mode this version does not know; diagnostics should
+                # still print, counting the route as SSR.
+                mode = modes.get(pattern, "ssr")
+                counts[mode if mode in ("ssg", "isr", "ssr") else "ssr"] += 1
     return {"present": True, "schema_version": saved.get("schema_version"), "routes": counts}
 
 

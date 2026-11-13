@@ -285,3 +285,19 @@ def test_growing_generator_output_renders_new_pages(tmp_path):
     (tmp_path / "app" / "params.json").write_text('["a", "b"]', encoding="utf-8")
     write_manifest(tmp_path)
     assert set(static_digests(tmp_path)) == {"/blog/a", "/blog/b"}
+
+
+def test_info_tolerates_unknown_render_mode(tmp_path):
+    # A-2: an unknown render mode in the manifest must not crash
+    # `pynext info` with KeyError; it is counted as SSR.
+    from pynext.info import collect_info, format_info
+    manifest_dir = tmp_path / ".pynext"
+    manifest_dir.mkdir()
+    (manifest_dir / "manifest.json").write_text(json.dumps({
+        "schema_version": 10,
+        "routes": {"/": {"kind": "page"}},
+        "render_modes": {"/": "bogus-mode"},
+    }), encoding="utf-8")
+    info = collect_info(tmp_path)
+    assert info["manifest"]["routes"] == {"total": 1, "ssg": 0, "isr": 0, "ssr": 1, "api": 0}
+    assert "1 SSR" in format_info(info)
