@@ -459,6 +459,22 @@ def _validate_location(location: str) -> str:
         raise ValueError("redirect location must be a non-empty string")
     if any(ord(c) < 32 or ord(c) == 127 or c == " " for c in location):
         raise ValueError("redirect location must not contain control characters or spaces")
+    if "\\" in location:
+        # A6-M1: browsers (WHATWG URL) treat "\\" as "/" in special
+        # schemes, so "/\\evil.com" resolves to "//evil.com" — an open
+        # redirect that the scheme-relative check below would miss.
+        raise ValueError("redirect location must not contain backslashes")
+    try:
+        location.encode("ascii")
+    except UnicodeEncodeError as exc:
+        # A6-L1: redirect_response encodes the location as ASCII for the
+        # Location header; rejecting here raises ValueError (the error
+        # the middleware layer expects) instead of letting
+        # UnicodeEncodeError escape as a 500. Percent-encode non-ASCII
+        # characters before calling.
+        raise ValueError(
+            "redirect location must be ASCII (percent-encode non-ASCII characters)"
+        ) from exc
     if location.startswith("/") and not location.startswith("//"):
         return location
     if _ABSOLUTE_URL.fullmatch(location):

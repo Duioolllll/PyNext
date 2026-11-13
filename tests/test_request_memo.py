@@ -119,3 +119,134 @@ def _return(value):
         return value
 
     return compute
+
+
+def test_set_during_inflight_compute_is_not_clobbered_a6_l4():
+    """A6-L4: a value set() while a computation is in flight must win.
+
+    Before the fix, get_or_compute stored its result unconditionally on
+    completion, so a slow computation overwrote a newer explicit set()
+    (read-your-own-writes violation). The awaiting caller still gets the
+    computed value; only the memo keeps the set value.
+    """
+
+    async def run():
+        memo = RequestMemo()
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        async def slow():
+            started.set()
+            await resume.wait()
+            return "STALE-COMPUTED"
+
+        pending = asyncio.create_task(memo.get_or_compute("k", slow))
+        await started.wait()
+        memo.set("k", "FRESH-SET")
+        assert memo.get("k") == "FRESH-SET"
+
+        resume.set()
+        assert await pending == "STALE-COMPUTED"
+        assert memo.get("k") == "FRESH-SET"
+
+    asyncio.run(run())
+
+
+def test_invalidate_during_inflight_compute_is_not_resurrected_a6_l4():
+    """Same generation guard as A6-L4, for invalidate(): a computation
+    in flight when its key is invalidated must not store back."""
+
+    async def run():
+        memo = RequestMemo()
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        async def slow():
+            started.set()
+            await resume.wait()
+            return "STALE-COMPUTED"
+
+        pending = asyncio.create_task(memo.get_or_compute("k", slow))
+        await started.wait()
+        assert memo.invalidate("k") is True
+        assert memo.get("k") is None
+
+        resume.set()
+        assert await pending == "STALE-COMPUTED"
+        assert memo.get("k") is None
+
+    asyncio.run(run())
+
+
+def test_set_without_inflight_compute_leaves_other_computes_alone():
+    """A set() that displaces no computation must not disturb an
+    in-flight computation for another key."""
+
+    async def run():
+        memo = RequestMemo()
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        async def slow():
+            started.set()
+            await resume.wait()
+            return "computed-j"
+
+        pending = asyncio.create_task(memo.get_or_compute("j", slow))
+        await started.wait()
+        memo.set("k", "fresh-k")
+        resume.set()
+        assert await pending == "computed-j"
+        assert memo.get("j") == "computed-j"
+        assert memo.get("k") == "fresh-k"
+
+    asyncio.run(run())
+
+
+def test_memo_entries_are_bounded_a6_l5():
+    """A6-L5: entries past MAX_ENTRIES evict the oldest first.
+
+    A memo that never resets (memoize() outside a request scope) must
+    not grow without bound.
+    """
+    memo = RequestMemo()
+    for i in range(RequestMemo.MAX_ENTRIES + 50):
+        memo.set(f"key-{i}", i)
+    assert len(memo._values) == RequestMemo.MAX_ENTRIES
+    assert memo.get("key-0") is None
+    assert memo.get("key-49") is None
+    assert memo.get("key-50") == 50
+    assert memo.get(f"key-{RequestMemo.MAX_ENTRIES + 49}") == RequestMemo.MAX_ENTRIES + 49
+
+
+def test_get_or_compute_respects_entry_bound_a6_l5():
+    """A6-L5: a completed computation also evicts oldest first."""
+
+    async def run():
+        memo = RequestMemo()
+        for i in range(RequestMemo.MAX_ENTRIES):
+            memo.set(f"key-{i}", i)
+        assert await memo.get_or_compute("new-key", _return("new")) == "new"
+        assert len(memo._values) == RequestMemo.MAX_ENTRIES
+        assert memo.get("key-0") is None
+        assert memo.get("new-key") == "new"
+
+    asyncio.run(run())
+
+
+def test_memoize_outside_request_scope_is_bounded_a6_l5():
+    """A6-L5: the review's repro — memoize() outside a request scope
+    creates a memo that is never reset; its entries must still be
+    bounded. Runs in a fresh context so the leaked memo cannot pollute
+    other tests.
+    """
+    import contextvars
+
+    from pynext.request_memo import current_memo, memoize_sync
+
+    def run():
+        for i in range(RequestMemo.MAX_ENTRIES + 10):
+            memoize_sync(f"key-{i}", lambda i=i: i)
+        memo = current_memo()
+        assert memo is not None
+        assert len(memo._values) == RequestMemo.MAX_ENTRIES
+        assert memo.get("key-0") is None
+
+    contextvars.Context().run(run)

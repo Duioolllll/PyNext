@@ -605,6 +605,13 @@ class MetricsCollector:
     """
 
     _MAX_SAMPLES = 2048
+    #: HTTP methods counted individually in per-route metrics (A6-L3).
+    #: Any other method token is folded into "OTHER": the method comes
+    #: from the request line, so counting it verbatim would let an
+    #: attacker grow the per-route ``methods`` dict without bound, one
+    #: entry per distinct token.
+    _KNOWN_METHODS = frozenset(
+        {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"})
 
     def __init__(self, enabled=True):
         self.enabled = enabled
@@ -693,7 +700,9 @@ class MetricsCollector:
             })
             entry["count"] += 1
             entry["status"][str(status)] = entry["status"].get(str(status), 0) + 1
-            entry["methods"][method] = entry["methods"].get(method, 0) + 1
+            upper = method.upper() if isinstance(method, str) else ""
+            bucket = upper if upper in self._KNOWN_METHODS else "OTHER"
+            entry["methods"][bucket] = entry["methods"].get(bucket, 0) + 1
             entry["latency"].append(float(latency_ms))
             entry["bytes"] += int(response_bytes or 0)
             if queue_wait_ms is not None:

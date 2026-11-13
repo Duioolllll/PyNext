@@ -60,6 +60,22 @@ def test_destination_must_not_contain_dot_segments():
         compile_custom_routes({"redirects": [{"source": "/old", "destination": "/blog/../x"}]})
 
 
+def test_destination_must_not_contain_backslash_a6_l2():
+    """A6-L2: a backslash in the redirect destination path is rejected.
+
+    Browsers (WHATWG URL) treat "\\" as "/" for http(s), so a Location
+    of "/\\evil.com" resolves to "//evil.com" — an open redirect of the
+    same class as A6-M1. The percent-encoded form stays accepted.
+    """
+    with pytest.raises(ValueError):
+        compile_custom_routes({"redirects": [{"source": "/old", "destination": "/\\evil.com"}]})
+    with pytest.raises(ValueError):
+        compile_custom_routes({"redirects": [{"source": "/old", "destination": "https://example.com/\\evil.com"}]})
+    routes = compile_custom_routes(
+        {"redirects": [{"source": "/old", "destination": "/%5cevil.com"}]})
+    assert routes.match_redirect("/old") == (307, "/%5cevil.com")
+
+
 def test_redirect_destination_may_be_absolute_but_rewrite_may_not():
     routes = compile_custom_routes(
         {"redirects": [{"source": "/out", "destination": "https://example.com/x"}]})

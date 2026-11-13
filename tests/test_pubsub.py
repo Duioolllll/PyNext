@@ -48,3 +48,26 @@ def test_pubsub_wakes_waiter_on_close_and_validates_bounds():
     asyncio.run(run())
     with pytest.raises(ValueError):
         WebSocketPubSub(queue_size=0)
+
+
+def test_publish_rejects_lone_surrogate_with_value_error_a7_l2():
+    """A7-L2: a str containing a lone surrogate must fail with
+    ValueError, not UnicodeEncodeError.
+
+    The documented contract is "Messages are str or bytes"; a str that
+    is not valid UTF-8 text is rejected at publish time instead of
+    leaking an unexpected exception type to the caller.
+    """
+
+    async def run():
+        broker = WebSocketPubSub()
+        async with broker.subscribe("t"):
+            with pytest.raises(ValueError, match="valid UTF-8"):
+                await broker.publish("t", "bad\ud800surrogate")
+            with pytest.raises(ValueError, match="valid UTF-8"):
+                await broker.publish("t", "\udfff")
+            # Valid text and bytes still publish normally.
+            assert await broker.publish("t", "ok") == 1
+            assert await broker.publish("t", b"ok-bytes") == 1
+
+    asyncio.run(run())
