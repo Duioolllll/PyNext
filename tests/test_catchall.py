@@ -251,3 +251,39 @@ def test_cli_build_is_quiet_without_catch_alls(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Built 1 routes" in out
     assert "Catch-all coverage" not in out
+
+
+def test_verify_affixed_dynamic_beats_plain_dynamic():
+    """A1-M3: an affixed dynamic segment (v[id]) is more specific than a
+    plain dynamic segment ([id]), matching the Rust trie's
+    static > affixed > dynamic order — the build must not fail for a
+    valid app, whichever of the two owns the path.
+    """
+    # /v1 is owned by the affixed route: the trie serves it, so the
+    # enumeration must agree instead of naming /[id] the winner.
+    verify_static_enumeration(["/v[id]", "/[id]"], {"/v1": "/v[id]"})
+    # The same pair with the plain route as owner is genuinely wrong:
+    # the trie serves /v[id], so the owner must be /v[id].
+    with pytest.raises(ValueError, match="most specific"):
+        verify_static_enumeration(["/v[id]", "/[id]"], {"/v1": "/[id]"})
+    # Suffix affix: /posts/x.json is owned by /posts/[name].json.
+    verify_static_enumeration(
+        ["/posts/[name].json", "/posts/[id]"], {"/posts/x.json": "/posts/[name].json"})
+
+
+def test_verify_affixed_tiebreak_follows_trie_order():
+    """A1-M3: two affixed segments matching one path have a deterministic
+    runtime winner (the trie's BTreeMap<(prefix, suffix)> order), so the
+    build must accept the trie winner and only reject a true tie.
+    """
+    # ("", ".json") < ("v", ""): [id].json wins /v1.json at runtime.
+    verify_static_enumeration(
+        ["/v[id]", "/[id].json"], {"/v1.json": "/[id].json"})
+    with pytest.raises(ValueError, match="most specific"):
+        verify_static_enumeration(
+            ["/v[id]", "/[id].json"], {"/v1.json": "/v[id]"})
+    # Same (prefix, suffix) with different names: the trie stores both
+    # under one key and cannot distinguish them — still ambiguous.
+    with pytest.raises(ValueError, match="ambiguously matched"):
+        verify_static_enumeration(
+            ["/[a].json", "/[b].json"], {"/x.json": "/[a].json"})

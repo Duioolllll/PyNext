@@ -895,11 +895,30 @@ def _deserialize(data):
     return FetchResult(status, headers, body)
 
 
+def _read_capped(fp):
+    """Read at most ``MAX_CACHE_BODY_BYTES + 1`` bytes from ``fp``.
+
+    The ``+1`` distinguishes an exactly-at-cap body from an over-cap
+    one without buffering more than the cap: an upstream that streams
+    unbounded data must not exhaust this worker's memory (A-3). The
+    2 MiB store cap in ``_fetch_once`` only runs after the whole body
+    was already read, so it cannot protect the read itself. Raises
+    ``ValueError`` when the body exceeds the cap.
+    """
+    data = fp.read(MAX_CACHE_BODY_BYTES + 1)
+    if len(data) > MAX_CACHE_BODY_BYTES:
+        raise ValueError(
+            f"urllib_fetcher response body exceeds the {MAX_CACHE_BODY_BYTES}-byte cap")
+    return data
+
+
 async def urllib_fetcher(url, *, method="GET", headers=(), body=None, timeout=10.0):
     """Fetch ``url`` with the stdlib and return a :class:`FetchResult`.
 
     Only ``http``/``https`` URLs are allowed. HTTP error statuses are
-    returned as results, not raised; transport errors propagate.
+    returned as results, not raised; transport errors propagate. Response
+    bodies larger than ``MAX_CACHE_BODY_BYTES`` raise ``ValueError``
+    instead of being buffered (see :func:`_read_capped`).
     """
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -921,11 +940,11 @@ async def urllib_fetcher(url, *, method="GET", headers=(), body=None, timeout=10
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return FetchResult(response.status,
                                    tuple((k.lower(), v) for k, v in response.headers.items()),
-                                   response.read())
+                                   _read_capped(response))
         except urllib.error.HTTPError as exc:
             return FetchResult(exc.code,
                                tuple((k.lower(), v) for k, v in exc.headers.items()),
-                               exc.read())
+                               _read_capped(exc))
 
     return await asyncio.to_thread(_do)
 

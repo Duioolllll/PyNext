@@ -950,6 +950,14 @@ class Session(MutableMapping):
         self._initial = json.dumps({"data": self._data, "csrf": self._csrf}, sort_keys=True)
         self._rotate = False
         self._invalidated = False
+        # Purposes whose single-use token entry this request consumed
+        # (A3-L1): verify_single_use_token deletes the entry from the
+        # in-memory data, but the store only learns about it when the
+        # middleware saves after the handler. If that save fails (409
+        # fencing conflict, 503 store outage) the middleware salvages
+        # just the consumption — reload, drop these purposes, save —
+        # so the token cannot verify again on retry.
+        self._consumed_single_use = set()
         # Lifetime anchors, filled in by SessionMiddleware from the
         # loaded SessionRecord (None for a fresh session — the middleware
         # substitutes "now"). Not part of the persisted data.
@@ -1114,7 +1122,10 @@ class Session(MutableMapping):
         # Consume first, then judge: one attempt, whatever the outcome.
         stored = self._data.get(_META_KEY)
         if isinstance(stored, dict) and isinstance(stored.get("single_use"), dict):
-            stored["single_use"].pop(purpose, None)
+            if stored["single_use"].pop(purpose, None) is not None:
+                # A3-L1: remember the consumption so the middleware can
+                # persist it even if the post-handler save fails.
+                self._consumed_single_use.add(purpose)
             if not stored["single_use"] and stored.get("auth_at") is None:
                 del self._data[_META_KEY]
         if not isinstance(entry, dict):
@@ -1410,6 +1421,54 @@ class SessionMiddleware:
             if metrics is not None:
                 metrics.observe_degraded("sessions", policy, "refused")
 
+    async def _persist_consumed_single_use(self, session, token, now):
+        """Best-effort: persist single-use token consumption after a failed save (A3-L1).
+
+        The handler already ran the sensitive action behind the consumed
+        token; if the consumption never reaches the store, the client
+        can retry after the 409/503 and the token verifies again. Reload
+        the stored row, drop the consumed purposes from it, and save it
+        back under its current version — the concurrent writer's other
+        changes are preserved. Retries a few times on fencing conflicts;
+        failure is logged, not raised: the original 409/503 response
+        still goes out, and the residual replay risk is visible in the
+        log instead of silent.
+        """
+        consumed = getattr(session, "_consumed_single_use", None)
+        if not consumed or token is None:
+            return
+        for _attempt in range(3):
+            try:
+                loaded = await self.store.load(token)
+            except SessionUnavailable:
+                log.warning("Could not persist consumed single-use token(s) %s: "
+                            "session store unavailable", sorted(consumed))
+                return
+            if loaded is None:
+                return
+            data, csrf, version = loaded[0], loaded[1], loaded[2]
+            meta = data.get(_META_KEY)
+            single_use = meta.get("single_use") if isinstance(meta, dict) else None
+            if not isinstance(single_use, dict) or not any(p in single_use for p in consumed):
+                return  # already gone (another request consumed it, or never stored)
+            for purpose in consumed:
+                single_use.pop(purpose, None)
+            if not single_use and isinstance(meta, dict) and meta.get("auth_at") is None:
+                del data[_META_KEY]
+            try:
+                await self.store.save(token, data, csrf, version,
+                                      self._expires_at(session, now))
+            except SessionConflict:
+                continue
+            except SessionUnavailable:
+                log.warning("Could not persist consumed single-use token(s) %s: "
+                            "session store unavailable", sorted(consumed))
+                return
+            return
+        log.warning("Could not persist consumed single-use token(s) %s after 3 "
+                    "fencing retries; the token may verify again on retry",
+                    sorted(consumed))
+
     async def __call__(self, request, call_next):
         self._ensure_purge_task()
         token = self._cookie(request)
@@ -1473,6 +1532,10 @@ class SessionMiddleware:
                     revoked = await self.store.delete(token_to_delete)
                 except SessionUnavailable:
                     self._report_store(request, healthy=False)
+                    # A3-L1: the session survives (delete failed), so a
+                    # token consumed by this request's handler must still
+                    # be persisted, or it verifies again on retry.
+                    await self._persist_consumed_single_use(session, token_to_delete, now)
                     return Response("Session unavailable", status=503,
                                     headers=[(b"retry-after", b"1"), (b"cache-control", b"no-store")])
                 if revoked is False:
@@ -1494,12 +1557,17 @@ class SessionMiddleware:
                                                 expires,
                                                 previous_token=old_token if session._rotate and old_token else None)
             except SessionConflict:
+                # A3-L1: the handler already ran the sensitive action
+                # behind the consumed token; salvage just the
+                # consumption so the token cannot verify again on retry.
+                await self._persist_consumed_single_use(session, old_token or new_token, now)
                 if isinstance(response, StreamingResponse):
                     await response.aclose()
                 return Response("Session changed; retry the request", status=409,
                                 headers=[(b"cache-control", b"no-store")])
             except SessionUnavailable:
                 self._report_store(request, healthy=False)
+                await self._persist_consumed_single_use(session, old_token or new_token, now)
                 if isinstance(response, StreamingResponse):
                     await response.aclose()
                 return Response("Session unavailable", status=503,

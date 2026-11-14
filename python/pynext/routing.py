@@ -46,12 +46,22 @@ def _build_path(pattern, params, *, encode):
     """
     if not isinstance(pattern, str) or not pattern.startswith("/"):
         raise ValueError(f"Route pattern must start with '/': {pattern!r}")
+    if pattern != "/" and pattern.endswith("/"):
+        raise ValueError(f"Route pattern must not end with '/': {pattern!r}")
     segments = pattern.strip("/").split("/") if pattern != "/" else []
     keys = {}
-    for segment in segments:
+    for index, segment in enumerate(segments):
+        # A1-L1: validate the pattern the way the router does, instead of
+        # silently producing a URL no route can ever match.
+        if segment in ("", ".", ".."):
+            raise ValueError(
+                f"Route pattern must not contain empty, '.' or '..' segments: {pattern!r}")
         parsed = _segment_param(segment)
         if parsed:
             name, kind, _prefix, _suffix = parsed
+            if kind in ("catch_all", "optional") and index != len(segments) - 1:
+                raise ValueError(
+                    f"Catch-all parameter {name!r} must be the last segment: {pattern!r}")
             if name in keys:
                 raise ValueError(f"Duplicate parameter {name!r} in route pattern {pattern!r}")
             keys[name] = kind

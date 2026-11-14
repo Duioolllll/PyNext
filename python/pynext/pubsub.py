@@ -129,7 +129,15 @@ class WebSocketPubSub:
         self._check_loop()
         self._validate_topic(topic)
         if isinstance(message, str):
-            size = len(message.encode("utf-8"))
+            try:
+                size = len(message.encode("utf-8"))
+            except UnicodeEncodeError as exc:
+                # A7-L2: a str with lone surrogates is not valid UTF-8
+                # text. Reject it with the documented ValueError instead
+                # of letting UnicodeEncodeError escape to the caller.
+                raise ValueError(
+                    "Message must be valid UTF-8 text (lone surrogates are not allowed)"
+                ) from exc
         elif isinstance(message, bytes):
             size = len(message)
         else:

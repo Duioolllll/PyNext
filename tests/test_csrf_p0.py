@@ -235,6 +235,22 @@ def test_security_config_rejects_invalid_trusted_origin(bad):
         SecurityConfig(csrf_trusted_origins=bad)
 
 
+def test_security_config_rejects_samesite_none_without_secure():
+    """A1-L8: SameSite=None requires Secure (RFC 6265bis) — browsers
+    reject the cookie otherwise and CSRF protection silently breaks.
+    The session cookie already enforces this; the CSRF cookie config
+    must too, instead of relying on `pynext check`."""
+    with pytest.raises(ValueError, match="requires csrf_cookie_secure=True"):
+        SecurityConfig(csrf_cookie_samesite="None", csrf_cookie_secure=False)
+    # SameSite=None with Secure stays legal, as do Lax/Strict either way.
+    assert SecurityConfig(csrf_cookie_samesite="None",
+                          csrf_cookie_secure=True).csrf_cookie_samesite == "None"
+    assert SecurityConfig(csrf_cookie_samesite="Lax",
+                          csrf_cookie_secure=False).csrf_cookie_samesite == "Lax"
+    assert SecurityConfig(csrf_cookie_samesite="Strict",
+                          csrf_cookie_secure=False).csrf_cookie_samesite == "Strict"
+
+
 # --- S-P0-5: cycle_key / flush aliases ------------------------------------
 
 

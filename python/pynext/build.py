@@ -888,6 +888,10 @@ def _write_manifest(root, deployment_id, lock_timeout, selected, tracker,
         # later at runtime are not part of the build manifest.
         manifest["dynamic_accesses"] = {pattern: accesses for pattern, accesses in app.dynamic_accesses.items()
                                         if accesses}
+        # Accesses dropped by the 32-access cap (A1-L4): the stored
+        # entries alone would hide how much was lost.
+        manifest["dynamic_accesses_dropped"] = {pattern: count for pattern, count in app.dynamic_accesses_dropped.items()
+                                                if count}
         manifest["isr_tags"] = app.isr_tags
         # Only the file names and the public-variable keys are recorded, never
         # values: secrets stay out of the manifest, and the public keys show
@@ -1013,6 +1017,8 @@ def _finish_manifest(root, manifest, app, rendered, *, previous=None, deployment
     # of the build manifest.
     manifest["dynamic_accesses"] = {pattern: accesses for pattern, accesses in app.dynamic_accesses.items()
                                     if accesses}
+    manifest["dynamic_accesses_dropped"] = {pattern: count for pattern, count in app.dynamic_accesses_dropped.items()
+                                            if count}
     manifest["isr_static_paths"] = asyncio.run(_enumerate_isr_static_paths(app))
     if rendered is None:
         if previous is not None:
@@ -1160,6 +1166,27 @@ def _previous_static_pages(previous):
     return result
 
 
+async def _enumerate_static_patterns(app, patterns):
+    """Enumerate current generator paths for the given patterns.
+
+    Returns ``{pattern: set(paths)}`` without rendering anything.
+    A pattern whose generator raises is omitted, so the caller can
+    mark it stale and let the render pass report the failure instead
+    of failing the build here. Force-dynamic patterns are not
+    enumerated: they render nothing at build time.
+    """
+    enumerated = {}
+    for pattern in sorted(patterns):
+        if app.dynamic_modes.get(pattern) == "force-dynamic":
+            continue
+        generator = app.static_generators.get(pattern)
+        try:
+            enumerated[pattern] = set(await _materialize_params(app, pattern, generator))
+        except Exception:
+            continue
+    return enumerated
+
+
 def _render_incremental(app, manifest, previous, *, _on_pattern_error=None):
     """Render only the static pages whose inputs changed since the last build.
 
@@ -1188,6 +1215,7 @@ def _render_incremental(app, manifest, previous, *, _on_pattern_error=None):
     static_dir = app.root / ".pynext" / "static"
     stale_patterns = set()
     reused = {}
+    reused_sizes = {}
     reused_bytes = 0
     for path, entry in prev_pages.items():
         pattern = entry["pattern"]
@@ -1209,7 +1237,35 @@ def _render_incremental(app, manifest, previous, *, _on_pattern_error=None):
             stale_patterns.add(pattern)
             continue
         reused[path] = entry
+        reused_sizes[path] = len(body)
         reused_bytes += len(body)
+    # A generator's output may have changed since the last build even
+    # when the page module did not: the data it reads (a JSON file, a
+    # database, the environment) is not part of `sources`, so the
+    # pattern never goes stale and its reused pages are taken at face
+    # value. Re-enumerate the patterns that still have reused pages:
+    # paths the generator no longer lists are pruned from the manifest
+    # instead of being served forever, and newly listed paths make the
+    # pattern stale so the render pass picks them up. A generator that
+    # now fails is also marked stale so the render pass reports it.
+    patterns_with_reused = {entry["pattern"] for entry in reused.values()}
+    if patterns_with_reused:
+        enumerated = asyncio.run(_enumerate_static_patterns(app, patterns_with_reused))
+        for pattern in sorted(patterns_with_reused):
+            current = enumerated.get(pattern)
+            if current is None:
+                # Generator failed (or the pattern is force-dynamic and
+                # was not enumerated): re-render the pattern so the
+                # render pass reports the failure; a force-dynamic
+                # pattern renders nothing and keeps its reused pages.
+                stale_patterns.add(pattern)
+                continue
+            kept = {path for path, entry in reused.items() if entry["pattern"] == pattern}
+            if current - kept:
+                stale_patterns.add(pattern)
+            for path in kept - current:
+                reused_bytes -= reused_sizes.pop(path)
+                del reused[path]
     for pattern in app.static_generators:
         if not any(entry["pattern"] == pattern for entry in reused.values()):
             stale_patterns.add(pattern)

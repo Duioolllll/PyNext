@@ -87,12 +87,20 @@ def _check_destination(destination, source_params, *, allow_absolute):
         path = urlsplit(destination).path
         if _is_reserved(path):
             raise ValueError(f"Custom route destination is a reserved path: {destination!r}")
+        if "\\" in path:
+            # A6-L2: browsers (WHATWG URL) treat "\\" as "/" in special
+            # schemes, so "/\\evil.com" resolves to "//evil.com" — an
+            # open redirect. Same class as A6-M1.
+            raise ValueError(f"Custom route destination must not contain backslashes: {destination!r}")
         if any(part in (".", "..") for part in path.split("/")):
             raise ValueError(f"Custom route destination must not contain '.' or '..': {destination!r}")
     elif allow_absolute and re.match(r"https?://", destination):
         parts = urlsplit(destination)
         if not parts.netloc:
             raise ValueError(f"Custom route destination needs a host: {destination!r}")
+        if "\\" in parts.path:
+            # A6-L2: same WHATWG normalization as the relative case.
+            raise ValueError(f"Custom route destination must not contain backslashes: {destination!r}")
         if any(part in (".", "..") for part in parts.path.split("/")):
             raise ValueError(f"Custom route destination must not contain '.' or '..': {destination!r}")
     else:

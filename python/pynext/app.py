@@ -52,7 +52,7 @@ from .build import _config_error, _short_repr
 from .fetch_cache import FetchCache, fetch_cache_scope
 from .request_memo import clear_request_memo, ensure_request_memo, request_memo_scope
 from .matcher import compile_header_rules, compile_middleware_entries
-from .middleware import MAX_MIDDLEWARE_REWRITES, MiddlewareResult, ScopedMiddleware
+from .middleware import MAX_MIDDLEWARE_REWRITES, MiddlewareResult, MiddlewareScope, ScopedMiddleware
 from .custom_routes import compile_custom_routes
 from .images import (MAX_IMAGE_QUALITY, MAX_IMAGE_WIDTH, ImageBusy, ImageUnavailable, optimize_image)
 from .observability import (
@@ -1679,6 +1679,10 @@ class App:
         # Per-pattern dynamic accesses recorded during SSG/ISR prerenders
         # (see _merge_dynamic_accesses); written to the build manifest.
         self.dynamic_accesses = {}
+        # Per-pattern accesses dropped by the 32-access cap (A1-L4):
+        # the cap counts, not just the stored entries, so a page that
+        # reads the clock in a loop does not silently lose the overflow.
+        self.dynamic_accesses_dropped = {}
         self._dev_static_paths = {}
         self.isr_policies = {}
         self.layout_policies = {}
@@ -2861,7 +2865,23 @@ class App:
         on every request (or a regenerating ISR page) warns once per
         expression instead of once per render. The report is written to
         the build manifest as ``dynamic_accesses``.
+
+        Accesses dropped by the 32-access cap (``state.dropped``, A1-L4)
+        are accumulated per pattern into ``dynamic_accesses_dropped`` and
+        written to the manifest as ``dynamic_accesses_dropped``, with a
+        warning the first time a pattern drops any — the stored entries
+        alone would otherwise hide how much was lost.
         """
+        if not state.accesses and not state.dropped:
+            return
+        if state.dropped:
+            total = self.dynamic_accesses_dropped.get(pattern, 0) + state.dropped
+            self.dynamic_accesses_dropped[pattern] = total
+            if total == state.dropped:
+                log.warning(
+                    "Static page %s dropped %d dynamic access(es) beyond the "
+                    "%d-access cap; only the first %d are recorded",
+                    pattern, state.dropped, MAX_DYNAMIC_ACCESSES, MAX_DYNAMIC_ACCESSES)
         if not state.accesses:
             return
         known = self.dynamic_accesses.setdefault(pattern, [])
@@ -3658,6 +3678,26 @@ class App:
             html = "<!DOCTYPE html>" + html
         return Response(html, media_type="text/html; charset=utf-8", csp_nonce=nonce)
 
+    def _scope_match_path(self, path):
+        """Return the path scopes and header rules are evaluated against.
+
+        Scopes and header rules are written against the app-relative
+        path the router sees (A1-H2): the same
+        :func:`pynext.routing.preprocess_pathname` the dispatcher uses,
+        so a ``base_path`` prefix is stripped and the trailing-slash
+        policy applied before matching. A path outside the base path
+        preprocesses to ``None``; it is returned unchanged so evaluation
+        falls back to the raw path instead of crashing — ``_dispatch``
+        answers 404 for it anyway. A path that is already app-relative
+        (a middleware rewrite, the WebSocket pre-flight synthetic
+        request, a path ``_dispatch`` already preprocessed) passes
+        through unchanged, so this is safe to apply at every evaluation
+        point.
+        """
+        preprocessed = preprocess_pathname(path, base_path=self.base_path,
+                                           trailing_slash=self.trailing_slash)
+        return preprocessed if preprocessed is not None else path
+
     async def _run_middleware(self, request, terminal):
         """Run the global middleware chain around ``terminal(request)``.
 
@@ -3762,8 +3802,19 @@ class App:
             if index == len(self.middleware):
                 return await terminal_wrapper(current)
             scope = self.middleware_scopes[index]
-            if scope is not None and not scope.matches_request(current):
-                return await invoke(index + 1, current)
+            if scope is not None:
+                # A1-H2: scopes are evaluated against the app-relative
+                # routing path, the same value the router sees. A
+                # matcher Scope and a pynext.scoped MiddlewareScope
+                # share this check (compile_middleware_entries unwraps
+                # both into this tuple).
+                match_path = self._scope_match_path(current.path)
+                if isinstance(scope, MiddlewareScope):
+                    matched = scope.matches(current, path=match_path)
+                else:
+                    matched = scope.matches_request(current, path=match_path)
+                if not matched:
+                    return await invoke(index + 1, current)
             called = False
             downstream_raised = False
 
@@ -3851,7 +3902,7 @@ class App:
             return response
         present = {key for key, _value in response.headers}
         for rule in self.header_rules:
-            if not rule.matches_request(request):
+            if not rule.matches_request(request, path=self._scope_match_path(request.path)):
                 continue
             for key, value in rule.headers:
                 if key in present:
@@ -3884,7 +3935,7 @@ class App:
             response = await self._dispatch_response(request)
         except _SyncHandlerBusy:
             response = Response("Service Unavailable", status=503, headers=[(b"retry-after", b"1")])
-            apply_path_headers(response, request.path, path_headers=self.path_headers)
+            apply_path_headers(response, self._scope_match_path(request.path), path_headers=self.path_headers)
             apply_cors_headers(request, response, config=self.security)
             apply_security_headers(response, config=self.security, production=self.production)
             if request.method == "HEAD":
@@ -3995,7 +4046,7 @@ class App:
                                     headers=[(b"retry-after", b"1")])
             # Health responses skip the security-header step here (the
             # transport applies it); path headers still apply, before it.
-            return apply_path_headers(response, request.path, path_headers=self.path_headers)
+            return apply_path_headers(response, self._scope_match_path(request.path), path_headers=self.path_headers)
         preflight = cors_preflight_response(request, config=self.security)
         if self.middleware:
             async def terminal(current):
@@ -4008,7 +4059,7 @@ class App:
             self._apply_path_headers(request, response)
             if preflight is None:
                 apply_cors_headers(request, response, config=self.security)
-            apply_path_headers(response, request.path, path_headers=self.path_headers)
+            apply_path_headers(response, self._scope_match_path(request.path), path_headers=self.path_headers)
             apply_security_headers(response, config=self.security, production=self.production)
             self.custom_routes.apply_to_response(response, request.path)
             if request.method == "HEAD":
@@ -4019,14 +4070,14 @@ class App:
             return response
         if preflight is not None:
             self._apply_path_headers(request, preflight)
-            apply_path_headers(preflight, request.path, path_headers=self.path_headers)
+            apply_path_headers(preflight, self._scope_match_path(request.path), path_headers=self.path_headers)
             apply_security_headers(preflight, config=self.security, production=self.production)
             self.custom_routes.apply_to_response(preflight, request.path)
             return preflight
         response = await self._dispatch_timed(request)
         self._apply_path_headers(request, response)
         apply_cors_headers(request, response, config=self.security)
-        apply_path_headers(response, request.path, path_headers=self.path_headers)
+        apply_path_headers(response, self._scope_match_path(request.path), path_headers=self.path_headers)
         apply_security_headers(response, config=self.security, production=self.production)
         self.custom_routes.apply_to_response(response, request.path)
         return response
@@ -4635,7 +4686,7 @@ class App:
         """
         return await self._rate_limit_denied(scope, path)
 
-    async def _authorize_websocket(self, path, query_string=b"", headers=(), raw_path=None):
+    async def _authorize_websocket(self, path, query_string=b"", headers=(), raw_path=None, pattern=None, params=None):
         """Pre-handshake authorization for a WebSocket upgrade.
 
         Returns ``None`` when the upgrade may proceed, else a ``Response``
@@ -4645,6 +4696,17 @@ class App:
         then the handler's ``@require_auth``/``@require_permission`` policy
         — all before the handshake completes, so a denial is a rejected
         upgrade, never an accepted socket closed afterwards.
+
+        When ``pattern`` is given (A1-H1), the authorization checks the
+        policy of exactly that route pattern — the one the caller already
+        matched for the handler — instead of re-matching the path itself.
+        The two matches can disagree when an encoded delimiter (``%2F``)
+        changes the segment count: the handler lookup runs on the decoded
+        path while a fresh match here would run on the normalized encoded
+        form, so a protected handler could be checked against a public
+        route's policy. Callers that do not know the pattern (the native
+        transport, where Rust already rejected ``%2F`` and both sides
+        share one decoded path) keep the re-match behaviour.
 
         The upgrade is allowed only when the chain reaches the terminal:
         a middleware that short-circuits with its own response (even a
@@ -4673,35 +4735,45 @@ class App:
         path = preprocess_pathname(path, base_path=self.base_path, trailing_slash=self.trailing_slash)
         if path is None:
             return Response("Not Found", status=404)
-        # Match on the per-segment decoded form (Next.js
-        # decodePathParams) so the pre-flight checks the same route the
-        # handler will run; when no encoded path is available (native
-        # transport, where Rust already decoded it) the decoded path
-        # normalizes to the same form. When the encoded path is
-        # available the match form still carries the base prefix, so
-        # strip it (the boundary check above already settled it) and
-        # mirror the trailing-slash policy.
-        try:
-            match_path = _normalize_path_for_matching(raw_path or path)
-        except BadRequest:
-            return Response("Bad Request", status=400)
-        if raw_path:
-            if self.base_path and match_path != "/":
-                if match_path == self.base_path:
-                    match_path = "/"
-                elif match_path.startswith(self.base_path + "/"):
-                    match_path = match_path[len(self.base_path):]
-            if self.trailing_slash == "ignore" and match_path != "/" and match_path.endswith("/"):
-                match_path = match_path.rstrip("/") or "/"
-        match = self.router.matches(match_path)
-        if match is None:
-            return Response("Not Found", status=404)
-        pattern, raw_params, kinds = match
-        handler = self.websocket_entries.get(pattern)
-        if handler is None:
-            return Response("Not Found", status=404)
-        # The matched values are already decoded and delimiter-safe.
-        params = _typed_params(raw_params, kinds)
+        if pattern is not None:
+            # A1-H1: the caller already matched the handler's pattern;
+            # check that pattern's policy, never re-match the path. The
+            # caller also passes the params from its own match, so the
+            # middleware chain sees the same values the handler will.
+            handler = self.websocket_entries.get(pattern)
+            if handler is None:
+                return Response("Not Found", status=404)
+            params = dict(params) if params is not None else {}
+        else:
+            # Match on the per-segment decoded form (Next.js
+            # decodePathParams) so the pre-flight checks the same route the
+            # handler will run; when no encoded path is available (native
+            # transport, where Rust already decoded it) the decoded path
+            # normalizes to the same form. When the encoded path is
+            # available the match form still carries the base prefix, so
+            # strip it (the boundary check above already settled it) and
+            # mirror the trailing-slash policy.
+            try:
+                match_path = _normalize_path_for_matching(raw_path or path)
+            except BadRequest:
+                return Response("Bad Request", status=400)
+            if raw_path:
+                if self.base_path and match_path != "/":
+                    if match_path == self.base_path:
+                        match_path = "/"
+                    elif match_path.startswith(self.base_path + "/"):
+                        match_path = match_path[len(self.base_path):]
+                if self.trailing_slash == "ignore" and match_path != "/" and match_path.endswith("/"):
+                    match_path = match_path.rstrip("/") or "/"
+            match = self.router.matches(match_path)
+            if match is None:
+                return Response("Not Found", status=404)
+            pattern, raw_params, kinds = match
+            handler = self.websocket_entries.get(pattern)
+            if handler is None:
+                return Response("Not Found", status=404)
+            # The matched values are already decoded and delimiter-safe.
+            params = _typed_params(raw_params, kinds)
         request = Request("GET", path, bytes(query_string),
                           tuple((bytes(name), bytes(value)) for name, value in headers),
                           b"", params, self, {WS_PREFLIGHT_STATE_KEY: True}, raw_path=raw_path or "")
@@ -4833,9 +4905,14 @@ class App:
             return
         # Authorization runs before the handshake completes: a denied
         # upgrade is refused with a close instead of an accept, so the
-        # handler never runs and no data is sent.
+        # handler never runs and no data is sent. The already-matched
+        # pattern (and its params) is passed through (A1-H1) so the
+        # pre-flight checks the policy of the route the handler will
+        # actually run, instead of re-matching the path in a form that
+        # can point at a different route.
         denied = await self._authorize_websocket(raw_path, scope.get("query_string", b""),
-                                                 scope.get("headers", []), raw_path=encoded_path)
+                                                 scope.get("headers", []), raw_path=encoded_path,
+                                                 pattern=pattern, params=params)
         if denied is not None:
             await send({"type": "websocket.close", "code": 1008})
             return

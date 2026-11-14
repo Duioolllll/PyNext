@@ -491,3 +491,17 @@ def test_auto_workers_describe_states_the_basis():
     assert decision.describe() == (
         "auto -> 4 worker(s) (cpus=4, available memory=4.0 GiB, "
         "limited by cpus; max 8)")
+
+
+def test_max_concurrent_per_ip_help_matches_defaults(monkeypatch, capsys):
+    # A-5: the help said "a quarter of the 64-slot pool" but the
+    # defaults are max_concurrent=128 and max_concurrent_per_ip=16
+    # (one eighth of 128).
+    monkeypatch.setattr(sys, "argv", ["pynext", "start", "--help"])
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 0
+    # argparse wraps the help text, so collapse whitespace first.
+    out = " ".join(capsys.readouterr().out.split())
+    assert "one eighth of the 128-slot pool" in out
+    assert "64-slot pool" not in out

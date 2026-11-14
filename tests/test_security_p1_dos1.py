@@ -328,3 +328,63 @@ def test_asgi_fast_body_still_succeeds(tmp_path, monkeypatch):
             await app.isr.close()
 
     asyncio.run(run())
+
+
+def test_h2c_slow_handler_survives_idle_timeout(tmp_path):
+    """R5-L2: an h2c connection with a slow handler must not be cut by
+    the idle watchdog: the connection is not idle while a request is
+    being handled, unlike a connection with no in-flight request."""
+    (tmp_path / "app" / "slow").mkdir(parents=True)
+    (tmp_path / "app" / "slow" / "route.py").write_text(
+        'import asyncio\n'
+        'from pynext import Response, route\n@route("GET")\n'
+        'async def get():\n'
+        '    await asyncio.sleep(2.5)\n'
+        '    return Response("slow-ok")\n', encoding="utf-8")
+
+    async def run():
+        app = create_app(tmp_path)
+        server = start_native(app, asyncio.get_running_loop(), port=0,
+                              header_read_timeout_ms=1000)
+        host, port = server.address.rsplit(":", 1)
+        reader, writer = await asyncio.open_connection(host, int(port))
+        connection = h2.connection.H2Connection(
+            config=h2.config.H2Configuration(header_encoding="utf-8"))
+        connection.initiate_connection()
+        writer.write(connection.data_to_send())
+        await writer.drain()
+        try:
+            async def response(stream_id):
+                headers = None
+                body = b""
+                async with asyncio.timeout(10):
+                    while True:
+                        packet = await reader.read(65535)
+                        assert packet, "connection closed before the slow response arrived"
+                        for event in connection.receive_data(packet):
+                            if isinstance(event, h2.events.ResponseReceived) \
+                                    and event.stream_id == stream_id:
+                                headers = dict(event.headers)
+                            elif isinstance(event, h2.events.DataReceived):
+                                connection.acknowledge_received_data(
+                                    event.flow_controlled_length, event.stream_id)
+                                body += event.data
+                            elif isinstance(event, h2.events.StreamEnded) \
+                                    and event.stream_id == stream_id:
+                                return headers, body
+                        writer.write(connection.data_to_send())
+                        await writer.drain()
+            connection.send_headers(1, [(":method", "GET"), (":scheme", "http"),
+                                        (":authority", server.address), (":path", "/slow")],
+                                    end_stream=True)
+            writer.write(connection.data_to_send())
+            await writer.drain()
+            headers, body = await response(1)
+            assert headers[":status"] == "200"
+            assert body == b"slow-ok"
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            await asyncio.to_thread(server.stop)
+            await app.isr.close()
+    asyncio.run(run())

@@ -38,3 +38,26 @@ def test_windows_global_npm_wrapper_uses_node_without_a_shell(tmp_path, monkeypa
     paths = {"node": "node.exe", "esbuild": str(npm / "esbuild.cmd")}
     monkeypatch.setattr(client, "shutil", SimpleNamespace(which=paths.get))
     assert client._esbuild(project) == ["node.exe", str(wrapper)]
+
+
+def test_relative_pynext_esbuild_is_resolved_to_absolute_a7_l1(tmp_path, monkeypatch):
+    """A7-L1: a relative PYNEXT_ESBUILD with separators must come back absolute.
+
+    Before the fix, _esbuild returned shutil.which()'s verbatim relative
+    path ("tools/esbuild"). The --version probe runs in the process cwd
+    and passed, but bundling runs with cwd=<root>/islands where the
+    relative path no longer resolves.
+    """
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    fake = tools / "esbuild"
+    fake.write_text("#!/bin/sh\necho 0.1.0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PYNEXT_ESBUILD", "tools/esbuild")
+    monkeypatch.chdir(tmp_path)
+    assert client._esbuild(tmp_path) == [str(fake.resolve())]
+    # Root-relative fallback: cwd without the tool, root with it.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert client._esbuild(tmp_path) == [str(fake.resolve())]

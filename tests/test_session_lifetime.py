@@ -403,6 +403,73 @@ def test_single_use_token_over_http(tmp_path):
     asyncio.run(run())
 
 
+class _BumpSessionVersion:
+    """Test helper: simulates a concurrent writer (A3-L1).
+
+    Re-saves the session row — bumping its fencing version — before
+    the handler runs, so the middleware's post-handler save hits a
+    SessionConflict. A plain async callable, like SessionMiddleware.
+    """
+
+    def __init__(self, store, paths):
+        self.store = store
+        self.paths = paths
+
+    async def __call__(self, request, call_next):
+        if request.path in self.paths:
+            session = request.state.get("session")
+            token = session._token if session is not None else None
+            if token is not None:
+                loaded = await self.store.load(token)
+                if loaded is not None:
+                    await self.store.save(token, loaded[0], loaded[1], loaded[2],
+                                          time.time() + 3600)
+        return await call_next(request)
+
+
+def test_single_use_consumption_survives_save_conflict_a3_l1(tmp_path):
+    """A3-L1: a token consumed by the handler must stay consumed when
+    the post-handler save fails with a fencing conflict.
+
+    Before the fix, the middleware answered 409 and dropped the session
+    object, so the in-memory-only consumption never reached the store
+    and the same token verified again on retry. The middleware now
+    salvages just the consumption (reload, drop the purpose, save).
+    """
+    _build_lifetime_api(tmp_path)
+    store = SQLiteSessionStore(tmp_path / "sessions.sqlite3")
+    bump = _BumpSessionVersion(store, {"/api/confirm"})
+    app = create_app(tmp_path,
+                     middleware=[SessionMiddleware(store, secure=False), bump],
+                     security=SecurityConfig(csrf_enabled=True))
+
+    async def run():
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://test") as client:
+                csrf = await _login(client)
+                issued = await client.post("/api/issue", headers={"x-csrf-token": csrf})
+                assert issued.status_code == 200
+                single_use = issued.json()["single_use"]
+                # The bump middleware re-saved the row before the
+                # handler ran, so the post-handler save conflicts.
+                confirm = await client.post("/api/confirm", headers={
+                    "x-csrf-token": csrf, "x-single-use-token": single_use})
+                assert confirm.status_code == 409
+                # The handler verified the token (its action ran), and
+                # the recovery save persisted the consumption: a fresh
+                # load must no longer verify the same token.
+                token = client.cookies.get("pynext_session")
+                assert token
+                loaded = await store.load(token)
+                assert loaded is not None
+                restored = Session(loaded[0])
+                assert restored.verify_single_use_token("delete-account", single_use) is False
+        finally:
+            await app.isr.close()
+    asyncio.run(run())
+
+
 # ----------------------------------------------------------------------
 # S-P1-21: re-authentication freshness
 # ----------------------------------------------------------------------

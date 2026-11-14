@@ -247,3 +247,70 @@ def test_format_bytes():
     assert format_bytes(230) == "230 B"
     assert format_bytes(1664) == "1.6 KB"
     assert format_bytes(2 * 1024 * 1024) == "2.0 MB"
+
+
+def _make_generator_app(tmp_path, slugs):
+    blog = tmp_path / "app" / "blog" / "[slug]"
+    blog.mkdir(parents=True)
+    (tmp_path / "app" / "params.json").write_text(json.dumps(slugs), encoding="utf-8")
+    (blog / "page.py").write_text(
+        'import json\n'
+        'from pathlib import Path\n'
+        'from pynext import page, h\n'
+        'def generate_static_params():\n'
+        '    data = json.loads((Path(__file__).resolve().parents[2] / "params.json").read_text(encoding="utf-8"))\n'
+        '    return [{"slug": slug} for slug in data]\n'
+        '@page(render="ssg")\ndef Page(params): return h("p", {}, params["slug"])\n',
+        encoding="utf-8")
+
+
+def test_shrinking_generator_output_prunes_dropped_pages(tmp_path):
+    # A-1: when generate_static_params enumerates fewer paths on a
+    # rebuild, the dropped paths must leave the manifest instead of
+    # being served forever from the previous build.
+    _make_generator_app(tmp_path, ["a", "b"])
+    write_manifest(tmp_path)
+    assert set(static_digests(tmp_path)) == {"/blog/a", "/blog/b"}
+    (tmp_path / "app" / "params.json").write_text('["a"]', encoding="utf-8")
+    write_manifest(tmp_path)
+    assert set(static_digests(tmp_path)) == {"/blog/a"}
+
+
+def test_growing_generator_output_renders_new_pages(tmp_path):
+    # A-1 (other direction): paths newly enumerated by the generator
+    # must be rendered even when the page module itself is unchanged.
+    _make_generator_app(tmp_path, ["a"])
+    write_manifest(tmp_path)
+    assert set(static_digests(tmp_path)) == {"/blog/a"}
+    (tmp_path / "app" / "params.json").write_text('["a", "b"]', encoding="utf-8")
+    write_manifest(tmp_path)
+    assert set(static_digests(tmp_path)) == {"/blog/a", "/blog/b"}
+
+
+def test_info_tolerates_unknown_render_mode(tmp_path):
+    # A-2: an unknown render mode in the manifest must not crash
+    # `pynext info` with KeyError; it is counted as SSR.
+    from pynext.info import collect_info, format_info
+    manifest_dir = tmp_path / ".pynext"
+    manifest_dir.mkdir()
+    (manifest_dir / "manifest.json").write_text(json.dumps({
+        "schema_version": 10,
+        "routes": {"/": {"kind": "page"}},
+        "render_modes": {"/": "bogus-mode"},
+    }), encoding="utf-8")
+    info = collect_info(tmp_path)
+    assert info["manifest"]["routes"] == {"total": 1, "ssg": 0, "isr": 0, "ssr": 1, "api": 0}
+    assert "1 SSR" in format_info(info)
+
+
+def test_info_tolerates_build_report_missing_keys(tmp_path):
+    # A-3: a build-report.json with only the version key must not crash
+    # `pynext info` with KeyError on the missing static_pages/routes.
+    from pynext.info import collect_info, format_info
+    report_dir = tmp_path / ".pynext"
+    report_dir.mkdir()
+    (report_dir / "build-report.json").write_text(
+        json.dumps({"version": 1, "duration_seconds": 1.0}), encoding="utf-8")
+    info = collect_info(tmp_path)
+    out = format_info(info)
+    assert "Build report: present" in out

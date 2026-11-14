@@ -71,6 +71,7 @@ def authorization_policy(fn):
     return AuthorizationPolicy(requires_auth=requires_auth,
                                permissions=tuple(permissions), scopes=tuple(scopes))
 
+import hashlib
 import math
 import threading
 import time
@@ -91,7 +92,12 @@ def _login_key(client_ip, account):
 
     The account is stripped and case-folded so ``User@example`` and
     ``user@example`` share one counter — otherwise an attacker could
-    dodge the limit by varying the case. The IP is taken as given: the
+    dodge the limit by varying the case. The account is then hashed
+    (SHA-256) instead of stored verbatim: the key is attacker-controlled
+    and unbounded (a form body can carry ~1 MiB), so a raw key would let
+    a flood of long usernames grow the 10,000-entry table to gigabytes
+    (A3-L2). A hash keeps the key at a fixed 64 characters while
+    preserving the case-folding intent. The IP is taken as given: the
     caller passes the already-resolved client IP (the direct peer, or
     the address resolved through trusted proxies — see
     :meth:`pynext.ratelimit.RateLimiter.key_for`); this module does no
@@ -100,7 +106,8 @@ def _login_key(client_ip, account):
     peer shares the ``"unknown"`` IP.
     """
     ip = "unknown" if client_ip is None else str(client_ip).strip() or "unknown"
-    return (ip, str(account).strip().casefold())
+    account_key = hashlib.sha256(str(account).strip().casefold().encode("utf-8")).hexdigest()
+    return (ip, account_key)
 
 
 class LoginRateLimiter:

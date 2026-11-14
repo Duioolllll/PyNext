@@ -93,6 +93,37 @@ def test_redirect_response_defaults_to_307_and_validates_targets():
         redirect_response("/news", status=200)
 
 
+def test_redirect_response_rejects_backslash_open_redirect_a6_m1():
+    """A6-M1: "/\\evil.com" must not pass validation.
+
+    Browsers (WHATWG URL) treat "\\" as "/" for http(s), so a Location
+    of "/\\evil.com" resolves to "//evil.com" — an open redirect the
+    scheme-relative check alone would miss. Percent-encoded "%5c" stays
+    safe (it does not normalize to a host separator) and is still
+    accepted.
+    """
+    for bad in ("/\\evil.com", "/\\@evil.com", "https://example.com/\\evil.com",
+                "/a\\b", "\\\\evil.com"):
+        with pytest.raises(ValueError):
+            redirect_response(bad)
+    assert redirect_response("/%5cevil.com").status == 307
+    assert redirect_response("/news").status == 307
+
+
+def test_redirect_response_rejects_non_ascii_with_value_error_a6_l1():
+    """A6-L1: a non-ASCII redirect target must fail with ValueError.
+
+    Before the fix, redirect_response("/café") raised UnicodeEncodeError
+    (from the ASCII encode of the Location header), which the middleware
+    layer does not expect — the request answered 500. Validation now
+    rejects non-ASCII up front, and the percent-encoded form works.
+    """
+    for bad in ("/café", "/카페", "/news/☕"):
+        with pytest.raises(ValueError):
+            redirect_response(bad)
+    assert redirect_response("/caf%C3%A9").status == 307
+
+
 def test_is_redirect_response_and_classify_response():
     assert is_redirect_response(redirect_response("/news"))
     assert is_redirect_response(Response("", status=308, headers=[(b"location", b"/x")]))

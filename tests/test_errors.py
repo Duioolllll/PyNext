@@ -96,6 +96,13 @@ def test_redirect_rejects_bad_input():
         RedirectError("/bad\nlocation")
     with pytest.raises(ValueError):
         RedirectError("/caf\u00e9")
+    # A1-L5: every C0 control character and DEL is rejected at
+    # construction, not just CR/LF — to_response() puts the location in
+    # a Location header, and the HTTP layer refuses control characters.
+    for bad in ("/bad\x00location", "/bad\tlocation", "/bad\x7flocation",
+                "/bad\rlocation", "/bad\x01location", "/bad\x1blocation"):
+        with pytest.raises(ValueError, match="control characters"):
+            RedirectError(bad)
     for status in (301, 302, 303, 307, 308):
         assert RedirectError("/x", status=status).status == status
 
@@ -314,3 +321,109 @@ def test_signals_and_500_on_both_transports(tmp_path, mode, caplog):
 def test_signal_error_is_base_class():
     assert issubclass(NotFoundError, SignalError)
     assert issubclass(RedirectError, SignalError)
+
+
+class _BadStrError(Exception):
+    """An exception whose __str__ raises (A1-M5)."""
+
+    def __str__(self):
+        raise RuntimeError("boom in str")
+
+
+def test_compute_digest_survives_exploding_str():
+    """A1-M5: compute_digest must not propagate an exception whose
+    __str__ raises — the 500 handler would die instead of answering.
+    The fallback digest is stable per exception type."""
+    try:
+        raise _BadStrError("x")
+    except _BadStrError as exc:
+        first = compute_digest(exc)
+        second = compute_digest(exc)
+    assert re.fullmatch(r"[0-9a-f]{16}", first)
+    assert first == second
+    # A different exploding-str type gets a different fallback digest.
+    class _OtherBadStr(Exception):
+        def __str__(self):
+            raise RuntimeError("boom too")
+
+    try:
+        raise _OtherBadStr("x")
+    except _OtherBadStr as exc:
+        assert compute_digest(exc) != first
+
+
+def test_digest_for_error_registers_exploding_str():
+    """A1-M5: digest_for_error registers an exploding-str exception and
+    lookup_error restores it, with an unprintable-message placeholder."""
+    try:
+        raise _BadStrError("m5-unique-errdigest")
+    except _BadStrError as exc:
+        digest, count = digest_for_error(exc)
+    assert re.fullmatch(r"[0-9a-f]{16}", digest)
+    record = lookup_error(digest)
+    assert record is not None
+    assert record["type"] == "_BadStrError"
+    assert record["count"] == count
+
+
+def test_500_for_exploding_str_error_is_a_normal_response(tmp_path):
+    """A1-M5: a page raising an exception whose __str__ raises still gets
+    a normal 500 response carrying a digest and request_id, not a
+    transport failure."""
+    _write_page(tmp_path, "badstr",
+                "class BadStr(Exception):\n"
+                "        def __str__(self):\n"
+                "            raise RuntimeError('boom in str')\n"
+                "    raise BadStr('x')")
+    write_manifest(tmp_path)
+    app = create_app(tmp_path)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get("/badstr")
+
+    response = asyncio.run(run())
+    assert response.status_code == 500
+    match = re.fullmatch(r"Internal Server Error \(request_id: ([0-9a-f-]+), "
+                         r"digest: ([0-9a-f]{16})\)", response.text)
+    assert match, response.text
+    request_id, digest = match.groups()
+    assert response.headers["x-request-id"] == request_id
+    record = lookup_error(digest)
+    assert record is not None
+    assert record["type"] == "BadStr"
+
+
+def test_digest_for_error_reregisters_after_eviction(monkeypatch):
+    """A1-L6: when the registry evicts a record whose digest is still
+    cached on the exception instance, digest_for_error re-registers it
+    instead of returning a count lookup_error can never resolve."""
+    from pynext import errors
+    from pynext.errors import _ErrorRegistry
+
+    # A fresh registry: the process-global one already holds entries from
+    # other tests, so its oldest entry is not ours.
+    monkeypatch.setattr(errors, "_REGISTRY", _ErrorRegistry())
+    monkeypatch.setattr(errors, "_MAX_REGISTRY_ENTRIES", 2)
+    first_exc = None
+    try:
+        _raise_value_error("l6-first-errdigest")
+    except ValueError as exc:
+        first_exc = exc
+        digest, count = digest_for_error(exc)
+        assert lookup_error(digest) is not None
+    # Fill the registry past the bound so the first record is evicted.
+    for i in range(2):
+        try:
+            _raise_value_error(f"l6-filler-{i}-errdigest")
+        except ValueError as filler:
+            digest_for_error(filler)
+    assert lookup_error(digest) is None
+    # The same instance again: the cached digest must resolve.
+    digest_again, count_again = digest_for_error(first_exc)
+    assert digest_again == digest
+    record = lookup_error(digest)
+    assert record is not None
+    assert record["type"] == "ValueError"
+    assert record["count"] == count_again

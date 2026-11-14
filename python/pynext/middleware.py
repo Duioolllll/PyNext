@@ -357,9 +357,17 @@ class MiddlewareScope:
         object.__setattr__(self, "missing", _coerce_conditions(self.missing, "missing"))
         object.__setattr__(self, "_source_re", _compile_source(self.source))
 
-    def _matches_source(self, request: "Request") -> bool:
-        if self._source_re.fullmatch(request.path):
+    def _matches_source(self, request: "Request", path=None) -> bool:
+        # ``path`` overrides the path the source pattern is evaluated
+        # against: callers pass the app-relative routing path (the same
+        # value the router sees) so a ``base_path`` prefix or a trailing
+        # slash cannot silently bypass a scope (A1-H2). Defaults to
+        # ``request.path``.
+        target = path if path is not None else request.path
+        if self._source_re.fullmatch(target):
             return True
+        if path is not None:
+            return False
         # Fail-closed OR: also try the raw (still-encoded) target the
         # transport recorded. An encoded path must not dodge the scope.
         raw = getattr(request, "raw_path", None)
@@ -371,15 +379,17 @@ class MiddlewareScope:
             decoded = raw.decode("latin-1") if isinstance(raw, (bytes, bytearray)) else str(raw)
         return decoded != request.path and self._source_re.fullmatch(decoded) is not None
 
-    def matches(self, request: "Request") -> bool:
+    def matches(self, request: "Request", path=None) -> bool:
         """Return whether the middleware should run for ``request``.
 
         A scope that cannot be evaluated (for example a malformed query
         string) matches: execution is fail-closed, so the middleware runs
-        rather than being silently skipped.
+        rather than being silently skipped. ``path`` overrides the path
+        the ``source`` pattern is evaluated against (see
+        :meth:`_matches_source`).
         """
         try:
-            if self._source_re is not None and not self._matches_source(request):
+            if self._source_re is not None and not self._matches_source(request, path):
                 return False
             return (all(item.matches(request) for item in self.has)
                     and not any(item.matches(request) for item in self.missing))
@@ -449,6 +459,22 @@ def _validate_location(location: str) -> str:
         raise ValueError("redirect location must be a non-empty string")
     if any(ord(c) < 32 or ord(c) == 127 or c == " " for c in location):
         raise ValueError("redirect location must not contain control characters or spaces")
+    if "\\" in location:
+        # A6-M1: browsers (WHATWG URL) treat "\\" as "/" in special
+        # schemes, so "/\\evil.com" resolves to "//evil.com" — an open
+        # redirect that the scheme-relative check below would miss.
+        raise ValueError("redirect location must not contain backslashes")
+    try:
+        location.encode("ascii")
+    except UnicodeEncodeError as exc:
+        # A6-L1: redirect_response encodes the location as ASCII for the
+        # Location header; rejecting here raises ValueError (the error
+        # the middleware layer expects) instead of letting
+        # UnicodeEncodeError escape as a 500. Percent-encode non-ASCII
+        # characters before calling.
+        raise ValueError(
+            "redirect location must be ASCII (percent-encode non-ASCII characters)"
+        ) from exc
     if location.startswith("/") and not location.startswith("//"):
         return location
     if _ABSOLUTE_URL.fullmatch(location):

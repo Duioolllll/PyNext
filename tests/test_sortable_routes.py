@@ -36,17 +36,25 @@ def test_specificity_static_segments():
 
 def test_specificity_dynamic_segments():
     for segment in ["[id]", "[slug]", "[userId]", "[post-id]"]:
-        assert get_segment_specificity(segment) == 1
+        assert get_segment_specificity(segment) == 2
 
 
 def test_specificity_catch_all_segments():
     for segment in ["[...slug]", "[...path]", "[...params]"]:
-        assert get_segment_specificity(segment) == 2
+        assert get_segment_specificity(segment) == 3
 
 
 def test_specificity_optional_catch_all_segments():
     for segment in ["[[...slug]]", "[[...path]]", "[[...params]]"]:
-        assert get_segment_specificity(segment) == 3
+        assert get_segment_specificity(segment) == 4
+
+
+def test_specificity_affixed_dynamic_segments():
+    """A1-M4: an affixed dynamic parameter ranks between static and plain
+    dynamic (the Rust trie's static > affixed > dynamic order)."""
+    for segment in ["v[version]", "[name].json", "api[version]", "users[admin]",
+                    "v[version].json", "a[v]"]:
+        assert get_segment_specificity(segment) == 1
 
 
 def test_specificity_edge_cases():
@@ -56,14 +64,17 @@ def test_specificity_edge_cases():
     assert get_segment_specificity("[id") == 0
     assert get_segment_specificity("id]") == 0
     # Malformed optional catch-all: treated as dynamic.
-    assert get_segment_specificity("[[...slug]") == 1
+    assert get_segment_specificity("[[...slug]") == 2
     # Malformed optional catch-all: treated as catch-all.
-    assert get_segment_specificity("[...slug]]") == 2
+    assert get_segment_specificity("[...slug]]") == 3
 
 
 def test_specificity_segments_with_brackets_but_not_dynamic():
-    assert get_segment_specificity("api[version]") == 0
-    assert get_segment_specificity("users[admin]") == 0
+    # A second parameter (or a stray bracket) after the first one means
+    # no single well-formed parameter: the segment is not affixed.
+    assert get_segment_specificity("v[version]x[y]") == 0
+    assert get_segment_specificity("a[b]c[d]") == 0
+    assert get_segment_specificity("v[id") == 0
 
 
 # --- compare_routes: ported from sortable-routes.test.ts ---
@@ -74,6 +85,21 @@ def test_compare_prioritizes_shorter_routes():
     assert compare_routes("/api/users", "/api") == 1
     assert compare_routes("/", "/about") == -1
     assert compare_routes("/about", "/") == 1
+
+
+def test_compare_prioritizes_static_over_affixed_over_dynamic():
+    """A1-M4: static < affixed dynamic < plain dynamic (the Rust trie
+    order). The finding's reproduction: /x/a[v] used to sort before /x/new
+    because the affixed segment fell through to static."""
+    assert compare_routes("/x/new", "/x/a[v]") == -1
+    assert compare_routes("/x/a[v]", "/x/new") == 1
+    assert compare_routes("/x/a[v]", "/x/[id]") == -1
+    assert compare_routes("/x/[id]", "/x/a[v]") == 1
+    assert compare_routes("/x/v[version]", "/x/[id]") == -1
+    assert sort_routes(["/x/a[v]", "/x/new"]) == ["/x/new", "/x/a[v]"]
+    assert sort_routes(["/x/[id]", "/x/v[version]"]) == ["/x/v[version]", "/x/[id]"]
+    assert sort_routes(["/x/[id]", "/x/[name].json", "/x/new"]) == [
+        "/x/new", "/x/[name].json", "/x/[id]"]
 
 
 def test_compare_prioritizes_static_over_dynamic():
@@ -364,6 +390,17 @@ def _draw_route(data, allow_params=True):
                 segments.append(f"[...{name}]")
         elif allow_params and data.draw(st.integers(min_value=0, max_value=3)) == 0:
             segments.append(f"[{data.draw(_PARAM_NAME)}]")
+        elif allow_params and data.draw(st.integers(min_value=0, max_value=5)) == 0:
+            # Affixed dynamic segment (A1-M4): the comparator must rank
+            # it between static and plain dynamic, like the Rust trie.
+            # Only the two shapes whose (prefix, suffix) order agrees
+            # with lexicographic order are generated, so the comparator
+            # and the trie cannot disagree on the tie-break.
+            name = data.draw(_PARAM_NAME)
+            if data.draw(st.booleans()):
+                segments.append(f"v[{name}]")
+            else:
+                segments.append(f"[{name}].json")
         else:
             segments.append(data.draw(_STATIC_SEGMENT))
     return "/" + "/".join(segments)

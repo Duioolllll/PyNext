@@ -191,6 +191,23 @@ def test_metrics_prometheus_text():
     assert snap["routes"]["/blog/[slug]"]["latency_ms"]["p99"] == 2.5
 
 
+def test_unknown_methods_fold_into_other_a6_l3():
+    """A6-L3: attacker-chosen method tokens must not grow the methods dict.
+
+    Before the fix, observe_request keyed methods verbatim, so 500
+    distinct method tokens produced 500 entries that are never evicted.
+    Known methods are still counted individually; anything else folds
+    into a single "OTHER" bucket.
+    """
+    collector = MetricsCollector()
+    for i in range(500):
+        collector.observe_request("/api/x", f"X-CUSTOM-{i}", 200, 1.0)
+    collector.observe_request("/api/x", "GET", 200, 1.0)
+    collector.observe_request("/api/x", "get", 200, 1.0)
+    methods = collector.snapshot()["routes"]["/api/x"]["methods"]
+    assert methods == {"OTHER": 500, "GET": 2}
+
+
 def test_native_server_records_queue_wait_and_worker_start():
     async def run():
         app = create_app(EXAMPLE)

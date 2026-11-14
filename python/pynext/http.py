@@ -308,6 +308,13 @@ class SecurityConfig:
             raise ValueError("csrf_cookie_samesite must be Lax, Strict or None")
         if not isinstance(self.csrf_cookie_secure, bool):
             raise TypeError("csrf_cookie_secure must be a bool")
+        # A1-L8: SameSite=None requires Secure (RFC 6265bis) — browsers
+        # reject the cookie otherwise and CSRF protection silently breaks.
+        # The session cookie already enforces this (sessions.py); the CSRF
+        # cookie config must too, instead of relying on `pynext check`.
+        if self.csrf_cookie_samesite == "None" and not self.csrf_cookie_secure:
+            raise ValueError("csrf_cookie_samesite='None' requires csrf_cookie_secure=True: "
+                             "browsers reject SameSite=None cookies without Secure")
         if isinstance(self.csrf_cookie_max_age, bool) or not isinstance(self.csrf_cookie_max_age, int) \
                 or not 0 < self.csrf_cookie_max_age <= 2_592_000:
             raise ValueError("csrf_cookie_max_age must be an integer from 1 to 2592000")
@@ -1077,6 +1084,17 @@ def _compile_path_pattern(source):
         raise TypeError(f"path header source must be a str, got {type(source).__name__}")
     if not source.startswith("/") or (len(source) > 1 and source.endswith("/")) or "//" in source:
         raise ValueError(f"Invalid path header source {source!r}: must be an absolute normalized path")
+    # A1-L9: '%' must not appear, like matcher.compile_matcher rejects it.
+    # A literal '%' in a source could never match what its author intends:
+    # the rule is evaluated against the decoded routing path, where '%2F'
+    # has already become '/', so a source carrying '%2F' silently never
+    # fires — while the matcher (the other per-path header system) rejects
+    # the same source at startup. Reject it here too so the two systems
+    # agree and a bad rule fails at startup instead of never matching.
+    if "%" in source:
+        raise ValueError(
+            f"Invalid path header source {source!r}: '%' must not appear "
+            "(a decoded routing path never contains it, so this pattern could never match)")
     if source == "/":
         return re.compile(r"/")
     segments = source[1:].split("/")
@@ -1705,6 +1723,12 @@ class Response:
             self.body = bytes(body)
         else:
             raise TypeError(f"Response body must be str or bytes, got {type(body).__name__}")
+        # A1-L7: 1xx, 204 and 304 responses must not carry a body (RFC 9110
+        # §15), like StreamingResponse already enforces. Reject a body
+        # here instead of letting the server silently drop it (or worse,
+        # frame it); an empty body with those statuses stays legal.
+        if self.body and (status < 200 or status in (204, 304)):
+            raise ValueError("Response body is not allowed with this status")
         self.status = status
         self.headers = [(bytes(k).lower(), bytes(v)) for k, v in headers]
         for key, value in self.headers:

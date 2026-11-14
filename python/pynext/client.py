@@ -89,6 +89,13 @@ def _esbuild(root):
         executable = shutil.which(explicit) or (str(candidate.resolve()) if candidate.is_file() else None)
         if not executable or not os.access(executable, os.X_OK):
             raise ValueError("PYNEXT_ESBUILD does not point to an executable")
+        # A7-L1: which() returns a name with separators verbatim, so a
+        # relative PYNEXT_ESBUILD (e.g. "tools/esbuild") came back
+        # relative. The --version probe runs in the process cwd and
+        # passes, but bundling runs with cwd=<root>/islands where the
+        # relative path no longer resolves. Normalize to an absolute
+        # path up front so every later subprocess finds it.
+        executable = str(Path(executable).resolve())
         if sys.platform == "win32" and Path(executable).suffix.lower() in {".bat", ".cmd"}:
             raise ValueError("PYNEXT_ESBUILD must point to a native esbuild executable on Windows")
         return [str(executable)]

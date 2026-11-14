@@ -26,12 +26,17 @@ know (see :func:`pynext.build._segment_param`):
 - a trailing ``/*`` — zero or more segments (``/api/*`` matches
   ``/api`` itself and everything below it).
 
-A matcher is always evaluated against the single decoded routing path
-(``Request.path``) — the same value the router sees — so there is no
-second, differently-normalized path for a scope check to disagree with.
-Patterns containing ``%``, ``?`` or ``#`` are rejected at startup:
-such a pattern could never match a decoded routing path, so accepting
-it would only create a rule that silently never fires.
+A matcher is evaluated against the app-relative routing path — the
+decoded ``Request.path`` after :func:`pynext.routing.preprocess_pathname`
+has stripped the ``base_path`` prefix and applied the trailing-slash
+policy — which is the same value the router sees. Callers pass that
+path to :meth:`Scope.matches_request` / :meth:`HeaderRule.matches_request`
+as ``path``; evaluating against the raw request path instead would let
+a ``base_path`` prefix or a trailing slash silently bypass a scope or
+a header rule (A1-H2). Patterns containing ``%``, ``?`` or ``#`` are
+rejected at startup: such a pattern could never match a decoded
+routing path, so accepting it would only create a rule that silently
+never fires.
 
 ``has`` / ``missing`` conditions follow Next.js ``RouteHasSchema``
 semantics (``middleware-config.ts:13-33``, ``matchHas`` in
@@ -95,7 +100,11 @@ class Matcher:
         match = self.regex.match(path)
         if match is None:
             return None
-        return {name: match.group(name) for name in self.param_names}
+        # Group names are positional (p0, p1, ...) because parameter
+        # names may contain hyphens or start with a digit (A1-M2),
+        # which Python regex group names forbid; param_names maps them
+        # back to the original names.
+        return {name: match.group(f"p{index}") for index, name in enumerate(self.param_names)}
 
 
 def compile_matcher(source):
@@ -146,17 +155,24 @@ def compile_matcher(source):
                 raise ValueError(f"Optional catch-all must use [[...name]]: {segment!r} in {source!r}")
             if name in names:
                 raise ValueError(f"Duplicate matcher parameter {name!r} in {source!r}")
+            # Parameter names are [A-Za-z0-9_-]+, but Python regex group
+            # names must be identifiers: a hyphen or a leading digit
+            # (``[my-id]``, ``[0id]``) is a valid route parameter the
+            # router accepts, yet ``(?P<my-id>...)`` fails to compile
+            # (A1-M2). Use a positional group name and map it back in
+            # Matcher.matches.
+            group = f"p{len(names)}"
             names.append(name)
             if double_open:
                 if not last:
                     raise ValueError(f"Optional catch-all must be the last segment: {source!r}")
-                parts.append(rf"(?:/(?P<{name}>.*))?")
+                parts.append(rf"(?:/(?P<{group}>.*))?")
             elif dots:
                 if not last:
                     raise ValueError(f"Catch-all must be the last segment: {source!r}")
-                parts.append(rf"/(?P<{name}>.+)")
+                parts.append(rf"/(?P<{group}>.+)")
             else:
-                parts.append(rf"/(?P<{name}>[^/]+)")
+                parts.append(rf"/(?P<{group}>[^/]+)")
             continue
         if segment in (".", ".."):
             raise ValueError(f"matcher source must not contain '.' or '..' segments: {source!r}")
@@ -187,9 +203,14 @@ def _compile_has_value(condition_type, value):
             f"has/missing value for {condition_type!r} exceeds {MAX_HAS_VALUE_LENGTH} characters")
     if any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise ValueError(f"has/missing value for {condition_type!r} must not contain control characters")
-    text = value.lower() if condition_type == "host" else value
+    # Host candidates are already lowercased by _request_host, so the
+    # pattern must match case-insensitively without rewriting its text:
+    # lowercasing the text itself corrupts regex escapes (A1-M1) —
+    # ``\A`` becomes the BEL escape ``\a``, ``\D`` becomes ``\d``, and
+    # ``\Z`` becomes the invalid escape ``\z``.
+    flags = re.IGNORECASE if condition_type == "host" else 0
     try:
-        return re.compile(text)
+        return re.compile(value, flags)
     except re.error as exc:
         raise ValueError(f"Invalid has/missing value regex {value!r}: {exc}") from exc
 
@@ -235,7 +256,11 @@ class HasCondition:
             if candidate is None:
                 return False
         else:  # host
-            candidate = host or ""
+            # Lowercase the candidate so a direct matches() call agrees
+            # with matches_request(), where _request_host already
+            # lowercases it (A1-M1). The compiled pattern is
+            # case-insensitive, so this is belt and braces.
+            candidate = (host or "").lower()
             if not candidate:
                 return False
         if self._regex is None:
@@ -335,8 +360,14 @@ class Scope:
         return not any(condition.matches(headers=headers, query=query, cookies=cookies, host=host)
                        for condition in self.missing)
 
-    def matches_request(self, request):
-        """True when this scope matches ``request`` (a ``Request``)."""
+    def matches_request(self, request, path=None):
+        """True when this scope matches ``request`` (a ``Request``).
+
+        ``path`` overrides the path the matcher is evaluated against:
+        callers pass the app-relative routing path (see the module
+        docstring) so a scope is checked against the same path the
+        router sees. Defaults to ``request.path``.
+        """
         try:
             query = request.query
         except Exception:
@@ -344,7 +375,7 @@ class Scope:
             # hold (so a `missing` query condition does hold); header,
             # cookie and host conditions are unaffected.
             query = {}
-        return self.matches(request.path, headers=request.headers, query=query,
+        return self.matches(path if path is not None else request.path, headers=request.headers, query=query,
                             cookies=_parse_cookies(request.headers),
                             host=_request_host(request))
 
@@ -421,13 +452,19 @@ class HeaderRule:
         return not any(condition.matches(headers=headers, query=query, cookies=cookies, host=host)
                        for condition in self.missing)
 
-    def matches_request(self, request):
-        """True when this rule applies to ``request`` (a ``Request``)."""
+    def matches_request(self, request, path=None):
+        """True when this rule applies to ``request`` (a ``Request``).
+
+        ``path`` overrides the path the matcher is evaluated against:
+        callers pass the app-relative routing path (see the module
+        docstring) so a rule is checked against the same path the
+        router sees. Defaults to ``request.path``.
+        """
         try:
             query = request.query
         except Exception:
             query = {}
-        return self.matches(request.path, headers=request.headers, query=query,
+        return self.matches(path if path is not None else request.path, headers=request.headers, query=query,
                             cookies=_parse_cookies(request.headers),
                             host=_request_host(request))
 
@@ -513,6 +550,10 @@ def compile_middleware_entries(entries):
 
     Plain async callables stay global (``Scope`` ``None``);
     :class:`ScopedMiddleware` entries keep their compiled scope.
+    :func:`pynext.scoped` entries (``pynext.middleware.ScopedMiddleware``)
+    are unwrapped the same way, so the app checks their scope once,
+    against the app-relative routing path (A1-H2), instead of the
+    wrapper re-checking the raw request path inside ``__call__``.
     Raises :class:`TypeError` for a non-callable entry or a sync
     callable, and :class:`ValueError` for an invalid scope (the scope
     itself is already compiled by :func:`scoped_middleware`, so this is
@@ -522,12 +563,19 @@ def compile_middleware_entries(entries):
         return ()
     if not isinstance(entries, (list, tuple)):
         raise TypeError("middleware must be a list or tuple")
+    # Lazy import: middleware.py does not import matcher.py, but keep
+    # the dependency one-directional at module load time.
+    from .middleware import ScopedMiddleware as _MiddlewareScoped
     compiled = []
     for item in entries:
         if isinstance(item, ScopedMiddleware):
             fn, scope = item.middleware, item.scope
             if not isinstance(scope, Scope):
                 raise TypeError("scoped middleware scope must be a Scope")
+        elif isinstance(item, _MiddlewareScoped):
+            # pynext.scoped: the scope is a MiddlewareScope; the app's
+            # _run_middleware checks it with the preprocessed path.
+            fn, scope = item.middleware, item.scope
         else:
             fn, scope = item, None
         if not _is_async_callable(fn):

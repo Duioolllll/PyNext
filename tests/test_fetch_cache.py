@@ -503,7 +503,9 @@ def test_apply_fetch_revalidate():
 """Fetch/data cache + per-request memoization (track C P1-1/P1-2)."""
 import asyncio
 import contextvars
+import http.server
 import logging
+import threading
 
 import httpx
 import pytest
@@ -511,7 +513,8 @@ import pytest
 from pynext import (FetchCache, FetchResult, create_app, fetch_cache_key,
                     fetch_cached, get_fetch_cache, memoize, memoize_sync,
                     resolve_fetch_policy)
-from pynext.cache import ISRCache
+from pynext.cache import MAX_CACHE_BODY_BYTES, ISRCache
+from pynext.fetch_cache import urllib_fetcher
 from pynext.request_memo import (RequestMemo, clear_request_memo, current_memo,
                                  ensure_request_memo, request_memo_scope)
 
@@ -1048,3 +1051,60 @@ def test_app_fetch_cached_shared_by_layout_and_page_and_persisted(tmp_path):
             assert "upstream-data|upstream-data|calls=1" in second.text
 
     _run(run())
+
+
+# --- urllib_fetcher body cap (A-3) -----------------------------------------
+
+class _CappedBodyHandler(http.server.BaseHTTPRequestHandler):
+    """Serves a fixed body with a configurable status (class attributes)."""
+
+    body = b""
+    status = 200
+
+    def do_GET(self):
+        self.send_response(self.status)
+        self.send_header("Content-Length", str(len(self.body)))
+        self.end_headers()
+        self.wfile.write(self.body)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def _local_http_server():
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CappedBodyHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_urllib_fetcher_rejects_body_over_cap(_local_http_server):
+    """A-3: a body over MAX_CACHE_BODY_BYTES must raise instead of being
+    buffered whole — before the fix a 64 MiB upstream body was read
+    fully into memory (RSS +~100 MiB) and only rejected afterwards."""
+    _CappedBodyHandler.body = b"x" * (MAX_CACHE_BODY_BYTES + 1024)
+    _CappedBodyHandler.status = 200
+    with pytest.raises(ValueError, match="exceeds the .*byte cap"):
+        asyncio.run(urllib_fetcher(_local_http_server))
+
+
+def test_urllib_fetcher_accepts_body_at_cap(_local_http_server):
+    """A-3: a body exactly at the cap still fetches normally."""
+    _CappedBodyHandler.body = b"y" * MAX_CACHE_BODY_BYTES
+    _CappedBodyHandler.status = 200
+    result = asyncio.run(urllib_fetcher(_local_http_server))
+    assert result.status == 200
+    assert len(result.body) == MAX_CACHE_BODY_BYTES
+
+
+def test_urllib_fetcher_caps_error_body(_local_http_server):
+    """A-3: the HTTPError branch (exc.read) is capped the same way."""
+    _CappedBodyHandler.body = b"z" * (MAX_CACHE_BODY_BYTES + 1024)
+    _CappedBodyHandler.status = 500
+    with pytest.raises(ValueError, match="exceeds the .*byte cap"):
+        asyncio.run(urllib_fetcher(_local_http_server))
