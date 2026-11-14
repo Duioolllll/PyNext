@@ -2942,7 +2942,7 @@ impl IdleClock {
         // Saturating: a guard must never drive the count below zero.
         let _ = self
             .busy
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
                 Some(count.saturating_sub(1))
             });
     }
